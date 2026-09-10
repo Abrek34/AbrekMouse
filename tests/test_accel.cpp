@@ -5223,6 +5223,8 @@ struct evt {
 
 struct sim {
     bool dropped = false;
+    bool has_syn = false;                 // a SYN_REPORT arrived this invocation
+    bool wrote_unsynced = false;          // some event written without a SYN yet
     double dx = 0, dy = 0;
     bool has_motion = false;
     std::vector<evt> out;
@@ -5239,8 +5241,10 @@ struct sim {
                 dropped = false;
                 return;
             }
+            has_syn = true;
             flush();
             out.push_back({ev_syn, syn_report, 0});
+            wrote_unsynced = false;
         } else if (dropped) {
             return;                  // R12: discard all non-SYN while dropped
         } else if (type == ev_rel) {
@@ -5248,15 +5252,26 @@ struct sim {
             else if (code == rel_y) dy += value;
             has_motion = true;
         } else {
-            out.push_back({type, code, value});   // buttons etc. forwarded
+            // Buttons/wheel/etc. — daemon flushes pending motion BEFORE
+            // forwarding a non-motion event (daemon.cpp:1376-1387), so the
+            // partial frame is not reordered after the button.
+            flush();
+            out.push_back({type, code, value});
+            wrote_unsynced = true;
         }
     }
 
     void end_batch() {
-        // Motion that never reached a SYN_REPORT is lost (daemon locals
-        // dx/dy live inside one process_device() invocation).
-        dx = dy = 0;
-        has_motion = false;
+        // Daemon process_device() tail (daemon.cpp:1391-1396): a frame that
+        // never reached SYN_REPORT is NOT lost — pending motion is flushed
+        // and, if any event was written unsynced, a synthetic SYN_REPORT
+        // closes the frame.  Locals are per-invocation, so reset them.
+        if (!has_syn) {
+            flush();
+            if (wrote_unsynced) out.push_back({ev_syn, syn_report, 0});
+        }
+        has_syn = false;
+        wrote_unsynced = false;
     }
 
     void flush() {
@@ -5265,6 +5280,7 @@ struct sim {
         out.push_back({ev_rel, rel_y, (int)dy});
         dx = dy = 0;
         has_motion = false;
+        wrote_unsynced = true;
     }
 };
 
@@ -5359,15 +5375,61 @@ static void test_syn_dropped_event_stream() {
         EXPECT(s.out[1].type == ev_syn && s.out[1].code == syn_report);
     }
 
-    SECTION("T24 — motion without SYN_REPORT is lost at batch end (daemon locals)");
+    SECTION("T24 — motion without SYN_REPORT is flushed at batch end (BUG-20: synthetic SYN)");
     {
+        // Daemon tail (daemon.cpp:1391-1396): a frame that ended without a
+        // SYN_REPORT is flushed with a synthetic SYN — the partial motion is
+        // NOT dropped (this test documents the real queue behavior, replacing
+        // the stale "motion is lost" model).
         sim s;
         s.handle(ev_rel, rel_x, 8);      // partial frame, no SYN yet
-        s.end_batch();                   // batch boundary: deltas dropped
-        s.handle(ev_syn, syn_report, 0); // nothing to flush; bare SYN forwarded
-        EXPECT(s.out.size() == 1);
-        EXPECT(s.out[0].type == ev_syn && s.out[0].code == syn_report);
-        EXPECT(!s.dropped && !s.has_motion);
+        s.end_batch();                   // daemon flushes + synthetic SYN_REPORT
+        EXPECT(s.out.size() == 3);
+        EXPECT(has_rel(s.out, 8, 0));
+        EXPECT(s.out[2].type == ev_syn && s.out[2].code == syn_report);
+        EXPECT(!s.dropped && !s.has_motion && !s.has_syn);
+    }
+
+    SECTION("T24 — batch end with only forwarded buttons emits one synthetic SYN");
+    {
+        // Non-motion events written unsynced also close with a synthetic SYN
+        // (daemon.cpp:1393-1395, wrote_unsynced_event path).
+        sim s;
+        s.handle(ev_key, btn_left, 1);   // forwarded immediately
+        s.end_batch();
+        EXPECT(s.out.size() == 2);
+        EXPECT(s.out[0].type == ev_key && s.out[0].code == btn_left);
+        EXPECT(s.out[1].type == ev_syn && s.out[1].code == syn_report);
+        EXPECT(!s.has_syn && !s.wrote_unsynced);
+    }
+
+    SECTION("T24 — clean batch ending on SYN_REPORT does not double-flush");
+    {
+        // has_syn=true path: the real SYN already closed the frame, so
+        // end_batch() adds nothing (no synthetic SYN, no stray REL).
+        sim s;
+        s.handle(ev_rel, rel_x, 3);
+        s.handle(ev_syn, syn_report, 0);
+        s.end_batch();
+        EXPECT(s.out.size() == 3);
+        EXPECT(has_rel(s.out, 3, 0));
+        EXPECT(s.out.back().type == ev_syn && s.out.back().code == syn_report);
+        EXPECT(!s.wrote_unsynced);
+    }
+
+    SECTION("T24 — motion then button (no SYN): relative order preserved, one closing SYN");
+    {
+        // Daemon flushes pending motion BEFORE forwarding the button
+        // (daemon.cpp:1383-1387), so motion stays ahead of the button and the
+        // whole frame closes with a single synthetic SYN at batch end.
+        sim s;
+        s.handle(ev_rel, rel_x, 4);
+        s.handle(ev_key, btn_left, 1);
+        s.end_batch();
+        EXPECT(s.out.size() == 4);
+        EXPECT(has_rel(s.out, 4, 0));
+        EXPECT(s.out[2].type == ev_key && s.out[2].code == btn_left);
+        EXPECT(s.out[3].type == ev_syn && s.out[3].code == syn_report);
     }
 
     SECTION("T24 — dropped flag does NOT leak into the next good batch window");

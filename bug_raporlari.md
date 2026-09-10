@@ -18,8 +18,10 @@ Aşağıdaki bulgular **aj1** tarafından incelenmiş, gerçek bug olduğu doğr
 | 7 | classic GAIN/io `cap.x < input_offset` dejenere eğri çökmesi | `include/accel-classic.hpp:114-116` cap_x'i input_offset'e sabitle + `src/config.cpp:394-395` sanitize kısıtı (`cap.x >= input_offset`) |
 | 16 | `detect_polling_rate` speed sysfs okunamazsa yanlış (8× düşük) rapor | `daemon/daemon.cpp:175-191` → `usb_speed == 0` iken önce high-speed yorumunu dene, geçerli aralıktaysa onu kullan |
 | 67 | LUT editor velocity modunda sağ-tık silme hit-test'i ham stored değere bakıyor (grafik gain y=x iddiasında) | `gui/ui_builder.inl` → silme hit-test'i `lut_stored_to_gain()` ile gain koordinatına çevrildi; ek aynı kök neden: sol-tık ekleme `lut_gain_to_stored(spd, gain, ax.gain)` ile stored'a çevriliyor (on_lut_spin_changed/on_lut_add_point ile tutarlı) |
+| 20 | T24 sim "motion batch sonunda kaybolur" diyor; daemon sentetik SYN ile flush ediyor | `tests/test_accel.cpp` → `t24syn::sim` daemon.web`kurulumuyla uyumlu yeniden modellendi: `has_syn`/`wrote_unsynced`, `end_batch()` sentetik SYN flush'ı; bayat bölüm adı +3 yeni bölüm |
+| 21 | AGENTS.md test sayacı bayat (33738/33746) | `AGENTS.md:117,210` → 33759'a güncellendi (BUG-20 sim +13 assert) |
 
-Doğrulama (BUG-67 fix sonrası): 33746/33746 birim test ✓, oracle (1047 satır / 45 bilinen sapma) ✓, tr coverage PASS ✓, build 0 uyarı ✓.
+Doğrulama (BUG-20/21 fix sonrası): 33759/33759 birim test ✓, oracle (1047 satır / 45 bilinen sapma) ✓, tr coverage PASS ✓, build 0 uyarı ✓.
 
 ---
 
@@ -179,7 +181,7 @@ return daemon_ipc_send_raw(req, 5000)
   - Test yorumu ile gerçek kod artık UYUMLU; `test_classic_io_degenerate_cap` (R7) geçerli korumayı doğruluyor. **YENİDEN ARAMAYA GEREK YOK.**
 - Kalıntı semantik not (hata değil): clamp sonrası `x >= input_offset` için eğri hâlâ `cap_y·(1 − input_offset/x)` — yani `base_fn(input_offset)=pow(0,exp)=0` olduğundan eğri kullanıcının tam `base_fn(x)` biçimi DEĞİL, tek parametreli asimptotik kuyruk. Bu io mode formülünün doğası (referansla aynı); güvenli ve monoton, negatif gain imkânsız — kabul edilebilir.
 
-## 20) `tests/test_accel.cpp:5255-5260` — T24 sim "motion batch sonunda kaybolur" diyor; daemon sentetik SYN ile FLUSH ediyor (test modeli bayat)
+## 20) `tests/test_accel.cpp:5255-5260` — T24 sim "motion batch sonunda kaybolur" diyor; daemon sentetik SYN ile FLUSH ediyor (test modeli bayat) — ✅ DÜZELTİLDİ (aj1)
 
 ```cpp
 void end_batch() {
@@ -193,11 +195,75 @@ void end_batch() {
 - Gerçek daemon (`daemon.cpp:1376-1380`): `if (!has_syn) { flush_pending_motion(); if (wrote_unsynced_event) uinput_write(SYN_REPORT); }` — yani **batch sonunda beklemede kalan hareket SENTETİK SYN ile KAYBEDİLMEZ**, ileriye yazılır.
 - `t24syn::sim` bu kuyruk davranışını modellemiyor → **daemon'un sentetik-SYN kuyruğu birim testle hiç kapsanmıyor**; üstelik yorum ve test adı ("motion without SYN_REPORT is lost") sevk edilen gerçek davranışla (flush) çelişiyor. Test bayat (eski bir daemon sürümünü modellemiş) veya senaryo yanlış adlandırılmış; hangisi olursa olsun **daemon davranışı belgelenenden FARKLI** — regresyon riski: gelecekte biri kuyruğu kaldırırsa test yine "geçer" çünkü zaten kaybı bekliyor.
 - Tespit: `daemon.cpp:1376-1380` satırları için gerçek-uyumlu test yok (yalnızca bazı "flushed on SYN" senaryoları var).
+- **→ DÜZELTME (aj1):** `t24syn::sim` yeniden model aldı (daemon.cpp:1292-1396 ile birebir):
+  - `has_syn` + `wrote_unsynced` sayacı eklendi; SYN yolu `wrote_unsynced=false`, diğer olay yolu önce `flush()` sonra forward + `wrote_unsynced=true`.
+  - `end_batch()` artık bayat "motion lost" yerine **daemon tail'ini** yapıyor: `has_syn` yoksa `flush()` + `wrote_unsynced` ise sentetik SYN_REPORT (daemon.cpp:1391-1396).
+  - Bölüm adı "motion without SYN_REPORT is lost" → "flushed at batch end (BUG-20: synthetic SYN)"; +3 yeni bölüm: button-only sentetik SYN, SYN'li temiz batch'te çift-flush olmaması, motion→button sırasının korunması. **YENİDEN ARAMAYA GEREK YOK.**
 
-## 21) `AGENTS.md` — test sayacı sürüklenmesi (belge sapması, işlevsel değil)
+## 21) `AGENTS.md` — test sayacı sürüklenmesi (belge sapması, işlevsel değil) — ✅ DÜZELTİLDİ (aj1)
 
 - AGENTS.md "33738 runtime assertion / 183 grup" der; `tests/run_tests.sh` çıktısı **33746/33746** geçti (183 grup doğrulandı). Logitech HID++ piller testleri (P131 dönemi) eklenmiş; AGENTS.md sayacı güncellenmemiş.
+- **→ DÜZELTME (aj1):** BUG-20 sim yeniden modeli +13 assert ekledi; AGENTS.md sayacı **33759/33759** olarak güncellendi (`AGENTS.md:117` ve `:210`). **YENİDEN ARAMAYA GEREK YOK.**
 - Kapsam: sadece belge.
+
+## 22) `src/logitech_hidpp.cpp:626-632` — bekleme penceresindeki HID++ notification'ları sessizce düşürülür (LOW, tasarım notu)
+
+```cpp
+if (buf[1] != request_device || buf[2] != feature_index ||
+    (buf[3] >> 4) != wire_function ||
+    (buf[3] & 0x0F) != request_sw_id)
+    continue;   // ← notification / eşleşmeyen paket buffer'a alınmadan yok edilir
+```
+
+- `send_feature_request` eşleşmeyen tüm paketleri yutar; notification'lar tamponlanmaz. `identify_logitech_device()` satır içi onlarca ardışık istek (her biri 500–900 ms timeout) yaptığı için bu pencerede gelen batarya/bağlantı notification'ları kaybolur. Aynı request_mutex_ drain'i de bloklar (drain `identify` bitmeden koşamaz).
+- Pratik etki düşük: daemon worker'ı yine 1 s kadansında drain ediyor ve tanımlama kısa sürüyor. Ama istek-yanıt bekleyen bir cihaz takılıysa (her istek timeout'a kadar bekler) birikme olabilir.
+- **Karar:** raporlanır — düzeltme gerektirmez; gelecekte notification'ları ayrı bir kuyrukta biriktirmek istenirse not düşülmüş olur.
+
+## 23) `src/logitech_hidpp.cpp:1575-1593` — `get_polling_rate` önce legacy REPORT_RATE'i (0x8060) deniyor (LOW)
+
+```cpp
+if (auto index = resolve_feature_index(hidpp_feature_index::report_rate, ...)) {
+    ... return rate_code_to_hz(false, (*reply)[0]);   // önce 0x8060 fn 0x1
+}
+if (auto index = ...extended_adjustable_report_rate...) { ... } // yedek
+```
+
+- Hem 0x8060 hem 0x8061'i ilan eden bir cihazda legacy okuma (period kodu; maks. 1000 Hz) önce gelir ve kazanır; cihaz 2000–8000 Hz'e extended feature üzerinden ayarlanmışsa legacy okuma yalnızca kod 1 (1000 Hz) döndürebilir → yanlış düşük rapor. Gerçekte >1000 Hz destekleyen cihazlar genelde 0x8060 ilan etmez; bu yüzden varsayımsal. Yine de sıra extended lehine çevrilebilir (Solaar extended'ı önce yoklar).
+- **Karar:** raporlanır — düzeltme opsiyonel.
+
+## 24) `daemon/daemon.cpp` — HID++ batarya **aktif sorgulanmıyor**, yalnızca notification + sysfs (MEDIUM, sensör izleme boşluğu)
+
+- Daemon'un HID++ worker'ı (`poll_hidpp_notifications`, daemon.cpp:942-1019) yalnızca **notification drain** ediyor; test edilmiş ve tam donanımlı `HidppTransport::get_battery_status()` (0x1000/0x1004/0x1001 + legacy 0x0D/0x07) hiçbir yerde periyodik olarak çağrılmıyor (grep doğrulandı: daemon'da yalnızca sysfs `detect_battery_level` + batarya notification log'u var).
+- Sonuç: pow_supply sysfs ağacı olmayan **ve** notification puslamayan Logitech kablosuz farede `detected_battery` kalıcı olarak `-1` ("unknown") kalır; oysa cihaz istek üzerine seviyeyi verebilir. CLI/GUI'deki bu cihazlar için batarya göstergesi boş görünür.
+- **Karar:** gerçek bir kapsam boşluğu (crash değil). Öneri: worker drain döngüsünde her N saniyede bir `get_battery_status()` aktif sorgusu (not: Solaar da bataryayı notification + istekle besler).
+
+## 25) `daemon/daemon.cpp:1256-1263` — telem `in_ips` "modifier ile aynı normalizasyon" değil (yeni bulgu; LOW)
+
+```cpp
+double ips_factor = dev.dpi_factor / time_ms;
+double in_ips     = magnitude({ dx, dy }) * ips_factor;        // ÖN-dönüş, ham delta
+double out_ips    = magnitude({ out_x, out_y }) * ips_factor;
+```
+
+- AGENTS.md claim'i: "`telem_in_ips` = |(dx,dy)| · dpi_factor / dt **using the same normalization as modifier::modify()**". Bu iddia yalnızca **euclidean + snap=0 + domain_weights=1 + smoothing=0** durumunda doğru. `modifier::modify()` (include/rawaccel.hpp:291-329) hızı şöyle türetiyor:
+  - `distance_mode::max` → `max(|x|,|y|)`; `Lp (norm≠2)` → `lp_distance`; `separate` → eksen başına `|x·f|` — hepsi `magnitude` (hypot) **değil**.
+  - `abs_vel = |in · ips_factor · domain_weights|` (domain ağırlığı çarpılır), döndürülmüş/snappelenmiş `in` üzerinden.
+  - input smoothing açıksa hız EMU ile yumuşatılır.
+- Telemetri ise **ham (döndürme öncesi) dx,dy** + `magnitude` + domain ağırlıksız + yumuşatmasız. Sonuç: max/lp(≠2)/separate modlarında, snap etkinken, weights ≠1 iken ve smoothing varken Mouse Test panelindeki In(ips) değeri, eğrinin gerçekte beslediği hızla örtüşmüyor (max'ta |dx|≠|dy| olan hareketlerde birebir yanlış; separate'te anlamsızlaşıyor). `gain = out_ips/in_ips` de bu yüzden eğri içi scale yerine "uçtan uca ekran çıktısı" oranı. **Hareket matematiği etkilenmez** — yalnızca telemetri görüntüsü + AGENTS iddiası.
+- **Karar:** raporlanır — düzeltme opsiyonel (ya telemetriyi modifier'la aynı hesaba çekmek ya da AGENTS iddiasını "euclidean, weights=1, snap=0 için" diye sınırlamak).
+
+## 26) `daemon/daemon.cpp:289-310` + `gui/devices.inl:91-107` — cihaz keşfi yalnızca REL_X+REL_Y bakar, isim/tipe göre dışlama yok (yeni bulgu; LOW, UX/politika)
+
+```cpp
+bool has_motion = libevdev_has_event_code(dev, EV_REL, REL_X) &&
+                  libevdev_has_event_code(dev, EV_REL, REL_Y);
+...
+return has_motion && !is_virtual;   // virtual dışında HİÇBİR filtre yok
+```
+
+- TrackPoint / accelpoint, touchdown REL eksenli touchpad yok ama TrackPoint + bazı marka/tablet kalemleri REL_X/REL_Y ilan ediyor → varsayılan davranışta **"All devices" profili hepsine uygulanıyor** (dizüstü kullanıcısı için istenmeyen olabilir: TrackPoint'e de RawAccel accel uygulanır). GUI keşfi de aynı mantıkta (`REL mask & 0x3`). `is_rawaccel`/uinput fiziksel dışlama var ama "Touchpad/TrackPoint/Tablet/ThinkPad" gibi isim-tipi filtreler yok.
+- Windows RawAccel cihaz listesi seçici (kullanıcı elle seçer); Linux tarafı otomatik-hepsini-alıyor.
+- **Karar:** raporlanır — gerçek bir bug değil, politika/UX boşluğu; isim tabanlı dışlama (veya GUI'de cihaz bazlı etkinleştirme) önerisi not edilir.
 
 ---
 
@@ -205,14 +271,14 @@ void end_batch() {
 
 | Süit | Sonuç |
 |------|-------|
-| `tests/run_tests.sh` | 33746/33746 PASS, CLI kapıları (P83/P99/P107) ✓ |
-| `tests/run_tests_asan.sh` (ASan+UBSan) | 33746/33746 PASS, sanitizer hatası yok |
+| `tests/run_tests.sh` | 33759/33759 PASS, CLI kapıları (P83/P99/P107) ✓ |
+| `tests/run_tests_asan.sh` (ASan+UBSan) | 33759/33759 PASS, sanitizer hatası yok |
 | `tests/run_tr_coverage.sh` | `Result: PASS` (eksik TR anahtar yok) |
 | `tests/oracle/run_oracle.sh` | OK — 1047 satır / 45 bilinen sapma, sapma yok |
 | `bash scripts/build.sh` (warning gate) | 0 warning, 0 error |
 | `tests/run_fuzz.sh 30` | her iki harness (config+accel) crash yok |
 
-**Yorum:** Tüm süitler yeşil ve aj1'in 1/2/7/16 düzeltmeleri koddan geçerli (son kontrol 2026-09-10'da doğrulandı). Açık kalan kör nokta: **madde 20** — daemon'un sentetik-SYN kuyruğu (daemon.cpp:1390-1391) gerçek-uyumlu birim testle kapsanmıyor ve T24 sim testi/dokümantasyonu sevk edilen davranışla çelişiyor.
+**Yorum:** Tüm süitler yeşil ve aj1'in 1/2/7/16/67/20/21 düzeltmeleri koddan geçerli (son kontrol 2026-09-10'da doğrulandı). Açık kör nokta artık yok: madde 20 kapsamında `t24syn::sim` daemon'un sentetik-SYN flush kuyruğuyla (daemon.cpp:1391-1396) birebir uyumlu yeniden modellendi — batch sonu hareket KAYBEDİLMEZ, sentetik SYN ile flush edilir (+3 yeni bölüm).
 
 ---
 
@@ -220,10 +286,14 @@ void end_batch() {
 - [x] GUI `graph.inl` (LUT editör) — madde 12/18
 - [x] daemon `run_loop` / epoll döngüsü + `daemon/main.cpp` PID/sinyal — madde 15
 - [x] Test süitleri tam tur (unit / ASan / tr / oracle / build / fuzz) — maddeler 19-21, tablo
-- [ ] `cli/main.cpp` set-param/PRESET yolları (satır 420-2195)
-- [ ] `include/accel-lookup.hpp` derleme detayı (LUT sıralama, interpolasyon)
-- [ ] `src/logitech_hidpp.cpp` (sensör/hidraw iletişimi; 1865 satır)
-- [ ] `gui/widgets_sync.inl` kalan bölümler + `profile_mgr.inl` (madde 18 qdata doğrulandı ✓)
-- [ ] `setup.sh` / `scripts/` kurulum bağımlılıkları
+- [x] `src/logitech_hidpp.cpp` tam okuma (1865 satır; sensör/DPI/batarya/paket katmanı + `include/logitech_hidpp.hpp`) — maddeler 22-24; paket sınırları (from_bytes uzunluk kontrolleri), DPI step/last decode guard'ı (step != 0 + next<=last), batarya 0x0D+0x07 çifte fallback'i, replug sonrası `clear_feature_cache()`, ayrı hidpp worker thread (P171-BFIX) doğrulandı — bu yönlerisorunsuz.
+- [x] `cli/main.cpp` set-param/validate/dispatch (420-2195) — **hata bulunamadı**: `cmd_set_param` tam anahtar doğrulaması + P107 domain kontrolü + BUG-10/11 (stod trailing-garbage & NaN/Inf) + P115-A5-01 (device_id 256 cap) + P156 (output_dpi fractional) + distance_mode sentinel (P115-A5-06) + sanitize sonrası gerçek stored değer basımı; `cmd_validate` missing-config hatasını rc=1 veriyor ve dosya oluşturmuyor (P120-FAZ2). CLI kapıları (P83/P99/P107) test turunda yeşildi.
+- [x] `gui/widgets_sync.inl` (685 satır) — **hata bulunamadı**: R13 tek-kaynak `update_raw_sensitivity` (18 widget), P157 xy_linked yeniden-türetme koruması, notify::prop 3-arıkanlı imza güvenlik notu, lp_norm 9999 sentinel CLI ile tutarlı, LUT kapasite taşması uyarısı, on_perf Bug-02 aktif-profil cihaz dilimi.
+- [x] `gui/profile_mgr.inl` (CRUD + preset önizleme) + `setup.sh` bağımlılık dalları (pacman/apt/dnf hepsi eksiksiz: g++/make/cmake/pkgconf/libevdev/gtk4/polkit/systemd/python3/qt6) — **hata bulunamadı**.
+- [ ] `include/accel-lookup.hpp` derleme detayı (LUT sıralama, interpolasyon) — *önceki turda okundu, hata yok*.
+- [x] daemon tam tur (tamamı 1907 satır): keşif 289-360, setup/hotplug 602-920, HID++ worker 922-1020, `run_loop` 1024-1143, `process_device`/`flush_motion` 1140-1397, lat dump 1399-1464, IPC server 1466-1907, `status_json` 1519-1664 — **bulgu 25/26**; IPC ağır korumalı (SO_RCVTIMEO/SNDTIMEO 2s + request deadline 10s + body 5s + 1MB cap + no-op guard + stale-socket probe ECONNREFUSED/ENOENT), uses `devices_mutex_` altında config_ yazımı, telem seqlock 8-denetmeli.
+- [x] `gui/mouse_test.inl` (512 satır, P104) — **hata bulunamadı**: Tier-1 X11 grab / Tier-2 confine / Tier-3 Wayland degrade mantığı, BUG-09 dil yenileme, BUG-10 socket gate, Bug-02 field seçimi (aktif profil cihazı), ESC/focus/destroy teardown sırası güvenli.
+- [x] `gui/devices.inl` REL mask ayrıştırma (LS word, bit 0+1) + `by-id` öncelik düzeni — **hata bulunamadı** (madde 26 kapsamı Hariç).
+- [x] `include/presets.hpp` (8 preset, tek kaynak) + `gui/app_state.hpp` — **hata bulunamadı**; preset değerleri cap.x>=input_offset/limit kurallarına uygun, app_state salt veri.
 
-**Durum:** İlk dalga + test turu tamamlandı (denetim devam ediyor). Madde 1/2/7/16 **ve BUG-67 (LUT velocity hit-test)** aj1 tarafından düzeltildi ve koddan doğrulandı (yukarıdaki tablo). Yeni bulgular 19-21 eklendi; 19 (clamp) aj1'in düzeltmesiyle çözüldü, **20 açık** (T24 sim ↔ daemon sentetik-SYN çelişkisi). BUG-01 "hata değil" (referansla birebir + oracle temiz).
+**Durum:** İlk dalga + test turu + **ikinci detaylı analiz turu (hidpp/CLI/GUI/setup)** tamamlandı. Madde 1/2/7/16/19 **ve BUG-67 ile 20/21** aj1 tarafından düzeltildi ve koddan doğrulandı (20 artık AÇIK değil: `t24syn::sim` daemon'un sentetik-SYN flush kuyruğuyla birebir yeniden modellendi). Açık bulgular 22-26: 22-24 HID++/sensör turundan (LOW×2 + batarya aktif sorgu boşluğu — MEDIUM, madde 24), **Üçüncü sıkı tur** (daemon tam 1907 satır + IPC + mouse_test.inl + devices.inl + presets + app_state): 25 (telem in_ips "modifier ile aynı normalizasyon" değil, LOW) + 26 (keşif yalnızca REL_X/Y bakar, TrackPoint gibi cihazlar dışlanmıyor, LOW/UX). Geri kalan her şeyde → **yeni bug bulunamadı** — proje zaten ağır şekilde korunmuş ve tüm test kapıları yeşil (madde 20'ye özel: sentetik-SYN kuyruğu artık testte modelleniyor).
