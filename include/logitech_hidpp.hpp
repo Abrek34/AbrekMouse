@@ -267,6 +267,9 @@ public:
     explicit HidppTransport(const std::string& hidraw_path);
     ~HidppTransport();
 
+    HidppTransport(const HidppTransport&) = delete;
+    HidppTransport& operator=(const HidppTransport&) = delete;
+
     bool is_open() const { return fd_ >= 0; }
 
     uint16_t vendor_id() const { return vendor_id_; }
@@ -484,7 +487,7 @@ std::optional<hidpp_pairing_slot> hidpp_parse_receiver_pairing(
     const std::vector<uint8_t>& payload, uint8_t slot, bool bolt = false);
 
 /// Discover all Logitech hidraw devices on the system.
-std::vector<std::string> discover_logitech_hidraw_devices();
+std::vector<std::string> discover_logitech_hidraw_devices(const char* root = "/dev");
 
 /// Try to open and identify a Logitech HID++ device.
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path);

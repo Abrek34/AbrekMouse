@@ -596,13 +596,8 @@ static app_config app_config_from_json_obj(const json& j) {
     if (j.contains("version") && j["version"].is_string())
         cfg.version = j["version"].get<std::string>();
 
-    // N-17: the active profile name is matched against profile names, so cap it
-    // like the name/device_id fields (MAX_NAME_LEN) to keep profiles.jsons
-    // names bounded.
-    if (j.contains("active_profile") && j["active_profile"].is_string()) {
-        const std::string value = j["active_profile"].get<std::string>();
-        cfg.active_profile = value.substr(0, MAX_NAME_LEN);
-    }
+    if (j.contains("active_profile"))
+        cfg.active_profile = json_get_string_limited(j["active_profile"], "default", MAX_NAME_LEN);
     if (j.contains("use_raw_input") && j["use_raw_input"].is_boolean())
         cfg.use_raw_input = j["use_raw_input"].get<bool>();
 
@@ -883,7 +878,15 @@ static bool version_lt(const std::string& lhs, const std::string& rhs) {
     if (!parse(rhs, b)) return false; // corrupt rhs never compares less
     if (a[0] != b[0]) return a[0] < b[0];
     if (a[1] != b[1]) return a[1] < b[1];
-    return a[2] < b[2];
+    if (a[2] != b[2]) return a[2] < b[2];
+    // FINDING-34-3: first 3 components equal — a version with more
+    // components is greater (e.g. "0.6.4" < "0.6.4.1").
+    auto count_dots = [](const std::string& s) {
+        int n = 0;
+        for (char c : s) n += (c == '.');
+        return n;
+    };
+    return count_dots(lhs) < count_dots(rhs);
 }
 
 bool migrate_config(app_config& cfg) {

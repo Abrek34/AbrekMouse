@@ -59,11 +59,8 @@ static std::vector<CurvePt> compute_curve(const accel_args& args,
     for (int i = 0; i <= N; i++) {
         double s = max_speed * i / N;
         double g = au.apply(s, args);
-        // Defensive: NaN/Inf gain feeds straight into cairo_line_to() coords
-        // below, where it can produce undefined rendering on some Cairo
-        // backends.  Replace with 0 so the curve dips to the x-axis and the
-        // problem is visually obvious instead of crashing the GUI.
-        if (!std::isfinite(g)) g = 0.0;
+        // L-BUG-12: keep NaN/Inf gains raw — draw_curve() renders them as a red
+        // dashed marker (visible gap) instead of silently clamping to 0.0.
         pts.push_back({s, g});
     }
     return pts;
@@ -84,6 +81,9 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
 
     // Dynamic max_gain: use the shared helper (also used by gesture handlers)
     double max_gain = compute_max_gain(S, max_speed);
+    // Cache for on_graph_motion — the crosshair hit-test must scale exactly
+    // like this rendered frame (L-BUG-17).
+    S->graph_last_max_gain = max_gain;
 
     auto to_cx = [&](double s)  { return GRAPH_ML + (s / max_speed) * PW; };
     auto to_cy = [&](double g)  { return GRAPH_MT + PH - std::clamp(g / max_gain, 0.0, 1.0) * PH; };
@@ -126,13 +126,39 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
         cairo_set_source_rgb(cr, col[0], col[1], col[2]);
         cairo_set_line_width(cr, 2.2);
         bool first = true;
+        bool bad = false;
         for (auto& p : pts) {
+            if (!std::isfinite(p.gain)) {
+                // L-BUG-12: break the path so the NaN/Inf LUT span shows up as
+                // a visible gap instead of being silently clamped to 0.0.
+                first = true;
+                bad = true;
+                continue;
+            }
             double cx = to_cx(p.speed);
             double cy = to_cy(p.gain);
             if (first) { cairo_move_to(cr, cx, cy); first = false; }
             else        cairo_line_to(cr, cx, cy);
         }
         cairo_stroke(cr);
+
+        if (bad) {
+            // Red dashed stripes over every NaN/Inf sample — the broken span
+            // is drawn in a warning color so the configuration error is obvious.
+            cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
+            cairo_set_line_width(cr, 2.0);
+            double dash[] = {4.0, 4.0};
+            cairo_set_dash(cr, dash, 2, 0);
+            for (auto& p : pts) {
+                if (!std::isfinite(p.gain)) {
+                    double cx = to_cx(p.speed);
+                    cairo_move_to(cr, cx, GRAPH_MT);
+                    cairo_line_to(cr, cx, GRAPH_MT + PH);
+                }
+            }
+            cairo_stroke(cr);
+            cairo_set_dash(cr, nullptr, 0, 0);
+        }
     };
 
     auto& dp = cur_prof(S);
@@ -165,12 +191,12 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
     // Axis titles
     cairo_set_font_size(cr, 11);
     cairo_move_to(cr, GRAPH_ML + PW / 2 - 35, GRAPH_MT + PH + 30);
-    cairo_show_text(cr, "Speed (ips)");
+    cairo_show_text(cr, tr("Speed (ips)"));
 
     cairo_save(cr);
     cairo_translate(cr, 11, GRAPH_MT + PH / 2 + 20);
     cairo_rotate(cr, -M_PI / 2);
-    cairo_show_text(cr, "Gain");
+    cairo_show_text(cr, tr("Gain"));
     cairo_restore(cr);
 
     // Legend
@@ -184,17 +210,20 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
         cairo_move_to(cr, lx + 16, ly + 4);
         cairo_show_text(cr, label);
     };
-    draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10, C_CURVE, "X Axis");
+    draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10, C_CURVE, tr("X Axis"));
     if (!S->xy_linked)
-        draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 24, C_CURVE2, "Y Axis");
+        draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 24, C_CURVE2, tr("Y Axis"));
 
     // Zoom hint
     {
         char buf[48];
         if (S->lut_graph_mode)
-            snprintf(buf, sizeof(buf), "%.0f ips  (left click=add, right click=remove)", max_speed);
+            snprintf(buf, sizeof(buf), "%s",
+                     trf("%.0f ips  (left click=add, right click=remove)",
+                         max_speed).c_str());
         else
-            snprintf(buf, sizeof(buf), "%.0f ips  (scroll=zoom)", max_speed);
+            snprintf(buf, sizeof(buf), "%s",
+                     trf("%.0f ips  (scroll=zoom)", max_speed).c_str());
         cairo_set_source_rgba(cr, C_TEXT[0], C_TEXT[1], C_TEXT[2], 0.5);
         cairo_set_font_size(cr, 9);
         cairo_move_to(cr, GRAPH_ML + 4, GRAPH_MT + 12);
@@ -203,11 +232,16 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
 
     // Draw LUT points visually on the graph in LUT mode
     if (S->lut_graph_mode) {
+        cairo_save(cr);
+        cairo_rectangle(cr, GRAPH_ML, GRAPH_MT, PW, PH);
+        cairo_clip(cr);
         auto& dp2 = cur_prof(S);
         bool  vel = dp2.prof.accel_x.gain;
         auto  pts = lut_get_points(dp2.prof.accel_x);
         for (auto& p : pts) {
-            double px = to_cx(p.first);
+            // BUG-NEW-50: to_cx() has no vertical-style clamp — a zoomed-out
+            // point beyond max_speed would draw over the right margin/labels.
+            double px = std::clamp(to_cx(p.first), GRAPH_ML, GRAPH_ML + PW);
             double py = to_cy(lut_stored_to_gain(p.first, p.second, vel));
             // Nokta dairesi
             cairo_set_source_rgb(cr, C_DOT[0], C_DOT[1], C_DOT[2]);
@@ -218,6 +252,7 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
             cairo_arc(cr, px, py, 2.0, 0, 2 * M_PI);
             cairo_fill(cr);
         }
+        cairo_restore(cr);
     }
 }
 
@@ -284,7 +319,10 @@ void on_graph_motion(GtkEventControllerMotion*, double cx, double cy, gpointer u
 
     double max_speed = 50.0 / S->graph_zoom + S->graph_pan_x;
     max_speed = std::max(max_speed, 5.0);
-    double max_gain = compute_max_gain(S, max_speed);
+    // Use the max_gain cached by the last draw — recomputing compute_max_gain()
+    // (400 apply samples) here on every mouse-move event is pure waste; the
+    // scale cannot change between draws (L-BUG-17).
+    double max_gain = S->graph_last_max_gain;
 
     const auto& ax = cur_prof(S).prof.accel_x;
     auto pts = lut_get_points(ax);

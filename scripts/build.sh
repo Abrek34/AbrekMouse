@@ -13,6 +13,10 @@ if [ "${RAWACCEL_USE_CMAKE:-0}" = "1" ]; then
 fi
 
 # Environment detection
+if ! command -v pkg-config >/dev/null 2>&1; then
+    echo "pkg-config not found. Install pkgconf or pkg-config." >&2
+    exit 1
+fi
 EVDEV_CFLAGS="$(pkg-config --cflags libevdev)"
 EVDEV_LIBS="$(pkg-config --libs libevdev)"
 HAVE_GTK4=0
@@ -80,7 +84,7 @@ if [ "${USE_CMAKE:-0}" = "1" ]; then
     cd "$BUILD"
     cmake .. -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_GUI=ON -DBUILD_TESTS=ON \
-        2>&1 | tail -5
+        2>&1
     make -j$(nproc) 2>&1
     cd -
 else

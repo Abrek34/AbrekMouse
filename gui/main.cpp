@@ -149,6 +149,10 @@ int main(int argc, char* argv[]) {
     } else {
         state.config_path = find_config_path();
     }
+    if (state.config_path.empty()) {
+        g_warning("find_config_path() returned empty — falling back to /etc/rawaccel/settings.json");
+        state.config_path = "/etc/rawaccel/settings.json";
+    }
     state.lang_path = (fs::path(state.config_path).parent_path() / "gui_lang").string();
 
     try {
@@ -193,7 +197,7 @@ int main(int argc, char* argv[]) {
         (void)ec;
     }
     std::string lock_path = (cfg_dir / "rawaccel-gui.lock").string();
-    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
     if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
         // Held by a live instance.  Deliberately NOT routed through tr(): the
         // translation-coverage scanner requires every tr() key to have a dict

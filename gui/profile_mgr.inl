@@ -13,9 +13,8 @@
 /// onto an arbitrary target (save_config uses the same protection).
 static bool write_text_file(const char* path, const std::string& content) {
     std::string tmp = std::string(path) + ".tmp";
-    // Unlink a stale temp from an earlier aborted export before retrying once;
-    // O_NOFOLLOW guarantees we never follow an attacker's symlink here either.
-    ::unlink(tmp.c_str());
+    // FINDING-21-1: no pre-open unlink() — the EEXIST branch below already
+    // covers a stale temp from an earlier aborted write (same as save_config).
     int fd = ::open(tmp.c_str(),
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (fd < 0 && errno == EEXIST) {
@@ -394,6 +393,13 @@ void on_duplicate_profile(GtkButton*, gpointer user_data) {
         if (n == 1) name = base + " 2";
         else        name = base + " " + std::to_string(n + 1);
     }
+    // L-BUG-32: if all 1000 generated names collided, give up instead of
+    // silently adding a duplicate name (ambiguous combo + daemon lookup).
+    for (const auto& p : S->config.profiles)
+        if (p.name == name) {
+            set_status(S, tr("Could not duplicate profile: no free name."));
+            return;
+        }
     device_profile copy = cur_prof(S);
     copy.name = name;
     copy.device_id.clear();

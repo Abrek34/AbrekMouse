@@ -1027,3 +1027,23 @@
   cosmetic/minor seviyede. Kod kalitesi yüksek — defense-in-depth,
   kapsamlı input validation, thread safety, resource management
   ve error handling iyi uygulanmış.
+
+================================================================================
+  SON DOĞRULAMA — batch-3 (10 Eylül 2026)
+================================================================================
+  BUG-NEW-1  (LOW, inotify tek event): KAPANDI — devices.inl artık packed
+             events için offset-walking read() yapıyor.
+  BUG-NEW-2  (LOW, save_lang_pref atomic): KAPANDI — tr.inl O_EXCL|O_NOFOLLOW
+             + tmp+rename kullanıyor (BUG-136 ile aynı, ikisi de kapandı).
+  BUG-NEW-3  (LOW, hint label): KAPANDI — ui_builder.inl:689 artık "stable USB
+             composite ID (vendor:product:serial)" diyor.
+  BUG-NEW-4  (INFO): DOĞRU — find_mice() yalnız listen döndürür, EPOLL
+             setup_devices()'de; değişiklik gerekmez.
+  BUG-NEW-5  (LOW, DevSnap indent): KAPANDI — daemon.cpp girinti düzeltildi.
+  BUG-NEW-6  (INFO): TASARIM — KDE manuel adım hatırlatması bilinçli
+             (mimari sınır), değişiklik yok.
+  BUG-NEW-7  (INFO): DOĞRU — time_ms clamp guard mevcut.
+  BUG-NEW-8  (INFO, C-style cast): DÜZELTİLDİ — cli/main.cpp
+             static_cast<uint64_t>(0) kullanıyor.
+
+  Bu dosyadaki tüm bulgular kapatıldı (DÜZELTİLDİ / KAPANDI / TASARIM / DOĞRU).

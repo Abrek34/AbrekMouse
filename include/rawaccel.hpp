@@ -258,10 +258,14 @@ public:
         // 2. Angle snap
         // O2: also include the in.y==0 case (pure horizontal movement) in snap.
         // Previous code skipped snap for pure-X movement due to the "in.y != 0" guard.
-        if (flags.compute_ref_angle && (in.x != 0 || in.y != 0)) {
-            if (in.x == 0) {
+        // L-BUG-24: the snap angle reference used exact ==0 on floats — a
+        // rotated or scaled axis lands on micro-offsets, so the horizontal /
+        // vertical branches were missed.  Use an epsilon comparison instead.
+        if (flags.compute_ref_angle &&
+            (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
+            if (std::abs(in.x) < 1e-9) {
                 reference_angle = M_PI / 2;
-            } else if (in.y == 0) {
+            } else if (std::abs(in.y) < 1e-9) {
                 reference_angle = 0.0;  // pure horizontal
             } else {
                 reference_angle = std::atan(std::fabs(in.y / in.x));

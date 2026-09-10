@@ -92,7 +92,7 @@ struct power {
             break;
         case cap_mode::in:
             if (args.cap.x > 0) {
-                if (args.cap.x <= offset.x) { cap_x = 0; cap_y = offset.y; return; }
+                if (args.cap.x <= offset.x) { cap_x = 0; cap_y = offset.y; break; }
                 cap_x = args.cap.x;
                 cap_y = gain_fn(args.cap.x, n, scale);
             }

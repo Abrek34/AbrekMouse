@@ -32,6 +32,7 @@ cleanup_tmp() {
     rm -f "${TMP_FILES[@]}"
 }
 trap cleanup_tmp EXIT   # P114 BUG-H: hiçbir fail-erken çıkışta /tmp kalmasın
+die() { echo "Hata: $*" >&2; exit 1; }   # L-BUG-41: unhelpful chatter→açıklayıcı hata
 
 if [ ! -x "$CLI" ]; then
     echo "Hata: CLI kapısı çalıştırılamadı: $CLI" >&2
@@ -47,6 +48,7 @@ if [ -x "$CLI" ]; then
     TMP_FILES+=( "$TMPN256" )
     TMPN257=$(mktemp)
     TMP_FILES+=( "$TMPN257" )
+    command -v python3 || die "python3 is required for P83 test gates"
     python3 - "$TMPN256" "$TMPN257" <<'PY'
 import sys
 open(sys.argv[1], 'w').write('a' * (256))

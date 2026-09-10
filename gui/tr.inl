@@ -21,6 +21,7 @@
 
 #include <clocale>
 #include <cstdarg>
+#include <atomic>
 #include <unordered_map>
 
 enum TrKind { TR_LABEL, TR_MARKUP, TR_BUTTON, TR_CHECK, TR_TOOLTIP };
@@ -31,7 +32,7 @@ struct TrEntry {
     std::string key;
 };
 
-static int g_lang = 0; // 0 = English, 1 = Türkçe
+static std::atomic<int> g_lang { 0 }; // L-BUG-17: 0 = English, 1 = Türkçe (atomic)
 static std::vector<TrEntry> g_tr_registry;
 
 static void tr_register(GtkWidget* w, TrKind kind, const char* key) {
@@ -70,6 +71,13 @@ static const char* tr(const char* key) {
                                                                 "<b>Donanım Ayarları (Logitech HID++)</b>"},
             {"<b>Gain Curve</b>  <small>(scroll = zoom)</small>",
                                                                 "<b>Kazanım Eğrisi</b>  <small>(tekerlek = yakınlaştır)</small>"},
+            {"Speed (ips)",         "Hız (inç/sn)"},
+            {"Gain",                "Kazanç"},
+            {"X Axis",              "X Ekseni"},
+            {"Y Axis",              "Y Ekseni"},
+            {"%.0f ips  (scroll=zoom)",                  "%.0f inç/sn  (tekerlek=yakınlaştır)"},
+            {"%.0f ips  (left click=add, right click=remove)",
+                                                                "%.0f inç/sn  (sol tık=ekle, sağ tık=kaldır)"},
             // ── Buttons / checks / labels ───────────────────────────────────
             {"● Checking...",             "● Denetleniyor..."},
             {"Reload",                    "Yeniden Yükle"},
@@ -79,6 +87,8 @@ static const char* tr(const char* key) {
             {"Save",                      "Kaydet"},
             {"New profile",               "Yeni profil"},
             {"Duplicate profile",         "Profili çoğalt"},
+            {"Could not duplicate profile: no free name.",
+                                                                "Profil çoğaltılamadı: boş isim yok."},
             {"Rename profile",            "Profili yeniden adlandır"},
             {"Reset to defaults",         "Varsayılana sıfırla"},
             {"Delete profile",            "Profili sil"},

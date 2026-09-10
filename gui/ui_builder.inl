@@ -372,6 +372,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             auto pts = lut_get_points(ax);
             lut_set_points(ax, pts); // lut_set_points already sorts
             if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            S2->unsaved = true; // P-BUG-4: sort also mutates the LUT
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);
         }), S);
@@ -813,6 +814,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             pts.push_back({spd, lut_gain_to_stored(spd, gain, ax.gain)});
             lut_set_points(ax, pts);
             if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            S2->unsaved = true; // P-BUG-3: graph add must count as unsaved too
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);
             set_status(S2, trf("LUT point added: speed=%d gain=%s",
@@ -861,6 +863,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             pts.erase(pts.begin() + best_idx);
             lut_set_points(ax, pts);
             if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            S2->unsaved = true; // P-BUG-3: graph remove must count as unsaved too
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);
             set_status(S2, tr("LUT point removed."));
@@ -1039,6 +1042,21 @@ gboolean on_window_close_request(GtkWindow* win, gpointer user_data) {
             save_config_now(S2);
             gtk_window_destroy(GTK_WINDOW(S2->window));
         }), dlg);
+
+    // Escape = Cancel (L-BUG-18): a modal no-button-behavior dialog in GTK4 has
+    // no implicit dismiss key — without this the user can only reach Cancel by
+    // mouse, and there is no way to back out via keyboard.
+    GtkEventController* esc_ctrl = gtk_event_controller_key_new();
+    g_signal_connect(esc_ctrl, "key-pressed",
+        G_CALLBACK(+[](GtkEventControllerKey*, guint keyval, guint /*keycode*/,
+                       GdkModifierType /*state*/, gpointer d) -> gboolean {
+            if (keyval == GDK_KEY_Escape) {
+                gtk_window_destroy(GTK_WINDOW(d));
+                return true;
+            }
+            return false;
+        }), dlg);
+    gtk_widget_add_controller(dlg, esc_ctrl);
 
     gtk_window_present(GTK_WINDOW(dlg));
     return TRUE; // prevent close; window stays open until the dialog is dismissed

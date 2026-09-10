@@ -192,7 +192,7 @@ std::optional<hidpp_battery_info> parse_battery_status_feature(
     info.level = payload[0] == 0 ? 255 : payload[0];
     const uint8_t status = payload[2];
     info.charging = status == 0x01 || status == 0x04;
-    info.online = status != 0x05 && status != 0x06;
+    info.online = status != 0x05 && status != 0x06 && status != 0xFF;
     return info;
 }
 
@@ -377,7 +377,7 @@ std::optional<hidpp_pairing_slot> hidpp_parse_receiver_pairing(
             // Bolt receiver-info pairing payload:
             // kind, WPID high, WPID low, serial[4...].
             if (payload.size() < 4) return std::nullopt;
-            result.occupied = payload[1] != 0 || payload[2] != 0;
+            result.occupied = payload[1] != 0;
             // Bolt uses a little-endian-looking WPID on the wire: Solaar
             // extracts byte 3 as the high byte and byte 2 as the low byte.
             result.pid = static_cast<uint16_t>(
@@ -492,12 +492,8 @@ hidpp_notification::from_bytes(const uint8_t* data, size_t len) {
     const bool hidpp20 = (address & 0x0F) == 0;
     if (!hidpp10 && !legacy_battery && !legacy_illumination && !hidpp20)
         return std::nullopt;
-    // HID++ 2.0 notifications are identified by a non-zero feature/sub-id and a
-    // zero lower nibble in the address byte. Reject malformed packets that look
-    // like a response or a zero-value feature before they reach feature maps.
-    if (sub_id == 0 || (hidpp20 && (sub_id == 0 || (address & 0x0F) != 0)))
-        return std::nullopt;
-    if (legacy_battery && sub_id == 0x00) return std::nullopt;
+    // Reject packets with a zero sub-id before they reach feature maps.
+    if (sub_id == 0) return std::nullopt;
 
     hidpp_notification notification;
     notification.report_id = data[0];
@@ -509,9 +505,9 @@ hidpp_notification::from_bytes(const uint8_t* data, size_t len) {
         ? hidpp_notification::kind::legacy_battery
         : legacy_illumination
             ? hidpp_notification::kind::legacy_illumination
-            : hidpp10
-                ? hidpp_notification::kind::hidpp10
-                : hidpp_notification::kind::hidpp20;
+            : hidpp20
+                ? hidpp_notification::kind::hidpp20
+                : hidpp_notification::kind::hidpp10;
     notification.payload.assign(data + 4, data + len);
     return notification;
 }
@@ -584,12 +580,17 @@ HidppTransport::~HidppTransport() {
 }
 
 void HidppTransport::set_device_index(uint8_t idx) {
-    std::lock_guard lock(request_mutex_);
-    device_index_.store(idx, std::memory_order_relaxed);
+    // L-BUG-40: consistent lock order (feature_mutex_ → request_mutex_) with
+    // every reader path (resolve_feature_index, get_feature_metadata…).  The
+    // device index is an atomic; the mutexes guard the feature caches, so
+    // taking feature_mutex_ first can never deadlock against a reader (readers
+    // never hold request_mutex_ while acquiring feature_mutex_).
     std::lock_guard feature_lock(feature_mutex_);
     feature_indices_.clear();
     feature_sets_.clear();
     feature_metadata_sets_.clear();
+    std::lock_guard lock(request_mutex_);
+    device_index_.store(idx, std::memory_order_relaxed);
 }
 
 void HidppTransport::clear_feature_cache() {
@@ -923,7 +924,7 @@ std::optional<std::vector<uint8_t>> HidppTransport::read_register(
         // payload byte.  Match it as Solaar does so a stale slot response
         // cannot be returned for a different slot query.  Slots are read
         // from register 0x02B5, which encodes to request_id 0x83B5.
-        if (request_id == 0x83B5 && params && param_len != 0 &&
+        if ((request_id & 0x00FF) == 0x00B5 && params && param_len != 0 &&
             (len < 5 || buf[4] != params[0]))
             continue;
         return std::vector<uint8_t>(buf + 4, buf + len);
@@ -939,13 +940,12 @@ std::optional<std::vector<uint8_t>> HidppTransport::feature_request(
         return std::nullopt;
     const uint8_t target = target_device_index != 0xFF
         ? target_device_index : device_index_.load(std::memory_order_relaxed);
-    // The supports_feature() gate enumerates features for the transport's
-    // current device index.  Only apply it when the request targets that
-    // device; for an explicit alternate target, resolve_feature_index below
-    // is already target-correct and the gate would wrongly reject a feature
-    // the target actually supports.
-    if (target == device_index_.load(std::memory_order_relaxed) &&
-        !supports_feature(feature_id)) return std::nullopt;
+    // N-09: the capability gate previously enumerated features for the
+    // transport's current device_index_, not for the resolved target — an
+    // explicit alternate target (e.g. a device behind a receiver) could then
+    // have a supported feature wrongly rejected locally.  resolve_feature_index
+    // below is already target-correct and returns nullopt for unsupported
+    // features, so it is the authoritative gate.
     const auto index = resolve_feature_index(
         static_cast<hidpp_feature_index>(feature_id), target);
     if (!index) return std::nullopt;
@@ -1652,8 +1652,9 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
         std::find(info->dpi_levels.begin(), info->dpi_levels.end(), dpi) ==
             info->dpi_levels.end())
         return false;
-    if (info->supports_lift_off_distance && info->lift_off_distance > 2)
-        return false;
+    // P-BUG-1: do not refuse the whole DPI change just because the advertised
+    // LOD byte is out of the valid range (low=0, medium=1, high=2).  Clamp it
+    // to the highest valid value instead, matching set_lift_off_distance().
     const auto index = resolve_feature_index(
         info->extended ? hidpp_feature_index::extended_adjustable_dpi
                        : hidpp_feature_index::adjustable_dpi,
@@ -1667,7 +1668,7 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
             0, static_cast<uint8_t>(dpi >> 8), static_cast<uint8_t>(dpi),
             static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
             static_cast<uint8_t>(info->supports_lift_off_distance
-                ? info->lift_off_distance : 0)
+                ? std::min<uint16_t>(info->lift_off_distance, 2) : 0)
         };
         return send_feature_request(*index, 0x6, params, sizeof(params),
                                     std::chrono::milliseconds(700),
@@ -1779,10 +1780,10 @@ bool HidppTransport::set_lift_off_distance(hidpp_lift_off_distance distance,
 }
 
 // ── Discovery & identification ──────────────────────────────────────
-std::vector<std::string> discover_logitech_hidraw_devices() {
+std::vector<std::string> discover_logitech_hidraw_devices(const char* root) {
     std::vector<std::string> result;
     std::error_code ec;
-    fs::directory_iterator it("/dev", ec), end;
+    fs::directory_iterator it(root, ec), end;
     while (!ec && it != end) {
         const fs::path p = it->path();
         ++it;

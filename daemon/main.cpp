@@ -58,14 +58,12 @@ static bool write_pid(const std::string& path) {
         unlink(path.c_str());
         return false;
     }
-    fsync(fd); // ensure PID hits disk before another instance probes it
-    // BUG-17: open()'s mode argument is masked by the process umask.  When
-    // the systemd unit sets UMask=0077 (default-private files), our 0644
-    // becomes 0600 — root-only — and rawaccel-cli running as a normal
-    // user can no longer read the PID to display "running" status.
-    // The PID number is not sensitive (visible in /proc anyway), so force
-    // 0644 explicitly via fchmod() which ignores the umask.
-    fchmod(fd, 0644);
+    if (fsync(fd) != 0) // L-BUG-3: a failed fsync = PID may not survive a crash
+        std::cerr << "[rawaccel] warning: fsync PID file failed: "
+                  << strerror(errno) << "\n";
+    else if (fchmod(fd, 0644) != 0) // L-BUG-3: keep the "running" probe readable
+        std::cerr << "[rawaccel] warning: fchmod PID file failed: "
+                  << strerror(errno) << "\n";
     close(fd);
     g_pid_file = path;
     return true;
@@ -118,6 +116,19 @@ static std::string resolve_config_path() {
         if (ret == 0 && result && result->pw_dir && result->pw_dir[0] != '\0') {
             std::string path = std::string(result->pw_dir) +
                                "/.config/rawaccel/settings.json";
+            // FINDING-30-2: create the config directory for the SUDO user on
+            // first run (mkdir chain home → .config → rawaccel) and own it,
+            // so a fresh install without ~/.config/rawaccel doesn't fail.
+            std::string home = result->pw_dir;
+            ::mkdir(home.c_str(), 0700);
+            const std::string cfg = home + "/.config";
+            const std::string rac = cfg + "/rawaccel";
+            if (::mkdir(cfg.c_str(), 0700) == 0 || errno == EEXIST)
+                if (::mkdir(rac.c_str(), 0700) == 0 || errno == EEXIST) {
+                    const int chown_rc =
+                        ::chown(rac.c_str(), result->pw_uid, result->pw_gid);
+                    (void)chown_rc; // best-effort; ownership is cosmetic here
+                }
             return path; // return even if not yet existing — daemon will create it
         }
     }
@@ -177,6 +188,18 @@ static bool validate_config_path(const std::string& path) {
                           << "' is in a disallowed directory.\n";
                 return false;
             }
+        }
+        // FINDING-30-1: the file doesn't exist yet, so the parent directory
+        // must exist or the daemon will fail with a confusing startup error.
+        std::string parent = ".";
+        const size_t slash = p.find_last_of('/');
+        if (slash != std::string::npos)
+            parent = (slash == 0) ? "/" : p.substr(0, slash);
+        struct stat pst {};
+        if (stat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)) {
+            std::cerr << "[rawaccel] Config directory '" << parent
+                      << "' does not exist.\n";
+            return false;
         }
     }
     return true;
@@ -323,8 +346,11 @@ int main(int argc, char* argv[]) {
                          || write_pid(PID_FILE)
                          || write_pid(PID_FILE2));
         if (!retry_ok) {
+            const int e = errno;
             std::cerr << "[rawaccel] Another instance may already be running "
-                         "(PID file exists). Use 'rawaccel-cli stop' to stop it.\n";
+                         "(PID file exists). Use 'rawaccel-cli stop' to stop it."
+                      << (e != 0 ? " (" + std::string(strerror(e)) + ")" : "")
+                      << "\n";
             return 1;
         }
     }

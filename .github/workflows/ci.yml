@@ -177,7 +177,11 @@ jobs:
               if name == "_meta":
                   continue
               if name not in got:
-                  print("::warning::baseline'da var ama ciktida yok: %s" % name)
+                  # N-14: a baseline config that vanishes from the output is a
+                  # real regression signal (config disabled/renamed) — fail the
+                  # gate instead of silently passing with a warning.
+                  print("::error::baseline'da var ama ciktida yok (perf gate FAIL): %s" % name)
+                  failures.append("%s (baseline'da var, ciktida yok)" % name)
                   continue
               now = got[name]
               delta = (now - base) / base * 100.0

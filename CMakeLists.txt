@@ -82,7 +82,7 @@ add_library(rawaccel-config STATIC
 target_include_directories(rawaccel-config PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
-target_compile_options(rawaccel-config PRIVATE -O2 -Wall -Wextra)
+target_compile_options(rawaccel-config PRIVATE -O3 -Wall -Wextra)
 
 # ── Daemon ────────────────────────────────────────────────────────────────────
 if(BUILD_DAEMON)

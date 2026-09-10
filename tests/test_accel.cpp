@@ -83,7 +83,8 @@ static std::regex  g_filter_regex;
 #define EXPECT(cond) do { \
     if (!g_section_active) break; \
     g_tests++; \
-    if (cond) { \
+    auto _c = (cond); \
+    if (_c) { \
         g_passed++; \
         if (!g_quiet) std::printf("  PASS  %s\n", #cond); \
     } else { \
@@ -442,12 +443,31 @@ static void test_logitech_hidpp_packets() {
 
 static void test_logitech_hidraw_discovery() {
     SECTION("Logitech hidraw device discovery");
-    // This test just verifies the function runs without crashing
-    // It may return empty on systems without Logitech devices
+    const std::string root = "/tmp/rawaccel_hidraw_fixture";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+
+    // A missing scan root must yield an empty result without crashing.
+    auto missing = discover_logitech_hidraw_devices(root.c_str());
+    EXPECT(missing.empty());
+
+    std::filesystem::create_directories(root);
+    // Enumeration only considers hidraw-prefixed *character* files; a plain
+    // regular file is skipped (fs::is_character_file), so a rightname-but-
+    // wrong-type node can never be opened/ioctl'd for the vendor check.
+    {
+        std::ofstream(root + "/hidraw0") << "not a char device";
+        std::ofstream(root + "/hidraw3") << "not a char device";
+        std::ofstream(root + "/mouse")   << "x"; // non-hidraw name must be ignored
+    }
+    auto found = discover_logitech_hidraw_devices(root.c_str());
+    EXPECT(found.empty());
+    std::filesystem::remove_all(root, ec);
+
+    // The production scan (real /dev, default root) runs without crashing; on
+    // hardware with no Logitech hidraw node it returns an empty vector.
     auto devices = discover_logitech_hidraw_devices();
-    // No assertion on count — depends on hardware
-    // Just verify it doesn't crash and returns a valid vector
-    (void)devices;
+    (void)devices; // count depends on hardware — just exercise the default root
 }
 
 static void test_logitech_hidpp_hardware_controls() {
@@ -1935,14 +1955,50 @@ static void test_multi_profile_roundtrip() {
 // ── Test 22: atomic write — no partial-read window ───────────────────────────
 // Verify that save_config writes atomically (tmp → rename).
 
+// N-15: save_config writes its temp file as "<path>.<pid>.tmp".  The pid is
+// decided inside save_config, so tests can't hardcode the exact name.  Sweep
+// the parent directory for any "<path>.*.tmp" leftover so a stray temp file
+// from any pid (this run or a crashed one) is flagged.
+static int tmp_leftover_count(const std::string& base_path) {
+    const std::filesystem::path dir =
+        std::filesystem::path(base_path).parent_path();
+    const std::string stem =
+        std::filesystem::path(base_path).filename().string() + ".";
+    if (!std::filesystem::exists(dir)) return 0;
+    int n = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, stem.size(), stem) == 0 &&
+            name.size() >= stem.size() + 4 &&
+            name.compare(name.size() - 4, 4, ".tmp") == 0)
+            ++n;
+    }
+    return n;
+}
+
+static void remove_tmp_leftovers(const std::string& base_path) {
+    const std::filesystem::path dir =
+        std::filesystem::path(base_path).parent_path();
+    const std::string stem =
+        std::filesystem::path(base_path).filename().string() + ".";
+    if (!std::filesystem::exists(dir)) return;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, stem.size(), stem) == 0 &&
+            name.size() >= stem.size() + 4 &&
+            name.compare(name.size() - 4, 4, ".tmp") == 0)
+            std::filesystem::remove(entry.path());
+    }
+}
+
 static void test_atomic_write() {
     SECTION("atomic config write — no .tmp file left after successful save");
 
     std::string tmp_path = "/tmp/rawaccel_test_atomic.json";
     // N-15: save_config names the temp file with a pid suffix
     // (path.<pid>.tmp), so a bare "<path>.tmp" assertion could never detect a
-    // real leftover.  Compute the actual name the saver produces.
-    std::string tmp_file = tmp_path + "." + std::to_string(::getpid()) + ".tmp";
+    // real leftover.  Glob path.*.tmp to catch a leftover from any pid.
+    remove_tmp_leftovers(tmp_path);
 
     app_config cfg;
     device_profile dp; dp.name = "atomic_test";
@@ -1950,9 +2006,8 @@ static void test_atomic_write() {
 
     save_config(cfg, tmp_path);
 
-    // .tmp must not exist after a successful save
-    std::ifstream leftover(tmp_file);
-    EXPECT(!leftover.good()); // tmp file should be gone (renamed to final)
+    // No .tmp (any pid suffix) may exist after a successful save
+    EXPECT(tmp_leftover_count(tmp_path) == 0); // tmp files gone (renamed to final)
 
     // Final file must exist and be valid JSON
     app_config reloaded = load_config(tmp_path);

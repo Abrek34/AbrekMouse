@@ -100,10 +100,23 @@ static std::string line_of(const std::string& src, size_t off) {
 
 // true iff src[off] lies inside a `//` line comment or `/* */` block comment.
 // Prevents comment prose like "// tr(some_var)" from entering the dynamic list.
+// N-16: string / char literals are skipped so "//" inside them (e.g. a URL in
+// a translated string) is not mistaken for a comment opener.
 static bool in_comment(const std::string& src, size_t off) {
     size_t i = 0;
     while (i < src.size() && i < off) {
         char c = src[i];
+        if (c == '"' || c == '\'') {
+            const char quote = c;
+            i++;
+            while (i < src.size()) {
+                if (i >= off) return false; // inside a literal, not a comment
+                if (src[i] == '\\') { i += 2; continue; }
+                if (src[i] == quote) { i++; break; }
+                i++;
+            }
+            continue;
+        }
         if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
             while (i < src.size() && src[i] != '\n') {
                 if (i >= off) return true;

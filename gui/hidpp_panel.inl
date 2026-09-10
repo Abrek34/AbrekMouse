@@ -118,7 +118,7 @@ void hw_render_caps(AppState* S, int idx) {
     const std::string mid = logitech_compose_model_id(dev.info);
     if (!mid.empty()) {
         m += std::string(tr("Model ID: ")) + mid + "\n";
-        if (find_logitech_quirks(mid))
+        if (find_logitech_quirks(dev.info))
             m += std::string(tr("Model quirks: known (write-protect policy)")) + "\n";
     }
     if (S->hw_daemon_battery >= 0 && S->hw_daemon_battery <= 100)
@@ -562,7 +562,7 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
     task->idx = idx;
     task->hidraw_path = S->hidpp_devs[idx].hidraw_path;   // main-thread snapshot
     task->device_index = S->hidpp_devs[idx].device_index; // main-thread snapshot
-    task->dpi  = (uint16_t)gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->hw_dpi_spin));
+    task->dpi  = static_cast<uint16_t>(std::clamp((int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->hw_dpi_spin)), HW_DPI_MIN, HW_DPI_MAX));
     task->rate_hz = HW_RATES[(guint)std::clamp(
         (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_rate_combo)),
         0, HW_NRATES - 1)];

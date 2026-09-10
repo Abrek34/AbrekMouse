@@ -1067,6 +1067,14 @@ static int cmd_export(const app_config& cfg, const std::string& name) {
 static int cmd_import(app_config& cfg, const std::string& config_path, const std::string& json_file) {
     std::ifstream f(json_file);
     if (!f.is_open()) { std::cerr << "Cannot open: " << json_file << "\n"; return 1; }
+    // L-BUG-8: read the whole file into memory below — bound the size so a
+    // malformed multi-GB file cannot be slurped/parsed.
+    struct stat st;
+    if (stat(json_file.c_str(), &st) == 0 && st.st_size > 1024 * 1024) {
+        std::cerr << "Refusing to import: " << json_file
+                  << " is larger than 1MB\n";
+        return 1;
+    }
     std::string content((std::istreambuf_iterator<char>(f)), {});
     device_profile dp;
     try {
@@ -1386,9 +1394,9 @@ static int cmd_status(const std::string& config_path) {
                         }
 
                         // Latency stats (if any were recorded).
-                        if (d.contains("lat_samples") && d.value("lat_samples", (uint64_t)0) > 0) {
+                        if (d.contains("lat_samples") && d.value("lat_samples", static_cast<uint64_t>(0)) > 0) {
                             std::cout << "    latency    : "
-                                      << d.value("lat_samples", (uint64_t)0) << " samples, "
+                                      << d.value("lat_samples", static_cast<uint64_t>(0)) << " samples, "
                                       << "p50 " << d.value("lat_p50_us", 0.0) << " µs, "
                                       << "p95 " << d.value("lat_p95_us", 0.0) << " µs, "
                                       << "max " << d.value("lat_max_us", 0.0) << " µs\n";

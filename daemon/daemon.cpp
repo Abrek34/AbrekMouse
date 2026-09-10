@@ -1156,7 +1156,15 @@ void AccelDaemon::run_loop() {
         // permission/conflict that later cleared), force a scan every ~2 s even
         // without an inotify event — so the daemon converges on its own instead
         // of waiting for an unplug/replug.  Cheap: find_mice() on retired fds.
-        if (devices_.empty()) {
+        // L-BUG-2: snapshot the emptiness under the lock — devices_ is a
+        // std::vector and reading .empty() unsynchronized while another thread
+        // (hotplug) mutates it is a data race.
+        bool devices_empty;
+        {
+            std::lock_guard<std::mutex> lk(devices_mutex_);
+            devices_empty = devices_.empty();
+        }
+        if (devices_empty) {
             const double t = now_ms();
             if (t >= empty_rescan_ms_) {
                 empty_rescan_ms_ = t + 2000.0;

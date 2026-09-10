@@ -93,6 +93,11 @@ struct AppState {
     double graph_pan_x    = 0.0;
     bool   graph_drag     = false;
     double drag_pan_start = 0.0;
+    // Cached Y-axis max gain from the last draw — on_graph_motion reuses it
+    // instead of re-running the full 200-sample compute_max_gain() on every
+    // mouse move (L-BUG-17).  Any graph-visible state change triggers a
+    // queue_draw(), so between draws this always matches the rendered frame.
+    double graph_last_max_gain = 2.0;
 
     // KDE / libinput double-acceleration warning
     bool   is_kde          = false;   // true if running under KDE Plasma

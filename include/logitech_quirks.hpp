@@ -32,6 +32,10 @@
 
 namespace rawaccel {
 
+// Forward declaration — the definition below is needed by the
+// find_logitech_quirks(const hidpp_device_info&) overload (NEW-3 fix).
+inline std::string logitech_compose_model_id(const hidpp_device_info& info);
+
 // ── Per-model quirks table (mirrors Solaar device_quirks.py) ─────────────────
 
 /// One 0x8071 RGBEffects NvConfig (persistent boot/shutdown effect) cap.
@@ -98,6 +102,20 @@ inline const logitech_quirks* find_logitech_quirks(const std::string& model_id) 
             model_id.compare(model_id.size() - klen, klen, entry.model_id) == 0)
             return &entry.quirks;
     }
+    return nullptr;
+}
+
+/// Overload: also try the raw 12-char model_id from the device info, which
+/// logitech_compose_model_id() may abbreviate to ≤8 chars when transport
+/// flags are set (NEW-3 fix).
+inline std::string logitech_compose_model_id(const hidpp_device_info& info);
+inline const logitech_quirks* find_logitech_quirks(
+        const hidpp_device_info& info) {
+    const std::string mid = logitech_compose_model_id(info);
+    if (auto q = find_logitech_quirks(mid))
+        return q;
+    if (info.model_id != mid)
+        return find_logitech_quirks(info.model_id);
     return nullptr;
 }
 
@@ -168,15 +186,22 @@ inline logitech_controls logitech_controls_for(
 }
 
 /// Rebuild Solaar's composited modelId (upper-case hex, btid+btleid+wpid+usbid)
-/// from the transport ids decoded by the transport.  Falls back to the raw
-/// DEVICE_FW_VERSION model-id byte range ([7:13]) when no transport id is set.
+/// used to key the quirks table.  The raw DEVICE_FW_VERSION model-id byte
+/// range ([7:13], 6 bytes → 12 hex chars) already IS Solaar's `modelId` — the
+/// firmware zero-pads the byte-pairs of transports the device does not sit on
+/// (e.g. "B38940B4C355"), so every quirks key is 12 chars.  Re-assembling only
+/// the flagged transport ids drops that padding and yields ≤8 chars, which can
+/// never match the 12-char keys (NEW-3) — wireless devices would silently lose
+/// all model quirks.  Prefer the raw 12-char range; keep the decoded per-
+/// transport ids for callers that need the individual pairs.
 inline std::string logitech_compose_model_id(const hidpp_device_info& info) {
+    if (!info.model_id.empty())
+        return info.model_id;
     std::string out;
     for (const std::string* id : {&info.bluetooth_id, &info.bluetooth_le_id,
                                   &info.wireless_pid, &info.usb_id})
         if (!id->empty()) out += *id;
-    if (!out.empty()) return out;
-    return info.model_id;
+    return out;
 }
 
 } // namespace rawaccel

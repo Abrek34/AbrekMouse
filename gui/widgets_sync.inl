@@ -450,9 +450,11 @@ void on_xy_link_toggled(GtkCheckButton* btn, gpointer user_data) {
     widgets_to_profile(S);
 }
 
-void on_save_clicked(GtkButton*, gpointer user_data) {
-    auto* S = static_cast<AppState*>(user_data);
-    // Save As: always ask for a name so the default profile is never overwritten.
+// L-BUG-30: on_save_clicked / on_apply_clicked were ~30 identical lines.
+// Shared "Save As" flow: asks for a name, upserts the profile, persists it.
+// save_config_now() auto-sends SIGHUP when the daemon is running, so both
+// handlers end with the same persist call.
+static void save_profile_as_dialog(AppState* S) {
     std::string cur_name = S->config.profiles.empty() ? "" : cur_prof(S).name;
     show_input_dialog(S, tr("Save Profile As"), tr("Profile name"), cur_name.c_str(),
         [S](const std::string& name) {
@@ -482,35 +484,14 @@ void on_save_clicked(GtkButton*, gpointer user_data) {
         });
 }
 
-void on_apply_clicked(GtkButton*, gpointer user_data) {
-    auto* S = static_cast<AppState*>(user_data);
-    // Apply & Reload: same Save As logic, then reload the daemon.
-    std::string cur_name = S->config.profiles.empty() ? "" : cur_prof(S).name;
-    show_input_dialog(S, tr("Save Profile As"), tr("Profile name"), cur_name.c_str(),
-        [S](const std::string& name) {
-            if (name.empty()) return;
-            widgets_to_profile(S);
-            device_profile dp = cur_prof(S);
-            dp.name = name;
+void on_save_clicked(GtkButton*, gpointer user_data) {
+    save_profile_as_dialog(static_cast<AppState*>(user_data));
+}
 
-            bool found = false;
-            for (int i = 0; i < (int)S->config.profiles.size(); ++i) {
-                if (S->config.profiles[i].name == name) {
-                    S->config.profiles[i] = dp;
-                    S->current_profile_idx = i;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                S->config.profiles.push_back(dp);
-                S->current_profile_idx = (int)S->config.profiles.size() - 1;
-            }
-            S->config.active_profile = name;
-            rebuild_profile_combo(S);
-            // save_config_now() auto-sends SIGHUP when daemon is running.
-            save_config_now(S);
-        });
+void on_apply_clicked(GtkButton*, gpointer user_data) {
+    // Apply & Reload: same Save As logic, then reload the daemon.
+    // save_config_now() auto-sends SIGHUP when daemon is running.
+    save_profile_as_dialog(static_cast<AppState*>(user_data));
 }
 
 void on_daemon_start(GtkButton*, gpointer user_data) {

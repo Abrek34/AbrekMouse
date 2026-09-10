@@ -223,8 +223,7 @@ private:
     double empty_rescan_ms_ = 0;
 
     // ── P168: HID++ notification drain state ────────────────────────────────
-    // Only touched from the loop thread (no sync needed), same as
-    // hotplug_retry_ / empty_rescan_ms_ above.
+    // Only touched from the hidpp thread (no sync needed).
     // Paths of currently-identified Logitech hidraw devices with their
     // cached feature maps (post-replug cache is cleared + re-identified).
     std::vector<hidpp_device> hidpp_devs_;
