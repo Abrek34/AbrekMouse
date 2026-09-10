@@ -1023,13 +1023,18 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
 }
 
 std::vector<std::pair<uint16_t, uint8_t>> HidppTransport::get_feature_set() {
+    const uint8_t target = device_index_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lock(feature_mutex_);
+        const auto it = feature_sets_.find(target);
+        if (it != feature_sets_.end()) return it->second;
+    }
     const auto metadata = get_feature_metadata();
     std::vector<std::pair<uint16_t, uint8_t>> features;
     features.reserve(metadata.size());
     for (const auto& item : metadata)
         features.emplace_back(item.feature_id, item.index);
     {
-        const uint8_t target = device_index_.load(std::memory_order_relaxed);
         std::lock_guard lock(feature_mutex_);
         feature_sets_[target] = features;
     }

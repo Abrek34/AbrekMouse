@@ -939,6 +939,7 @@ void AccelDaemon::poll_hidpp_notifications() {
         for (auto it = hidpp_devs_.begin(); it != hidpp_devs_.end();) {
             if (!seen.count(it->hidraw_path)) {
                 log("HID++ device removed: " + it->hidraw_path, true);
+                hidpp_transports_.erase(it->hidraw_path);
                 it = hidpp_devs_.erase(it);
             } else {
                 ++it;
@@ -963,11 +964,15 @@ void AccelDaemon::poll_hidpp_notifications() {
     hidpp_drain_ms_ = t + 1000.0;
 
     for (const auto& dev : hidpp_devs_) {
-        HidppTransport transport(dev.hidraw_path);
-        if (!transport.is_open()) continue;
-        transport.set_device_index(dev.device_index);
+        auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
+        if (!transport_ptr || !transport_ptr->is_open()) {
+            transport_ptr = std::make_unique<HidppTransport>(dev.hidraw_path);
+            if (!transport_ptr->is_open()) continue;
+            transport_ptr->clear_feature_cache();
+        }
+        transport_ptr->set_device_index(dev.device_index);
         drain_hidpp_notifications(
-            transport, dev, 8,
+            *transport_ptr, dev, 8,
             [this](const hidpp_notification_event& event) {
                 switch (event.kind) {
                 case hidpp_notification_event_kind::battery:

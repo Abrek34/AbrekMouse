@@ -12,6 +12,7 @@
 #include <functional>
 #include <set>
 #include <unordered_map>
+#include <memory>
 #include <cstdint>
 
 namespace rawaccel {
@@ -226,6 +227,7 @@ private:
     // Paths of currently-identified Logitech hidraw devices with their
     // cached feature maps (post-replug cache is cleared + re-identified).
     std::vector<hidpp_device> hidpp_devs_;
+    std::unordered_map<std::string, std::unique_ptr<HidppTransport>> hidpp_transports_;
     double hidpp_rescan_ms_ = 0;    // next hidraw re-scan time
     double hidpp_drain_ms_  = 0;    // next notification drain time
 

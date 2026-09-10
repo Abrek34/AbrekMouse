@@ -15,8 +15,16 @@ inline double magnitude(vec2d v) {
 inline double lp_distance(vec2d v, double p) {
     // R6: guard against pow(0, negative) = Inf when both components are zero.
     // The correct Lp distance for the zero vector is always 0.
-    if (v.x == 0 && v.y == 0) return 0;
-    return std::pow(std::pow(std::fabs(v.x), p) + std::pow(std::fabs(v.y), p), 1.0 / p);
+    double ax = std::fabs(v.x);
+    double ay = std::fabs(v.y);
+    if (ax == 0 && ay == 0) return 0;
+    // Factor out the larger component so the inner ratio is always ≤ 1,
+    // preventing pow overflow for large inputs with high p norms.
+    //   ||v||_p = M * (1 + (m/M)^p)^(1/p)   where M = max, m = min.
+    double M = ax > ay ? ax : ay;
+    double m = ax > ay ? ay : ax;
+    double result = M * std::pow(1.0 + std::pow(m / M, p), 1.0 / p);
+    return std::isfinite(result) ? result : M;
 }
 
 inline double maxsd(double a, double b) {

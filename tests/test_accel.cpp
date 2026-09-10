@@ -7780,10 +7780,10 @@ static void test_p106_extremes_table() {
         sp.init(sa);
         EXPECT_NEAR(sp.calc_speed_whole({1,0}, 1.0), 1.0, 1e-9);
         EXPECT_NEAR(sp.calc_speed_whole({0,1}, 1.0), 1.0, 1e-9);
-        // SURPRISE: tiny lp_norm ile (3,4) gibi çapraz vektörde 2^(1/p) → +Inf
-        // (sanitize lp_norm<=0'ı engeller ama 1e-9 geçer; pipeline Inf'i zero'lar).
-        EXPECT(std::isinf(sp.calc_speed_whole({3,4}, 1.0)));
-        EXPECT(sp.calc_speed_whole({3,4}, 1.0) > 0);
+        // tiny lp_norm ile (3,4) gibi çapraz vektörde 2^(1/p) → overflow.
+        // lp_distance artık factored-out form kullanıyor: M*(1+(m/M)^p)^(1/p).
+        // İç Inf.isfinite guard'ı yakalayıp max bileşene (M=4) clamped return eder.
+        EXPECT_NEAR(sp.calc_speed_whole({3,4}, 1.0), 4.0, 1e-9);
         sa.whole = false;                                      // separate: |x|,|y|
         sp.init(sa);
         double vx = 0, vy = 0;
