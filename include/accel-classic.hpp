@@ -111,6 +111,12 @@ private:
         switch (args.cap_mode_val) {
         case cap_mode::io:
             cap_x = args.cap.x;
+            // BUG-7 fix: if cap.x < input_offset, base_fn(cap_x) receives a
+            // non-positive base → pow(neg, frac) = NaN → base_fn = 0, and the
+            // entire accelerated tail collapses to the degenerate constant
+            // cap_y·(1 − cap_x/x).  Clamp the breakpoint up to input_offset
+            // so the curve keeps its intended shape (no silent gain loss).
+            if (cap_x < args.input_offset) cap_x = args.input_offset;
             cap_y = args.cap.y - 1;
             if (cap_y < 0) { cap_y = -cap_y; sign = -sign; }
             {

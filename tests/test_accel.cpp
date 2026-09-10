@@ -4105,6 +4105,24 @@ static void test_classic_io_degenerate_cap() {
     // x > input_offset → should be finite
     double r = c(10.0, args);
     EXPECT(std::isfinite(r));
+
+    // BUG-7 fix: init_gain::io clamps cap_x up to input_offset, so the
+    // accelerated tail is a sane asymptotic curve (1.0 → cap.y) instead of
+    // the old negative-gain degenerate constant.  Verify the curve still has
+    // upward slope beyond input_offset and never produces negative gain.
+    double r_slow = c(6.0, args);
+    double r_fast = c(100.0, args);
+    double r_inf  = c(1e9, args);
+    EXPECT(std::isfinite(r_slow));
+    EXPECT(std::isfinite(r_fast));
+    EXPECT(std::isfinite(r_inf));
+    EXPECT(r_fast > r_slow);          // still accelerating
+    EXPECT(r_inf > r_fast);           // approaches cap.y from below
+    EXPECT(r_inf <= args.cap.y + 1e-9); // asymptotic ceiling ≈ cap.y
+    EXPECT(r_slow >= 1.0);
+    // gain never goes negative (the old degenerate path produced sign flips)
+    EXPECT(c(10.0, args) > 0.0);
+    EXPECT(c(100.0, args) > 0.0);
 }
 
 // ── BUG-9: classic cap_mode::in with cap.x <= input_offset ──────────────────

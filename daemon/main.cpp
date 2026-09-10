@@ -107,9 +107,14 @@ static std::string resolve_config_path() {
     if (sudo_user && sudo_user[0] != '\0') {
         struct passwd  pwd_buf;
         struct passwd* result = nullptr;
-        // Allocate a reasonably large buffer for getpwnam_r
+        // BUG-2 fix: retry with larger buffer on ERANGE (LDAP/NSS can
+        // produce entries larger than 16 KB on some systems).
         std::vector<char> buf(16384);
         int ret = getpwnam_r(sudo_user, &pwd_buf, buf.data(), buf.size(), &result);
+        if (ret == ERANGE) {
+            buf.resize(buf.size() * 2);
+            ret = getpwnam_r(sudo_user, &pwd_buf, buf.data(), buf.size(), &result);
+        }
         if (ret == 0 && result && result->pw_dir && result->pw_dir[0] != '\0') {
             std::string path = std::string(result->pw_dir) +
                                "/.config/rawaccel/settings.json";

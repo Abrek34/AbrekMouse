@@ -235,10 +235,16 @@ pid_t read_daemon_pid() {
         FILE* fp = fopen(path.c_str(), "r");
         if (!fp) continue;
         pid_t pid = 0;
-        // Empty / malformed PID file → fscanf returns 0 or EOF and `pid`
-        // stays 0; the `pid > 0` guard below filters those out.  We keep
-        // the unused result silent for -Wunused-result + _FORTIFY_SOURCE.
-        (void)!fscanf(fp, "%d", &pid);
+        // BUG-1 fix: strtol + range check instead of fscanf("%d") to avoid
+        // UB when the PID value exceeds INT_MAX (C11 §7.21.6.2).
+        char buf[32] = {};
+        if (fgets(buf, sizeof(buf), fp)) {
+            errno = 0;
+            char* end = nullptr;
+            long v = strtol(buf, &end, 10);
+            if (end != buf && errno == 0 && v > 0 && v <= INT_MAX)
+                pid = static_cast<pid_t>(v);
+        }
         fclose(fp);
         if (pid > 0 && pid_is_rawaccel_daemon(pid)) return pid;
         // BUG-07: stale PID file (PID recycled, or a dead daemon left it

@@ -392,6 +392,10 @@ static void sanitize_accel_args(accel_args& a) {
     // cap values: negative caps are meaningless.
     if (a.cap.x < 0) a.cap.x = 0;
     if (a.cap.y < 0) a.cap.y = 0;
+    // BUG-7 fix: classic GAIN/io requires cap.x >= input_offset, otherwise
+    // base_fn(cap_x) gets a non-positive base and the accelerated tail silently
+    // collapses (accel-classic.hpp init_gain::io).  Clamp breakpoint up.
+    if (a.cap.x < a.input_offset) a.cap.x = a.input_offset;
 
     // P120-FAZ2 (Aj8 BUG-3): cap the gain-driving fields at the GUI gauge
     // maxima (SCALE_MAX / EXP_POWER_MAX / CAP_X_MAX / CAP_Y_MAX /

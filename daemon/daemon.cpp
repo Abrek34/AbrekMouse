@@ -180,8 +180,23 @@ static int detect_polling_rate(const std::string& event_path) {
             if (binterval < 1 || binterval > 16) return 0;
             const double interval_us = 125.0 * (1u << (binterval - 1));
             rate_hz = static_cast<int>(1000000.0 / interval_us);
+        } else if (usb_speed == 0) {
+            // BUG-16 fix: `speed` sysfs could not be read (missing/unknown).
+            // Previously this fell into the full-speed branch and reported an
+            // up-to-8× too low rate for high-speed gaming mice.  Try the
+            // high-speed interpretation first; a valid high-speed result in
+            // [POLL_RATE_MIN, POLL_RATE_MAX] wins, otherwise fall back to
+            // the full-speed interpretation.
+            if (binterval >= 1 && binterval <= 16) {
+                const double hs_interval_us = 125.0 * (1u << (binterval - 1));
+                const int hs_rate = static_cast<int>(1000000.0 / hs_interval_us);
+                if (hs_rate >= static_cast<int>(POLL_RATE_MIN) &&
+                    hs_rate <= static_cast<int>(POLL_RATE_MAX))
+                    return std::clamp(hs_rate, (int)POLL_RATE_MIN, (int)POLL_RATE_MAX);
+            }
+            rate_hz = 1000 / binterval;
         } else {
-            // Full-speed (or unknown/low): bInterval is in 1ms units
+            // Full-speed: bInterval is in 1ms units
             rate_hz = 1000 / binterval;
         }
         if (rate_hz > 0)

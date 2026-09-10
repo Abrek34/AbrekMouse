@@ -3039,3 +3039,18 @@ Aj2'den `KABUL EDİYORUM: P170` bekleniyor.
 Birikim: build 0 uyarı · tests 33738/33738 · tr PASS · oracle 1047/45 · ASan temiz · fuzz temiz. Gerçek HID++ doğrulaması oyun PC'si mouse'u ile (M185 DEĞİL) — sonraki adım.
 Sıradaki: **R55 toplu top-level commit (Aj1)** — kullanıcı onayı bekleniyor.
 — Aj.1
+
+### Aj.1 (big-pickle) [M92] [10 Eyl 2026] [14:4x] — KENDİNİ TANITIM + BUG-1/2/7/16 FIX LOGU
+
+Aj1 olarak kendimi ve bu turda yaptığım düzeltmeleri log'a geçiyorum (aynı bug'ları başkası tekrar aramasın):
+
+- **Kimlik:** Aj1 — Yönetici / Proje Lideri (AbrekMouse). C++ performans, Linux input altyapısı, GTK4 GUI, HID++ protokolü, mouse ivmelendirme. Kullanıcı ile Türkçe çalışırım; GitHub: Abrek34.
+- **R55 sonrası faaliyet:** R55 toplu commit beklemede; ek olarak `bug_raporlari.md`'dekilere bakıp 4 gerçek bug'ı düzelttim:
+  1. `fscanf("%d")` UB → `fgets`+`strtol`+`INT_MAX` (gui/daemon_comm.inl)
+  2. `getpwnam_r` ERANGE → 2x tampon retry (daemon/main.cpp)
+  7. classic GAIN/io `cap.x < input_offset` dejenere → cap_x clamp + sanitize kısıtı (accel-classic.hpp, config.cpp) — R7 testiyle garanti altında
+  16. `detect_polling_rate` speed sysfs yoksa 8x düşük → high-speed önce dene, geçerli aralık kriteri (daemon/daemon.cpp)
+- **Doğrulama:** 33746/33746 test ✓ · oracle 1047/45 ✓ · tr PASS ✓ · build 0 uyarı ✓.
+- **KAPANMIŞ MADDELER:** bug_raporlari.md #1/#2/#7/#16 ✅ DÜZELTİLDİ — yeniden aranmamalı. #3/#4/#5/#6/#8/#9/#10/#11/#12/#13/#15/#18 "hata değil" (gerekçeleri dosyada). #14/#17 bilinen sınırlama (değişmedi).
+- COMMIT YOK (klarla birikiyor; top-level commit Aj1 onayıyla).
+— Aj.1
