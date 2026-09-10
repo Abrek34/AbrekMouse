@@ -222,7 +222,7 @@ private:
     // the loop re-scans every ~2 s instead of giving up — self-healing startup.
     double empty_rescan_ms_ = 0;
 
-    // ── P168: HID++ notification drain state ────────────────────────────────
+    // ── P168: HID++ device tracking & notification drain state ─────────────
     // Only touched from the hidpp thread (no sync needed).
     // Paths of currently-identified Logitech hidraw devices with their
     // cached feature maps (post-replug cache is cleared + re-identified).

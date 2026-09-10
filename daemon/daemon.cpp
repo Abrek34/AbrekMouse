@@ -373,7 +373,8 @@ static std::string resolve_stable_id(const std::string& event_node) {
 static std::vector<std::string> find_mice() {
     std::vector<std::string> result;
     glob_t g{};
-    if (glob("/dev/input/event*", 0, nullptr, &g) == 0) {
+    int glob_result = glob("/dev/input/event*", 0, nullptr, &g);
+    if (glob_result == 0) {
         for (size_t i = 0; i < g.gl_pathc; i++) {
             int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
             if (fd < 0) {
@@ -385,7 +386,8 @@ static std::vector<std::string> find_mice() {
             close(fd);
         }
     }
-    globfree(&g);
+    if (glob_result == 0)
+        globfree(&g);
     return result;
 }
 
@@ -1852,7 +1854,7 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
         return false;
     }
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         log("IPC: socket() failed: " + std::string(strerror(errno)));
         return false;

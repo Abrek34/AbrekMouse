@@ -2744,11 +2744,13 @@ static void test_cfg_p54_guards() {
     {
         const std::string path = "/tmp/test_p54_b3.json";
         std::filesystem::remove(path);
+        remove_tmp_leftovers(path);
         app_config cfg;
         cfg.active_profile = "p54";
         save_config(cfg, path);
-        // N-15: temp name carries the pid suffix — assert on the real name.
-        EXPECT(!std::filesystem::exists(path + "." + std::to_string(::getpid()) + ".tmp"));
+        // N-15: temp name carries the pid suffix — glob path.*.tmp so a
+        // leftover from any pid is caught.
+        EXPECT(tmp_leftover_count(path) == 0);
         EXPECT(std::filesystem::exists(path));
         EXPECT(std::filesystem::file_size(path) > 0);
         std::filesystem::remove(path);
@@ -4328,9 +4330,10 @@ static void test_motion_math_clamp_remainder_reset() {
 static void test_save_config_durability_path() {
     SECTION("BUG-13 — save_config: tmp file is removed and target updated atomically");
     std::string path = "/tmp/_rawaccel_save_test.json";
-    // N-15: save_config names the temp file with a pid suffix.
-    std::string tmp  = path + "." + std::to_string(::getpid()) + ".tmp";
-    std::remove(path.c_str()); std::remove(tmp.c_str());
+    // N-15: save_config names the temp file with a pid suffix.  Glob
+    // path.*.tmp so a leftover from any pid is caught.
+    std::remove(path.c_str());
+    remove_tmp_leftovers(path);
 
     app_config cfg;
     device_profile dp; dp.name = "test"; dp.dev_cfg.dpi = 800;
@@ -4344,7 +4347,7 @@ static void test_save_config_durability_path() {
     // Target file must exist; tmp file must NOT exist (renamed away).
     struct stat st;
     EXPECT(stat(path.c_str(), &st) == 0);
-    EXPECT(stat(tmp.c_str(),  &st) != 0); // tmp gone
+    EXPECT(tmp_leftover_count(path) == 0); // tmp (any pid) gone
 
     // File must be non-empty (fsync ensures content reached disk before rename)
     EXPECT(st.st_size > 0);

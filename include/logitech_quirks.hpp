@@ -95,11 +95,11 @@ inline const logitech_quirks* find_logitech_quirks(const std::string& model_id) 
         if (model_id == entry.model_id)
             return &entry.quirks;
     // Short-key fallback: quirks table may use abbreviated keys (e.g. "32")
-    // that are suffixes of the full composed model ID.
+    // that must match the FULL composed model ID (exact length, not suffix).
     for (const auto& entry : LOGITECH_QUIRKS) {
         size_t klen = std::char_traits<char>::length(entry.model_id);
-        if (klen <= 4 && model_id.size() >= klen &&
-            model_id.compare(model_id.size() - klen, klen, entry.model_id) == 0)
+        if (klen <= 4 && model_id.size() == klen &&
+            model_id == entry.model_id)
             return &entry.quirks;
     }
     return nullptr;

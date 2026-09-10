@@ -377,7 +377,7 @@ std::optional<hidpp_pairing_slot> hidpp_parse_receiver_pairing(
             // Bolt receiver-info pairing payload:
             // kind, WPID high, WPID low, serial[4...].
             if (payload.size() < 4) return std::nullopt;
-            result.occupied = payload[1] != 0;
+            result.occupied = payload[0] != 0;
             // Bolt uses a little-endian-looking WPID on the wire: Solaar
             // extracts byte 3 as the high byte and byte 2 as the low byte.
             result.pid = static_cast<uint16_t>(
