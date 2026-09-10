@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build (portable) + Unit tests + Warning gate
+    runs-on: ubuntu-24.04
+    env:
+      RAWACCEL_PORTABLE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libevdev-dev libgtk-4-dev
+
+      - name: Build (warning-as-failure gate)
+        run: |
+          set -o pipefail
+          # Capture full output, then fail if any warning/error line appears.
+          bash scripts/build.sh 2>&1 | tee build.log
+          if grep -E "warning:|error:" build.log; then
+            echo "::error::Build produced warnings or errors (see above)."
+            exit 1
+          fi
+
+      - name: Verify binaries
+        run: |
+          test -x build-manual/rawaccel-daemon
+          test -x build-manual/rawaccel-cli
+          test -x build-manual/rawaccel-gui
+          file build-manual/rawaccel-*
+
+      - name: Run unit tests
+        run: bash tests/run_tests.sh
+
+      - name: Run oracle (reference cross-check)
+        # Differential check vs the vendored official RawAccel reference.
+        # Fails (exit 1) if any row outside tests/oracle/known_deviations.txt drifts.
+        run: bash tests/oracle/run_oracle.sh
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+  sanitizers:
+    name: Tests under ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev
+
+      - name: Build & run tests with -fsanitize=address,undefined
+        env:
+          # Fail loud on any sanitizer report
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+        run: |
+          mkdir -p build-manual
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+              -fsanitize=address,undefined -fno-omit-frame-pointer \
+              -I include -I src \
+              tests/test_accel.cpp src/config.cpp \
+              -o build-manual/test_accel_asan
+          build-manual/test_accel_asan
+
+  fuzz-smoke:
+    name: Fuzz smoke (60s per harness)
+    runs-on: ubuntu-24.04
+    # Only run on push / manual dispatch — keeps PRs fast.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev clang
+
+      - name: Run fuzz harnesses (60s each)
+        run: bash tests/run_fuzz.sh 60
+
+      - name: Upload crashes on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            tests/corpus_config
+            tests/corpus_accel
+          if-no-files-found: ignore
+
+  perf-gate:
+    name: Hot-path performance gate (P137)
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev
+
+      - name: Run hot-path perf gate
+        run: |
+          set -e
+          if [ ! -x scripts/bench_hotpath.sh ]; then
+            echo "Perf gate SKIP: scripts/bench_hotpath.sh (Aj5 P135) henüz yok."
+            exit 0
+          fi
+          if [ ! -f tests/perf_baseline.json ]; then
+            echo "Perf gate SKIP: tests/perf_baseline.json (P137) henüz yok."
+            exit 0
+          fi
+          # R53 (Aj7): tek-koşum gürültüsü sahte FAIL üretebildigi icin 3 kosum
+          # yapilip her config iin MEDYAN baseline ile karsilastirilir.
+          # Iterasyon sayisi baseline metodolojisinden (_meta.iterations) okunur
+          # ki kosum kosulu baseline uretiminden sapmasin (R53 duzeltmesi).
+          ITER=$(python3 -c 'import json;print(json.load(open("tests/perf_baseline.json"))["_meta"]["iterations"])')
+          echo "perf-gate: iterations=$ITER (baseline _meta), median-of-3 koşum"
+          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out1 2>&1
+          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out2 2>&1
+          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out3 2>&1
+          python3 - <<'PY'
+          import json, re, sys, statistics
+
+          baseline = json.load(open("tests/perf_baseline.json"))
+
+          runs = []
+          for f in ("bench_hotpath.out1", "bench_hotpath.out2", "bench_hotpath.out3"):
+              run = {}
+              for ln in open(f).read().splitlines():
+                  m = re.match(r"^([a-z][a-z0-9+./()_ -]*?):\s*([0-9.]+)\s*ns/event$", ln)
+                  if m:
+                      run[m.group(1).strip()] = float(m.group(2))
+              runs.append(run)
+
+          if not any(runs):
+              print("::error::bench_hotpath SUMMARY parse edilemedi (3 kosum da bos)")
+              sys.exit(1)
+
+          got = {}
+          for name in {n for r in runs for n in r}:
+              vals = [r[name] for r in runs if name in r]
+              got[name] = statistics.median(vals)
+
+          threshold = baseline.get("_meta", {}).get("threshold_percent", 5.0)
+          failures = []
+          print("config | baseline | median | delta%")
+
+          for name, base in baseline.items():
+              if name == "_meta":
+                  continue
+              if name not in got:
+                  print("::warning::baseline'da var ama ciktida yok: %s" % name)
+                  continue
+              now = got[name]
+              delta = (now - base) / base * 100.0
+              flag = "FAIL" if delta > threshold else "ok"
+              print("%-32s | %8s | %8s | %+5.2f%% %s" % (name, base, now, delta, flag))
+              if delta > threshold:
+                  failures.append("%s %+.2f%% (%s -> %s ns/event)" % (name, delta, base, now))
+
+          if failures:
+              print("::error::Perf gate FAIL (%d config +%%%s ustu):" % (len(failures), threshold))
+              for f in failures:
+                  print("::error::  " + f)
+              sys.exit(1)
+
+          print("Perf gate OK — hicbir config baseline'i +%%%s asmadi (median-of-3)." % threshold)
+PY

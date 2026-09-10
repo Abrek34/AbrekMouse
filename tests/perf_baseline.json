@@ -1,0 +1,18 @@
+{
+  "noaccel": 7.154,
+  "power-whole": 9.1183,
+  "classic": 26.4416,
+  "power+rot45+snap15+clamp": 27.5543,
+  "power-dual+4ema": 425.352,
+  "apply_motion_math(full)": 21.9622,
+  "_meta": {
+    "unit": "ns/event",
+    "iterations": 300000,
+    "runs_used": 3,
+    "method": "median",
+    "source": "scripts/bench_hotpath.sh (Aj5 P135)",
+    "captured_by": "Aj2 (P137) 07 Sep 2026 20:55",
+    "threshold_percent": 5.0,
+    "note": "CI perf-gate: rerun script, if any config >5% slower than baseline -> FAIL"
+  }
+}

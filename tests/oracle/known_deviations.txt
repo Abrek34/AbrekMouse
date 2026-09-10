@@ -1,0 +1,65 @@
+# T13 — Known, intentional deviations of the local port from the official
+# RawAccel reference. Rows here are expected to differ; run_oracle.sh treats
+# only rows NOT in this list as drift. Format: <case-name>\t<spd>
+#
+# Deviation classes (both are documented port conventions with their own tests):
+#  1. classic *exp<=1* → the local port's "linear path" returns the constant
+#     gain 1+acceleration. The official reference keeps x^(exp-1), which
+#     explodes (e.g. gain ≈ 448 at speed 0.001 for exp=0.5) on the physical
+#     expectation that exp<1 is an unusual config. AGENTS.md test:
+#     "classic linear path (exp<=1) cap".
+#     Reachability (T15/T16): the GUI spinner is bounded to [1,10]
+#     (gui/ui_builder.inl `make_spin(1,10,...)`), and `sanitize_accel_args`
+#     now clamps exponent_classic to [1,10] (src/config.cpp), so a real
+#     daemon/GUI/CLI config can never carry exp<1 — these rows are only
+#     reachable through the raw algorithm API, where the port keeps its
+#     safe documented behavior.
+#  2. power / synchronous at speed 0 → the port guards `x <= 0 → 1.0`
+#     (identity); the reference blindly runs the formula, yielding artifacts
+#     (power → 0, synchronous → ≈0.667). Speed 0 is non-physical for a mouse
+#     (output = input × gain = 0 anyway). AGENTS.md test: "synchronous power<1".
+classic_gain_exp_le1	0.001
+classic_gain_exp_le1	0.005
+classic_gain_exp_le1	0.01
+classic_gain_exp_le1	0.1
+classic_gain_exp_le1	0.5
+classic_gain_exp_le1	1
+classic_gain_exp_le1	3
+classic_gain_exp_le1	5
+classic_gain_exp_le1	7.5
+classic_gain_exp_le1	10
+classic_gain_exp_le1	15
+classic_gain_exp_le1	30
+classic_gain_exp_le1	50
+classic_gain_exp_le1	100
+classic_gain_exp_le1	250
+classic_gain_exp_le1	500
+classic_gain_exp_le1	1000
+classic_gain_exp_le1	2000
+classic_gain_exp_le1	3000
+classic_gain_exp_le1	4000
+classic_gain_exp_le1	5000
+classic_gain_exp_le1	10000
+classic_gain_exp_le1	100000
+power_gain_p1	0
+power_legacy_p1	0
+sync_gain_p2	0
+sync_gain_p1	0
+sync_gain_p07	0
+sync_legacy_p2	0
+sync_legacy_p1	0
+sync_legacy_mot05_gam2	0
+sync_gain_mot2_gam05	0
+game_apex_power	0
+p155_io_cap0_legacy	0.0001
+p155_io_cap0_legacy	0.001
+p155_io_cap0_legacy	0.01
+p155_io_cap0_legacy	0.1
+p155_io_cap0_legacy	1
+p155_io_cap0_legacy	3
+p155_io_cap0_legacy	5
+p155_io_cap0_legacy	10
+p155_io_cap0_legacy	100
+p155_io_cap0_legacy	1000
+p155_io_cap0_legacy	10000
+p155_io_cap0_legacy	100000

@@ -1,0 +1,44 @@
+=== RawAccel Hot-Path Benchmark ===
+Date: Sal 08 Eyl 2026 21:00:33 +03
+Host: cachyos-x8664
+CPU: Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz
+Kernel: 7.2.3-1-cachyos
+Iterations per run: 1000000
+Perf runs per config: 3
+Binary: /home/a/Masaüstü/Linux-Raw-Accel-main/build-manual/bench_hotpath
+Compiler: g++ (GCC) 16.2.1 20260810
+
+=== Timing Results (nanoseconds per event) ===
+noaccel: 8.30123 ns/event (1000000 iterations)
+power-whole: 9.95463 ns/event (1000000 iterations)
+classic: 26.5763 ns/event (1000000 iterations)
+power+rot45+snap15+clamp: 26.731 ns/event (1000000 iterations)
+power-dual+4ema: 22.7414 ns/event (1000000 iterations)
+apply_motion_math(full): 22.5251 ns/event (1000000 iterations)
+
+=== SUMMARY ===
+noaccel: 8.30123 ns/event
+power-whole: 9.95463 ns/event
+classic: 26.5763 ns/event
+power+rot45+snap15+clamp: 26.731 ns/event
+power-dual+4ema: 22.7414 ns/event
+apply_motion_math(full): 22.5251 ns/event
+
+=== Hardware Counters ===
+perf not available. Install 'perf' package for cycles/instructions/syscalls measurements.
+
+=== Baseline Summary ===
+Configuration                    | ns/event
+--------------------------------|----------
+noaccel | 6.25702 ns
+power-whole | 9.33078 ns
+classic | 26.6414 ns
+power+rot45+snap15+clamp | 28.0546 ns
+power-dual+4ema | 23.2615 ns
+apply_motion_math(full) | 23.8848 ns
+noaccel | 6.25702 ns
+power-whole | 9.33078 ns
+classic | 26.6414 ns
+power+rot45+snap15+clamp | 28.0546 ns
+power-dual+4ema | 23.2615 ns
+apply_motion_math(full) | 23.8848 ns

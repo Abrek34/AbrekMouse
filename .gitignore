@@ -1,0 +1,11 @@
+# Paketleme artıkları
+packaging/src/
+packaging/pkg/
+*.pkg.tar.zst
+packaging/*.srcinfo
+# Dağıtım kopyası (yayına hazır) git tarafindan izlenmez — git archive ile yeniden uretilir
+yayına hazır/
+
+# Derleme çıktıları (setup.sh/build.sh uretir)
+build-manual/
+build/

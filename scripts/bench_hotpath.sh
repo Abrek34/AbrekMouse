@@ -1,0 +1,69 @@
+#!/bin/bash
+# bench_hotpath.sh — Hot-path microbenchmark for RawAccel Linux
+# Measures cycles, instructions, and syscalls per event for different acceleration configurations.
+# Usage: ./scripts/bench_hotpath.sh [iterations] [perf-runs] [output-file]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+BUILD_DIR="$PROJECT_ROOT/build-manual"
+BENCH_BIN="$BUILD_DIR/bench_hotpath"
+ITERATIONS="${1:-1000000}"
+PERF_RUNS="${2:-3}"
+OUTPUT_FILE="${3:-$PROJECT_ROOT/bench_hotpath_results.txt}"
+
+if [[ ! -f "$BENCH_BIN" ]]; then
+    echo "Building benchmark..."
+    cd "$PROJECT_ROOT"
+    g++ -O3 -march=native -std=c++20 \
+        -I"$PROJECT_ROOT/include" \
+        -I"$PROJECT_ROOT/include/nlohmann" \
+        "$PROJECT_ROOT/tests/bench_hotpath.cpp" \
+        -o "$BENCH_BIN"
+fi
+
+if [[ ! -f "$BENCH_BIN" ]]; then
+    echo "ERROR: Failed to build benchmark binary" >&2
+    exit 1
+fi
+
+{
+    echo "=== RawAccel Hot-Path Benchmark ==="
+    echo "Date: $(date)"
+    echo "Host: $(hostname)"
+    echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+    echo "Kernel: $(uname -r)"
+    echo "Iterations per run: $ITERATIONS"
+    echo "Perf runs per config: $PERF_RUNS"
+    echo "Binary: $BENCH_BIN"
+    echo "Compiler: $(g++ --version | head -1)"
+    echo ""
+    
+    # Run benchmark without perf (timing only)
+    echo "=== Timing Results (nanoseconds per event) ==="
+    "$BENCH_BIN" "$ITERATIONS"
+    echo ""
+    
+    # Run with perf if available
+    if command -v perf &> /dev/null; then
+        echo "=== Hardware Counters (perf stat) ==="
+        perf stat -r "$PERF_RUNS" -e cycles,instructions,syscalls -- "$BENCH_BIN" "$ITERATIONS" 2>&1 | \
+            grep -E "(cycles|instructions|syscalls|ns/event|SUMMARY|===|Performance counter)"
+        echo ""
+    else
+        echo "=== Hardware Counters ==="
+        echo "perf not available. Install 'perf' package for cycles/instructions/syscalls measurements."
+        echo ""
+    fi
+    
+    echo "=== Baseline Summary ==="
+    echo "Configuration                    | ns/event"
+    echo "--------------------------------|----------"
+    "$BENCH_BIN" "$ITERATIONS" 2>&1 | grep -E "(noaccel|power-whole|classic|power\+rot45|power-dual|apply_motion_math)" | \
+        sed 's/: / | /' | sed 's/ ns\/event.*/ ns/'
+    
+} | tee "$OUTPUT_FILE"
+
+echo ""
+echo "Results saved to: $OUTPUT_FILE"

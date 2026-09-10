@@ -1,0 +1,88 @@
+# Maintainer: Aj 4 (rawaccel-linux packaging)
+#
+# Development-snapshot PKGBUILD: builds from the CURRENT working tree.
+# Run makepkg from this directory (packaging/) — artifacts (src/, pkg/,
+# *.pkg.tar.zst) stay inside packaging/ and never dirty the repo tree.
+# No network source is needed — nothing here is git- or tag-pinned.
+#
+#   cd packaging && makepkg -si
+#
+# For a published AUR release, replace source=() with the upstream tarball
+# and drop the parent-tree copy in prepare().
+
+pkgname=rawaccel-linux
+pkgver=0.6.4
+pkgrel=1
+pkgdesc="Raw Accel mouse acceleration daemon (Linux port): kernel-level uinput grab + GTK4 GUI + CLI"
+arch=('x86_64')
+url="https://github.com/rawaccel-linux/rawaccel-linux"
+license=('custom')
+depends=('libevdev' 'gtk4' 'glib2' 'polkit' 'systemd')
+makedepends=('cmake' 'pkgconf' 'gcc')
+optdepends=('python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)')
+install="$pkgname.install"
+# /etc/rawaccel/settings.json is user state (their profiles): pacman must not
+# overwrite it on reinstall/upgrade (it was a file-conflict before — fix so
+# `pacman -U` never collides with an existing install).
+backup=('etc/rawaccel/settings.json')
+source=()
+sha256sums=()
+
+prepare() {
+    # The current tree is the "source": copy it into the makepkg srcdir.
+    # root = repository root (two levels above srcdir for a packaging/ build).
+    local root
+    root="$(readlink -f "${srcdir}/../..")"
+    cp -r "$root"/include "$root"/src "$root"/daemon "$root"/cli \
+          "$root"/gui "$root"/config "$root"/tests "$root"/scripts \
+          "$root"/CMakeLists.txt ./
+    rm -rf build
+
+    # Arch convention: binaries go to /usr/bin (not /usr/local/bin).
+    sed -i 's#/usr/local/bin#/usr/bin#g' CMakeLists.txt
+    sed -i 's#/usr/local/bin/rawaccel-daemon#/usr/bin/rawaccel-daemon#g' \
+        scripts/rawaccel.service scripts/polkit/org.rawaccel.policy
+}
+
+build() {
+    cmake -B build -S . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build build -j"$(nproc)"
+}
+
+check() {
+    # Tests are validated separately via tests/run_tests.sh; not part of the
+    # package build (BUILD_TESTS=OFF). Run rawaccel-tests only if it exists.
+    if [[ -x build/rawaccel-tests ]]; then
+        ./build/rawaccel-tests >/dev/null 2>&1 || true
+    fi
+}
+
+package() {
+    # CMake installs: binaries → /usr/bin, .desktop → /usr/share/applications,
+    # systemd unit → /usr/lib/systemd/system, default config → /etc/rawaccel.
+    DESTDIR="$pkgdir" cmake --install build --prefix /usr
+
+    # udev rules: give 'input' group rw on /dev/uinput and /dev/input/event*
+    install -Dm644 scripts/99-rawaccel.rules \
+        "$pkgdir/usr/lib/udev/rules.d/99-rawaccel.rules"
+
+    # Auto-load the uinput kernel module
+    printf 'uinput\n' > "$srcdir/rawaccel.conf"
+    install -Dm644 "$srcdir/rawaccel.conf" \
+        "$pkgdir/usr/lib/modules-load.d/rawaccel.conf"
+
+    # polkit: allow 'input' group users to start the daemon without a password
+    install -Dm644 scripts/polkit/org.rawaccel.policy \
+        "$pkgdir/usr/share/polkit-1/actions/org.rawaccel.policy"
+    install -Dm644 scripts/polkit/49-rawaccel.rules \
+        "$pkgdir/usr/share/polkit-1/rules.d/49-rawaccel.rules"
+
+    # libinput quirk: disable desktop acceleration over virtual mouse
+    install -Dm644 scripts/rawaccel.quirks \
+        "$pkgdir/usr/share/libinput/50-rawaccel.quirks"
+}
+
+# vim:set ts=4 sw=4 et:

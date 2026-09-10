@@ -1,0 +1,32 @@
+pre_install() {
+    # Clean shadows from a previous setup.sh / old /etc install.
+    # setup.sh used to place the unit and binaries in /etc/systemd/system and
+    # /usr/local/bin, which SHADOW the package's /usr/lib/systemd/system unit
+    # and /usr/bin binaries — the old binary kept running even after the package
+    # was installed/upgraded. Removing them lets the packaged unit win.
+    systemctl disable --now rawaccel.service &>/dev/null || true
+    rm -f /etc/systemd/system/rawaccel.service
+    rm -f /etc/systemd/user/rawaccel.service
+    rm -f /usr/local/bin/rawaccel-daemon /usr/local/bin/rawaccel-cli /usr/local/bin/rawaccel-gui
+    # User-installed legacy binaries in ~/.local/bin also shadow system ones.
+    rm -f /home/*/.local/bin/rawaccel-daemon \
+          /home/*/.local/bin/rawaccel-cli \
+          /home/*/.local/bin/rawaccel-gui
+    systemctl daemon-reload &>/dev/null || true
+}
+
+post_install() {
+    # Fresh install: make the daemon start on boot (matches scripts/install.sh).
+    systemctl daemon-reload
+    systemctl enable rawaccel.service &>/dev/null || true
+}
+
+post_upgrade() {
+    systemctl daemon-reload
+    # Restart if the user had it running; never re-enable a service they disabled.
+    systemctl try-restart rawaccel.service &>/dev/null || true
+}
+
+pre_remove() {
+    systemctl disable --now rawaccel.service &>/dev/null || true
+}
