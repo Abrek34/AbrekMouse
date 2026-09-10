@@ -21,6 +21,16 @@ namespace rawaccel {
 
 namespace {
 
+// A single unresponsive/replay-looped receiver must never stall device
+// identification for minutes (BUG-01).  Every unbounded enumeration loop in
+// the identify path shares this budget; once it is exhausted the loop gives
+// up on the remaining slots/chunks so later, unrelated, faster steps (name,
+// battery, DPI, notifications) still run.
+constexpr auto kIdentifyBudget = std::chrono::seconds(20);
+// After this many consecutive per-slot/timeouts the loop aborts early, as
+// Solaar does, instead of walking hundreds of indices at ~1 s each.
+constexpr int kIdentifyTimeoutStreak = 3;
+
 bool is_hidpp_error(const uint8_t* data, size_t len) {
     return data && len >= 4 &&
            (data[0] == 0x10 || data[0] == 0x11 || data[0] == 0x12) &&
@@ -1099,7 +1109,9 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
     // a single unresponsive slot cannot freeze far slower sensors (name, DPI)
     // that follow.  Isolated misses are still skipped and the run continues.
     int consecutive_timeouts = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kIdentifyBudget;
     for (uint16_t i = 1; i < count; ++i) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
         if (i == fs->params[0]) continue;
         // GetFeatureId has one parameter byte, so the request is short even
         // though devices commonly return its four-byte metadata in a long
@@ -1112,7 +1124,7 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
             ? hidpp_parse_feature_metadata(static_cast<uint8_t>(i), *frsp)
             : std::nullopt;
         if (!metadata) {
-            if (++consecutive_timeouts >= 3) break;
+            if (++consecutive_timeouts >= kIdentifyTimeoutStreak) break;
             continue;
         }
         consecutive_timeouts = 0;
@@ -1282,7 +1294,7 @@ std::optional<hidpp_device_info> HidppTransport::get_device_info(uint8_t target_
                     0x10, &param, 1, std::chrono::milliseconds(700),
                     target_device_index);
                 if (!record) {
-                    if (++consecutive_timeouts >= 3) break;
+                    if (++consecutive_timeouts >= kIdentifyTimeoutStreak) break;
                     continue;
                 }
                 consecutive_timeouts = 0;
@@ -1414,13 +1426,21 @@ std::vector<hidpp_pairing_slot> HidppTransport::get_pairing_info(uint8_t target_
             count = (*receiver_info)[6];
     }
 
+    const auto pairing_deadline =
+        std::chrono::steady_clock::now() + kIdentifyBudget;
+    int pairing_timeouts = 0;
     for (uint8_t slot = 1; slot <= count; ++slot) {
+        if (std::chrono::steady_clock::now() >= pairing_deadline) break;
         const uint8_t subregister = bolt
             ? static_cast<uint8_t>(0x50 + slot)
             : static_cast<uint8_t>(0x20 + slot - 1);
         auto payload = read_register(0x02B5, &subregister, 1,
                                      std::chrono::milliseconds(900), 0xFF);
-        if (!payload) continue;
+        if (!payload) {
+            if (++pairing_timeouts >= kIdentifyTimeoutStreak) break;
+            continue;
+        }
+        pairing_timeouts = 0;
         if (auto parsed = hidpp_parse_receiver_pairing(*payload, slot, bolt)) {
             if (!bolt && parsed->occupied) {
                 const uint8_t name_subregister =
@@ -1493,12 +1513,23 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
 
         // GetDpiList returns chunks.  Each chunk starts with three bytes of
         // feature metadata; the remainder contains big-endian DPI values.
+        // A device that never sends the 0x0000 terminator must not burn the
+        // full 256 × 700 ms budget (BUG-01): cap with the shared budget and
+        // bail after a short timeout streak.
         std::vector<uint8_t> list_bytes;
+        const auto dpi_deadline =
+            std::chrono::steady_clock::now() + kIdentifyBudget;
+        int dpi_timeouts = 0;
         for (uint16_t chunk = 0; chunk < 256; ++chunk) {
+            if (std::chrono::steady_clock::now() >= dpi_deadline) break;
             const uint8_t list_params[3] = {0, 0, static_cast<uint8_t>(chunk)};
             auto reply = request(hidpp_feature_index::extended_adjustable_dpi,
                                  0x2, list_params, sizeof(list_params));
-            if (!reply || reply->size() <= 3) break;
+            if (!reply || reply->size() <= 3) {
+                if (++dpi_timeouts >= kIdentifyTimeoutStreak) break;
+                continue;
+            }
+            dpi_timeouts = 0;
             list_bytes.insert(list_bytes.end(), reply->begin() + 3, reply->end());
             if (list_bytes.size() >= 2 &&
                 list_bytes[list_bytes.size() - 1] == 0 &&
@@ -1526,11 +1557,19 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
         info.dpi_default = read_be16(&(*current)[3]);
         info.dpi_current = current_dpi != 0 ? current_dpi : info.dpi_default;
         std::vector<uint8_t> list_bytes;
+        const auto dpi_deadline =
+            std::chrono::steady_clock::now() + kIdentifyBudget;
+        int dpi_timeouts = 0;
         for (uint16_t chunk = 0; chunk < 256; ++chunk) {
+            if (std::chrono::steady_clock::now() >= dpi_deadline) break;
             const uint8_t list_params[3] = {0, 0, static_cast<uint8_t>(chunk)};
             auto reply = request(hidpp_feature_index::adjustable_dpi, 0x1,
                                  list_params, sizeof(list_params));
-            if (!reply || reply->size() <= 1) break;
+            if (!reply || reply->size() <= 1) {
+                if (++dpi_timeouts >= kIdentifyTimeoutStreak) break;
+                continue;
+            }
+            dpi_timeouts = 0;
             list_bytes.insert(list_bytes.end(), reply->begin() + 1, reply->end());
             if (list_bytes.size() >= 2 &&
                 list_bytes[list_bytes.size() - 1] == 0 &&

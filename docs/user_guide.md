@@ -12,8 +12,9 @@ and how to get back to raw 1:1. Everything here uses `rawaccel-cli`; the GUI
 sudo bash setup.sh
 ```
 
-This installs all dependencies, builds, installs binaries + systemd/udev/polkit
-daemon, enables the service, and applies the KDE Plasma flat-acceleration fix.
+This installs all dependencies, builds, installs binaries + systemd/udev
+daemon (no polkit policy/rules are installed — RawAccel 0.6.4+),
+enables the service, and applies the KDE Plasma flat-acceleration fix.
 
 Verify:
 

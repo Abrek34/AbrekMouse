@@ -126,9 +126,12 @@ static std::string daemon_ipc_send(const std::string& request) {
         char buf[4096];
         while (true) {
             ssize_t n = recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            if (resp.size() + (size_t)n > 65536) break; // check before append
+            if (n <= 0) break; // EOF (daemon closed) or 2 s RCVTIMEO
             resp.append(buf, (size_t)n);
+            // C-4: no silent 64 KB truncation — the daemon closes the socket
+            // after the full response, so keep reading.  Runaway guard only
+            // (a stuck/broken daemon should not balloon memory forever).
+            if (resp.size() > 16 * 1024 * 1024) { resp.clear(); break; }
         }
         close(fd);
         return resp;
@@ -459,10 +462,14 @@ static int cmd_delete(app_config& cfg, const std::string& config_path, const std
     if (cfg.profiles.empty()) {
         cfg.active_profile.clear();
         active_changed = true;
+        // C-7: report the empty state clearly instead of "Active profile is
+        // now: " (trailing blank) — the next run recreates the default profile.
+        std::cout << "No profiles remain — a fresh 'default' profile is "
+                     "recreated on the next run.\n";
     }
     if (!safe_save(cfg, config_path)) return 1;
     std::cout << "Deleted profile: " << name << "\n";
-    if (active_changed)
+    if (active_changed && !cfg.active_profile.empty())
         std::cout << "Active profile is now: " << cfg.active_profile << "\n";
     return daemon_apply_if_enabled(cfg);
 }
@@ -612,6 +619,14 @@ static int cmd_validate(const std::string& config_path) {
                 std::cerr << "ERROR: Profile with empty name found.\n";
                 has_errors = true;
             }
+            // C-5: mirror the load-side MAX_NAME_LEN cap so validate() reports
+            // an over-long name as an error instead of silently accepting it
+            // only to be truncated at the next load.
+            if (dp.name.size() > MAX_NAME_LEN) {
+                std::cerr << "ERROR: Profile name exceeds " << MAX_NAME_LEN
+                          << " chars in profile '" << dp.name << "'\n";
+                has_errors = true;
+            }
             // Sanitize and check for clamping (would have happened on load)
             auto& p = dp.prof;
             if (p.speed_min > p.speed_max && p.speed_max > 0) {
@@ -699,8 +714,10 @@ static std::string stored_value_str(const device_profile& dp, const std::string&
         }
     }
     if (key == "distance_mode") {
-        if (!sp.whole)            return "separate";
-        if (sp.lp_norm >= 16)     return "max";
+        // C-3: match print_profile() — lp_norm<=0 (hand-edited JSON) and
+        // lp_norm>=16 both behave as "max", so report the same string.
+        if (!sp.whole)                   return "separate";
+        if (sp.lp_norm >= 16 || sp.lp_norm <= 0) return "max";
         if (std::fabs(sp.lp_norm - 2.0) < 1e-9) return "euclidean";
         return "lp";
     }
@@ -915,6 +932,13 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
                          "natural, jump, synchronous, lookup, noaccel\n";
             return 1;
         }
+        // C-8: with mode=lookup but no LUT data the daemon gets an empty
+        // curve; warn loudly instead of letting the user believe it took.
+        if (val == "lookup" && a.length == 0) {
+            std::cerr << "WARNING: mode=lookup has no LUT data yet — set it "
+                         "with `rawaccel-cli set-param lut-data` before it "
+                         "does anything useful.\n";
+        }
     }
     else if (key == "gain")             {
         bool b;
@@ -1065,17 +1089,23 @@ static int cmd_export(const app_config& cfg, const std::string& name) {
 }
 
 static int cmd_import(app_config& cfg, const std::string& config_path, const std::string& json_file) {
-    std::ifstream f(json_file);
+    std::ifstream f(json_file, std::ios::in | std::ios::binary);
     if (!f.is_open()) { std::cerr << "Cannot open: " << json_file << "\n"; return 1; }
-    // L-BUG-8: read the whole file into memory below — bound the size so a
-    // malformed multi-GB file cannot be slurped/parsed.
-    struct stat st;
-    if (stat(json_file.c_str(), &st) == 0 && st.st_size > 1024 * 1024) {
+    // L-BUG-8 + C-10: bound the file by reading chunked, not with stat() —
+    // stat can fail (FUSE, pipes, exotic filesystems) and would silently
+    // bypass the size limit, letting a malformed multi-GB file be slurped.
+    std::string content;
+    char chunk[1 << 16];
+    constexpr size_t kImportMax = 1024 * 1024;
+    while (f && content.size() <= kImportMax) {
+        f.read(chunk, sizeof(chunk));
+        content.append(chunk, (size_t)f.gcount());
+    }
+    if (content.size() > kImportMax) {
         std::cerr << "Refusing to import: " << json_file
                   << " is larger than 1MB\n";
         return 1;
     }
-    std::string content((std::istreambuf_iterator<char>(f)), {});
     device_profile dp;
     try {
         dp = profile_from_json(content);
@@ -1131,6 +1161,13 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                      "(would leave the config ambiguous).\n";
         return 1;
     }
+    // C-2: enforce the same MAX_NAME_LEN cap that every other
+    // profile-create/rename path enforces (P82-MED-1 symmetric cap).
+    if (dp.name.size() > MAX_NAME_LEN) {
+        std::cerr << "Imported profile name is " << dp.name.size()
+                  << " chars (max " << MAX_NAME_LEN << ").\n";
+        return 1;
+    }
     for (auto& existing : cfg.profiles) {
         if (existing.name == dp.name) {
             std::cerr << "Profile '" << dp.name << "' already exists. "
@@ -1139,12 +1176,7 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
         }
     }
     cfg.profiles.push_back(dp);
-    try {
-        save_config(cfg, config_path);
-    } catch (std::exception& e) {
-        std::cerr << "Failed to save config: " << e.what() << "\n";
-        return 1;
-    }
+    if (!safe_save(cfg, config_path)) return 1;
     std::cout << "Imported profile: " << dp.name << "\n";
     return daemon_apply_if_enabled(cfg);
 }
@@ -2155,17 +2187,25 @@ int main(int argc, char* argv[]) {
     const bool config_exists = ::access(config_path.c_str(), F_OK) == 0;
     app_config cfg;
     if (!config_exists) {
-        // Create minimal default
+        // Create minimal default.  C-1: keep active_profile non-empty and
+        // pointing at the very profile we just created so the saved file is
+        // self-consistent (a dangling/empty active_profile makes the first
+        // `rawaccel-cli delete default` fail confusingly).
         device_profile dp;
         dp.name = "default";
         dp.dev_cfg.dpi = 800;
         dp.dev_cfg.polling_rate = 1000;
         cfg.profiles.push_back(dp);
+        cfg.active_profile = dp.name;
         try { save_config(cfg, config_path); }
         catch (const std::exception& e) {
-            std::cerr << "Warning: could not save default config: " << e.what() << "\n";
+            // C-9: a missing default config is fatal — without it every
+            // later command runs against an empty/phantom in-memory config.
+            std::cerr << "ERROR: could not save default config: " << e.what() << "\n";
+            return 1;
         } catch (...) {
-            std::cerr << "Warning: could not save default config.\n";
+            std::cerr << "ERROR: could not save default config.\n";
+            return 1;
         }
     } else {
         try {

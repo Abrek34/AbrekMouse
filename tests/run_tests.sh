@@ -1,6 +1,7 @@
 #!/bin/bash
 # RawAccel Linux — Test çalıştırıcı
 set -e
+set -o pipefail   # L-2: a forgotten gate in a pipeline must not pass silently
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
@@ -13,7 +14,7 @@ echo "=== RawAccel Linux Birim Testleri ==="
 echo "Derleniyor..."
 
 # config.cpp ayrı derleme birimi olarak derlenir (M2: ODR sorununu önler)
-$CXX $CXXFLAGS \
+$CXX $CXXFLAGS -lpthread \
     "$ROOT/tests/test_accel.cpp" \
     "$ROOT/src/config.cpp" \
     "$ROOT/src/logitech_receiver.cpp" \

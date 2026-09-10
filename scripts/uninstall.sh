@@ -49,6 +49,12 @@ rm -f /usr/local/bin/rawaccel-gui
 rm -f /usr/bin/rawaccel-daemon
 rm -f /usr/bin/rawaccel-cli
 rm -f /usr/bin/rawaccel-gui
+# M-1: user-level binaries shadow system ones on PATH.
+shopt -s nullglob
+rm -f /home/*/.local/bin/rawaccel-daemon \
+      /home/*/.local/bin/rawaccel-cli \
+      /home/*/.local/bin/rawaccel-gui
+shopt -u nullglob
 
 # Remove system files
 echo "[4/4] Removing system files..."
@@ -56,6 +62,7 @@ rm -f /etc/udev/rules.d/99-rawaccel.rules
 rm -f /usr/lib/udev/rules.d/99-rawaccel.rules
 rm -f /etc/modules-load.d/rawaccel.conf
 rm -f /usr/share/applications/rawaccel.desktop
+# 0.6.4 (BUG-02) sonrası polkit bölümleri kurulmuyor; eski kurulum kalıntısıysa temizle:
 rm -f /usr/share/polkit-1/actions/org.rawaccel.policy
 rm -f /usr/share/polkit-1/rules.d/49-rawaccel.rules
 # Remove only RawAccel's dedicated libinput quirk file.  Do not touch
@@ -87,7 +94,10 @@ if [[ -x "$KDE_FIX" ]]; then
             [[ -f "$home/.config/kwinrc" ]] || continue
             user="$(basename "$home")"
             echo "      Removing kwinrc traces for user '$user'..."
-            sudo -u "$user" bash "$KDE_FIX" --remove >/dev/null 2>&1 || \
+            # H-3: sudo resets session env by default; preserve the KDE
+            # detection variables or --remove silently no-ops.
+            sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+                bash "$KDE_FIX" --remove >/dev/null 2>&1 || \
                 echo "      (kwinrc trace cleanup skipped for '$user')"
         done
     fi

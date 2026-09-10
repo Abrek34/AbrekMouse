@@ -116,6 +116,7 @@ if(BUILD_CLI)
     )
     target_link_libraries(rawaccel-cli
         rawaccel-config
+        Threads::Threads
     )
 
     install(TARGETS rawaccel-cli DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -133,6 +134,7 @@ if(BUILD_GUI)
     target_link_libraries(rawaccel-gui
         rawaccel-config
         ${GTK4_LIBRARIES}
+        Threads::Threads
         dl
     )
 
@@ -168,6 +170,7 @@ if(BUILD_TESTS)
     )
     target_link_libraries(rawaccel-tests
         rawaccel-config
+        Threads::Threads
         dl
     )
     add_test(NAME rawaccel-unit-tests COMMAND rawaccel-tests)

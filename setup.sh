@@ -57,7 +57,7 @@ done
 # ── Paket çakışma kontrolü ────────────────────────────────────────────────────
 if command -v pacman &>/dev/null && pacman -Qi rawaccel-linux &>/dev/null 2>&1; then
     warn "Arch paketi rawaccel-linux yüklü (pacman)."
-    warn "setup.sh ile üstüne kurmak /etc/rawaccel/settings.json, .desktop ve polkit dosyalarında"
+    warn "setup.sh ile üstüne kurmak /etc/rawaccel/settings.json ve .desktop dosyalarında"
     warn "çakışmaya neden olur ve paket kurulumunu bozar."
     warn "Tavsiye ya da: sudo pacman -Rns rawaccel-linux ile kaldırın, ya da sadece paketi kullanın."
     echo "Devam etmek için Enter'a basın (iptal için Ctrl+C)..."
@@ -176,7 +176,7 @@ clean_old_install() {
     # PID/socket dosyalarını temizle
     rm -f /run/rawaccel.pid /run/rawaccel.sock /tmp/rawaccel.pid /tmp/rawaccel.sock 2>/dev/null || true
 
-    # Eski binary, servis, udev, polkit, desktop dosyaları (+ PKGBUILD yolları,
+    # Eski binary, servis, udev, desktop dosyaları (+ PKGBUILD yolları,
     # + setup.sh tarafından kurulan quirks/modprobe dosyaları)
     local files=(
         /usr/local/bin/rawaccel-daemon
@@ -194,9 +194,27 @@ clean_old_install() {
         /etc/modprobe.d/rawaccel.conf
         /usr/share/libinput/50-rawaccel.quirks
         /usr/share/applications/rawaccel.desktop
+    )
+    # 0.6.4 (BUG-02): polkit policy (+rules) etkisizdi — pkexec özel action
+    # desteklemez. Kuruluysa temizle:
+    files+=(
         /usr/share/polkit-1/actions/org.rawaccel.policy
         /usr/share/polkit-1/rules.d/49-rawaccel.rules
     )
+    # M-1: user-level binaries shadow the system ones on PATH and live on
+    # after upgrade, making "already fixed" bugs look unfixed.
+    if [[ -n "$REAL_HOME" ]]; then
+        rm -f "$REAL_HOME/.local/bin/rawaccel-daemon" \
+              "$REAL_HOME/.local/bin/rawaccel-cli" \
+              "$REAL_HOME/.local/bin/rawaccel-gui" 2>/dev/null || true
+    fi
+    # M-1: also every homedir (in case of multi-user boxes).
+    for home in /home/*; do
+        [[ "$home" == "$REAL_HOME" ]] && continue
+        rm -f "$home/.local/bin/rawaccel-daemon" \
+              "$home/.local/bin/rawaccel-cli" \
+              "$home/.local/bin/rawaccel-gui" 2>/dev/null || true
+    done
     for f in "${files[@]}"; do
         [[ -e "$f" ]] && rm -f "$f" && ok "Silindi: $f"
     done
@@ -281,11 +299,11 @@ do_install() {
         /usr/share/libinput/50-rawaccel.quirks
     ok "libinput quirk yüklendi: /usr/share/libinput/50-rawaccel.quirks"
 
-    # polkit
-    install -Dm644 "$ROOT/scripts/polkit/org.rawaccel.policy" \
-        /usr/share/polkit-1/actions/org.rawaccel.policy
-    install -Dm644 "$ROOT/scripts/polkit/49-rawaccel.rules" \
-        /usr/share/polkit-1/rules.d/49-rawaccel.rules
+    # NB: polkit action/rules yok (0.6.4, BUG-02).  pkexec özel action
+    # (--action) desteklemez — org.freedesktop.policykit.exec kullanır — bu
+    # yüzden org.rawaccel.daemon.start politika + 49-rawaccel.rules ölü koddan
+    # ibaretti ve "input grubu şifresiz yetkili" iddiası fiilen hiçbir şey
+    # yapmıyordu. GUI düz `pkexec rawaccel-daemon` çalıştırır.
 
     # desktop entry
     [[ -f "$ROOT/build-manual/rawaccel-gui" ]] && \
@@ -314,7 +332,14 @@ do_install() {
 # KDE fix adımı bu sanal cihaz için per-device override yazacak.
 start_service() {
     say "[5/7] Servis başlatılıyor..."
-    systemctl enable --now rawaccel.service
+    # H-1: with `set -euo pipefail` an unbounded `systemctl enable --now`
+    # would abort the whole install on any service problem (bad config,
+    # blocked uinput…) and dead-code the graceful warning below.  Fail
+    # soft: warn, then let verify_install/report the final status.
+    if ! systemctl enable --now rawaccel.service; then
+        warn "Servis başlatılamadı — kuruluma devam ediliyor; günlük: journalctl -u rawaccel -n 50"
+        return 0
+    fi
     sleep 2 # virtual device'ın evdev/proc'a yansıması için kısa bekle
     if systemctl is-active --quiet rawaccel.service; then
         ok "Servis ÇALIŞIYOR."
@@ -346,7 +371,12 @@ fix_kde_plasma() {
     # kde-fix-accel.sh global + per-device override yazar; gerçek kullanıcı olarak
     # çalıştırılmalı (kwinrc kullanıcının ev dizininde, sahibinin user olması lazım).
     if [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
-        sudo -u "$REAL_USER" bash "$ROOT/scripts/kde-fix-accel.sh" --fix \
+        # H-3: sudo resets the session environment by default — without
+        # XDG_CURRENT_DESKTOP/DESKTOP_SESSION/DBUS_SESSION_BUS_ADDRESS/
+        # XDG_RUNTIME_DIR the KDE detection and the live KWin reload are
+        # silently skipped.  Preserve them so the fix actually runs.
+        sudo -u "$REAL_USER" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+            bash "$ROOT/scripts/kde-fix-accel.sh" --fix \
             || warn "kde-fix-accel.sh hata verdi"
     else
         warn "scripts/kde-fix-accel.sh bulunamadı; KDE fix atlandı."
@@ -369,7 +399,6 @@ verify_install() {
             || { err "udev kuralı GÜNCEL DEĞİL (hidraw eksik): $udev_rule"; missing=1; }
         [[ $missing -eq 1 ]] || ok "udev kuralı mevcut (uinput+hidraw)"
     else err "udev kuralı EKSİK: $udev_rule"; missing=1; fi
-    [[ -f /usr/share/polkit-1/actions/org.rawaccel.policy ]] && ok "polkit mevcut" || { err "polkit EKSİK"; missing=1; }
     [[ -f /usr/share/libinput/50-rawaccel.quirks ]] && ok "libinput quirk mevcut" || { err "libinput quirk EKSİK"; missing=1; }
     if systemctl is-active --quiet rawaccel.service; then ok "Servis ÇALIŞIYOR"
     else err "Servis ÇALIŞMIYOR — journalctl -u rawaccel -n 50"; missing=1; fi
@@ -449,7 +478,9 @@ do_uninstall() {
     # KDE kwinrc izleri: per-device (RawAccel) override bölümlerini kaldır ve
     # global [Libinput]'i adaptive'e döndür (kde-fix-accel.sh --remove).
     if [[ -n "$REAL_USER" ]] && [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
-        sudo -u "$REAL_USER" bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
+        # H-3: preserve the session env so kwinrc detection + D-Bus reload work.
+        sudo -u "$REAL_USER" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+            bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
             || warn "kwinrc iz temizliği hata verdi (önemsiz)."
     fi
     ok "Kaldırma tamamlandı. Kullanıcı configi (~/.config/rawaccel + /etc/rawaccel) korundu."

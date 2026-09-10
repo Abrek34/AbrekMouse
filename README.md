@@ -68,8 +68,9 @@ Compiled binaries are placed in `build-manual/`.
 
 The **canonical one-shot installer is `setup.sh`** at the repo root. It installs
 all system dependencies (for your distro), cleans any previous install, builds,
-installs binaries + systemd/udev/polkit/desktop/libinput-quirk, enables the
-service, and applies the KDE Plasma flat-acceleration fix:
+installs binaries + systemd/udev/desktop/libinput-quirk (no polkit policy is
+installed — RawAccel 0.6.4+ relies on the `input` group and default pkexec),
+enables the service, and applies the KDE Plasma flat-acceleration fix:
 
 ```bash
 sudo bash setup.sh                # full install (deps + build + system-wide + KDE fix)
@@ -542,8 +543,7 @@ rawaccel-linux/
 │   ├── rawaccel.desktop       # .desktop file
 │   ├── rawaccel.quirks        # libinput quirk (mouse resolution)
 │   ├── 99-rawaccel.rules      # udev rule (keeps /dev/uinput accessible)
-│   ├── polkit/                # PolicyKit rules
-│   └── kde-fix-accel.sh       # Plasma flat-acceleration fix
+│   ├── kde-fix-accel.sh       # Plasma flat-acceleration fix
 │   └── virtmouse-game.c       # Live game-speed harness (P64, see Testing)
 ├── tests/
 │   ├── test_accel.cpp         # Unit + integration tests

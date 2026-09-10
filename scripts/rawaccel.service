@@ -52,13 +52,17 @@ UMask=0077
 ReadWritePaths=/etc/rawaccel /run
 # Capability bounding set: only what the daemon actually exercises.
 #   CAP_CHOWN              : chown(IPC socket) to root:input
-#   CAP_DAC_READ_SEARCH    : read /dev/input/event* even if not in input grp
-#   CAP_DAC_OVERRIDE       : open /dev/uinput when udev rule hasn't propagated
+#   CAP_DAC_OVERRIDE       : open /dev/uinput + /dev/input/event* as root
 #   CAP_FOWNER             : chmod the IPC socket regardless of effective uid
+# CAP_DAC_READ_SEARCH is intentionally absent (M-7): the daemon runs as root,
+# so DAC_OVERRIDE covers opening input nodes, and DAC_READ_SEARCH has been
+# unprivileged-incompatible / container-noise since kernel 5.x for no gain
+# here (it is also useless in a User Namespace where our cap bounding set
+# would be ignored anyway).
 # Drops everything else (CAP_SYS_*, CAP_NET_*, CAP_KILL, CAP_BPF, etc.).
 # If a future kernel/distro change requires more, a clear EPERM in journald
 # will indicate which cap is missing.
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
 AmbientCapabilities=
 
 # Network: this is a 100% local mouse driver — no network access ever.

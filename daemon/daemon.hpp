@@ -190,6 +190,9 @@ private:
     // Guards devices_ against concurrent access from ipc_thread_ (status_json)
     // and loop_thread_ (setup/hotplug/cleanup).  Always held briefly (< 1µs typical).
     mutable std::mutex        devices_mutex_;
+    // R1-04: log() is called from the loop, hidpp, ipc and main threads —
+    // serialise the write so lines never interleave / race iostream+cb_.
+    mutable std::mutex        log_mu_;
     std::function<void(const std::string&)> log_cb_;
     bool                verbose_     = false;
 

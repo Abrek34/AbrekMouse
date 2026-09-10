@@ -20,6 +20,7 @@
 #include "tr.inl"
 #include <fcntl.h>    // open() for the single-instance lock file (BUG-01)
 #include <sys/file.h> // flock() — cross-user/session instance guard (BUG-01)
+#include <ctime>      // time() for the corrupt-config backup suffix (M-8)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -157,7 +158,21 @@ int main(int argc, char* argv[]) {
 
     try {
         state.config = load_config(state.config_path);
-    } catch (...) {
+    } catch (const std::exception& e) {
+        // M-8/R2-04: never silently overwrite a corrupt config with defaults.
+        // Stash the offending file aside (best-effort) so its contents are
+        // recoverable, then load a default profile and surface the warning.
+        std::string backup = state.config_path + ".corrupt-" +
+                             std::to_string(time(nullptr));
+        std::error_code ec;
+        fs::copy_file(state.config_path, backup,
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec)
+            state.config_load_warn = trf("Config load error (%s) — defaults loaded; could not back up %s.",
+                                         e.what(), state.config_path.c_str());
+        else
+            state.config_load_warn = trf("Config load error (%s) — corrupt file backed up to %s; defaults loaded.",
+                                         e.what(), backup.c_str());
         device_profile dp;
         dp.name = "default";
         dp.dev_cfg.dpi = 800;

@@ -41,8 +41,13 @@ write_kwinrc() {
     local profile="$1"  # 1 = flat, 2 = adaptive
     local accel="$2"    # 0 for flat, -0.5 or 0 for adaptive
 
-    # Create backup
-    [[ -f "$KWINRC" ]] && cp "$KWINRC" "$KWINRC.rawaccel-backup.$(date +%Y%m%d-%H%M%S)"
+    # Create backup (keep only the newest 5 — M-2)
+    if [[ -f "$KWINRC" ]]; then
+        local ts
+        ts="$(date +%Y%m%d-%H%M%S)-$$"
+        cp -a "$KWINRC" "$KWINRC.rawaccel-backup.$ts"
+        ls -1t "$KWINRC".rawaccel-backup.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+    fi
 
     # Use python3 for clean INI manipulation (preserves comments/sections).
     # We write BOTH the global [Libinput] section AND per-device overrides
@@ -52,7 +57,7 @@ write_kwinrc() {
     # which override the global setting.
     if command -v python3 &>/dev/null; then
         python3 - "$KWINRC" "$profile" "$accel" << 'PYEOF'
-import sys, os, re
+import sys, os, re, tempfile
 
 kwinrc, profile, accel = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -114,11 +119,30 @@ for d in devices:
     header = f"[Libinput][{d['bus']}][{d['vendor']}][{d['product']}][{d['name']}]"
     text = upsert_section(text, header, kv)
 
-# Atomic rename
-tmp = kwinrc + ".tmp"
-with open(tmp, "w") as f:
-    f.write(text)
-os.rename(tmp, kwinrc)
+# Atomic rename (M-2): mkstemp in the same dir + fsync + replace, and
+# fsync the parent dir so a crash cannot leave a stale/zero-byte kwinrc.
+# Resolve a symlinked kwinrc (dotfiles-managed KDE) so the link is kept.
+d = os.path.dirname(kwinrc) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kwinrc.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    target = os.path.realpath(kwinrc)
+    os.replace(tmp, target)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 
 print(f"  Updated {kwinrc}")
 print(f"  + global [Libinput] → profile={profile}")
@@ -308,7 +332,7 @@ PYEOF
     echo "  ✓ RawAccel traces removed from kwinrc (profile=2, accel=-0.5)."
     ;;
 
---fix|*)
+--fix)
     echo "=== KDE RawAccel Fix: Disable Pointer Acceleration ==="
     if ! check_kde; then
         echo "  Not a KDE session (XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP)."
@@ -318,7 +342,15 @@ PYEOF
 
     PROFILE=$(get_current_profile)
     if [[ "$PROFILE" == "1" ]]; then
-        echo "  ✓ Pointer acceleration is already Flat. No change needed."
+        # H-2: global Flat alone does NOT cover per-device overrides.  If a
+        # RawAccel virtual device was recreated (daemon restart/hot-plug)
+        # after the last fix, KDE's own curve silently applies on that device
+        # despite the global "already Flat" state.  Re-run the idempotent
+        # writer so every live (RawAccel) device gets its override too.
+        echo "  ✓ Global acceleration is already Flat — ensuring per-device overrides."
+        write_kwinrc "1" "0"
+        reload_kwin
+        echo "  ✓ Per-device overrides ensured (flat). No change needed for global."
         exit 0
     fi
 
@@ -332,5 +364,9 @@ PYEOF
     echo ""
     echo "  To verify: bash scripts/kde-fix-accel.sh --check"
     echo "  To undo:   bash scripts/kde-fix-accel.sh --undo"
+    ;;
+*)
+    # L-5: reject unknown options instead of silently running the fix.
+    die "Bilinmeyen seçenek: '$MODE'. Kullanım: ${0##*/} [--check|--undo|--fix]"
     ;;
 esac

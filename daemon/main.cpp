@@ -293,7 +293,7 @@ int main(int argc, char* argv[]) {
         // Check for a stale PID file (left behind by a crashed previous instance):
         // if the recorded PID no longer exists, delete the file and retry.
         auto try_clear_stale = [](const char* path) -> bool {
-            int fd = open(path, O_RDONLY);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
             if (fd < 0) return false;
             char buf[32] = {};
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -306,8 +306,13 @@ int main(int argc, char* argv[]) {
             // A corrupted PID file should never let us cast garbage to int.
             pid_t pid = (end > buf && errno == 0 && val > 0 &&
                          val <= INT_MAX) ? static_cast<pid_t>(val) : 0;
+            // D-6: re-verify liveness right before the unlink.  The TOCTOU
+            // window between pid_file_is_live() and here is re-checked so the
+            // file is only removed when the recorded PID truly no longer
+            // exists; a recycled PID is treated as live and boots are refused
+            // instead of a live daemon's PID file being deleted.  The follow-up
+            // write_pid() is O_CREAT|O_EXCL, so at most one starter wins.
             if (pid > 0 && kill(pid, 0) != 0 && errno == ESRCH) {
-                // Process does not exist — remove the stale PID file
                 unlink(path);
                 return true;
             }

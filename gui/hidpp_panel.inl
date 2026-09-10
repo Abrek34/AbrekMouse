@@ -528,6 +528,7 @@ void hw_start_scan(AppState* S) {
 
 /// Background query of the currently selected device's onboard settings.
 void hw_query_current(AppState* S) {
+    if (!S->hw_dev_combo) return;
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
     if (S->hw_busy || idx < 0 || idx >= (int)S->hidpp_devs.size()) return;
     S->hw_busy = true;
@@ -552,6 +553,8 @@ void on_hw_refresh_clicked(GtkButton*, gpointer user_data) {
 
 void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
+    if (!S->hw_dev_combo)
+        return hw_set_status(S, tr("Select a Logitech HID++ device first."));
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
     if (idx < 0 || idx >= (int)S->hidpp_devs.size())
         return hw_set_status(S, tr("Select a Logitech HID++ device first."));

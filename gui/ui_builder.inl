@@ -1175,6 +1175,10 @@ static std::vector<rawaccel_dev_t> kde_enumerate_rawaccel_devices() {
 /// `header` includes the brackets, e.g. "[Libinput]" or
 /// "[Libinput][3][1133][50498][Logitech ... (RawAccel)]".
 /// Section ends at the next line starting with '['.
+/// R2-01: previously every non-key line inside the section (user comments
+/// '#...'/'...', blank lines) was erased along with the keys, silently
+/// destroying user comments.  Now comments/blank lines inside the section
+/// are preserved and re-appended after the new keys.
 static void kde_upsert_section(std::vector<std::string>& lines,
                                const std::string& header,
                                const std::vector<std::pair<std::string, std::string>>& kv) {
@@ -1183,23 +1187,34 @@ static void kde_upsert_section(std::vector<std::string>& lines,
     for (size_t i = 0; i < lines.size(); i++) {
         if (lines[i] == header) { start = i; break; }
     }
-    std::vector<std::string> body;
-    body.reserve(kv.size());
-    for (auto& [k, v] : kv) body.push_back(k + "=" + v);
 
     if (start == std::string::npos) {
         // Append at end (with blank separator if file isn't empty)
         if (!lines.empty() && !lines.back().empty()) lines.emplace_back();
         lines.push_back(header);
-        for (auto& l : body) lines.push_back(l);
+        for (auto& [k, v] : kv) lines.push_back(k + "=" + v);
         return;
     }
-    // Find end of section (next '[' line or EOF)
+    // Walk the section body, separating key=value lines from content that must
+    // be preserved (comments, blanks).  INI keys are 'name=value'.
     size_t end = start + 1;
-    while (end < lines.size() && (lines[end].empty() || lines[end][0] != '[')) end++;
-    // Replace [start+1, end) with body
+    std::vector<std::string> preserved;      // comments / blank lines, in order
+    std::vector<std::string> body;           // new key=value lines
+    body.reserve(kv.size());
+    for (auto& [k, v] : kv) body.push_back(k + "=" + v);
+    while (end < lines.size() && lines[end][0] != '[') {
+        std::string& ln = lines[end];
+        bool is_key = !ln.empty() && ln[0] != '#' && ln[0] != ';' &&
+                      ln.find('=') != std::string::npos;
+        if (!is_key)
+            preserved.push_back(ln);         // keep user comments/blank lines
+        end++;
+    }
+    // Replace [start+1, end) content: new keys, then preserved comments.
     lines.erase(lines.begin() + (long)start + 1, lines.begin() + (long)end);
     lines.insert(lines.begin() + (long)start + 1, body.begin(), body.end());
+    lines.insert(lines.begin() + (long)start + 1 + (long)body.size(),
+                 preserved.begin(), preserved.end());
 }
 
 /// Atomically write a kwinrc-style INI file (with possibly nested sections)
@@ -1466,6 +1481,11 @@ void on_activate(GtkApplication* gapp, gpointer user_data) {
     std::string dup_warn = check_duplicate_device_ids(S->config);
     if (!dup_warn.empty())
         set_status(S, dup_warn);
+    // M-8/R2-04: surface a corrupt-config startup warning (dump earlier in
+    // main()); shown after build_ui() so the status bar widget exists.
+    if (!S->config_load_warn.empty())
+        set_status(S, dup_warn.empty() ? S->config_load_warn
+                                       : dup_warn + " | " + S->config_load_warn);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────

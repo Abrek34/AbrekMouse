@@ -109,6 +109,11 @@ struct AppState {
     int    detected_dpi          = 0;  // 0 = unknown
     int    detected_polling_rate = 0;  // 0 = unknown
     int    detected_battery      = -1; // -1 = unknown, 0-100 = percent
+    // M-8/R2-04: non-empty when the persisted config could not be parsed at
+    // startup.  The offending file is stashed aside (settings.json.corrupt-N);
+    // a default profile is loaded and the warning is surfaced in the status
+    // bar so the GUI never silently overwrites the corrupt file's contents.
+    std::string config_load_warn;
     // Auto-fill hint labels and buttons (Device section)
     GtkWidget* dpi_detected_lbl      = nullptr;
     GtkWidget* polling_detected_lbl  = nullptr;

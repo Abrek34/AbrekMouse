@@ -2,6 +2,7 @@
 # RawAccel Linux — ASan + UBSan ile birim testler
 # Kullanım: bash tests/run_tests_asan.sh
 set -e
+set -o pipefail   # L-2
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
@@ -19,7 +20,7 @@ mkdir -p "$ROOT/build-manual"
 
 echo "=== RawAccel Linux Birim Testleri (ASan + UBSan) ==="
 echo "Derleniyor..."
-$CXX $CXXFLAGS \
+$CXX $CXXFLAGS -lpthread \
     "$ROOT/tests/test_accel.cpp" \
     "$ROOT/src/config.cpp" \
     "$ROOT/src/logitech_receiver.cpp" \

@@ -109,7 +109,7 @@ echo "[1/3] Building rawaccel-daemon..."
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
         "$ROOT/cli/main.cpp" \
-        $LDFLAGS_HARDEN \
+        -lpthread $LDFLAGS_HARDEN \
         -o "$BUILD/rawaccel-cli"
 
     if [ "$HAVE_GTK4" = "1" ]; then
@@ -119,7 +119,7 @@ echo "[1/3] Building rawaccel-daemon..."
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
         "$ROOT/gui/main.cpp" \
-            $GTK4_LIBS -ldl $LDFLAGS_HARDEN \
+            -lpthread $GTK4_LIBS -ldl $LDFLAGS_HARDEN \
             -o "$BUILD/rawaccel-gui"
     else
         echo "[3/3] Skipping rawaccel-gui (GTK4 development files not found)."

@@ -1,6 +1,6 @@
 # RawAccel Linux 0.6.4 — Security & Bug Audit
 
-Audit date: 2026-09-10. Codebase: rawaccel-linux 0.6.4 (C++20, GTK4 GUI + systemd daemon + CLI). Every source, header, script, packaging and config file was read line-by-line; the remaining files (`gui/ui_builder.inl`, `gui/graph.inl`, `gui/mouse_test.inl`, `gui/tr.inl`, `tests/test_accel.cpp` tail) were pattern-audited for risky API usage.
+Audit date: 2026-09-10 (updated 2026-09-11). Codebase: rawaccel-linux 0.6.4 (C++20, GTK4 GUI + systemd daemon + CLI). Every source, header, script, packaging and config file was read line-by-line. On 2026-09-11 the last four GUI files previously pattern-audited (`gui/ui_builder.inl`, `gui/graph.inl`, `gui/mouse_test.inl`, `gui/tr.inl`) plus the daemon hot-plug inotify paths (`daemon/daemon.cpp`, `gui/devices.inl`), HID++ tail (`src/logitech_hidpp.cpp`), and the remaining `include/*.hpp` tails were fully read; only `tests/test_accel.cpp` tail and `scripts/bench_hotpath.sh` / `scripts/virtmouse-game.c` remain pattern-audited via risky-call grep + targeted reads.
 
 Severity scale: CRITICAL / HIGH / MEDIUM / LOW / INFO. No CRITICAL or HIGH findings. Two MEDIUM robustness/availability issues, two LOW privilege-design notes, rest are confirmed-safe items.
 
@@ -92,6 +92,8 @@ Related informational context: udev rules give `input` group `0660` rw on `/dev/
 **CLI/GUI behavior**
 - Full arity checks for every subcommand + `-c ""` rejection (P99); `set-param` out-of-domain values are rejected (rc=1, config byte-identical) not silently clamped (P107); duplicate/empty profile names rejected; 256/257-char name gates under test; `import` rejects oversized LUT (>514 raw) instead of truncating.
 - GUI: KDE double-accel detection (kwinrc parse w/ safe `strtol`/`strtod`), kwinrc fix writes + qdbus reconfigure run as the user, `systemsettings` spawn uses constants (no shell injection); X11 pointer-lock uses dlopen'd `libX11` talk-to-window only, released on focus loss/ESC.
+- Inotify walks are header-bounded in both processes: daemon `handle_hotplug` (daemon.cpp:853-872) derefs `ev` only while `i < n` and advances `i += sizeof(inotify_event)+ev->len`; GUI `on_inotify_event`/`on_hidraw_inotify_event` (devices.inl:209-263) guard `off + sizeof(inotify_event) <= bytes_read` before each deref and `strncmp(ev->name,"event",5)` reads at most 5 bytes of a NAME_MAX+1 buffer. Kernel-written inotify events keep `len` internally consistent, so the walk can never run off the buffer.
+- LUT editor bounds (graph.inl): `lut_set_points` truncates to `LUT_POINTS_CAPACITY` (257) before writing `data[i*2]/data[i*2+1]` (max index 513 ≤ capacity 514); spin ranges are capped (`LUT_SPEED_SPIN_MAX=10000`, `LUT_GAIN_SPIN_MAX=10000`) so `lut_gain_to_stored` cannot overflow to Inf; `safe_f` clamps double→float overflow/NaN to 0.0 (BUG-7 defence); `lut_get_points` reads `length/2` pairs → bounded by the same capacity. Graph labels use `snprintf` into fixed 16/48-byte buffers.
 - Tests: custom assertion harness (`tests/test_accel.cpp`, ~8.8k lines), fuzz harnesses (`fuzz_accel`, `fuzz_config`) with ASan/UBSan, hot-path benchmark, differential oracle for reference parity, ASan test runner (`run_tests_asan.sh`), tr-coverage scanner.
 
 **Misc accepted**
@@ -102,9 +104,9 @@ Related informational context: udev rules give `input` group `0660` rw on `/dev/
 
 ## 4. Coverage summary
 
-Read completely (line-by-line): `include/*.hpp` (all 15, incl. `accel-*.hpp` algorithms, `logitech_*`, `presets`, `rawaccel*`, `config`, `math-vec2`, `accel-union`), `src/config.cpp`, `src/logitech_receiver.cpp`, `src/logitech_hidpp.cpp`, `daemon/daemon.cpp`, `daemon/main.cpp`, `daemon/lat_stats.hpp`, `daemon/motion_math.hpp`, `cli/main.cpp`, `gui/main.cpp`, `gui/app_state.hpp`, `gui/daemon_comm.inl`, `gui/devices.inl`, `gui/profile_mgr.inl`, `gui/hidpp_panel.inl`, `gui/widgets_sync.inl` (pkexec/daemon-control parts), `setup.sh`, all of `scripts/*` (rules, service, polkit, desktop, quirks, install/uninstall/kde-fix/build/bench), `packaging/PKGBUILD`, `CMakeLists.txt`, `config/default.json`, `tests/*` (harnesses, run_tests.sh, fuzz drivers).
+Read completely (line-by-line): `include/*.hpp` (all 15, incl. `accel-*.hpp` algorithms, `logitech_*`, `presets`, `rawaccel*`, `config`, `math-vec2`, `accel-union`), `src/config.cpp`, `src/logitech_receiver.cpp`, `src/logitech_hidpp.cpp`, `daemon/daemon.cpp`, `daemon/main.cpp`, `daemon/lat_stats.hpp`, `daemon/motion_math.hpp`, `cli/main.cpp`, `gui/main.cpp`, `gui/app_state.hpp`, `gui/daemon_comm.inl`, `gui/devices.inl`, `gui/profile_mgr.inl`, `gui/hidpp_panel.inl`, `gui/widgets_sync.inl`, `gui/ui_builder.inl`, `gui/graph.inl`, `gui/mouse_test.inl`, `gui/tr.inl` (all line-by-line as of 2026-09-11), `setup.sh`, all of `scripts/*` (rules, service, polkit, desktop, quirks, install/uninstall/kde-fix/build/bench), `packaging/PKGBUILD`, `CMakeLists.txt`, `config/default.json`, `tests/*` (harnesses, run_tests.sh, fuzz drivers).
 
-Pattern-audited (risky-call grep + targeted reads): `gui/ui_builder.inl`, `gui/graph.inl`, `gui/mouse_test.inl`, `gui/tr.inl`, `tests/test_accel.cpp` tail, `scripts/bench_hotpath.sh`, `scripts/virtmouse-game.c`.
+Pattern-audited (risky-call grep + targeted reads): `tests/test_accel.cpp` tail, `scripts/bench_hotpath.sh`, `scripts/virtmouse-game.c`.
 
 ## 5. Bottom line
 

@@ -19,6 +19,11 @@ post_install() {
     # Fresh install: make the daemon start on boot (matches scripts/install.sh).
     systemctl daemon-reload
     systemctl enable rawaccel.service &>/dev/null || true
+    systemctl try-restart rawaccel.service &>/dev/null || true
+    # Reload udev rules we installed so /dev/input/event* and /dev/uinput
+    # permissions apply now, not only after a reboot (M-4).
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
 }
 
 post_upgrade() {

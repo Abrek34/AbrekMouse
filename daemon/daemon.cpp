@@ -48,9 +48,9 @@ static double now_ms() {
 /// on read, or repeated failed open) stays on the re-open deny list.  A
 /// broken node that remains listed in /dev/input would otherwise be
 /// re-grabbed + uinput-create/destroyed every ~2 s forever.
-/// P131: backoff shortened to 10 s — long enough to stop the churn loop,
-/// short enough that a genuinely recovered device is re-grabbed quickly.
-static constexpr double DENY_REOPEN_MS = 10000.0; // 10 s
+/// P131: backoff shortened (was longer), R1-07: 10 s → 5 s — still stops the
+/// ~2 s churn loop while a transient device hiccup recovers much sooner.
+static constexpr double DENY_REOPEN_MS = 5000.0; // 5 s
 
 /// P131/BUG-02: is this device currently on the re-open deny list?
 /// Keyed by BOTH the /dev/input path and (when known) the stable device_id,
@@ -405,6 +405,8 @@ AccelDaemon::~AccelDaemon() {
 
 void AccelDaemon::log(const std::string& msg, bool verbose_only) {
     if (verbose_only && !verbose_) return;
+    // R1-04: multiple threads call log() — serialise.
+    std::lock_guard<std::mutex> lk(log_mu_);
     if (log_cb_) log_cb_(msg);
     else         std::cout << "[rawaccel] " << msg << "\n";
 }
@@ -412,17 +414,24 @@ void AccelDaemon::log(const std::string& msg, bool verbose_only) {
 bool AccelDaemon::start(const std::string& config_path) {
     if (running_.load()) return true;
 
-    config_path_ = config_path.empty() ? find_config_path() : config_path;
-
-    try {
-        config_ = load_config(config_path_);
-    } catch (std::exception& e) {
-        log("Config load failed: " + std::string(e.what()) + " — using defaults.");
-        device_profile dp;
-        dp.name = "default";
-        dp.dev_cfg.dpi = 800;
-        dp.dev_cfg.polling_rate = 1000;
-        config_.profiles.push_back(dp);
+    {   // D-1: main thread writes config_path_/config_ here while the IPC
+        // server (started before start() by main.cpp) may already read them
+        // under devices_mutex_.  Guard the writes so the status path never
+        // observes a torn config_path_.
+        std::lock_guard<std::mutex> lk(devices_mutex_);
+        config_path_ = config_path.empty() ? find_config_path() : config_path;
+        try {
+            config_ = load_config(config_path_);
+        } catch (std::exception& e) {
+            log("Config load failed: " + std::string(e.what()) + " — using defaults.");
+            config_.profiles.clear();
+            device_profile dp;
+            dp.name = "default";
+            dp.dev_cfg.dpi = 800;
+            dp.dev_cfg.polling_rate = 1000;
+            config_.profiles.push_back(dp);
+            config_.active_profile = "default";
+        }
     }
 
     // ── epoll setup ───────────────────────────────────────────────────────────
@@ -464,10 +473,35 @@ bool AccelDaemon::start(const std::string& config_path) {
     }
 
     running_.store(true);
-    loop_thread_ = std::thread([this] { run_loop(); });
+    // R1-01: a thread body that escapes with an exception would hit
+    // std::terminate() and kill the whole process.  Wrap every worker in an
+    // outer try/catch that logs the failure and degrades to a graceful stop
+    // (the inner loops already have targeted catches; this is the last line
+    // of defense so a single bad code path can never crash the daemon).
+    loop_thread_ = std::thread([this] {
+        try {
+            run_loop();
+        } catch (const std::exception& e) {
+            log(std::string("loop thread aborted: ") + e.what());
+            request_stop();
+        } catch (...) {
+            log("loop thread aborted: unknown exception");
+            request_stop();
+        }
+    });
     // P171-BFIX: HID++ notification draining on its own thread — never on the
     // loop thread where it would delay mouse event processing.
-    hidpp_thread_ = std::thread([this] { run_hidpp_worker(); });
+    hidpp_thread_ = std::thread([this] {
+        try {
+            run_hidpp_worker();
+        } catch (const std::exception& e) {
+            log(std::string("hidpp worker aborted: ") + e.what());
+            request_stop();
+        } catch (...) {
+            log("hidpp worker aborted: unknown exception");
+            request_stop();
+        }
+    });
     log("Daemon started.");
     return true;
 }
@@ -739,8 +773,10 @@ void AccelDaemon::teardown_devices() {
         fd_to_dev_.clear();
     }
     for (auto& dev : to_destroy) {
-        if (epoll_fd_ >= 0 && dev.fd_in >= 0)
-            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, dev.fd_in, nullptr);
+        if (epoll_fd_ >= 0 && dev.fd_in >= 0 &&
+            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, dev.fd_in, nullptr) < 0)
+            log("teardown: epoll_ctl(del) failed for " + dev.path + ": " +
+                std::string(strerror(errno)), true);
         if (dev.uidev) {
             libevdev_uinput_destroy(dev.uidev);
             dev.uidev = nullptr;
@@ -813,9 +849,28 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
 
     if (!any_live) {
         // No grabbed devices yet — do a full setup so new devices are opened.
-        teardown_devices();
-        if (!setup_devices())
-            log("Reload: no devices available after reload.");
+        // F-4 (INFO) fast path: if the live grab set is unchanged (devices are
+        // already open but no profile matched), a teardown+setup would close
+        // and recreate the virtual uinput device — swallowing ~100-150 ms of
+        // mouse input for every reload while all profiles are disabled/absent.
+        // Re-applying the identity profile in place (no re-grab) is equivalent
+        // to what teardown+setup yields for a profile-less reload; new/removed
+        // devices are handled by the hot-plug scan, not here.
+        bool have_open = false;
+        {
+            std::lock_guard<std::mutex> lk(devices_mutex_);
+            have_open = !devices_.empty();
+        }
+        if (have_open) {
+            std::lock_guard<std::mutex> lk(devices_mutex_);
+            static const device_profile identity{};
+            for (auto& dev : devices_) apply_profile(dev, identity);
+            log("Reload: no profile matched — re-applied identity to open devices (fast path).");
+        } else {
+            teardown_devices();
+            if (!setup_devices())
+                log("Reload: no devices available after reload.");
+        }
     }
     log("Config reloaded.");
 }
@@ -929,7 +984,9 @@ void AccelDaemon::do_hotplug_scan() {
 
             if (!still_physical) {
                 log("Hot-plug: mouse disconnected: " + it->name + " (" + it->path + ")");
-                epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd_in, nullptr);
+                if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd_in, nullptr) < 0)
+                    log("hot-plug: epoll_ctl(del) failed for " + it->path + ": " +
+                        std::string(strerror(errno)), true);
                 opened_paths_.erase(it->path);
                 to_destroy.push_back(std::move(*it));
                 it = devices_.erase(it);
@@ -1208,10 +1265,21 @@ void AccelDaemon::run_loop() {
                 continue;
             }
 
-            // O(1) fd -> device lookup
-            auto it = fd_to_dev_.find(fd);
-            if (it != fd_to_dev_.end() && it->second < devices_.size())
-                process_device(devices_[it->second]);
+            // O(1) fd -> device lookup.  R1-03: take the fd index under
+            // devices_mutex_ so the map+vector read is never concurrent with
+            // a hot-plug mutation from this thread's own scan or with the
+            // hidpp battery thread's locked iteration.  The pointer stays
+            // valid for the call: vector erase only happens in the cleanup
+            // loop below, after this dispatch batch finishes.
+            mouse_device* dev = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(devices_mutex_);
+                auto it = fd_to_dev_.find(fd);
+                if (it != fd_to_dev_.end() && it->second < devices_.size())
+                    dev = &devices_[it->second];
+            }
+            if (dev)
+                process_device(*dev);
         }
 
         // Clean up any devices that got a fatal I/O error during processing
@@ -1222,7 +1290,9 @@ void AccelDaemon::run_loop() {
             while (dit != devices_.end()) {
                 if (dit->disconnected) {
                     log("Removing disconnected device: " + dit->name);
-                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, dit->fd_in, nullptr);
+                    if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, dit->fd_in, nullptr) < 0)
+                        log("disconnect cleanup: epoll_ctl(del) failed for " +
+                            dit->path + ": " + std::string(strerror(errno)), true);
                     fd_to_dev_.erase(dit->fd_in);
                     opened_paths_.erase(dit->path);
                     // P121/BUG-02: an I/O error often means the node is dead but
@@ -1306,11 +1376,12 @@ static inline bool uinput_write_rel(libevdev_uinput* uidev, int x, int y) {
 
 /// Apply acceleration to accumulated (dx,dy) and write REL events to uidev.
 /// Updates dev timing and subpixel remainder. Does NOT write SYN.
-/// Measures processing latency (time from call entry to last uinput write) in µs.
+/// Measures processing latency (time from the start of the process_device()
+/// read batch — including button/wheel work — to last uinput write) in µs.
 /// Returns false if a uinput write fails (caller should mark dev as disconnected).
 static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
-                         double dx, double dy) {
-    const uint64_t t_start = now_ns(); // latency measurement start
+                         double dx, double dy, uint64_t batch_start_ns) {
+    const uint64_t t_now = now_ns(); // interval / telemetry timestamp
 
     // Raw passthrough: bypass the entire acceleration pipeline.
     // No rotation, no snap, no speed clamp, no weights, no subpixel accumulation.
@@ -1326,7 +1397,7 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         int ix = static_cast<int>(std::clamp(dx, INT_LO, INT_HI));
         int iy = static_cast<int>(std::clamp(dy, INT_LO, INT_HI));
         if (!uinput_write_rel(uidev, ix, iy)) return false;
-        double lat_us = static_cast<double>(now_ns() - t_start) / 1000.0;
+        double lat_us = static_cast<double>(t_now - batch_start_ns) / 1000.0;
         dev.lat.record(lat_us);
         // Live telemetry: raw-passthrough path (no modifier). Fill counters and
         // deltas only — speeds are undefined without the speed pipeline.
@@ -1339,12 +1410,7 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         dev.telemetry->samples.fetch_add(1, std::memory_order_release);
         dev.telemetry->dx.store(static_cast<double>(ix), std::memory_order_relaxed);
         dev.telemetry->dy.store(static_cast<double>(iy), std::memory_order_relaxed);
-        // P100: P93-perf'teki ile aynı optimizasyon — now_ms() yerine zaten
-        // alınan t_start'tan türet (ns→ms). P121/BUG-06: telem_wall_ms
-        // status dev JSON'unda yayımlanır (istemci bayatlık hesaplayabilsin),
-        // bu yüzden ek clock_gettime okuması israf olur. Önceden 3 syscall,
-        // artık 2 — değer anlamsal olarak aynı monotonic-RAW.
-        dev.telemetry->wall_ms.store(static_cast<double>(t_start) / 1'000'000.0,
+        dev.telemetry->wall_ms.store(static_cast<double>(t_now) / 1'000'000.0,
                                      std::memory_order_relaxed);
         // bump counter to even (write complete)
         dev.telemetry->samples.fetch_add(1, std::memory_order_release);
@@ -1352,13 +1418,12 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     }
 
     // P93-perf: derive the interval timestamp from the latency-start read
-    // (t_start) instead of calling now_ms() again.  This drops the per-event
-    // clock_gettime read count from 3 to 2 (start + end) — one fewer vDSO call
-    // (~13 ns on this kernel) with no semantic change: the interval is measured
-    // start-to-start, and the sub-µs gap between the old now_ms() read and
-    // function entry is negligible vs a >=0.0625ms poll window.  Both timers
-    // stay on the same CLOCK_MONOTONIC_RAW source (AGENTS.md contract).
-    double now = static_cast<double>(t_start) / 1'000'000.0; // ns -> ms, same clock source
+    // (t_now) instead of calling now_ms() again.  This keeps the per-event
+    // clock_gettime read count at 2 inside flush_motion (start + end).  The
+    // interval is measured start-to-start on the same CLOCK_MONOTONIC_RAW
+    // source (AGENTS.md contract).  (D-4: latency itself is measured against
+    // batch_start_ns so the read/parse phase is included too.)
+    double now = static_cast<double>(t_now) / 1'000'000.0; // ns -> ms, same clock source
     milliseconds time_ms = now - dev.last_time_ms;
     // D6: modify() returns early when time<=0 (no motion applied).
     // flush_motion follows the same strategy: don't send motion for zero/negative intervals.
@@ -1394,9 +1459,10 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // bump counter to even (write complete)
     dev.telemetry->samples.fetch_add(1, std::memory_order_release);
 
-    // Record processing latency (µs): time from flush_motion entry to last write.
-    // This covers: modifier math + uinput write (does NOT include kernel→user round-trip).
-    double lat_us = static_cast<double>(now_ns() - t_start) / 1000.0;
+    // Record processing latency (µs): time from the process_device() read-batch
+    // start (button/wheel work included) to this last write.
+    // This covers: event parse + modifier math + uinput write (no kernel→user round-trip).
+    double lat_us = static_cast<double>(t_now - batch_start_ns) / 1000.0;
     dev.lat.record(lat_us);
     return true;
 }
@@ -1404,6 +1470,16 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
 void AccelDaemon::process_device(mouse_device& dev) {
     auto* uidev = dev.uidev;
     if (!uidev) return;
+    // D-4: latency is anchored at the start of this read batch so button /
+    // wheel events processed before the motion SYN are counted too.
+    const uint64_t batch_start_ns = now_ns();
+
+    // R1-08: a pathological/foreign device that never signals EAGAIN could
+    // spin this drain loop forever and hold the whole loop thread.  Cap each
+    // read batch; level-triggered epoll re-reports the fd so the remainder
+    // is picked up on the next dispatch — no events are lost.
+    constexpr int kMaxDrainPerBatch = 4096;
+    int drained = 0;
 
     input_event ev;
 
@@ -1418,7 +1494,7 @@ void AccelDaemon::process_device(mouse_device& dev) {
     bool& syn_dropped = dev.syn_dropped;
     auto flush_pending_motion = [&]() -> bool {
         if (!has_motion) return true;
-        if (!flush_motion(dev, uidev, dx, dy)) {
+        if (!flush_motion(dev, uidev, dx, dy, batch_start_ns)) {
             dev.disconnected = true;
             return false;
         }
@@ -1429,7 +1505,7 @@ void AccelDaemon::process_device(mouse_device& dev) {
     };
 
     // Read all pending events
-    while (true) {
+    while (drained++ < kMaxDrainPerBatch) {
         ssize_t n = read(dev.fd_in, &ev, sizeof(ev));
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break; // normal: no more events
@@ -1714,8 +1790,11 @@ struct DevSnap {
 
             // Live telemetry (seqlock-style read): flush_motion() increments
             // telem_samples to an odd value before writing, writes the fields,
-            // then increments to an even value.
-            for (int attempts = 0; attempts < 8; attempts++) {
+            // then increments to an even value.  8 spins was too few under a
+            // very fast writer (~1 kHz+, BUG D-5) and silently dropped the
+            // sample; 64 bounded spins keep the read window cheap without ever
+            // blocking the writer.
+            for (int attempts = 0; attempts < 64; attempts++) {
                 const uint64_t s1 = dev.telemetry->samples.load(std::memory_order_acquire);
                 if (s1 == 0) break; // no motion yet
                 if ((s1 & 1) != 0) continue; // write in progress (odd counter) — spin
@@ -1870,7 +1949,14 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
     strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        log("IPC: bind() failed: " + std::string(strerror(errno)));
+        // D-7: between the stale-probe unlink() and this bind() a second
+        // daemon may have grabbed the socket.  Say so instead of a bare,
+        // confusing "bind() failed".
+        if (errno == EADDRINUSE)
+            log("IPC: socket path was taken concurrently — another daemon "
+                "started before us: " + sock_path);
+        else
+            log("IPC: bind() failed: " + std::string(strerror(errno)));
         close(fd);
         return false;
     }
@@ -1899,7 +1985,18 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
     ipc_sock_fd_.store(fd);
 
     ipc_running_.store(true);
-    ipc_thread_ = std::thread([this] { ipc_serve_loop(); });
+    // R1-01: escape-proof worker — never let an exception hit terminate().
+    ipc_thread_ = std::thread([this] {
+        try {
+            ipc_serve_loop();
+        } catch (const std::exception& e) {
+            log(std::string("ipc thread aborted: ") + e.what());
+            stop_ipc_server(); // degrade: close the socket, stop serving
+        } catch (...) {
+            log("ipc thread aborted: unknown exception");
+            stop_ipc_server();
+        }
+    });
     log("IPC socket: " + sock_path, true);
     return true;
 }
@@ -1967,13 +2064,22 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     // arbitrarily long; this caps the whole request (command line + body).
     const uint64_t deadline_ns = now_ns() + IPC_REQUEST_DEADLINE_NS;
 
+    // D-8: never drop a client without a reason — on command-line timeout
+    // reply with a JSON error (best-effort) instead of silently returning so
+    // the client does not hang waiting for a response that never comes.
+    auto reply_timeout = [&]() {
+        const char* resp = "{\"error\":\"request timeout\"}\n";
+        (void)send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+    };
+
     // Read the command line (up to a newline / 256 bytes).  Byte-wise recv is
     // fine here — IPC traffic is one short line per client.
     std::string line;
     char ch;
     while (line.size() < 256) {
-        if (now_ns() >= deadline_ns) return; // slow command line — drop
+        if (now_ns() >= deadline_ns) { reply_timeout(); return; } // slow command line
         ssize_t r = recv(client_fd, &ch, 1, 0);
+        if (r < 0 && errno == EINTR) continue; // D-9: retry on signal
         if (r <= 0) return;
         if (ch == '\n') break;
         line.push_back(ch);
@@ -2018,6 +2124,7 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
                 size_t want = std::min<size_t>(sizeof(tmp),
                                                (size_t)body_len - body.size());
                 ssize_t r = recv(client_fd, tmp, want, 0);
+                if (r < 0 && errno == EINTR) continue; // D-9: retry on signal
                 if (r <= 0) break; // timeout or client disconnected
                 body.append(tmp, (size_t)r);
             }
@@ -2043,6 +2150,7 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     size_t left = response.size();
     while (left > 0) {
         ssize_t w = send(client_fd, p, left, MSG_NOSIGNAL);
+        if (w < 0 && errno == EINTR) continue; // D-9: retry on signal
         if (w <= 0) {
             // EPIPE/ECONNRESET: peer closed.  EAGAIN/EWOULDBLOCK: peer stopped
             // reading and the 2 s SO_SNDTIMEO elapsed.  Either way the client

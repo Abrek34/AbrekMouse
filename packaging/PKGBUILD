@@ -19,7 +19,8 @@ url="https://github.com/rawaccel-linux/rawaccel-linux"
 license=('custom')
 depends=('libevdev' 'gtk4' 'glib2' 'polkit' 'systemd')
 makedepends=('cmake' 'pkgconf' 'gcc')
-optdepends=('python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)')
+optdepends=('python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)'
+            'qt6-tools: KWin live reconfigure during the KDE auto-fix (qdbus6)')
 install="$pkgname.install"
 # /etc/rawaccel/settings.json is user state (their profiles): pacman must not
 # overwrite it on reinstall/upgrade (it was a file-conflict before — fix so
@@ -40,8 +41,6 @@ prepare() {
 
     # Arch convention: binaries go to /usr/bin (not /usr/local/bin).
     sed -i 's#/usr/local/bin#/usr/bin#g' CMakeLists.txt
-    sed -i 's#/usr/local/bin/rawaccel-daemon#/usr/bin/rawaccel-daemon#g' \
-        scripts/rawaccel.service scripts/polkit/org.rawaccel.policy
 }
 
 build() {
@@ -73,12 +72,6 @@ package() {
     printf 'uinput\n' > "$srcdir/rawaccel.conf"
     install -Dm644 "$srcdir/rawaccel.conf" \
         "$pkgdir/usr/lib/modules-load.d/rawaccel.conf"
-
-    # polkit: allow 'input' group users to start the daemon without a password
-    install -Dm644 scripts/polkit/org.rawaccel.policy \
-        "$pkgdir/usr/share/polkit-1/actions/org.rawaccel.policy"
-    install -Dm644 scripts/polkit/49-rawaccel.rules \
-        "$pkgdir/usr/share/polkit-1/rules.d/49-rawaccel.rules"
 
     # libinput quirk: disable desktop acceleration over virtual mouse
     install -Dm644 scripts/rawaccel.quirks \
