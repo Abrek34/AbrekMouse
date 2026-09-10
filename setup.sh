@@ -61,7 +61,7 @@ if command -v pacman &>/dev/null && pacman -Qi rawaccel-linux &>/dev/null 2>&1; 
     warn "çakışmaya neden olur ve paket kurulumunu bozar."
     warn "Tavsiye ya da: sudo pacman -Rns rawaccel-linux ile kaldırın, ya da sadece paketi kullanın."
     echo "Devam etmek için Enter'a basın (iptal için Ctrl+C)..."
-    read -r
+    read -r _ || true
 fi
 
 # ── Gerçek kullanıcı ──────────────────────────────────────────────────────────
@@ -133,7 +133,7 @@ install_deps() {
         warn "  g++/clang++, make, cmake, pkg-config, libevdev (devel), gtk4 (devel),"
         warn "  systemd, polkit, python3, qt6-tools (qdbus6; KDE fix için)"
         warn "Devam etmek için Enter'a basın..."
-        read -r
+        read -r _ || true
     fi
 
     # ── Tam doğrulama: herhangi biri eksikse "bağımlılık hatası" görmeden
@@ -211,7 +211,11 @@ build_project() {
     # Mümkünse gerçek kullanıcı olarak derle (build-manual root'a ait olmasın).
     # Ama repo dizini bu kullanıcıya yazılabilir değilse root olarak dene —
     # kurulum "bağımlılık / izin hatası" yüzünden yarıda kalmasın.
-    if [[ -n "$REAL_USER" ]] && sudo -n -u "$REAL_USER" true 2>/dev/null && [[ -w "$ROOT" ]]; then
+    # M-BUG-19: bu noktada zaten root'uz, o yüzden `${ROOT}` üzerinde
+    # `[[ -w ]]` her zaman true döner (root her yere yazabilir) ve test asla
+    # gerçek kullanıcının iznini ölçmez.  İzni gerçek kullanıcı adıyla sor.
+    if [[ -n "$REAL_USER" ]] && sudo -n -u "$REAL_USER" true 2>/dev/null && \
+       sudo -n -u "$REAL_USER" test -w "$ROOT" 2>/dev/null; then
         sudo -u "$REAL_USER" bash "$ROOT/scripts/build.sh"
     else
         warn "Gerçek kullanıcı olarak derlenemiyor; root olarak derleniyor."
@@ -371,7 +375,7 @@ verify_install() {
     else err "Servis ÇALIŞMIYOR — journalctl -u rawaccel -n 50"; missing=1; fi
     if [[ -n "$REAL_USER" ]] && id -nG "$REAL_USER" | grep -qw input; then
         ok "$REAL_USER 'input' grubunda"
-    else
+    elif [[ -n "$REAL_USER" ]]; then
         warn "$REAL_USER henüz 'input' grubunda değil (çıkış-giriş gerekir)"
     fi
     echo ""
@@ -450,7 +454,9 @@ do_uninstall() {
     fi
     ok "Kaldırma tamamlandı. Kullanıcı configi (~/.config/rawaccel + /etc/rawaccel) korundu."
     echo "  /etc/rawaccel'i da silmek için: sudo rm -rf /etc/rawaccel"
-    echo "  Tamamen silmek için: rm -rf $REAL_HOME/.config/rawaccel"
+    if [[ -n "$REAL_HOME" ]]; then
+        echo "  Tamamen silmek için: rm -rf $REAL_HOME/.config/rawaccel"
+    fi
 }
 
 # ── Akış ──────────────────────────────────────────────────────────────────────
@@ -467,9 +473,13 @@ if [[ "$ACTION" == "uninstall" ]]; then
     exit 0
 fi
 
+# M-BUG-20: build before cleaning.  The old order cleaned the previous
+# install (removing /usr/bin binaries and stopping the service) and THEN
+# built; any build failure left the system with no RawAccel at all.  Building
+# first keeps the old install working until the new one is verified.
 install_deps
-clean_old_install   # her zaman önce temizle (eski/bozuk varsa)
 build_project
+clean_old_install   # eski/bozuk varsa tamamen temizle (build zaten başarılı)
 do_install
 start_service       # servis önce başlasın → sanal RawAccel cihazı oluşsun
 fix_kde_plasma      # sonra per-device kwinrc override yazılsın

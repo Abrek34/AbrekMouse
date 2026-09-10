@@ -545,12 +545,14 @@ static int cmd_create_preset(app_config& cfg, const std::string& config_path,
 /// Validate config file and report issues without modifying it.
 static int cmd_validate(const std::string& config_path) {
     // P120-FAZ2 (A5-03): a missing config is an explicit error (rc=1) with a
-    // clear "config yok" message — never a silent false-PASS, and validation
+    // clear message — never a silent false-PASS, and validation
     // must not CREATE the file (main() dispatches validate before any default
     // creation).  An existing-but-broken config reports errors to stderr and
     // the file is never written to.
     if (::access(config_path.c_str(), F_OK) != 0) {
-        std::cerr << "ERROR: config yok (not found): " << config_path << "\n";
+        // M-BUG-16: the "config yok" token leaked Turkish into an otherwise
+        // English CLI.  Validation is distributed to non-Turkish users too.
+        std::cerr << "ERROR: config file not found: " << config_path << "\n";
         return 1;
     }
     std::cout << "Validating config: " << config_path << "\n";
@@ -1355,10 +1357,18 @@ static int cmd_status(const std::string& config_path) {
                                       << (battery <= 20 ? "% (LOW)" : "%") << "\n";
 
                         // Effective profile: same priority as the daemon's find_profile
-                        // (device-specific → active → first).
+                        // (device-specific → empty-device_id catch-all → active → first).
                         const device_profile* matched = nullptr;
                         for (auto& p : cfg.profiles)
                             if (!p.device_id.empty() && p.device_id == dev_id) { matched = &p; break; }
+                        // BUG-NEW-60: the daemon's find_profile() checks empty-device_id
+                        // ("All devices") catch-all profiles BEFORE active_profile; the
+                        // CLI previously skipped this step, showing a different profile
+                        // than the daemon actually applied.
+                        if (!matched) {
+                            for (auto& p : cfg.profiles)
+                                if (p.device_id.empty()) { matched = &p; break; }
+                        }
                         if (!matched) {
                             for (auto& p : cfg.profiles)
                                 if (p.name == cfg.active_profile) { matched = &p; break; }

@@ -97,6 +97,11 @@ struct lat_stats {
     /// Caller must hold mtx.
     double percentile(double pct) const {
         if (count == 0) return 0.0;
+        // BUG-NEW-72: pct outside [0,100] previously made
+        // static_cast<uint64_t>(ceil(count·pct/100)) UB (negative)
+        // or returned max_us (pct > 100).  Clamp to the valid domain.
+        if (pct <= 0.0) return 0.0;
+        if (pct >= 100.0) return max_us;
         uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
         uint64_t cum = 0;
         for (int i = 0; i < BUCKETS; i++) {
@@ -122,6 +127,9 @@ struct lat_stats {
 
         double percentile(double pct) const {
             if (count == 0) return 0.0;
+            // BUG-NEW-72: same guard as the live percentile() above.
+            if (pct <= 0.0) return 0.0;
+            if (pct >= 100.0) return max_us;
             uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
             uint64_t cum = 0;
             for (int i = 0; i < BUCKETS; i++) {

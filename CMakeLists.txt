@@ -167,6 +167,7 @@ if(BUILD_TESTS)
     )
     target_link_libraries(rawaccel-tests
         rawaccel-config
+        dl
     )
     add_test(NAME rawaccel-unit-tests COMMAND rawaccel-tests)
 endif()

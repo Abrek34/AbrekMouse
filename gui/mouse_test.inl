@@ -184,8 +184,8 @@ static void mouse_test_set_hint(AppState* S, int state) {
     const char* txt = "";
     switch (state) {
         case 0: txt = tr("Pointer is locked inside this fullscreen test window.\nMove the mouse to see live speed/gain.\nPress ESC to release."); break;
-        case 1: txt = tr("Pointer grab failed — the cursor is confined as best effort (imleç kilidi yok).\nMove the mouse to see live speed/gain.\nPress ESC to release."); break;
-        case 2: txt = tr("Pointer lock unavailable — imleç kilidi yok: this Wayland session cannot grab the pointer.\nThe cursor is NOT locked inside this window (fullscreen coverage only).\nMove the mouse, then press ESC to close."); break;
+        case 1: txt = tr("Pointer grab failed — the cursor is confined as best effort (no pointer lock).\nMove the mouse to see live speed/gain.\nPress ESC to release."); break;
+        case 2: txt = tr("Pointer lock unavailable — no pointer lock: this Wayland session cannot grab the pointer.\nThe cursor is NOT locked inside this window (fullscreen coverage only).\nMove the mouse, then press ESC to close."); break;
         default: txt = ""; break;
     }
     gtk_label_set_text(GTK_LABEL(S->test_hint_lbl), txt);

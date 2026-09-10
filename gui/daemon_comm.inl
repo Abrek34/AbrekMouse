@@ -48,7 +48,11 @@ static int kde_libinput_accel_state() {
 
     // Scan for [Libinput] section and PointerAcceleration key
     bool in_libinput = false;
-    char line[512];
+    // M-BUG-6: real kwinrc lines are short, but a long nested device section
+    // header (e.g. "[Libinput][3][1133][50498][Logitech ... (RawAccel)]") plus a
+    // long key=value can exceed 512 bytes; fgets would truncate mid-pair and the
+    // key would be mis-read.  Generous limit that still bounds hostile files.
+    char line[8192];
     int result = -1;
     while (fgets(line, sizeof(line), f)) {
         // Strip newline

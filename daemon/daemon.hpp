@@ -211,9 +211,10 @@ private:
     std::unordered_map<std::string, double> dev_deny_until_ms_;
     // O(1) fd -> device index lookup (avoids linear scan in hot path)
     std::unordered_map<int, size_t> fd_to_dev_;
-    // Hot-plug retry counter — accessed only from run_loop() thread; no sync needed.
-    // Using atomic here for explicitness and to silence potential sanitizer warnings.
-    std::atomic<int> hotplug_retry_ { 0 };
+    // Hot-plug retry: wall-clock timestamp (ms, CLOCK_MONOTONIC_RAW) when
+    // the retry window started.  0 means no pending retry.
+    // Accessed only from run_loop() thread; no sync needed.
+    double hotplug_start_ms_ = 0;
     // Pending hot-plug flag: set by inotify, processed at safe point in loop
     std::atomic<bool> pending_hotplug_ { false };
     // Next time to run an empty-device re-scan (ms, CLOCK_MONOTONIC_RAW).

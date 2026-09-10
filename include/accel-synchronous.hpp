@@ -41,6 +41,10 @@ struct synchronous {
 
     double operator()(double x, const accel_args& args) const {
         if (x <= 0) return 1.0;
+        // DÜŞÜK-BUG-ALG-04: guard NaN/Inf too — legacy_apply calls log(x),
+        // and log(NaN)=NaN previously propagated downstream.  The gain path
+        // already guards via gain_apply; make the legacy path consistent.
+        if (!std::isfinite(x)) return 1.0;
         if (gain_mode) return gain_apply(x, args);
         return legacy_apply(x);
     }

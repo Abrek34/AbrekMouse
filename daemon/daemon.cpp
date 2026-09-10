@@ -142,6 +142,33 @@ static int sysfs_read_int(const std::string& sysfs_path) {
     return static_cast<int>(val);
 }
 
+/// Read the USB connection speed from sysfs `speed` and map it to the kernel
+/// `enum usb_device_speed` semantics used by detect_polling_rate().
+/// BUG-NEW-80: the sysfs `speed` file is a Mbps TEXT string ("1.5", "12",
+/// "480", "5000", "10000"), NOT an enum integer.  sysfs_read_int() would turn
+/// "12" into the int 12, which `>= 3` misread as HIGH speed (12 Mbps is
+/// full-speed), silently applying 125µs bInterval math to a 1ms-frame device.
+/// Returns:  3 = high-speed or faster (480+ Mbps, 125µs microframes)
+///           2 = full-speed                 (12 Mbps, 1ms frames)
+///           1 = low-speed                  (1.5 Mbps, 1ms frames)
+///           <= 0 = unreadable / unknown (read(), parse or range failure)
+static int sysfs_read_usb_speed(const std::string& sysfs_path) {
+    FILE* f = fopen(sysfs_path.c_str(), "r");
+    if (!f) return -1;
+    char buf[64] = {};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return -1;
+    errno = 0;
+    char* end = nullptr;
+    const double mbps = std::strtod(buf, &end);
+    if (end == buf || errno != 0 || !std::isfinite(mbps) || mbps <= 0)
+        return -1;
+    if (mbps >= 480.0) return 3; // High/Super/... Speed (125µs microframes)
+    if (mbps >= 12.0)  return 2; // Full-speed (1ms frames)
+    return 1;                    // Low-speed (1ms frames)
+}
+
 /// Detect mouse polling rate (Hz) from sysfs.
 /// Returns detected rate clamped to [POLL_RATE_MIN, POLL_RATE_MAX], or 0 if unknown.
 static int detect_polling_rate(const std::string& event_path) {
@@ -163,14 +190,16 @@ static int detect_polling_rate(const std::string& event_path) {
     if (binterval > 0) {
         // Determine the actual USB speed from sysfs to compute the correct
         // frame size: high-speed (480 Mbps) uses 125µs microframes, full-speed
-        // (12 Mbps) uses 1ms frames.  The speed value is:
+        // (12 Mbps) uses 1ms frames.  The `speed` node is a Mbps text string
+        // ("1.5", "12", "480", "5000", ...) — decoded by sysfs_read_usb_speed()
+        // into the kernel enum semantics below:
         //   1 = Low Speed (1.5 Mbps, not used for mice)
         //   2 = Full Speed (12 Mbps)
-        //   3 = High Speed (480 Mbps)
-        //   5 = SuperSpeed (5 Gbps)
+        //   3 = High Speed (480 Mbps, microframes)
+        //   5 = SuperSpeed (5 Gbps, microframes)
         int rate_hz = 0;
         snprintf(buf, sizeof(buf), "/sys/class/input/event%d/device/device/speed", n);
-        int usb_speed = sysfs_read_int(buf);
+        int usb_speed = sysfs_read_usb_speed(buf);
         if (usb_speed >= 3) {
             // High-speed or faster: bInterval is in 125µs units
             // For USB high-speed interrupt endpoints, bInterval is an
@@ -180,13 +209,14 @@ static int detect_polling_rate(const std::string& event_path) {
             if (binterval < 1 || binterval > 16) return 0;
             const double interval_us = 125.0 * (1u << (binterval - 1));
             rate_hz = static_cast<int>(1000000.0 / interval_us);
-        } else if (usb_speed == 0) {
+        } else if (usb_speed <= 0) {
             // BUG-16 fix: `speed` sysfs could not be read (missing/unknown).
             // Previously this fell into the full-speed branch and reported an
             // up-to-8× too low rate for high-speed gaming mice.  Try the
             // high-speed interpretation first; a valid high-speed result in
             // [POLL_RATE_MIN, POLL_RATE_MAX] wins, otherwise fall back to
-            // the full-speed interpretation.
+            // the full-speed interpretation.  BUG-NEW-80: the old `== 0`
+            // test was dead code — sysfs_read_int() returns -1, never 0.
             if (binterval >= 1 && binterval <= 16) {
                 const double hs_interval_us = 125.0 * (1u << (binterval - 1));
                 const int hs_rate = static_cast<int>(1000000.0 / hs_interval_us);
@@ -196,7 +226,7 @@ static int detect_polling_rate(const std::string& event_path) {
             }
             rate_hz = 1000 / binterval;
         } else {
-            // Full-speed: bInterval is in 1ms units
+            // Full/low speed: bInterval is in 1ms units
             rate_hz = 1000 / binterval;
         }
         if (rate_hz > 0)
@@ -1080,9 +1110,25 @@ void AccelDaemon::poll_hidpp_notifications() {
 
 void AccelDaemon::run_loop() {
     constexpr int MAX_EVENTS = 32;
+    constexpr int MAX_CONSECUTIVE_EPOLL_ERRORS = 10;
     epoll_event events[MAX_EVENTS];
+    int epoll_errors = 0;
 
     while (running_.load()) {
+        // Handle a config pushed over IPC (GUI/CLI "set_config" — syncs the
+        // user's edits into the daemon's own config file).  push_config() has
+        // already validated and persisted it, so this cannot throw.
+        // Process IPC push BEFORE SIGHUP reload: if both are pending
+        // simultaneously, the IPC push is newer and should take precedence.
+        {
+            std::lock_guard<std::mutex> lk(push_cfg_mu_);
+            if (push_cfg_pending_) {
+                apply_new_config(push_cfg_);
+                push_cfg_pending_ = false;
+                log("Applied config pushed over IPC.", true);
+            }
+        }
+
         // Handle config reload request (SIGHUP or IPC "reload")
         if (reload_flag_.exchange(false)) {
             log("Reloading config...");
@@ -1093,28 +1139,15 @@ void AccelDaemon::run_loop() {
             }
         }
 
-        // Handle a config pushed over IPC (GUI/CLI "set_config" — syncs the
-        // user's edits into the daemon's own config file).  push_config() has
-        // already validated and persisted it, so this cannot throw.
-        {
-            std::lock_guard<std::mutex> lk(push_cfg_mu_);
-            if (push_cfg_pending_) {
-                apply_new_config(push_cfg_);
-                push_cfg_pending_ = false;
-                log("Applied config pushed over IPC.", true);
-            }
-        }
-
         // Deferred hot-plug: wait for the kernel to finish creating the device node.
-        // We retry once per epoll_wait cycle (every ~10ms); after 8 retries (~80ms)
-        // we give up if the device still isn't ready. This keeps the event loop non-blocking.
+        // Wall-clock based: ~80ms after the hot-plug event, scan once.
         if (pending_hotplug_.load()) {
-            hotplug_retry_++;
-            // 8 × 10ms epoll_wait = ~80ms wait — USB hubs may take 50-100ms for
-            // the kernel to make the device node available.
-            if (hotplug_retry_ >= 8) {
+            const double t = now_ms();
+            if (hotplug_start_ms_ == 0) {
+                hotplug_start_ms_ = t;
+            } else if (t - hotplug_start_ms_ >= 80.0) {
                 pending_hotplug_.store(false);
-                hotplug_retry_ = 0;
+                hotplug_start_ms_ = 0;
                 do_hotplug_scan();
             }
         }
@@ -1139,9 +1172,22 @@ void AccelDaemon::run_loop() {
         int n = epoll_wait(epoll_fd_, events, MAX_EVENTS, 10);
         if (n < 0) {
             if (errno == EINTR) continue;
+            // BUG-NEW-81: a persistent epoll error must NOT kill the loop.
+            // The old `break` silently turned the daemon into a zombie
+            // ("running", mouse unprocessed, no event loop) on any transient
+            // EBADF/ENOMEM/EINVAL.  Count consecutive errors; only after a
+            // sustained streak (the fd set is genuinely unusable) do we give
+            // up and let the caller shut the daemon down in a visible way.
             log("epoll_wait error: " + std::string(strerror(errno)));
-            break;
+            if (++epoll_errors >= MAX_CONSECUTIVE_EPOLL_ERRORS) {
+                log("epoll_wait failed " + std::to_string(epoll_errors) +
+                    " times consecutively; shutting down.");
+                request_stop();
+                break;
+            }
+            continue;
         }
+        epoll_errors = 0;
 
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
@@ -1393,7 +1439,15 @@ void AccelDaemon::process_device(mouse_device& dev) {
             break;
         }
         if (n == 0) { dev.disconnected = true; break; } // EOF — treat as disconnect
-        if (n < (ssize_t)sizeof(ev)) break; // short read, skip
+        if (n < (ssize_t)sizeof(ev)) {
+            // BUG-NEW-82: a short read is not a recoverable partial event —
+            // the input-event stream is word-sized and any partial read leaves
+            // the stream misaligned.  Log it (verbose) so silent data loss on
+            // a torn read is at least diagnosable, then drop the tail.
+            log("read() short read (" + std::to_string(n) + " of " +
+                std::to_string(sizeof(ev)) + " bytes) on " + dev.name, true);
+            break;
+        }
 
         if (ev.type == EV_SYN) {
             if (ev.code == SYN_DROPPED) {
@@ -1869,6 +1923,14 @@ void AccelDaemon::ipc_serve_loop() {
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         int r = poll(&pfd, 1, 1000 /* ms */);
         if (r <= 0) continue; // timeout or error — check ipc_running_ again
+
+        // L-BUG-7: poll() re-arms immediately when the listening descriptor
+        // reports an error state (POLLNVAL after the fd is closed under us in
+        // shutdown, POLLERR/POLLHUP if the socket becomes unusable), so
+        // accept4() would fail and the loop would hot-spin until
+        // ipc_running_ clears.  Abandon the descriptor instead.
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            break;
 
         // R6: use the local 'fd' copy instead of ipc_sock_fd_ to avoid TOCTOU race
         // with stop_ipc_server() which may close ipc_sock_fd_ between poll() and accept4().

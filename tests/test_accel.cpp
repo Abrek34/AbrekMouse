@@ -1939,7 +1939,10 @@ static void test_atomic_write() {
     SECTION("atomic config write — no .tmp file left after successful save");
 
     std::string tmp_path = "/tmp/rawaccel_test_atomic.json";
-    std::string tmp_file = tmp_path + ".tmp";
+    // N-15: save_config names the temp file with a pid suffix
+    // (path.<pid>.tmp), so a bare "<path>.tmp" assertion could never detect a
+    // real leftover.  Compute the actual name the saver produces.
+    std::string tmp_file = tmp_path + "." + std::to_string(::getpid()) + ".tmp";
 
     app_config cfg;
     device_profile dp; dp.name = "atomic_test";
@@ -2689,7 +2692,8 @@ static void test_cfg_p54_guards() {
         app_config cfg;
         cfg.active_profile = "p54";
         save_config(cfg, path);
-        EXPECT(!std::filesystem::exists(path + ".tmp"));
+        // N-15: temp name carries the pid suffix — assert on the real name.
+        EXPECT(!std::filesystem::exists(path + "." + std::to_string(::getpid()) + ".tmp"));
         EXPECT(std::filesystem::exists(path));
         EXPECT(std::filesystem::file_size(path) > 0);
         std::filesystem::remove(path);
@@ -4269,7 +4273,8 @@ static void test_motion_math_clamp_remainder_reset() {
 static void test_save_config_durability_path() {
     SECTION("BUG-13 — save_config: tmp file is removed and target updated atomically");
     std::string path = "/tmp/_rawaccel_save_test.json";
-    std::string tmp  = path + ".tmp";
+    // N-15: save_config names the temp file with a pid suffix.
+    std::string tmp  = path + "." + std::to_string(::getpid()) + ".tmp";
     std::remove(path.c_str()); std::remove(tmp.c_str());
 
     app_config cfg;

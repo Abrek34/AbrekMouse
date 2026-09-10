@@ -10,6 +10,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <cmath>
 #include <poll.h>
 #include <filesystem>
 #include <climits>
@@ -55,6 +56,45 @@ uint16_t read_be16(const uint8_t* p) {
     return (static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]);
 }
 
+/// Decode a raw DPI byte-pair list into concrete DPI levels.
+///
+/// Logitech's DPI list encoding uses a 0xE000..0xFFFF marker pair whose low
+/// 13 bits are the step size; the following word is the last level produced
+/// by stepping from the previous level (Solaar's produce_dpi_list rule).
+/// Both the 0x2202 (extended, multi-sensor) and 0x2201 (legacy) paths push
+/// these raw bytes, so a single decoder keeps them consistent.  A truncated
+/// trailing marker (marker word without its `last` companion) is dropped
+/// rather than pushed as a bogus 0xE000+ level.
+std::vector<uint16_t> decode_dpi_levels(const std::vector<uint8_t>& list_bytes) {
+    std::vector<uint16_t> levels;
+    for (size_t i = 0; i + 1 < list_bytes.size(); i += 2) {
+        const uint16_t value = read_be16(&list_bytes[i]);
+        if (value == 0) break;
+        // 0xE000..0xFFFF denotes a step/last pair in Logitech's DPI
+        // list encoding (Solaar's produce_dpi_list uses the same rule).
+        if ((value >> 13) == 0x07) {
+            if (i + 3 < list_bytes.size()) {
+                const uint16_t step = value & 0x1FFF;
+                const uint16_t last = read_be16(&list_bytes[i + 2]);
+                if (step != 0 && !levels.empty() &&
+                    last > levels.back()) {
+                    uint32_t next = static_cast<uint32_t>(levels.back()) + step;
+                    for (; next <= last; next += step) {
+                        if (next > 0xFFFF) break; // guard against uint32→uint16 truncation
+                        levels.push_back(static_cast<uint16_t>(next));
+                    }
+                }
+                i += 2;
+            }
+            // else: truncated marker pair at the tail — drop it (nothing
+            // meaningful follows), matching the extended-path behaviour.
+        } else {
+            levels.push_back(value);
+        }
+    }
+    return levels;
+}
+
 std::string bytes_to_hex(const uint8_t* data, size_t size) {
     std::ostringstream out;
     out << std::uppercase << std::hex << std::setfill('0');
@@ -89,9 +129,15 @@ hidpp_battery_info battery_info_from_voltage(uint16_t voltage, bool charging) {
             if (voltage <= curve[i].first) {
                 const auto [lo_v, lo_p] = curve[i - 1];
                 const auto [hi_v, hi_p] = curve[i];
-                level = static_cast<uint8_t>(
-                    lo_p + (hi_p - lo_p) * (voltage - lo_v) /
-                               (hi_v - lo_v));
+                // M-BUG-13: the old all-integer expression truncated the
+                // interpolation to the floor percentage (e.g. 50.7% -> 50%)
+                // for mid-range voltages.  Convert before dividing so the
+                // percentage rounds to the nearest whole value.
+                const double fraction = static_cast<double>(voltage - lo_v) /
+                                       static_cast<double>(hi_v - lo_v);
+                const double pct = static_cast<double>(lo_p) +
+                                   static_cast<double>(hi_p - lo_p) * fraction;
+                level = static_cast<uint8_t>(std::lround(pct));
                 break;
             }
         }
@@ -511,7 +557,9 @@ std::optional<uint16_t> hidpp_device::notification_feature_id(
 // ── HidppTransport ──────────────────────────────────────────────────
 HidppTransport::HidppTransport(const std::string& hidraw_path)
     : hidraw_path_(hidraw_path) {
-    fd_ = open(hidraw_path.c_str(), O_RDWR | O_NONBLOCK);
+    // ORTA-BUG-TRANSPORT-01: add O_CLOEXEC so the hidraw fd can never leak
+    // into a future child process (the GUI lock file already uses O_CLOEXEC).
+    fd_ = open(hidraw_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd_ < 0) return;
 
     // Get device info
@@ -519,6 +567,15 @@ HidppTransport::HidppTransport(const std::string& hidraw_path)
     if (ioctl(fd_, HIDIOCGRAWINFO, &info) >= 0) {
         vendor_id_ = info.vendor;
         product_id_ = info.product;
+    } else {
+        // L-BUG-23: a failed HIDIOCGRAWINFO previously left vendor/product
+        // at 0 while the device was still probed as HID++ — receiver gating
+        // (get_pairing_info) then silently disabled every receiver register
+        // read with no way to tell why.  A hidraw node that cannot describe
+        // itself is not a usable HID++ endpoint; treat it as not open so
+        // callers report "unable to communicate" instead of guessing.
+        close(fd_);
+        fd_ = -1;
     }
 }
 
@@ -724,6 +781,12 @@ std::optional<hidpp_short_packet> HidppTransport::send_short(
                     return rsp;
                 }
             }
+            // BUG-22 (aj4): a notification that arrives in the response wait
+            // window is not this request's answer — stash it (bounded) instead
+            // of discarding it, so drain_notifications() can still deliver it.
+            if (auto notif = hidpp_notification::from_bytes(buf, len))
+                if (pending_notifications_.size() < 16)
+                    pending_notifications_.push_back(std::move(*notif));
         }
     }
     return std::nullopt;
@@ -766,6 +829,11 @@ std::optional<hidpp_long_packet> HidppTransport::send_long(
                     return rsp;
                 }
             }
+            // BUG-22 (aj4): stash notifications that arrive in the wait
+            // window instead of dropping them (see send_short).
+            if (auto notif = hidpp_notification::from_bytes(buf, len))
+                if (pending_notifications_.size() < 16)
+                    pending_notifications_.push_back(std::move(*notif));
         }
     }
     return std::nullopt;
@@ -808,6 +876,11 @@ std::optional<hidpp_very_long_packet> HidppTransport::send_very_long(
                     return rsp;
                 }
             }
+            // BUG-22 (aj4): stash notifications that arrive in the wait
+            // window instead of dropping them (see send_short).
+            if (auto notif = hidpp_notification::from_bytes(buf, len))
+                if (pending_notifications_.size() < 16)
+                    pending_notifications_.push_back(std::move(*notif));
         }
     }
     return std::nullopt;
@@ -848,8 +921,9 @@ std::optional<std::vector<uint8_t>> HidppTransport::read_register(
             continue;
         // Long receiver-info replies echo the sub-register in the first
         // payload byte.  Match it as Solaar does so a stale slot response
-        // cannot be returned for a different slot query.
-        if (request_id == 0x81B5 && params && param_len != 0 &&
+        // cannot be returned for a different slot query.  Slots are read
+        // from register 0x02B5, which encodes to request_id 0x83B5.
+        if (request_id == 0x83B5 && params && param_len != 0 &&
             (len < 5 || buf[4] != params[0]))
             continue;
         return std::vector<uint8_t>(buf + 4, buf + len);
@@ -863,12 +937,20 @@ std::optional<std::vector<uint8_t>> HidppTransport::feature_request(
     uint8_t target_device_index) {
     if (feature_id == 0 || param_len > 16)
         return std::nullopt;
-    if (!supports_feature(feature_id)) return std::nullopt;
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index : device_index_.load(std::memory_order_relaxed);
+    // The supports_feature() gate enumerates features for the transport's
+    // current device index.  Only apply it when the request targets that
+    // device; for an explicit alternate target, resolve_feature_index below
+    // is already target-correct and the gate would wrongly reject a feature
+    // the target actually supports.
+    if (target == device_index_.load(std::memory_order_relaxed) &&
+        !supports_feature(feature_id)) return std::nullopt;
     const auto index = resolve_feature_index(
-        static_cast<hidpp_feature_index>(feature_id), target_device_index);
+        static_cast<hidpp_feature_index>(feature_id), target);
     if (!index) return std::nullopt;
     return send_feature_request(*index, function_id, params, param_len,
-                                timeout, target_device_index);
+                                timeout, target);
 }
 
 bool HidppTransport::write_register(
@@ -1011,6 +1093,12 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
     const uint16_t count = static_cast<uint16_t>(count_response->params[0]) + 1;
     features.push_back({0x0000, 0, 0, 0});
     features.push_back({0x0001, fs->params[0], 0, 0});
+    // A non-responding device would otherwise stall the daemon for minutes
+    // (900 ms × up to 256 indices, ~4 min worst case).  Solaar aborts
+    // enumeration after a short run of consecutive timeouts; match that so
+    // a single unresponsive slot cannot freeze far slower sensors (name, DPI)
+    // that follow.  Isolated misses are still skipped and the run continues.
+    int consecutive_timeouts = 0;
     for (uint16_t i = 1; i < count; ++i) {
         if (i == fs->params[0]) continue;
         // GetFeatureId has one parameter byte, so the request is short even
@@ -1023,7 +1111,11 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
         const auto metadata = frsp
             ? hidpp_parse_feature_metadata(static_cast<uint8_t>(i), *frsp)
             : std::nullopt;
-        if (!metadata) continue;
+        if (!metadata) {
+            if (++consecutive_timeouts >= 3) break;
+            continue;
+        }
+        consecutive_timeouts = 0;
         const uint16_t fid = metadata->feature_id;
         features.push_back(*metadata);
         std::lock_guard lock(feature_mutex_);
@@ -1175,13 +1267,25 @@ std::optional<hidpp_device_info> HidppTransport::get_device_info(uint8_t target_
                 info.wireless_pid = take_id(0x04);
                 info.usb_id = take_id(0x08);
             }
-            for (uint8_t index = 0; index < (*count)[0]; ++index) {
+            // The advertised record count is untrusted (up to 255).  Real
+            // devices expose at most a handful of firmware records and a
+            // device that stops replying mid-loop would stall the daemon for
+            // minutes (700 ms × 255 ≈ 3 min).  Cap the iteration and bail
+            // after 3 consecutive timeouts, mirroring the feature-metadata
+            // guard.
+            const uint8_t record_count = std::min<uint8_t>((*count)[0], 8);
+            int consecutive_timeouts = 0;
+            for (uint8_t index = 0; index < record_count; ++index) {
                 const uint8_t param = index;
                 auto record = feature_request(
                     static_cast<uint16_t>(hidpp_feature_index::device_fw_version),
                     0x10, &param, 1, std::chrono::milliseconds(700),
                     target_device_index);
-                if (!record) continue;
+                if (!record) {
+                    if (++consecutive_timeouts >= 3) break;
+                    continue;
+                }
+                consecutive_timeouts = 0;
                 if (auto parsed = hidpp_parse_firmware_record(*record)) {
                     info.firmware_records.push_back(*parsed);
                     if (info.firmware_name.empty() &&
@@ -1289,7 +1393,7 @@ std::vector<hidpp_pairing_slot> HidppTransport::get_pairing_info(uint8_t target_
              product_id_ == 0xc525 || product_id_ == 0xc526 ||
              product_id_ == 0xc52e || product_id_ == 0xc52f ||
              product_id_ == 0xc531 || product_id_ == 0xc535 ||
-             product_id_ == 0xc542 || product_id_ == 0xc539 ||
+             product_id_ == 0xc539 ||
              product_id_ == 0xc53a || product_id_ == 0xc53d ||
              product_id_ == 0xc53f || product_id_ == 0xc541 ||
              product_id_ == 0xc545 || product_id_ == 0xc547 ||
@@ -1401,27 +1505,10 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
                 list_bytes[list_bytes.size() - 2] == 0)
                 break;
         }
-        for (size_t i = 0; i + 1 < list_bytes.size(); i += 2) {
-            const uint16_t value = read_be16(&list_bytes[i]);
-            if (value == 0) break;
-            // 0xE000..0xFFFF denotes a step/last pair in Logitech's DPI
-            // list encoding (Solaar's produce_dpi_list uses the same rule).
-            if ((value >> 13) == 0x07 && i + 3 < list_bytes.size()) {
-                const uint16_t step = value & 0x1FFF;
-                const uint16_t last = read_be16(&list_bytes[i + 2]);
-                if (step != 0 && !info.dpi_levels.empty() &&
-                    last > info.dpi_levels.back()) {
-                    uint32_t next = static_cast<uint32_t>(info.dpi_levels.back()) + step;
-                    for (; next <= last; next += step) {
-                        if (next > 0xFFFF) break; // guard against uint32→uint16 truncation
-                        info.dpi_levels.push_back(static_cast<uint16_t>(next));
-                    }
-                }
-                i += 2;
-            } else {
-                info.dpi_levels.push_back(value);
-            }
-        }
+        // The scan helper terminates when the terminator is reached; a
+        // 0xE000+ step-marker pair at the tail is also handled by
+        // decode_dpi_levels (never pushed raw).
+        info.dpi_levels = decode_dpi_levels(list_bytes);
         if (!info.dpi_levels.empty()) {
             info.dpi_min = info.dpi_levels.front();
             info.dpi_max = info.dpi_levels.back();
@@ -1450,11 +1537,9 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
                 list_bytes[list_bytes.size() - 2] == 0)
                 break;
         }
-        for (size_t i = 0; i + 1 < list_bytes.size(); i += 2) {
-            const uint16_t value = read_be16(&list_bytes[i]);
-            if (value == 0) break;
-            info.dpi_levels.push_back(value);
-        }
+        // Same encoding as the extended path: 0xE000+ step markers that the
+        // legacy fallback previously pushed raw are now expanded correctly.
+        info.dpi_levels = decode_dpi_levels(list_bytes);
         if (!info.dpi_levels.empty()) {
             info.dpi_min = info.dpi_levels.front();
             info.dpi_max = info.dpi_levels.back();
@@ -1496,11 +1581,16 @@ HidppTransport::get_onboard_profile_headers(uint8_t target_device_index) {
     auto read_headers = [&](uint8_t storage) {
         std::vector<hidpp_onboard_profile_header> result;
         for (uint8_t i = 0; i < info->profile_count; ++i) {
+            // Profile headers are read with ONBOARD_PROFILES fn 0x50, whose
+            // params are [memory:0x00 RAM / 0x01 ROM, 0, 0, index*4] (Solaar
+            // hidpp20.OnboardProfiles.get_profile_headers).  Solaar also uses
+            // fn 0x50 for raw sector reads, so this is not the register
+            // style 0x05 — using 0x05 here was silently rejected by devices.
             const uint8_t params[4] = {storage, 0, 0,
                                        static_cast<uint8_t>(i * 4)};
             const auto reply = feature_request(
                 static_cast<uint16_t>(hidpp_feature_index::onboard_profiles),
-                0x05, params, sizeof(params), std::chrono::milliseconds(700),
+                0x50, params, sizeof(params), std::chrono::milliseconds(700),
                 target_device_index);
             if (!reply || reply->size() < 3) return result;
             if ((*reply)[0] == 0xFF && (*reply)[1] == 0xFF) break;
@@ -1533,6 +1623,8 @@ HidppTransport::read_onboard_profile_sector(
     std::vector<uint8_t> result;
     result.reserve(size);
     for (size_t offset = 0; offset < size; offset += 16) {
+        // Sectors are read with ONBOARD_PROFILES fn 0x50 (Solaar's
+        // read_sector), params [sector_hi, sector_lo, offset_hi, offset_lo].
         const uint8_t params[4] = {
             static_cast<uint8_t>(sector >> 8),
             static_cast<uint8_t>(sector),
@@ -1541,7 +1633,7 @@ HidppTransport::read_onboard_profile_sector(
         };
         const auto reply = feature_request(
             static_cast<uint16_t>(hidpp_feature_index::onboard_profiles),
-            0x05, params, sizeof(params), std::chrono::milliseconds(700),
+            0x50, params, sizeof(params), std::chrono::milliseconds(700),
             target_device_index);
         if (!reply || reply->empty()) return std::nullopt;
         const size_t wanted = std::min<size_t>(16, size - offset);
@@ -1700,7 +1792,8 @@ std::vector<std::string> discover_logitech_hidraw_devices() {
         if (name.rfind("hidraw", 0) != 0) continue;
 
         std::string path = p.string();
-        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+        // ORTA-BUG-TRANSPORT-02: add O_CLOEXEC to the discovery ioctl fd too.
+        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) continue;
 
         struct hidraw_devinfo info;

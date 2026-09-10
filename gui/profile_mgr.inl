@@ -63,6 +63,7 @@ static std::string preset_preview_text(const std::string& preset) {
     case accel_mode::classic:     mode = tr("Classic");      break;
     case accel_mode::natural:     mode = tr("Natural");      break;
     case accel_mode::noaccel:     mode = tr("None (1:1)");   break;
+    default:                      mode = tr("Unknown");      break;
     }
     auto dfmt = [](double v) {
         std::ostringstream os;
@@ -506,6 +507,13 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     if (!g_file_get_contents(path, &data, &len, &err)) {
         set_status(S, trf("Import failed: %s", err ? err->message : "read error"));
         g_clear_error(&err);
+        g_free(path);
+        return;
+    }
+    constexpr gsize MAX_IMPORT_BYTES = 4 * 1024 * 1024; // 4 MiB
+    if (len > MAX_IMPORT_BYTES) {
+        set_status(S, tr("Import failed: file too large."));
+        g_free(data);
         g_free(path);
         return;
     }

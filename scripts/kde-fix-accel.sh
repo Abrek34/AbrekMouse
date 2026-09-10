@@ -181,9 +181,42 @@ case "$MODE" in
     PROFILE=$(get_current_profile)
     echo "  kwinrc: $KWINRC"
     echo "  PointerAccelerationProfile: '${PROFILE:-not set}'"
-    if [[ "$PROFILE" == "1" ]]; then
+    # BUG-NEW-84: also verify every per-device (RawAccel) override section is
+    # Flat.  A per-device override shadows the global [Libinput] section, so
+    # a global check alone can report "✓ Flat" while a (RawAccel) device is
+    # still adaptive → silent double-acceleration on that device.
+    nonflat=0
+    if command -v python3 &>/dev/null; then
+        nonflat=$(python3 - "$KWINRC" << 'PYEOF'
+import sys, re
+kwinrc = sys.argv[1]
+try:
+    with open(kwinrc) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    sys.exit(0)
+header = re.compile(r"^\[Libinput\](?:\[[^\]]*\]){3,4}\[[^\]]*\(RawAccel\)\]$")
+cur = None
+bad = 0
+for line in lines:
+    line = line.rstrip("\n")
+    if line.startswith("["):
+        cur = bool(header.match(line))
+        continue
+    if cur and line.startswith("PointerAccelerationProfile") and not line.startswith("PointerAccelerationProfile=1"):
+        bad += 1
+print(bad)
+PYEOF
+)
+    fi
+    if [[ "$PROFILE" == "1" ]] && [[ "$nonflat" -eq 0 ]]; then
         echo "  ✓ Flat (disabled) — correct for RawAccel."
         exit 0
+    elif [[ "$PROFILE" == "1" ]]; then
+        echo "  ⚠ Global profile is Flat, but $nonflat per-device (RawAccel)"
+        echo "    override(s) are NOT Flat — double-acceleration on those devices!"
+        echo "  Run: bash scripts/kde-fix-accel.sh"
+        exit 1
     else
         echo "  ⚠ NOT flat — double-acceleration will occur with RawAccel!"
         echo "  Run: bash scripts/kde-fix-accel.sh"
@@ -225,7 +258,13 @@ except FileNotFoundError:
     sys.exit(0)
 
 # 1) Drop every nested per-device (RawAccel) override section.
-header = re.compile(r"^\[Libinput\](?:\[[^\]]*\]){4}\[[^\]]*\(RawAccel\)\]$")
+# BUG-NEW-83: the writer (script + GUI) emits
+#   [Libinput][bus][vid][pid][Name (RawAccel)]
+# i.e. THREE groups between [Libinput] and the name.  The old `{4}` regex
+# demanded four and therefore never matched any real section, so --remove
+# left the per-device (RawAccel) overrides in kwinrc while printing "✓".
+# Match 3 or 4 groups to be robust across KWin's historical formats.
+header = re.compile(r"^\[Libinput\](?:\[[^\]]*\]){3,4}\[[^\]]*\(RawAccel\)\]$")
 lines = text.split("\n")
 out, i, skip = [], 0, False
 while i < len(lines):

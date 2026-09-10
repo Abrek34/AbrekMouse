@@ -120,11 +120,16 @@ struct power {
         // at/under offset.x).  Previously the offset check ran before the cap
         // check, so when output_offset > cap_y (offset.x > cap.x) the cap tail
         // was unreachable and the requested cap was silently ignored.
+        // ORTA-BUG-ALG-02: GAIN path had no local Inf guard — pow(scale·x, exp)
+        // overflows to Inf for extreme inputs, and the value propagated to the
+        // downstream modifier.  All other accel modes guard locally; match them.
+        double out;
         if (speed < cap_x) {
-            return base_fn_impl(speed);
+            out = base_fn_impl(speed);
         } else {
-            return cap_y + constant_b / speed;
+            out = cap_y + constant_b / speed;
         }
+        return std::isfinite(out) ? out : 1.0;
     }
 
 private:
@@ -167,6 +172,12 @@ private:
     }
 
     static double integration_constant(double input, double gain, double output) {
+        // Avoid catastrophic cancellation when output ≈ gain:
+        // (output - gain) * input is unreliable for large values.
+        // When the difference is negligible relative to gain, the curve is
+        // essentially flat in the cap region — return 0 (no tail needed).
+        if (gain > 0 && std::fabs(output - gain) < 1e-12 * gain)
+            return 0.0;
         return (output - gain) * input;
     }
 };

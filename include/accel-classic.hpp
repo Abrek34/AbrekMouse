@@ -125,7 +125,21 @@ private:
                     ? std::pow(a, args.exponent_classic - 1)
                     : 0.0;
             }
-            constant = (base_fn(cap_x, accel_raised, args) - cap_y) * cap_x;
+            // ORTA-BUG-ALG-03: base_fn(cap_x) can trip its own overflow guard
+            // (pow(·) → Inf → returns 0.0) even when accel_raised > 0.  The
+            // constant (0 - cap_y)·cap_x then produces a mis-shaped tail
+            // (cap_y·(1 − cap_x/x)) that no longer matches the analytic curve
+            // — a C1 break at cap_x.  Degrade cap_y+constant to 0 so both the
+            // body and the tail stay "identity" instead of a wrong curve.
+            {
+                const double bf = base_fn(cap_x, accel_raised, args);
+                if (bf == 0.0 && accel_raised > 0.0) {
+                    cap_y = 0;
+                    constant = 0;
+                } else {
+                    constant = (bf - cap_y) * cap_x;
+                }
+            }
             break;
         case cap_mode::in:
             {
@@ -152,7 +166,14 @@ private:
                     if (cap_y < 0) { cap_y = -cap_y; sign = -sign; }
                     cap_x = gain_inverse(cap_y, args.acceleration,
                                          args.exponent_classic, args.input_offset);
-                    constant = (base_fn(cap_x, accel_raised, args) - cap_y) * cap_x;
+                    // ORTA-BUG-ALG-03: same guard as the io branch.
+                    const double bf2 = base_fn(cap_x, accel_raised, args);
+                    if (bf2 == 0.0 && accel_raised > 0.0) {
+                        cap_y = 0;
+                        constant = 0;
+                    } else {
+                        constant = (bf2 - cap_y) * cap_x;
+                    }
                 }
             }
             break;
@@ -192,7 +213,16 @@ private:
     static double gain_accel(double x, double y, double power, double offset) {
         double denom = offset - x;
         if (denom == 0) return 0; // degenerate
-        return -std::pow(y / power, 1.0 / (power - 1)) / denom;
+        // BUG-NEW-71: for power ≈ 1 the exponent 1/(power-1) explodes
+        // (power 1.001 → 1000) and pow(y/power, 1000) overflows to Inf
+        // whenever cap_y-1 > power (y/power > 1).  The caller's isfinite()
+        // guard then sets accel_raised = 0, silently collapsing the whole
+        // IO+GAIN curve to identity.  Clamp the exponent so the result
+        // stays finite and usable (64 keeps pow(y/power,·) finite for the
+        // sanitized cap range y ≤ CAP_Y_MAX-1 = 99, power ≥ 1).
+        double ex = 1.0 / (power - 1);
+        if (!(ex > 0) || ex > 64.0) ex = 64.0; // !(ex>0) also catches NaN/Inf
+        return -std::pow(std::fabs(y / power), ex) / denom;
     }
 };
 

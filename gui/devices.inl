@@ -1,6 +1,8 @@
 // ── Mouse device discovery (no root needed) ───────────────────────────────────
 #include <linux/input.h>
 #include <fcntl.h>
+#include <iomanip>
+#include <sstream>
 
 /// Resolve a /dev/input/eventN path to its stable /dev/input/by-id/... symlink.
 /// Returns the by-id path if found, otherwise returns the original event_node.
@@ -130,10 +132,16 @@ static std::vector<InputDeviceInfo> list_mice() {
         if (ioctl(tfd, EVIOCGID, &iid) >= 0 && (iid.vendor || iid.product)) {
             m.vendor  = iid.vendor;
             m.product = iid.product;
-            char buf[512];
-            snprintf(buf, sizeof(buf), "usb:%04x:%04x:%s",
-                     iid.vendor, iid.product, m.uniq.c_str());
-            m.stable_id = std::string(buf);
+            // M-BUG-5: a fixed char[] buffer truncated very long `uniq` serial
+            // strings (kernel serials are short in practice, but an attacker or
+            // exotic USB descriptor could overflow the snprintf truncation and
+            // produce a stable_id that no longer matches the daemon's).  Build
+            // the string dynamically instead.
+            std::ostringstream ss;
+            ss << "usb:" << std::hex << std::setfill('0') << std::nouppercase
+               << std::setw(4) << iid.vendor << ":"
+               << std::setw(4) << iid.product << ":" << m.uniq;
+            m.stable_id = ss.str();
         } else {
             m.stable_id = m.event_node; // fallback
         }

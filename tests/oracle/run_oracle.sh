@@ -16,6 +16,9 @@ CXX="${CXX:-g++}"
 STD="-std=c++20"
 
 TOL="${TOL:-1e-9}"   # relative tolerance on gain (identical math ⇒ ~1e-15)
+# Validate TOL is numeric
+[[ "$TOL" =~ ^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
+    || { echo "Hata: TOL geçerli bir sayı değil: '$TOL'" >&2; exit 2; }
 VERBOSE=0
 # P114 BUG-E: --tolerance <val> flag'i gerçekten parse ediliyor (TOL env korunur).
 while [ $# -gt 0 ]; do
@@ -48,9 +51,9 @@ echo "[oracle] compiling local port ..."
     "$HERE/local.cpp" -o "$work/local_bin" || exit 1
 
 echo "[oracle] running reference ..."
-"$work/ref_bin"   > "$work/ref.out"
+"$work/ref_bin"   > "$work/ref.out" || { echo "Hata: reference binary crashed (exit $?)" >&2; exit 1; }
 echo "[oracle] running local port ..."
-"$work/local_bin" > "$work/local.out"
+"$work/local_bin" > "$work/local.out" || { echo "Hata: local binary crashed (exit $?)" >&2; exit 1; }
 
 known_set_file="$HERE/known_deviations.txt"
 

@@ -1,8 +1,13 @@
+// Linux-only project; glibc keeps fstat()/stat() (and O_PATH semantics) behind
+// the __USE_GNU/__USE_XOPEN2K8 feature gates.  M-BUG-14 uses fstat() to copy a
+// config's existing permission bits, so expose the declarations explicitly.
+#define _GNU_SOURCE 1
 #include "config.hpp"
 #include "nlohmann/json.hpp"
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <climits>
 #include <limits>
@@ -14,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 using json   = nlohmann::json;
@@ -156,8 +162,16 @@ static accel_args accel_args_from_json(const json& j) {
             if (cap[1].is_number()) a.cap.y = cap[1].get<double>();
         }
     }
-    if (j.contains("cap_mode") && j["cap_mode"].is_string())
-        a.cap_mode_val = str_to_cap(j["cap_mode"].get<std::string>());
+    if (j.contains("cap_mode") && j["cap_mode"].is_string()) {
+        // BUG-NEW-85: whitelist cap_mode just like mode — an unknown/typo
+        // string must not silently map to cap_mode::out (which changes the
+        // io behavior of classic/power/synchronous and runs a different curve
+        // branch).  Symmetric with the mode validation above.
+        const std::string cap_str = j["cap_mode"].get<std::string>();
+        if (cap_str != "in" && cap_str != "out" && cap_str != "io")
+            throw std::runtime_error("unknown cap_mode: '" + cap_str + "'");
+        a.cap_mode_val = str_to_cap(cap_str);
+    }
     if (j.contains("lut_data") && j["lut_data"].is_array() &&
         j.contains("lut_length") &&
         a.mode == accel_mode::lookup) {
@@ -251,8 +265,10 @@ static profile profile_from_json_obj(const json& j) {
             if (rw[1].is_number()) p.range_weights.y = rw[1].get<double>();
         }
     }
-    if (j.contains("accel_x")) p.accel_x = accel_args_from_json(j["accel_x"]);
-    if (j.contains("accel_y")) p.accel_y = accel_args_from_json(j["accel_y"]);
+    if (j.contains("accel_x") && j["accel_x"].is_object())
+        p.accel_x = accel_args_from_json(j["accel_x"]);
+    if (j.contains("accel_y") && j["accel_y"].is_object())
+        p.accel_y = accel_args_from_json(j["accel_y"]);
     if (j.contains("output_dpi") && j["output_dpi"].is_number())
         p.output_dpi = j["output_dpi"].get<double>();
     if (j.contains("yx_output_dpi_ratio") && j["yx_output_dpi_ratio"].is_number())
@@ -270,7 +286,7 @@ static profile profile_from_json_obj(const json& j) {
     if (j.contains("ud_output_dpi_ratio") && j["ud_output_dpi_ratio"].is_number())
         p.ud_output_dpi_ratio = j["ud_output_dpi_ratio"].get<double>();
 
-    if (j.contains("speed_processor")) {
+    if (j.contains("speed_processor") && j["speed_processor"].is_object()) {
         auto& sp_j = j["speed_processor"];
         auto& sp   = p.speed_processor_args;
         if (sp_j.contains("whole") && sp_j["whole"].is_boolean())
@@ -558,7 +574,8 @@ static device_profile device_profile_from_json(const json& j) {
     if (j.contains("polling_rate")) dp.dev_cfg.polling_rate = json_get_int_safe(j["polling_rate"], 1000);
     if (j.contains("disable"))      dp.dev_cfg.disable = j["disable"].is_boolean()
                                                          ? j["disable"].get<bool>() : false;
-    if (j.contains("profile"))      dp.prof          = profile_from_json_obj(j["profile"]);
+    if (j.contains("profile") && j["profile"].is_object())
+        dp.prof = profile_from_json_obj(j["profile"]);
     // Clamp to safe ranges after loading
     sanitize_device_config(dp.dev_cfg);
     sanitize_profile(dp.prof);
@@ -579,8 +596,13 @@ static app_config app_config_from_json_obj(const json& j) {
     if (j.contains("version") && j["version"].is_string())
         cfg.version = j["version"].get<std::string>();
 
-    if (j.contains("active_profile") && j["active_profile"].is_string())
-        cfg.active_profile = j["active_profile"].get<std::string>();
+    // N-17: the active profile name is matched against profile names, so cap it
+    // like the name/device_id fields (MAX_NAME_LEN) to keep profiles.jsons
+    // names bounded.
+    if (j.contains("active_profile") && j["active_profile"].is_string()) {
+        const std::string value = j["active_profile"].get<std::string>();
+        cfg.active_profile = value.substr(0, MAX_NAME_LEN);
+    }
     if (j.contains("use_raw_input") && j["use_raw_input"].is_boolean())
         cfg.use_raw_input = j["use_raw_input"].get<bool>();
 
@@ -648,15 +670,33 @@ void save_config(const app_config& cfg, const std::string& path) {
     std::string tmp_path = path + "." + std::to_string(::getpid()) + ".tmp";
     {
         std::string content = j.dump(4) + "\n";
+        // M-BUG-14: a blanket 0644 on the temp file silently widened an
+        // existing 0600 config to world-readable after the rename.  Preserve
+        // the current file's permission bits when present; fall back to 0600
+        // (settings files contain no secrets, but least-privilege is the
+        // safer default) for first-time saves.
+        //
+        // Note: uses open(O_PATH)+fstat rather than the POSIX stat() call —
+        // unistd.h's forward-declared `struct stat` tag makes the plain
+        // `::stat(...)` expression unwieldy, and O_PATH avoids needing read
+        // permission on the target.  O_NOFOLLOW keeps the B3 symlink rule:
+        // we only ever copy the mode of a path we could otherwise write.
+        struct stat pst = {};
+        mode_t mode = 0600;
+        int pfd = ::open(path.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
+        if (pfd >= 0) {
+            if (::fstat(pfd, &pst) == 0) mode = pst.st_mode & 0777;
+            ::close(pfd);
+        }
         int fd = ::open(tmp_path.c_str(),
-                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
         if (fd < 0 && errno == EEXIST) {
             // Stale temp from an earlier aborted save in this process — it is
             // ours (pid-suffixed) and guaranteed non-symlink only if unlinked
             // right here; retry once before giving up.
             ::unlink(tmp_path.c_str());
             fd = ::open(tmp_path.c_str(),
-                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
         }
         if (fd < 0)
             throw std::runtime_error("Cannot write temp config: " + tmp_path +
@@ -800,13 +840,9 @@ static void migrate_lookup_gain(app_config& cfg) {
                 if (!(x > 0)) continue; // first point at speed 0 stays (velocity division is guarded)
                 a.data[i * 2 + 1] = static_cast<float>(y * x);
             }
-            // Odd-length LUT: migrate the trailing unpaired element too
-            if (a.length % 2 != 0) {
-                int last = a.length - 1;
-                double y = a.data[last];
-                if (y != 0.0f) // only if non-zero (avoid clobbering sentinel)
-                    a.data[last] = static_cast<float>(y); // no x to multiply — keep as-is
-            }
+            // ORTA-BUG-MOTION-04: the odd-length trailing element needs no
+            // migration — it is unpaired (no x to multiply), so leave it as-is.
+            // (Previously a dead `y = data[last]; data[last] = y;` no-op.)
         };
         fix(dp.prof.accel_x);
         fix(dp.prof.accel_y);
@@ -824,15 +860,27 @@ static bool version_lt(const std::string& lhs, const std::string& rhs) {
             const std::string tok = (pos == std::string::npos) ? v.substr(start) : v.substr(start, pos - start);
             if (tok.empty()) return false;
             char* end = nullptr;
+            errno = 0;
             const unsigned long n = std::strtoul(tok.c_str(), &end, 10);
+            // BUG-NEW-70: strtoul overflow (ERANGE) sets errno and returns
+            // ULONG_MAX WITHOUT touching end — a value like "99999999999"
+            // falls through as ULONG_MAX and `static_cast<int>` is UB.
+            // Clamp to the int range instead of relying on the cast.
+            if (errno == ERANGE || end == tok.c_str())
+                return false;
             if (end && *end != '\0') return false;
-            out[part++] = static_cast<int>(n);
+            out[part++] = static_cast<int>(std::min<unsigned long>(n, INT_MAX));
             if (pos != std::string::npos) start = pos + 1;
         }
         return part > 0;
     };
     std::array<int,3> a = {0,0,0}, b = {0,0,0};
-    if (!parse(lhs, a) || !parse(rhs, b)) return false;
+    // YÜKSEK-BUG-MOTION-02: a corrupt/unparseable STORED version (e.g. "abc")
+    // must be treated as "older than any real version" so migration still runs.
+    // Previously parse() failure → false here silently skipped ALL migrations,
+    // leaving pre-0.4 lookup+gain data permanently unmigrated.
+    if (!parse(lhs, a)) return true; // corrupt lhs → older than everything
+    if (!parse(rhs, b)) return false; // corrupt rhs never compares less
     if (a[0] != b[0]) return a[0] < b[0];
     if (a[1] != b[1]) return a[1] < b[1];
     return a[2] < b[2];
@@ -858,7 +906,7 @@ bool migrate_config(app_config& cfg) {
     }
 
     // Migration from 0.2.x to 0.3.0
-    if (cfg.version == "0.2.0" || cfg.version == "0.2.1") {
+    if (version_lt(cfg.version, "0.3.0")) {
         // No breaking changes in 0.3.0, just new fields (version)
         // The struct default values handle new fields
         migrated = true;

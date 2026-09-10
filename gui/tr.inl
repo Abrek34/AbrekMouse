@@ -90,6 +90,7 @@ static const char* tr(const char* key) {
             {"Export failed: %s",               "Dışa aktarma hatası: %s"},
             {"Import failed: invalid profile JSON — %s", "İçe aktarma hatası: geçersiz profil JSON — %s"},
             {"Import failed: profile has no \"name\".", "İçe aktarma hatası: profilin \"name\" alanı yok."},
+            {"Import failed: file too large.", "İçe aktarma hatası: dosya çok büyük."},
             {"Import failed: profile \"%s\" already exists.", "İçe aktarma hatası: \"%s\" profili zaten var."},
             {"Import failed: %s",               "İçe aktarma hatası: %s"},
             {"Imported profile: %s",            "Profil içe aktarıldı: %s"},
@@ -322,9 +323,9 @@ static const char* tr(const char* key) {
              "Kazanç (×):"},
             {"Pointer is locked inside this fullscreen test window.\nMove the mouse to see live speed/gain.\nPress ESC to release.",
              "İmleç bu tam ekran test penceresinin içine kilitli.\nCanlı hız/kazanç için fareyi hareket ettirin.\nKilit ESC ile bırakılır."},
-            {"Pointer grab failed — the cursor is confined as best effort (imleç kilidi yok).\nMove the mouse to see live speed/gain.\nPress ESC to release.",
+            {"Pointer grab failed — the cursor is confined as best effort (no pointer lock).\nMove the mouse to see live speed/gain.\nPress ESC to release.",
              "İmleç yakalama başarısız — imleç en iyi çabayla sınırlanıyor (imleç kilidi yok).\nCanlı hız/kazanç için fareyi hareket ettirin.\nKilit ESC ile bırakılır."},
-            {"Pointer lock unavailable — imleç kilidi yok: this Wayland session cannot grab the pointer.\nThe cursor is NOT locked inside this window (fullscreen coverage only).\nMove the mouse, then press ESC to close.",
+            {"Pointer lock unavailable — no pointer lock: this Wayland session cannot grab the pointer.\nThe cursor is NOT locked inside this window (fullscreen coverage only).\nMove the mouse, then press ESC to close.",
              "İmleç kilidi yok — bu Wayland oturumu imleci yakalayamıyor.\nİmleç bu pencerenin içine kilitlenmiş DEĞİL (yalnızca tam ekran kapsamı).\nFareyi hareket ettirin, ardından kapatmak için ESC'ye basın."},
             {"Awaiting motion…",
              "Hareket bekleniyor…"},
@@ -503,12 +504,19 @@ static const char* tr(const char* key) {
 /// trf(key, ...) — format the *current-language* rendering of a source string.
 static std::string trf(const char* key, ...) {
     const char* fmt = tr(key);
-    char buf[2048];
     va_list ap;
     va_start(ap, key);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    // Two-pass: first measure, then format into exact-size buffer.
+    va_list ap2;
+    va_copy(ap2, ap);
+    int needed = vsnprintf(nullptr, 0, fmt, ap);
     va_end(ap);
-    return std::string(buf);
+    if (needed < 0) { va_end(ap2); return fmt; }
+    std::string buf(static_cast<size_t>(needed) + 1, '\0');
+    vsnprintf(buf.data(), buf.size(), fmt, ap2);
+    va_end(ap2);
+    buf.resize(static_cast<size_t>(needed));
+    return buf;
 }
 
 /// Create-and-register helpers for persistent (window-lifetime) widgets.

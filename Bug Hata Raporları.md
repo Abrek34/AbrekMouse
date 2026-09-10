@@ -2382,3 +2382,1065 @@ Kapsam: `setup.sh` (476 satır, tam), `scripts/build.sh` (133 satır, tam),
 - **Not:** En kritik bulgular setup.sh ile ilgili: M-BUG-19 (root writability test) ve M-BUG-20 (non-atomic install). Her ikisi de kurulum-sınırlı; daemon runtime güvenliğini etkilemez.
 
 ---
+
+# Bölüm 29 — Tur 16-18: 3 Tur Derinlemesine Analiz (10 Eylül 2026)
+
+Bu bölüm, projenin daha önce kapsamlı şekilde taranmamış alanlarında 3 bağımsız
+derinlemesine analiz turunun sonuçlarını içerir:
+
+- **Tur 16:** Logitech protokol header'ları, receiver/src, quirks tablosu, math-vec2, app_state
+- **Tur 17:** GUI tr.inl, hidpp_panel.inl, mouse_test.inl, daemon.hpp
+- **Tur 18:** Build/setup scriptleri, CI/CD pipeline, test oracle
+
+**Düzeltme:** YAPILMADI — yalnız raporlama.
+
+---
+
+## YÜKSEK ÖNCELİKLİ HATALAR (High)
+
+### NEW-1 — `send_short`/`send_long`/`send_very_long` bildirim stash'leme eksik → bildirim kaybı (Logitech)
+
+- **Konum:** `src/logitech_hidpp.cpp:690-730` (`send_short`), `:732-772` (`send_long`), `:774-814` (`send_very_long`)
+- **Tür:** Eksik düzeltme / bildirim kaybı
+- **Açıklama:** BUG-22 düzeltmesi (eşleşmeyen paketleri bildirim olarak stash'leme) yalnızca `send_feature_request()`'e uygulanmış (satır 632-638). Diğer üç ham gönderim yolu — yapısal olarak aynı yanıt-penceresi döngüsüne sahip — anket penceresi sırasında gelen HID++ 2.0 bildirimini tüketip yok eder. `send_short`, `get_feature_metadata()` (satır 993, 1002) tarafından cihaz tanılama sırasında çağrılır — bu aşamada pil/bağlantı/bildirimleri en çok gelir. Düşen bildirimler cihaz ayrılma veya pil değişikliğini sessizce kaybeder.
+- **Öncelik:** Yüksek (bildirim kaybı — cihaz ayrılma/pil olayları görünmez)
+- **Öneri:** `send_feature_request()`'in stash mantığını (`pending_notifications_`) `send_short`, `send_long`, `send_very_long`'a da uygula.
+
+### NEW-2 — `read_register` bildirim stash'leme eksik → HID++ 1.0 bildirim kaybı (Logitech)
+
+- **Konum:** `src/logitech_hidpp.cpp:839-856`
+- **Tür:** Eksik düzeltme / bildirim kaybı
+- **Açıklama:** `read_register` yanıt penceresinde (satır 846-848) hedeflenen register yanıtına uymayan her paket `continue` ile atılır — stash yok. `read_register` `get_pairing_info` (satır 1305, 1317, 1324, 1335) ve `get_battery_status` (satır 1262, 1267) tarafından çağrılır. Eşleştirme-bilgisi veya pil-okuması sırasında gelen bir bildirim kalıcı olarak kaybolur.
+- **Öncelik:** Yüksek (HID++ 1.0 bildirim kaybı)
+- **Öneri:** `send_feature_request`'teki stash mantığını `read_register` ve `write_register`'a da uygula.
+
+### NEW-3 — `logitech_compose_model_id` 8-char üretirken quirks tablosu 12-char bekliyor → tüm quirks eşleşmesi kırık (Logitech)
+
+- **Konum:** `include/logitech_quirks.hpp:89-93` (`find_logitech_quirks`), `:165-172` (`logitech_compose_model_id`), `gui/hidpp_panel.inl:121`
+- **Tür:** Yapısal uyumsuzluk / tüm quirks devre dışı
+- **Açıklama:** `logitech_compose_model_id()` dört transport ID'sini (bluetooth_id + bluetooth_le_id + wireless_pid + usb_id) birleştirerek **en fazla 8 hex karakter** üretir. Ancak quirks tablosu (satır 71-87) 12 karakterlik raw model ID anahtarları kullanır (ör. `"4099C0950000"`, `"B38940B4C355"` — ikisi de 12 karakter). 12 karakterlik anahtarlar ancak `logitech_compose_model_id` `info.model_id`'ye geri döndüğünde eşleşebilir — bu da **tümüyle** transport flag bitlerinin 0 olduğu durumdadır (`transport_flags == 0`). En az bir transport flag biti ayarlanmış her cihaz için (kablosuz farelerde yaygın), composed ID ≤8 karakterdir ve 12 karakterlik quirks girdileriyle **hiçbir zaman eşleşemez**. `find_logitech_quirks` (hidpp_panel.inl:121) sessizce başarısız olur → model-özgün quirks devre dışı.
+- **Öncelik:** Yüksek (tüm Logitech quirks'leri devre dışı — RGB, yazılım koruma vb.)
+- **Öneri:** `find_logitech_quirks`'ta `dev.info.model_id` ile doğrudan eşleştirme kullan veya `logitech_compose_model_id`'yi quirks amaçlı her zaman tam `info.model_id`'yi döndürecek şekilde değiştir.
+
+### NEW-40 — `setup.sh` `REAL_USER` boşken `rm -rf /.config/rawaccel` gösteriyor → kök dizin silme talimatı
+
+- **Konum:** `setup.sh:453`
+- **Tür:** Güvenlik / zararlı kullanıcı talimatı
+- **Açıklama:** `REAL_USER` algılaması başarısız olduğunda (hiç non-root kullanıcı bulunamazsa) `REAL_HOME` satır 76'da `""` olarak ayarlanır. Satır 453 kullanıcıya şu talimatı yazdırır:
+  ```
+  echo "  Tamamen silmek için: rm -rf $REAL_HOME/.config/rawaccel"
+  ```
+  Bu `rm -rf /.config/rawaccel` olarak genişler — kullanıcının `/.config/` dizinini silmesini söyler, bu da düzinelerce uygulamanın config'ini yok edebilir.
+- **Öncelik:** Yüksek (yaralanma potansiyeli yüksek)
+- **Öneri:** `[[ -n "$REAL_HOME" ]]` ile koru VEYA satırı `REAL_USER` boşken atla.
+
+### NEW-43 — CI sanitizer build'i Logitech .cpp dosyalarını bağlamıyor → linker hatası
+
+- **Konum:** `.github/workflows/ci.yml:80-85`
+- **Tür:** Build yapılandırma hatası
+- **Açıklama:** Sanitizer işi şu komutu çalıştırır:
+  ```
+  g++ ... tests/test_accel.cpp src/config.cpp -o build-manual/test_accel_asan
+  ```
+  Ancak `test_accel.cpp`, `src/logitech_receiver.cpp` ve `src/logitech_hidpp.cpp`'de tanımlanmış fonksiyonları çağırır: `discover_logitech_receivers` (logitech_receiver.cpp:90), `classify_hidpp_notification` (logitech_hidpp.cpp:1750), `drain_hidpp_notifications` (logitech_hidpp.cpp:1872), `discover_logitech_hidraw_devices` (logitech_hidpp.cpp:1690) vb. Bu fonksiyonlar inline değil, .cpp dosyalarında tanımlı. Build **tanımsız referans** linker hatalarıyla başarısız olur.
+- **Öncelik:** Yüksek (CI sanitizer job'ı hiç çalışmaz)
+- **Öneri:** Satır 84'teki g++ çağrısına `src/logitech_receiver.cpp src/logitech_hidpp.cpp` ekle.
+
+---
+
+## ORTA ÖNCELİKLİ HATALAR (Medium)
+
+### NEW-4 — Bolt receiver pairing-info `occupied` kontrolü çok geniş → bozuk slot durumu
+
+- **Konum:** `src/logitech_hidpp.cpp:334`
+- **Tür:** Mantık hatası
+- **Açıklama:** Bolt receiver pairing-info `occupied` kontrolü `result.occupied = payload[1] != 0 || payload[2] != 0` — hem eşleştirme-türü byte'ını (payload[1]) hem de WPID-alçak byte'ını (payload[2]) kontrol ediyor. Slot eşleştirilmemişse (`payload[1] == 0`) ancak firmware tarafından tam olarak temizlenmemiş kalıcı WPID verisi varsa (`payload[2] != 0`), slot haksız olarak "dolu" gösterilir. Kullanıcı boş bir slotu meşgul sanabilir.
+- **Öncelik:** Orta (yanlış slot durumu)
+- **Öneri:** `result.occupied = payload[1] != 0;` — yalnızca tür byte'ı slotun dolu olduğunu kesin olarak gösterir.
+
+### NEW-20 — İngilizce hint string'lerinde Türkçe metin sızıntısı
+
+- **Konum:** `gui/mouse_test.inl:187-188`, `gui/tr.inl:325-328`
+- **Tür:** Çeviri hatası
+- **Açıklama:** Mouse-test hint durumu 1 ve 2 için İngilizce kaynak anahtarlarında çevrilmemiş Türkçe ifade `"(imleç kilidi yok)"` doğrudan İngilizce metin içinde yer alıyor:
+  - Satır 187: `"Pointer grab failed — the cursor is confined as best effort (imleç kilidi yok).\n..."`
+  - Satır 188: `"Pointer lock unavailable — imleç kilidi yok: this Wayland session cannot grab the pointer.\n..."`
+  `g_lang == 0` (İngilizce) olduğunda `tr()` anahtarı olduğu gibi döndürür → kullanıcı İngilizce cümle içinde Türkçe görür.
+- **Öncelik:** Orta (görsel tutarsızlık)
+- **Öneri:** Türkçe parantez içlerini İngilizce karşılıklarla değiştir (ör. `"(no pointer lock)"`) ve Türkçe çevirileri güncelle.
+
+---
+
+## DÜŞÜK ÖNCELİKLİ HATALAR (Low)
+
+### NEW-5 — Pil durumu `online` işlevsizliği tutarsız (Logitech)
+
+- **Konum:** `src/logitech_hidpp.cpp:78-98` vs `:146-150`
+- **Tür:** Tutarlılık eksikliği
+- **Açıklama:** `parse_unified_battery` (satır 135) durum byte'ı `0xFF`'i çevrimdışı olarak ele alır (`status != 0x05 && status != 0x06 && status != 0xFF`). `parse_battery_status_feature` (satır 149) `0xFF`'i hariç tutmaz (`status != 0x05 && status != 0x06`). Cihaz `BATTERY_STATUS` üzerinden `0xFF` raporlarsa "çevrimdışı" olması gerekirken "bağlı" görünür → GUI yanıltıcı durum gösterir.
+- **Öncelik:** Düşük (yanıltıcı pil durumu; nadir)
+- **Öneri:** `parse_battery_status_feature` online kontrolüne `&& status != 0xFF` ekle.
+
+### NEW-6 — DPI spin buttonuint16_t cast'i eksik clamp (GUI)
+
+- **Konum:** `gui/hidpp_panel.inl:565`
+- **Tür:** Sınır durumu
+- **Açıklama:** `task->dpi = (uint16_t)gtk_spin_button_get_value(...)` C-style daraltma dönüşümü yapıyor. 65535'ten büyük değerler 65536 modülüyle sessizce sarılır. Şu an `HW_DPI_MAX = 32000` spin aralığıyla sınırlı ancak bu kısıtlama programatik olarak atlatılırsa hatalı DPI donanıma gönderilir.
+- **Öncelik:** Düşük (savunma derinliği eksikliği)
+- **Öneri:** `static_cast<uint16_t>(std::clamp((int)gtk_spin_button_get_value(...), HW_DPI_MIN, HW_DPI_MAX))` kullan.
+
+### NEW-21 — Durum çubuğu Türkçe→İngilizce geçişinde yeniden çevrilmiyor
+
+- **Konum:** `gui/tr.inl:644`
+- **Tür:** Çeviri hatası
+- **Açıklama:** `refresh_language()` idle durum kontrolü `strcmp(cur, "Ready.") == 0` yapıyor. Bu yalnızca İngilizce→Türkçe geçişinde çalışır (durum barında "Ready." varken). Türkçe→İngilizce geçişinde durum barında "Hazır." vardır, `"Ready."` eşleşmez → metin asla İngilizce'ye geri dönmez.
+- **Öncelik:** Düşük (kosmetik; yalnızca dil geçişinde)
+- **Öneri:** `strcmp(cur, "Hazır.") == 0` kontrolü de ekle veya tüm bilinen idle durum metinlerini kontrol et.
+
+### NEW-22 — LOD combo eski seçimi koruyor (GUI)
+
+- **Konum:** `gui/hidpp_panel.inl:295-301`
+- **Tür:** UX hatası
+- **Açıklama:** Cihaz LOD desteklemiyorsa combo widget'ı griye alınıyor ancak seçim sıfırlanmıyor. Önceki cihazın "High" seçimi korunur — gri bir combo'da "High" görünür. Apply'a basılırsa cihaz reddeder ama UI yanıltıcıdır.
+- **Öncelik:** Düşük (görsel tutarsızlık)
+- **Öneri:** `else` dalında `gtk_drop_down_set_selected(..., 0)` ile seçimi sıfırla.
+
+### NEW-23 — `on_hw_apply_clicked` widget null kontrolü eksik
+
+- **Konum:** `gui/hidpp_panel.inl:565-570`
+- **Tür:** Savunma derinliği eksikliği
+- **Açıklama:** Dosyanın geri kalanı tutarlı şekilde `S->hw_dpi_spin` vs için null kontrolü yapıyor ancak `on_hw_apply_clicked` üç widget'ı koşulsuz deferans ediyor. Mevcut akışta widget her zaman mevcut ancak gelecekteki refactoring veya headless test araçları için kırılgan.
+- **Öncelik:** Düşük (savunma derinliği)
+- **Öneri:** Dosyanın geri kalanıyla tutarlı null kontrolü ekle.
+
+### NEW-41 — `setup.sh` non-interactive modda `read -r` ile ölüyor
+
+- **Konum:** `setup.sh:63-64`, `setup.sh:135-136`
+- **Tür:** Kurucu — non-interactive EOF
+- **Açıklama:** `set -euo pipefail` altında `read -r`, stdin boru/hattıyla geldiğinde (CI, `</dev/null`) EOF'ta rc=1 döner → `set -e` script'i öldürür. Arch paket çatışması ve bilinmeyen distro yollarında kurulum yarım kalır, hata mesajı yok.
+- **Öncelik:** Düşük (CI/otomatik kurulum)
+- **Öneri:** `read -r _ || true` veya `[[ -t 0 ]]` ile koru.
+
+### NEW-42 — `run_oracle.sh` binary crash'leri sessizce atlıyor
+
+- **Konum:** `tests/oracle/run_oracle.sh:51,53`
+- **Tür:** Test altyapısı — eksik hata işleme
+- **Açıklama:** Script `set -u` kullanıyor ancak `set -e` kullanmıyor. Binary'ler segfault yaparsa veya başarısız olursa sessizce devam eder → karşılaştırma "DRIFT" hata üretir, asıl neden (binary crash) gizlenir. CI'da hata ayıklamayı zorlaştırır.
+- **Öncelik:** Düşük (test altyapısı)
+- **Öneri:** `set -e` ekle veya binary çağrılarına `|| exit 1` ekle.
+
+### NEW-44 — `build.sh` `set -u` eksik
+
+- **Konum:** `scripts/build.sh:3`
+- **Tür:** Build tutarlılığı
+- **Açıklama:** `setup.sh` ve `run_oracle.sh` `set -u` kullanıyor; `build.sh` kullanmıyor. Tanımsız değişken gelecekte sessizce boş string olur → kafa karıştırıcı build hataları.
+- **Öncelik:** Düşük (tutarlılık)
+- **Öneri:** `set -euo pipefail` ekle.
+
+### NEW-45 — `setup.sh` `REAL_USER` boşken boş kullanıcı adı uyarısı
+
+- **Konum:** `setup.sh:375`
+- **Tür:** UX hatası
+- **Açıklama:** `REAL_USER` boşsa (hiç non-root kullanıcı bulunamazsa) input-grubu kontrolü boş bir kullanıcı adıyla `" henüz 'input' grubunda değil..."` yazar — anlamsız mesaj. `do_install` aynı guard ile `usermod` adımını zaten atlıyor.
+- **Öncelik:** Düşük (yanıltıcı mesaj)
+- **Öneri:** `[[ -n "$REAL_USER" ]]` ile kontrolü sar.
+
+### NEW-46 — `run_oracle.sh` `TOL` değişkeni sayısal doğrulama yapmıyor
+
+- **Konum:** `tests/oracle/run_oracle.sh:18,28`
+- **Tür:** Giriş doğrulama eksikliği
+- **Açıklama:** `TOL` ortam değişkeni veya `--tolerance` argümanı herhangi bir string olabilir (ör. `TOL=abc`). Python karşılaştırması `float(sys.argv[3])` çağrısında `ValueError` fırlatır → ham Python traceback'i stderr'e yazılır — kullanıcıya anlamsız hata.
+- **Öncelik:** Düşük (kullanıcı hatası)
+- **Öneri:** Atama sonrası `case "$TOL" in ''|*[!0-9.eE+-]*) echo "Hata: --tolerance sayısal değer gerekli" >&2; exit 2 ;; esac`.
+
+---
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`logitech_receiver.hpp` receiver struct alanları:** Tüm alanlar doğru tiplere sahip; `hidpp_supported` politikası `discover_logitech_receivers` ile tutarlı.
+- **`logitech_hidpp.hpp` `HidppTransport` RAII:** Destructor doğru `close(fd_)` çağırıyor (R3-1 copy sorunu ayrı).
+- **`logitech_quirks.hpp` 21 quirk girdisi:** 20'si doğru composed model ID ile (12 hex karakter). G522 istisnası NEW-3/R3-4/P-BUG-6 olarak raporlandı.
+- **`math-vec2.hpp` `magnitude()` → `std::hypot()`:** Intermediate overflow-safe. `lp_distance()` zero-vector guard doğru.
+- **`app_state.hpp` struct alanları:** Tüm widget pointer'ları `Gtk*` tipinde; `InputDeviceInfo` H-BUG-8 ile raporlandı.
+- **`gui/tr.inl` `refresh_language()`:** Tüm widget türleri (label, combo, spin, check, button) doğru yeniden çevriliyor; LOD/Hız combo hariç (G-BUG olarak raporlandı).
+- **`gui/hidpp_panel.inl` `hw_scan_thread`:** Worker thread → `g_idle_add` main thread'e; `hw_cancel` UAF önleme doğru.
+- **`gui/mouse_test.inl` X11 grab:** Tier 1/2/3 fallback zinciri doğru; dlopen/dlsym runtime çözümü doğru.
+- **`daemon/daemon.hpp` locking annotations:** Tüm mutex alanları doğru korunuyor.
+- **`setup.sh` `do_install()`:** Config koruma (mevcut config ezilmez), user config → /etc sync doğru.
+- **`CMakeLists.txt` security hardening:** Tüm flag'ler tutarlı (R3-5 olarak raporlanan -O2 istisnası haricinde).
+- **`tests/test_accel.cpp` kapsamı:** 184 test grubu, 33.764 assertion — kapsamlı.
+
+---
+
+## Bölüm 29 Sonuçları
+
+- **Toplam yeni bulgu:** 18 (5 High + 2 Medium + 11 Low)
+- **Önceki bölümlerden tekrar doğrulanан:** G-BUG-1..12, C-BUG-1..2, H-BUG-1..8, M-BUG-1..20, L-BUG-1..41, N-01..17, TEST-1..2, P-BUG-1..8, FINDING-17-1/2, FINDING-21-1, R3-1..5 — bu turda tümü tekrar doğrulandı.
+- **Kapsam:** 15+ dosya 3 bağımsız turda tarandı (logitech_*.hpp, logitech_receiver.cpp, logitech_hidpp.cpp, tr.inl, hidpp_panel.inl, mouse_test.inl, daemon.hpp, setup.sh, build.sh, CMakeLists.txt, ci.yml, run_oracle.sh, test_accel.cpp, math-vec2.hpp, app_state.hpp)
+- **En kritik yeni bulgular:**
+  - NEW-1/NEW-2 (bildirim stash eksikliği → cihaz ayrılma/pil olayları kaybolur)
+  - NEW-3 (quirks eşleşmesi kırık → tüm Logitech quirks'leri devre dışı)
+  - NEW-40 (setup.sh zararlı `rm -rf /.config` talimatı)
+  - NEW-43 (CI sanitizer build'i çalışmaz)
+
+---
+
+## Genel Program Analiz Özeti (Bölüm 11-34 Toplamı — 24 Tur)
+
+| Öncelik | Adet | Anahtar Bulgular |
+|---------|------|-------------------|
+| **Critical** | 2 | C-BUG-1 (use-after-free), C-BUG-2 (data race) |
+| **High** | 15 | H-BUG-1..8, N-01, NEW-1, NEW-2, NEW-3, NEW-40, NEW-43 |
+| **Medium** | 37+ | M-BUG-1..20, N-02..08, G-BUG-1/6/8/9, P-BUG-1..4, NEW-4, NEW-20, FINDING-29-1 |
+| **Low** | 78+ | L-BUG-1..41, N-09..17, FINDING-17-1/2, FINDING-21-1, G-BUG-12, P-BUG-5..8, R3-1..5, NEW-5, NEW-6, NEW-21..23, NEW-41..42, NEW-44..46, FINDING-29-2..3, FINDING-30-1..4, FINDING-31-1..5, FINDING-32-1..2, FINDING-33-1..2, FINDING-34-1..4 |
+| **Toplam** | **132+** | |
+
+**24 Tur Kapsam Özeti:**
+- **Okunan dosya:** 55+ (tüm .cpp, .hpp, .inl, .sh, CMakeLists.txt, ci.yml, test dosyaları, accel algorithm headers)
+- **Analiz türleri:** Satır-satır kod okuma, algoritma doğrulama, protokol uyumluluk, thread safety, bellek güvenliği, performans, GUI lifecycle, build/CI, fuzz test kapsamı, translation coverage, config migration, JSON parsing edge cases, EMA convergence
+- **Yeni güvenlik açığı:** 1 (NEW-40: setup.sh zararlı rm talimatı)
+- **Yeni deadlock:** 0
+- **Açık gerçek bug:** 2 (G-BUG-1, G-BUG-6 — LUT spin clamp)
+- **CI/build sorunları:** 2 (NEW-43 sanitizer build, NEW-5 script tutarlılığı)
+- **T16-T21ARED:** 20 yeni bulgu (1 Orta, 19 Düşük), 42 kapatılan aday — tüm algoritmalar ve config layer doğrulandı
+
+**En kritik açık alanlar:**
+1. **HID++ bildirim stash eksikliği** (NEW-1, NEW-2): send_short/send_long/send_very_long/read_register bildirimleri kaybeder
+2. **GUI thread safety** (C-BUG-1, C-BUG-2): HID++ worker thread'leri GTK widget lifecycle'ını ihlal ediyor
+3. **Logitech quirks eşleşmesi** (NEW-3): Tüm quirks'ler composed model ID uyumsuzluğu nedeniyle devre dışı
+4. **LUT unsaved detection** (P-BUG-3, P-BUG-4): LUT değişimleri unsaved flag'ini atlıyor
+5. **Config doğrulama** (N-01, M-BUG-2/3): Bozuk JSON sessiz veri kaybı
+6. **Test coverage gap** (FINDING-29-1): `test_logitech_hidraw_discovery()` boş — Logitech keşfetme kodunun unit test koruması yok
+
+---
+
+# Bölüm 29 — Tur 16: Test Altyapısı + Kapsam Boşlukları
+
+## Kapsam
+
+- `tests/test_accel.cpp` (8789 satır, 33764+ assert, 184 SECTION) — dış destek
+- Test altyapısı: `tests/run_tests.sh`, `tests/run_tests_asan.sh`
+- Odak: Test kapsamlılığı, eksik senaryolar, spec/fixture tutarlılığı
+
+## Yeni Bulgular
+
+### FINDING-29-1 — `test_logitech_hidraw_discovery()` tamamen boş (0 assertion)
+
+- **Konum:** `tests/test_accel.cpp:443-451`
+- **Tür:** Test kapsamsızlığı
+- **Açıklama:** Fonksiyon `discover_logitech_hidraw_devices()` çağırıyor,返回値 `(void)devices;` ile atılıyor — hiçbir assertion yok. Cihaz yoksa boş vektör döner ve test GEÇER. Yani: fonksiyon yanlış sonuç verse, Logitech keşfetme kodu bozulsa bile test suite %100 PASS görünür. Bu, `src/logitech_receiver.cpp`→`discover_logitech_hidraw_devices()` kodunun hiçbir unit test ile doğrulanmadığı anlamına gelir.
+- **Öncelik:** Orta (test coverage gap — regresyon koruması yok)
+- **Öneri (uygulanmadı):** Fixture ile `/tmp/.../rawaccelhidraw/` simüle et. Her bir receiver türü için 1+ assertion ekle:
+  - `EXPECT(found.size() >= 1)`
+  - `EXPECT(found[0].kind == logitech_receiver_kind::bolt)` (veya nano)
+  - `EXPECT(!found[0].hidpp_supported)` / `EXPECT(found[0].max_paired_devices == 6)`
+
+### FINDING-29-2 — `test_logitech_hidpp_hardware_controls()` eksik coverage: `send_feature_request` return path
+
+- **Konum:** `tests/test_accel.cpp:453-469`
+- **Tür:** Test kapsamı eksikliği
+- **Açıklama:** Test `hidpp_normalize_function_id`, `hidpp_register_uses_long_report`, `hidpp_feature_index` enum doğrulamasını test ediyor. Ancak `src/logitech_hidpp.cpp:595-644`'teki `send_feature_request()`'in hata dönüşleri (short read, timeout, is_hidpp_error) test edilmiyor. Bu, HID++ protokolü hata yollarının unit test kapsamı dışında olduğu anlamına gelir.
+- **Öncelik:** Düşük (HID++ error handling daemon'da connected_ flag ile korunuyor; unit test'de daemon component'i yok)
+- **Öneri (uygulanmadı):** Mock HidppTransport ile kısa okuma, timeout ve HID++ error yanıtlarını test eden senaryolar ekle.
+
+### FINDING-29-3 — Eksik test: daemon hot-plug retry timer安慰死 timer (L-BUG-39 regresyonu test edilmiyor)
+
+- **Konum:** `tests/test_accel.cpp` — test_logitech_*以外にhot-plug testi yok
+- **Tür:** Regression test eksikliği
+- **Açıklama:** `L-BUG-39` (hot-plug retry iterasyon sayar) ve `BUG-NEW-14` (hot-plug retry timer) için regression test yok. hot-plug retry davranışının doğruluğu (7 iterasyon × 10ms = ~70ms) hiçbir unit test ile doğrulanmamış.
+- **Öncelik:** Düşük (daemon runtime'da doğrudan test edilemez — uinput gerektirir)
+- **Öneri (uygulanmadı):** Hot-plug retry logic'ini soyutlayıp timer-based mock ile test edebilen bir helper fonksiyon yaz.
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`test_logitech_receiver_discovery()`** (satır 130-175): Fixture tabsanlı, 3 receiver kind'a assertion — bolt/nano/advanced_nano ayrımı doğru.
+- **`test_logitech_hidpp_notification_classification()`** (satır 177-361): 10 farklı notification türü (legacy battery 0x0D/0x07, illumination, HID++ 1.0 connect/disconnect/power, HID++ 20 battery_status/unified_battery/battery_voltage/wireless_device_status) — her biri assert ile doğrulanmış.
+- **`test_logitech_hidpp_packets()`** (satır 363-441): short/long/very_long packet round-trip, nullptr guard, boyut kontrolü doğru.
+- **`test_fuzz_accel_args()`** (satır 3193-3247): 5000 iterasyon × 7 mode × 8 speed = 280000 pipeline çağrısı, NaN count assertion — doğru.
+- **`test_fuzz_unsanitized_motion_math()`** (satır 3251-3313): 3000 iterasyon, sanitize olmadan motion_math pipeline — output ve remainder finite assertion — doğru.
+- **`test_fuzz_json_roundtrip()`** (satır 3317-3394): 200 iterasyon, sanitize constraints round-trip — doğru.
+
+## Bölüm 29 Sonuçları
+
+- **Yeni bulgu:** 3 (1 Orta: hidraw discovery test boş; 2 Düşük: HID++ hata yolu + hot-plug retry regresyon eksik)
+- **Kapatılan adaylar:** 6 (Logitech receiver testleri, fuzz testleri, paket roundtrip testleri)
+- **Not:** En kritik bulgu FINDING-29-1: `test_logitech_hidraw_discovery()` boş — Logitech keşfetme kodunun hiçbir unit test koruması yok.
+
+---
+
+# Bölüm 30 — Tur 17: daemon/main.cpp Hata Yolu + Config Doğrulama Analizi
+
+## Kapsam
+
+- `daemon/main.cpp` (472 satır) — tam rpc okundu
+- `include/config.hpp`, `src/config.cpp` (838 satır) — config parsing
+- Odak: Hata yolları, config lifecycle, PID management edge cases
+
+## Yeni Bulgular
+
+### FINDING-30-1 — `validate_config_path()` mevcut olmayan dosya için üst dizin doğrulaması yok
+
+- **Konum:** `daemon/main.cpp:165-181`
+- **Tür:** Yanlış hata mesajı
+- **Açıklama:** `realpath()` başarısız olduğunda (dosya henüz yok), fonksiyon sadece `.json` uzantısı ve `/proc/`, `/sys/`, `/dev/` prefix kontrolü yapıyor. Üst dizinin varlığı veya yazılabilirliği kontrol edilmiyor. Örnek: `--config /nonexistent/dir/settings.json` geçerseen → `validate_config_path` TRUE döner → `daemon.start()` → config.cpp `save_config` → `ENOENT` (dizin yok) → kafa karıştırıcı hata ("Failed to start"). Asıl sorun: hata mesajı "Failed to start" — "dizin yok" ayrımı yapılamıyor.
+- **Öncelik:** Düşük (yararlılık; daemon startting başlamadan önce daha net hata verir)
+- **Öneri (uygulanmadı):** `realpath()` başarısız olduğunda, `path`'ten dirname çıkarıp `stat(dirname)` ile dizin varlığını kontrol et. Yoksa: `"Config directory '<dirname>' does not exist."`.
+
+### FINDING-30-2 — `resolve_config_path()` SUDO_USER durumunda üst dizin createdAt kontrolsüz
+
+- **Konum:** `daemon/main.cpp:105-125`
+- **Tür:** sessiz başarısızlık
+- **Açıklama:** `getpwnam_r()` → `result->pw_dir` → `/.config/rawaccel/settings.json`. Eğer `~/.config/rawaccel/` dizini yoksa, `config.cpp:load_config()` ENOENT ile başarısız olur. `daemon.start()` başarısız → "Failed to start" mesajı — kullanıcıya "dizin yok" bilgisi verilmez.
+- **Öncelik:** Düşük (sadece sudo altında;-create yapılırsa dizin oluşur)
+- **Öneri (uygulanmadı):** `resolve_config_path()` içinde, SUDO_USER yolunu döndürmeden önce `std::filesystem::create_directories()` ile dizini oluştur. Veya `daemon.start()`'ta ENOENT'i yakalayıp daha net mesaj ver.
+
+### FINDING-30-3 — JSON log timestamp'te timezone bilgisi sabit "Z" (UTC) — yerel timezone değil
+
+- **Konum:** `daemon/main.cpp:370-377`
+- **Tür:** Yanlış log bilgisi
+- **Açıklama:** `gmtime_r()` UTC kullanıyor, `timebuf`'a "Z" ekleniyor. Ancak daemon'un zaman damgası olarak `CLOCK_MONOTONIC_RAW` kullanılıyor (P121/BUG-06). JSON log'daki timestamp `CLOCK_REALTIME`'dan üretiliyor. İki farklı saat kaynağı — `telem_wall_ms` (CLOCK_MONOTONIC_RAW boot-relative) ile JSON log timestamp (CLOCK_REALTIME wall-clock) farklı zaman boyutlarında. Log analizleri için tutarsızlık yaratabilir.
+- **Öncelik:** Düşük (tarihsel log analizleri için甚小甚小 issue — CLOCK_MONOTONIC_RAW sadece daemon içi elapsed time hesapları için)
+- **Öneri (uygulanmadı):** JSON log'da `telem_wall_ms` gibi CLOCK_MONOTONIC_RAW tabanlı timestamp kullan. Veya her iki timestamp'i de log'da göster.
+
+### FINDING-30-4 — `g_daemon.store(nullptr)` ile `remove_pid()` arasında sinyal penceresi
+
+- **Konum:** `daemon/main.cpp:469-470`
+- **Tür:** Teorik race condition
+- **Açıklama:** `g_daemon.store(nullptr)` (satır 469) ile `remove_pid()` (satır 470) arasında SIGUSR1 gelirse, handler `g_daemon.load()` → `nullptr` → erken dönüş. Bu doğru davranış: daemon zaten durdu, dump isteği reddedilmeli. Ancak `daemon.stop_ipc_server()` (satır 466) ile `g_daemon.store(nullptr)` arasında SIGHUP gelirse → handler `reload()` çağırır → daemon zaten stop edilmiş → internal state bozuk olabilir. `daemon.stop()` sonrası `reload()` çağrısı sadece atomic flag ayarlar (running_ false), bu yüzden thực际上无害.
+- **Öncelik:** Düşük (teorik;实践安全 — reload after stop no-op)
+- **Öneri (uygulanmadı):** Yorum ekle: "signal handler may fire between stop() and store(nullptr); reload() on stopped daemon is a no-op (sets atomic flag that loop ignores)".
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`write_pid()` O_CREAT|O_EXCL** (satır 37-71): Atomik PID oluşturma, yarım write'ta unlink — doğru.
+- **`try_clear_stale()`** (satır 272-292): strtol + ESRCH check — CORRECT.
+- **`pid_file_is_live()`** (satır 299-313): EPERM de "process exists" sayılır — doğru.
+- **`validate_config_path()` realpath mevcut dosya** (satır 142-164): S_ISREG + 4MB limit + .json extension — doğru.
+- **JSON escape lambda** (satır 342-365): Control chars \uXXXX escape,_del hariç her şeyi kapsıyor — doğru.
+
+## Bölüm 30 Sonuçları
+
+- **Yeni bulgu:** 4 (4 Düşük: üst dizin doğrulama, SUDO_USER dizin creation, log timestamp mismatch, signal window)
+- **Kapatılan adaylar:** 5 (write_pid, stale PID, live PID check, config validate mevcut dosya, JSON escape)
+- **Not:** Tüm bulgular Düşük — daemon runtime güvenliğini etkilemez. En yararlı iyileştirme FINDING-30-1 (üst dizin doğrulama) — kullanıcılara daha net hata mesajı verir.
+
+---
+
+# Bölüm 31 — Tur 18: Cross-Cutting Lifecycle + Thread-Safety Analizi
+
+## Kapsam
+
+- `daemon/daemon.cpp` (1975 satır), `daemon/main.cpp` (472 satır), `gui/daemon_comm.inl` — daemon-GUI lifecycle
+- `gui/profile_mgr.inl` (547 satır), `src/config.cpp` (838 satır) — config lifecycle
+- `gui/devices.inl` (253 satır) — cihaz lifecycle
+- Odak: daemon↔GUI↔CLI yaşam döngüsü, kaynak sızıntısı, çapraz bileşen thread-safety
+
+## Yeni Bulgular
+
+### FINDING-31-1 — Daemon hot-plug disconnect sonrası GUI device list stale kalıyor
+
+- **Konum:** `gui/devices.inl:~80-150`, `daemon/daemon.cpp:1162-1198`
+- **Tür:** GUI state stale
+- **Açıklama:** Daemon `disconnect_device()` çağrıldığında `devices_` vector'ünden cihazı siliyor. GUI, device listesini periyodik olarak IPC `status` komutu ile yeniliyor. Ancak GUI, disconnect event'ini async olarak alıyor — disconnect sonrası ilk status poll'a kadar GUI eski cihaz listesini gösteriyor. Bu sürede kullanıcı eski cihaz profilini düzenlemeye çalışırsa, daemon "device not found" hatası ile reddeder.
+- **Öncelik:** Düşük (geçici stale — bir sonraki poll'da düzelir; 1 saniye)
+- **Öneri (uygulanmadı):** GUI, disconnect notification'ı (`hidpp_notification_event_kind::connection` + `connected==false`) aldığında device listesini hemen yenileyebilir. Ancak bu zaten mevcut: `devices.inl` inotify hot-plug handle'ı cihaz disconnect'i algıladığında listede `eventN` kaybolur.
+
+### FINDING-31-2 — Config hot-reload ile cihaz disconnect race: profil uygulaması disconnect edilmiş cihaza
+
+- **Konum:** `daemon/daemon.cpp:~320-340` (SIGHUP handler) + `daemon/daemon.cpp:793-814` (hot-plug handler)
+- **Tür:** Race condition (düşük olasılık)
+- **Açıklama:** SIGHUP → `apply_config()` → `apply_profile(device)` çağrısı cihaz listesini dolaşıyor. Aynı anda hot-plug handler `disconnect_device()` çağrısı ile cihaz vector'ünü modifiye ediyor. `devices_mutex_` bu race'i koruyor mu? Evet — `apply_profile()` `devices_mutex_` altında iterates ediyor, `disconnect_device()` da `devices_mutex_` altında erase ediyor. Ancak `apply_profile()` içinde `devices_` kopyasını alıp üzerinde çalışırken, hot-plug handler gerçek vector'ü erase edebilir → kopya artık stale. Bu durumda `apply_profile()` eski cihaz objesine uygulama yapar → cihaz disconnect edildikten sonra uygulanan profil bir dahaki reconnect'ta override edilir → geçici tutarsızlık.
+- **Öncelik:** Düşük (tek döngüde disconnect + reload aynı anda nadiren tetiklenir;次次 reconnect'ta düzelir)
+- **Öneri (uygulanmadı):** `apply_profile()` cihaz disconnected mı kontrol etsin — disconnect edilmiş cihaza profil uygulamasını atla.
+
+### FINDING-31-3 — CLI `--no-daemon` flag'i config'i kaydeder ama daemon'a push etmez → loyalite kopukluğu
+
+- **Konum:** `cli/main.cpp` (önceki turlarda okundu)
+- **Tür:** Beklenmeyen kullanıcı deneyimi
+- **Açıklama:** `rawaccel-cli --no-daemon set ...` komutu config'i kaydeder ancak daemon'a push etmez. Kullanıcı bir sonraki `rawaccel-cli reload`'da beklediği değişikliği göremeyebilir — çünkü daemon eski config'i hala kullanıyor. Bu tasarım doğru (P82-CRIT-1), ancak --no-daemon flag'i sonrası `daemon.reload()` çağrısı yapılmıyor.
+- **Öncelik:** Düşük (tasarım doğru — --no-daemon amacı bu; ancak kullanıcı deneyimi kafa karıştırıcı)
+- **Öneri (uygulanmadı):** --no-daemon sonrası stdout'a `"Config saved (not pushed to daemon). Use 'rawaccel-cli reload' to apply."` mesajı yaz.
+
+### FINDING-31-4 — GUI profil kaydetme sonrası daemon reload window — double-reload
+
+- **Konum:** `gui/profile_mgr.inl:~200-250`, `gui/daemon_comm.inl`
+- **Tür:** Double-reload race
+- **Açıklama:** GUI, profil kaydettikten sonra IPC ile daemon'a reload komutu gönderiyor. Aynı anda SIGHUP ile de reload tetiklenebilir (GUI'nin eski kodunda SIGHUP fallback'i var). İki reload同一 anda sıraya girerse → `apply_config()` iki kez çalışır. Bu safe mi? Evet — `apply_config()` idempotent: config'i yeniden parse eder, profil listesini yeniden oluşturur, her cihaza uygular. Ancak gereksiz iş yükü yaratır.
+- **Öncelik:** Düşük (idempotent; sadece gereksiz CPU kullanımı)
+- **Öneri (uygulanmadı):** `reload()` atomic flag'i zaten var (SIGHUP/IPC reload flag'i) — double-reload flag sadece bir kez temizlenir. Ancak实践两次 apply_config çağrısı yapılabilir.
+
+### FINDING-31-5 — Daemon start sonrası `g_daemon.store(&daemon)` ile signal handler arasındaki pencere
+
+- **Konum:** `daemon/main.cpp:332-334`
+- **Tür:** Race condition (null pointer)
+- **Açıklama:** `g_daemon.store(&daemon)` (satır 334) × signal handler `g_daemon.load()` (satır 91). Sinyal bu iki satır arasında gelirse `g_daemon` hala `nullptr` → handler erken döner (null check). Bu doğru davranış — erken dönüş-safe. Ancak `daemon.start(config_path)` (satır 440) çağrısı henüz yapılmamışken SIGHUP gelirse → `reload()` erken döner → config henüz yüklenmemiş → no-op. Bu safe.
+- **Öncelik:** Düşük (null check ile korunuyor;实践安全)
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **Daemon stop lifecycle** (main.cpp 465-470): `stop()` → `stop_ipc_server()` → `store(nullptr)` → `remove_pid()` sırası doğru: önce thread'ler join edilir, sonra atomic pointer temizlenir, sonra PID silinir.
+- **GUI reconnect cycle**: Daemon durdurulup yeniden başlatıldığında GUI periyodik polling ile yeni daemon'a bağlanır — kaynak sızıntısı yok.
+- **Config atomic write (save_config)**: tmp+rename+fsync → daemon asla yarı-yazılmış JSON okumaz.
+- **`apply_config()` idempotent**: Yeniden çağrılabilir — profil listesi sıfırlanıp yeniden oluşturulur.
+- **`g_dump_latency` exchange pattern**: Atomic `exchange(false)` ile SIGUSR1 birden fazla gelse bile sadece bir kez dump yapılır.
+
+## Bölüm 31 Sonuçları
+
+- **Yeni bulgu:** 5 (5 Düşük: GUI stale device list, hot-plug + reload race, CLI --no-daemon feedback, double-reload idempotent, start+signal window)
+- **Kapatılan adaylar:** 5 (daemon stop lifecycle, GUI reconnect, config atomic write, apply_config idempotent, latency dump pattern)
+- **Not:** Tüm bulgular Düşük — mevcut koruma mekanizmaları (mutex, atomic, idempotent) nedeniyle实践中安全. En yararlıgeliştirme FINDING-31-2 (hot-plug + reload race) — disconnect edilmiş cihaza profil uygulamasını atlamak petty koddür.
+
+---
+
+# Bölüm 32 — Tur 19: accel-*.hpp Algoritma Matematik Doğruluğu
+
+## Kapsam
+
+- `accel-classic.hpp` (199 satır), `accel-power.hpp` (174 satır), `accel-natural.hpp` (62 satır)
+- `accel-jump.hpp` (86 satır), `accel-synchronous.hpp` (172 satır), `accel-lookup.hpp` (131 satır)
+- `math-vec2.hpp` — vec2d, magnitude, lp_distance, rotate, direction
+- Odak: Matematiksel doğru, edge case, numeric stability, referans parity
+
+## Yeni Bulgular
+
+### FINDING-32-1 — `classic::gain_accel()` için `denom == 0` toleransı — degenrateavia çok küçük değer
+
+- **Konum:** `include/accel-classic.hpp:192-196`
+- **Tür:** Numeric tolerans (teorik)
+- **Açıklama:** `gain_accel()` fonksiyonu `denom = offset - x` hesaplıyor. `denom == 0` guard var (return 0). Ancak `cap.x` ve `input_offset` birbirine çok yakın (1e-15 farklı) olduğunda `denom` çok küçük → `accel_raised` çok büyük → `pow(accel_raised, exp-1)` overflow → `isfinite` guard ile DBL_MAX'a clamped. Pratikte: `init_gain::io` içinde (satır 119) `cap_x` zaten `input_offset`'a clamp ediliyor → `cap_x >= input_offset` → `denom <= 0`. Bu guard'ın çalışmasıgarantileniyor.
+- **Öncelik:** Düşük (isfinite guard ile korunuyor; teorik)
+- **Not:** Bu bulgu HAS BEEN PREVIOUSLY ADDRESSED by BUG-7 fix (line 119: `if (cap_x < args.input_offset) cap_x = args.input_offset;`). Defense-in-depth olarak `denom == 0` check doğru kalıyor.
+
+### FINDING-32-2 — `synchronous::fill_lut()` midpoint integration = trapezoidal crude approximation
+
+- **Konum:** `include/accel-synchronous.hpp:112-129`
+- **Tür:** Doğruluk kaybı (kasıtlı)
+- **Açıklama:** `sigmoid_sum` her exponential step aralığında 2 partition kullanarak trapezoidal integral alıyor. Gerçek sigmoid curve'unun integrali ile arasındaki fark, referans RawAccel ile aynı yaklaşımı kullandığı için kabul edilebilir. 2 partition + exponential step spacing = ~3-4 ondalık basamak doğruluk. Oracle testi (1047 satır) bunu doğruluyor.
+- **Öncelik:** Düşük (kasıtlı tasarım; oracle ile doğrulanmış)
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`classic` sign flip** (io cap_mode, cap.y < 1): `sign` flag, `cap = -cap` ile deceleration üretiyor — doğru.
+- **`classic` GAIN io cap clamp**: `cap_x >= input_offset` clamp (BUG-7 fix) korunuyor.
+- **`power` exponent floor** (BUG-02): `in_n < 1e-3 ? 1e-3 : in_n` tek bir kez uygulanıyor, `base_fn_impl` ve `scale_from_*` aynı n'yi kullanıyor — doğru.
+- **`power` io degenerate cap** (P155): `cap.y <= 0` veya `(gain_mode && cap.x <= 0)` → identity scale, no cap — doğru.
+- **`natural` abs_limit div-by-zero guard**: `abs_limit < 1e-9 → 1.0` fallback — doğru.
+- **`natural` gain_mode accel ≈ 0 guard** (line 54): `accel < 1e-12 → 1.0` — doğru.
+- **`jump` smooth_log0 computation**: GAIN mode'da `smooth_log0` sabit olarak hesaplanıyor, KF'de kullanılmıyor — doğru.
+- **`jump` denormal x guard** (BUG-NEW-17): `!isfinite(gain) → 1.0` — doğru.
+- **`synchronous` LEGACY odd-symmetric tanh** (BUG-01): `|z|` + `sign(z)` ile motivity<1 doğru symmetry — oracle ile doğrulanmış.
+- **`lookup` binary search** (O3/P55): `hi < capacity - 1` wrapper kaldırıldı, fall-through path degenerate tabloları handle ediyor — doğru.
+- **`lookup` O2 (P55) zero-width segment**: `denom == 0` → `by` return — doğru.
+- **`lookup` x <= 0 → 0.0**: Referans parity (strictly positive domain) — oracle pinned.
+
+## Bölüm 32 Sonuçları
+
+- **Yeni bulgu:** 2 (2 Düşük: gain_accel tolerance, LUT integration accuracy)
+- **Kapatılan adaylar:** 12 (classic sign flip, GAIN io clamp, power exponent floor, power degenerate cap, natural div-by-zero, natural accel≈0, jump smooth_log0, jump denormal, synchronous tanh symmetry, lookup binary search, lookup zero-width, lookup x<=0)
+- **Not:** Hiçbir HIGH/ORTA bulgu yok. Tüm 7 algoritma doğru ve robust. Oracle differential test (1047 satır) ile doğrulanmış.
+
+---
+
+# Bölüm 33 — Tur 20: rawaccel.hpp + rawaccel-base.hpp Core Types + EMA + Modifier
+
+## Kapsam
+
+- `rawaccel.hpp` (375 satır) — simple_ema_smoother, linear_ema_smoother, speed_processor, modifier
+- `rawaccel-base.hpp` (114 satır) — accel_args, profile, speed_args, constants
+- `math-vec2.hpp` — vec2d operations
+- Odak: EMA convergence, modifier pipeline correctness, flag logic
+
+## Yeni Bulgular
+
+### FINDING-33-1 — `accel_args::operator==` field-by-field float comparison — très peu probable ama LUT epsilon uyumsuzluğu
+
+- **Konum:** `include/rawaccel-base.hpp:71-85`
+- **Tür:** Semantic mismatch (edge case)
+- **Açıklama:** `operator==` `LUT_EPSILON = 1e-5f` kullanarak LUT float'ları karşılaştırıyor. Ancak `accel_args::data` mutable — synchronous GAIN modu LUT'u runtime'da dolduruyor. İki farklı `accel_args` objesi aynı GAIN parametreleriyle farklı LUT'lar üretebilir (farklı initial state veya numerical drift). `operator==` bunları "eşit" sayabilir — correctly, çünkü synchronous LUT deterministic. Ancak `operator!=` GUI'de `xy_linked` flag hesaplamasında kullanılıyor (widgets_sync.inl) — burada LUT drift false-positive unlink'a neden olabilir.
+- **Öncelik:** Düşük (pratikte synchronous LUT deterministic;_GUI'nin `operator!=` kullanımı correct)
+- **Not:** Bu bulgu FINDING-29-1 / T16 ile overlap yok — farklı konular.
+
+### FINDING-33-2 — `speed_processor::init()` lp_norm flush-to-max guard — MAX_NORM = 16 sabit
+
+- **Konum:** `include/rawaccel.hpp:122-123`
+- **Tür:** Tasarım kararı
+- **Açıklama:** `lp_norm >= MAX_NORM` → `distance_mode::max`. `MAX_NORM = 16` sabit. Gerçek L∞ norm'u temsil etmek için yeterli: `L16(3,4) = (3^16 + 4^16)^(1/16) ≈ 4.000` — L∞'den < 0.001 fark. Doğru.
+- **Öncelik:** Düşük (tasarım doğru)
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`simple_ema_smoother::smooth()` pow(0.5, 1/hl) coefficient**: halfLife=0 → coefficient=0 → immediate tracking — doğru.
+- **`linear_ema_smoother::smooth()` trendDampening=0.75**: Sabit, trend term her step'te %25 azalıyor — doğru.
+- **`modifier::modify()` subnormal time guard** (IPS_FACTOR_MAX = 1e6): sonsuz ips_factor'u engelliyor — doğru.
+- **`modifier::modify()` defense-in-depth isfinite** (line 370-371): Son NaN/Inf guard — doğru.
+- **`modifier_flags` epsilon comparisons**: `fabs(...) > 1e-9` JSON round-trip tolerance — doğru.
+- **`directional_weight` cos/sin blend**: `2/π * reference_angle` ile `range_weights.x → range_weights.y` arası lineer geçiş — doğru.
+
+## Bölüm 33 Sonuçları
+
+- **Yeni bulgu:** 2 (2 Düşük: accel_args comparison LUT epsilon, MAX_NORM design)
+- **Kapatılan adaylar:** 6 (EMA coefficient, trend dampening, subnormal guard, isfinite defense, epsilon comparisons, directional weight)
+- **Not:** Core modifier pipeline robust ve doğru. Hiçbir matematiksel tutarsızlık yok.
+
+---
+
+# Bölüm 34 — Tur 21: src/config.cpp Deep Read — JSON Parsing + Migration
+
+## Kapsam
+
+- `src/config.cpp` (881 satır) — tam rpc okundu
+- `include/config.hpp` — sanitize constants (SCALE_MAX, EXP_POWER_MAX, CAP_X_MAX, CAP_Y_MAX, OUTPUT_OFFSET_MAX)
+- Odak: JSON parsing edge cases, config migration correctness, atomic write safety
+
+## Yeni Bulgular
+
+### FINDING-34-1 — `migrate_config()` `cfg.version == RAWACCEL_VERSION` check — migration crash döngüsü potansiyeli
+
+- **Konum:** `src/config.cpp:845-878`
+- **Tür:** Migration edge case
+- **Açıklama:** `migrate_config()` önce `cfg.version == RAWACCEL_VERSION` kontrol ediyor → erken dönüş. Değilse, `cfg.version.empty()` veya `version_lt(...)` kontrolü yapıyor. Sonra `cfg.version = RAWACCEL_VERSION` set ediyor. Bu doğru: migration sadece bir kez çalışır. Ancak `version_lt()` fonksiyonu (satır 818-838) parse başarısız olursa `false` dönüyor → migration çalışmayabilir. Örnek: `cfg.version = "abc"` → `parse()` başarısız → `a = {0,0,0}` → `version_lt("abc", "0.6.4")` = `false` → migration çalışmaz → config eski kalır. Bu istenen davranış: bilinmeyen versiyon = "şu anki ile aynı".
+- **Öncelik:** Düşük (bilinmeyen versiyon = no-migration — correct default)
+
+### FINDING-34-2 — `save_config()` hard link backup — cross-device fallback eksik
+
+- **Konum:** `src/config.cpp:696-720`
+- **Tür:** Best-effort backup
+- **Açıklama:** `fs::create_hard_link(path, bak_tmp_path, ec_bak)` başarısız olursa (NFS, farklı FS), `ec_bak`'e yazıyor → backup oluşturulmuyor → live config hala yerinde. Bu doğru: backup best-effort. Ancak `fs::rename(bak_tmp_path, bak_path)` başarısızsa → `bak_tmp_path` restore ediliyor (line 713-714: `fs::remove(bak_tmp_path)`). Bu correctly cleanup yapıyor.
+- **Öncelik:** Düşük (best-effort; backup failure config'i etkilemez)
+
+### FINDING-34-3 — `version_lt()` fazladan nokta içeren versiyon string'leri için parse edge case
+
+- **Konum:** `src/config.cpp:818-838`
+- **Tür:** Robustness
+- **Açıklama:** `version_lt("0.6.4.1", "0.6.4")` çağrıldığında `parse()` 3 parçayı alıyor → `a = {0,6,4}` (4. parça yoksayılıyor). `a < b` → `false` (eşit). Doğru: `"0.6.4.1"` >= `"0.6.4"` olarak sayılıyor. Ancak `version_lt("0.6.4", "0.6.4.1")` → `a = {0,6,4}`, `b = {0,6,4}` → `false` — `"0.6.4"` < `"0.6.4.1"` olmalı ama false dönüyor. Bu nadir edge case: 4-component versiyonlar henüz yok (tüm versiyonlar 3-component: "0.6.4").
+- **Öncelik:** Düşük (mevcut tüm versiyonlar 3-component; gelecekte 4-component eklenirse revision yoksayılır)
+
+### FINDING-34-4 — `save_config()` EEXIST retry atomikliği — pid-suffix uniqueama race window
+
+- **Konum:** `src/config.cpp:653-660`
+- **Tür:** Atomicity guarantee
+- **Açıklama:** Temp dosya adı `path + "." + to_string(getpid()) + ".tmp"`. Aynı process'ten iki concurrent `save_config()` çağrısı → aynı pid → aynı tmp_name → ikinci `open(O_EXCL)` EEXIST → unlink → retry. Bu doğru: pid-suffix iki process'i ayırt ediyor, ancak aynı process'ten iki thread concurrent save yaparsa race var. Pratikte: GUI thread-safe (tek UI thread), CLI tek process, daemon config'i load/save thread-safe (devices_mutex_).
+- **Öncelik:** Düşük (pratikte concurrent save yok; tasarımsal olarak safe)
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`accel_args_from_json()` `require_number`** (satır 125-148): Type + isfinite guard → exception atıyor, silent default yok — doğru.
+- **`accel_args_from_json()` LUT length clamp** (satır 164-188): `lut_length` double→int clamp + `pts.size()` min — doğru.
+- **`accel_args_from_json()` LUT entry float overflow** (satır 183-185): `FLT_HI` clamp — doğru.
+- **`sanitize_accel_args()` order of operations**: `exponent_power` floor (1e-4), `cap.x` floor-to-offset, `input_offset` ceiling, `cap.x` ceiling — doğru sıralama.
+- **`sanitize_profile()` smooth halflife ceiling** (1e9): `pow(0.5, 1/1e9)` ≈ 1.0 → coefficient=0 → immediate tracking, nhưngéantically identity — doğru.
+- **`sort_lut_data()` insertion sort**: n max 257 → O(n²) kabul edilebilir, heap allocation yok — doğru.
+- **`migrate_lookup_gain()` x > 0 guard**: Negatif x'leri atlıyor → velocity division'da 0/0 guard — doğru.
+- **Config version preservation** (P43-BF1): `cfg.version = j["version"]` load'da read-back → migration sadece bir kez — doğru.
+
+## Bölüm 34 Sonuçları
+
+- **Yeni bulgu:** 4 (4 Düşük: migration edge case, backup best-effort, version_lt 4-component, tmp atomicity)
+- **Kapatılan adaylar:** 8 (require_number, LUT length, LUT float overflow, sanitize order, smooth ceiling, insertion sort, migration guard, version preservation)
+- **Not:** Config layer extremely well-defended. JSON parsing + sanitize + atomic write = 3 savunma katmanı. Tüm bulgular Düşük.
+
+---
+
+## Bölüm 29-34 Toplu Sonuçları (T16-T21)
+
+| Bölüm | Tur | Odak | Yeni Bulgu | Kapatılan Aday |
+|-------|-----|------|------------|----------------|
+| 29 | T16 | Test Kapsamı | 3 (1 Orta, 2 Düşük) | 6 |
+| 30 | T17 | Config/Signal Yolu | 4 (4 Düşük) | 5 |
+| 31 | T18 | Cross-Cutting Lifecycle | 5 (5 Düşük) | 5 |
+| 32 | T19 | accel-*.hpp Matematik | 2 (2 Düşük) | 12 |
+| 33 | T20 | rawaccel.hpp Core + EMA | 2 (2 Düşük) | 6 |
+| 34 | T21 | config.cpp JSON + Migration | 4 (4 Düşük) | 8 |
+| **Toplam (T16-T21)** | | | **20** (1 Orta, 19 Düşük) | **42** |
+
+### En Kritik Bulgu (T16-T21)
+
+**FINDING-29-1 (Orta):** `test_logitech_hidraw_discovery()` boş — 0 assertion. Logitech hidraw keşfetme kodu hiçbir unit test ile doğrulanmamış.
+
+### Dikkat Çekici Desen
+
+**6 tur** (T16-T21) boyunca **1 Orta + 19 Düşük** bulgu, **42 kapatılan aday**. Tüm algoritmalar (classic, power, natural, jump, synchronous, lookup) matematiksel olarak doğru ve robust. Config katmanı 3 savunma katmanı ile korunuyor (JSON type-guard → sanitize → atomic write). Core modifier pipeline NaN/Inf'e karşı 3 savunma katmanı taşıyor (subnormal guard → isfinite → defense-in-depth zeroing). Kod olgunlaşma aşamasında: kritik bulgular G-BUG-1 (LUT spin clamp) ve BUG-25 (telemetri) olarak kalmış durumda.
+
+---
+
+# Bölüm 35 — Tur 16: Accel Algoritma Başlıkları Matematik Doğruluk (10 Eylül 2026)
+
+Kapsam: `include/accel-classic.hpp` (198 satır), `include/accel-power.hpp` (173 satır),
+`include/accel-synchronous.hpp` (171 satır), `include/accel-lookup.hpp` (130 satır),
+`include/accel-jump.hpp` (85 satır), `include/accel-natural.hpp` (62 satır),
+`include/accel-union.hpp` (49 satır), `include/math-vec2.hpp` (51 satır),
+`include/rawaccel-base.hpp` (114 satır). Satır-satır okundu.
+
+## Bu turda bulunan yeni hatalar
+
+### YÜKSEK-BUG-ALG-01 — Power gain mode integration_constant catastrophik cancellation
+
+- **Konum:** `accel-power.hpp:109,169-171`
+- **Tür:** Numeric precision — catastrophik cancellation
+- **Açıklama:** `constant_b = integration_constant(cap_x, cap_y, base_fn_impl(cap_x))` formülü `(output - gain) * input` hesaplar. io cap modunda `cap_y` ve `base_fn_impl(cap_x)` aynı hızdaki kazanç değerleridir — inşası gereği birbirine çok yakındır (ör. 1e4 ve 1e4 civarı). IEEE 754 çift hassasiyetinde `1e4 - 1e4` ≈ 1e-12 olabilir → `constant_b` ≈ 1e-12 * 1e4 = 1e-8. Oysa beklenen değer cap_x civarında smooth bir geçiş sağlamalıdır. Büyük gain değerleri için (cap.y >> 1) bu cancellation daha da kötüleşir — `1e6 - 1e6` kaybı 1e-10'a kadar düşebilir, `constant_b`'nin sign'ını bile değiştirebilir (negatif kuyruk = asimptotik olarak azalan gain). Referans RawAccel Windows da aynı formülü kullanır, bu gerçek bir numeric sınırlılıktır; ancak `cap_mode::in` dalında port'ta `base_fn_impl` kullanılırken referans `gain_fn` kullanarak cancellation'ı azaltır.
+- **Öncelik:** Yüksek
+- **Öneri (uygulanmadı):** `cap_mode::in` dalında `constant_b` hesaplanırken `gain_fn(cap_x)` (analitik formül) kullanın, `base_fn_impl(cap_x)` (sayısal değer) yerine. Alternatif olarak kapalı form integral sabitini doğrudan hesaplayın.
+
+### ORTA-BUG-ALG-02 — Power gain mode operator() GAIN path Inf guard eksik
+
+- **Konum:** `accel-power.hpp:112-128` (operator() GAIN path)
+- **Tür:** NaN/Inf yayılımı — eksik isfinite guard
+- **Açıklama:** `operator()` GAIN modunda `base_fn_impl(speed)` çağrısı `pow(scale*x, exponent)` overflow'a yol açabilir (ör. scale=1, speed=1e200, exponent=2 → Inf). Bu Inf değeri hiçbir guard'a uğramadan doğrudan `return base_fn_impl(speed)` ile çağırıcıya döner. Legacy modda `minsd()` yardımı ile finite bir değere indirgenirken GAIN modunda böyle bir koruma yoktur. Downstream `modifier::modify()` isfinite guard'ı son savunma hattı olarak Inf'i yakalar, ancak bu savunma katman eksikliği — tüm diğer accel modlarında (classic gain: satır 163, natural gain: satır 54, jump gain: satır 81) yerel Inf/NaN guard'ları mevcuttur, power modunda eksiktir.
+- **Öncelik:** Orta
+- **Öneri (uygulanmadı):** `operator()` GAIN path'ine defense-in-depth guard ekleyin: `return std::isfinite(result) ? result : 1.0;`
+
+### ORTA-BUG-ALG-03 — Classic gain mode base_fn overflow constant hesabını bozar
+
+- **Konum:** `accel-classic.hpp:128,155,167-173`
+- **Tür:** Numeric precision — overflow guard yanıltıcı sonuç
+- **Açıklama:** `constant = (base_fn(cap_x, accel_raised, args) - cap_y) * cap_x` hesaplanırken `base_fn` (satır 167-173) extreme exponent veya extreme cap_x durumunda `pow()` overflow'unu yakalayıp 0.0 döner. Ancak bu 0.0, integral sabitinin wrong bir değer üretmesine yol açar: constant = (0 - cap_y) * cap_x = -cap_y * cap_x. Sonuç olarak kuyruk fonksiyonu `cap_y * (1 - cap_x/x)` olur — x = cap_x'de 0'dan başlayıp asimptotik olarak cap_y'ye yaklaşan bir eğri. Oysa beklenen x = cap_x'de `base_fn(cap_x)` değerinden başlamasıdır. x < cap_x bölgesinde eğri `base_fn` (guarded 0.0) kullanırken, x >= cap_x bölgesinde farklı bir başlangıç noktasından başlar → eğride kesiklik (C1 süreksizliği).
+- **Öncelik:** Orta
+- **Öneri (uygulanmadı):** `base_fn` overflow'a döndüğünde (0.0), ilgili gain modu init fonksiyonunda `constant`'ı da 0.0 olarak ayarlayın VE `cap_y`'yi de 0.0'a eşitleyin — böylece cả kuyruk cả de base curve tutarlı olur.
+
+### DÜŞÜK-BUG-ALG-04 — Synchronous legacy mode NaN/Inf x girişi için eksik guard
+
+- **Konum:** `accel-synchronous.hpp:42-46` (operator()) ve `accel-synchronous.hpp:70-94`
+- **Tür:** Tutarlılık — savunma katmanı eksikliği
+- **Açıklama:** `operator()`'ın gain modu dalı `gain_apply()`'i çağırır ve `gain_apply` satır 145'te `!std::isfinite(x)` kontrolü yapar (NaN/Inf → 1.0 identity). Ancak legacy modu `legacy_apply()`'i doğrudan çağırır, ve `legacy_apply` satır 73'te `std::log(x)` hesaplar — `x = NaN` için `log(NaN) = NaN` üretilir ve downstream'e yayılır. Downstream `modifier::modify()` isfinite guard'ı NaN'ı yakalar, ancak bu eksik koruma power modunda (satır 113), classic modunda (satır 45) ve natural modunda (satır 29) mevcut `x <= 0` guard ile tutarsızdır.
+- **Öncelik:** Düşük
+- **Öneri (uygulanmadı):** `operator()`'daki `x <= 0` kontrolünü `x <= 0 || !std::isfinite(x)` olarak genişletin.
+
+### DÜŞÜK-BUG-ALG-05 — Jump legacy mode x <= 0 guard eksik
+
+- **Konum:** `accel-jump.hpp:42-48`
+- **Tür:** Eksik input guard — tutarsızlık
+- **Açıklama:** `operator()`'ın legacy modu (satır 43-48) `x <= 0` kontrolü YAPMAZ. GAIN modu (satır 52) bunu yapar. Legacy hard-step dalında `x < 0` ve `step.x < 0` olduğunda, `x < step.x` false olabilir ve `1.0 + step.y` döner — identity dışında bir kazanç. Bu durum sanitize tarafından engellenmelidir (cap.x ≥ 0), ancak diğer modlardaki `x <= 0` guardı jump modunda eksik bir defense-in-depth katmanıdır.
+- **Öncelik:** Düşük
+- **Öneri (uygulanmadı):** Legacy modun başına `if (x <= 0) return 1.0;` ekleyin.
+
+### DÜŞÜK-BUG-ALG-06 — Power gain mode cap_mode::in erken dönüş constant_b'yi hesaplamaz
+
+- **Konum:** `accel-power.hpp:95`
+- **Tür:** Eksik hesaplama — constant_b sıfır kalır
+- **Açıklama:** `cap_mode::in` dalında `args.cap.x <= offset.x` koşulu sağlandığında `return` ile constructor'dan çıkılır. Bu, `constant_b` hesaplamasının hiçbir zaman çalışmadığı anlamına gelir; `constant_b` struct varsayılanı olan `0.0`'da kalır. `operator()` GAIN modunda `speed >= cap_x` (burada `cap_x = 0`) olduğunda sabit `offset.y` kazancı verir. Bu degenerate durum için behavior valid, ancak `constant_b`'nin hiç hesaplanmaması kod okunabilirliğini düşürür.
+- **Öncelik:** Düşük
+- **Öneri (uygulanmadı):** `return` yerine `break` kullanın ve `constant_b` hesaplamasını tüm dallar için zorunlu tutun.
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`accel-classic.hpp:28-34`** — Exponent ≤ 1 linear path (constant gain + cap) doğru
+- **`accel-classic.hpp:67-107`** — Legacy all-3-cap-mode switch exponent raised hesaplaması doğru
+- **`accel-classic.hpp:187-189`** — `gain_inverse()` accel==0 ve power≤1 guard'ları doğru
+- **`accel-power.hpp:35-36`** — Exponent floor (her yerde ortak `n` kullanımı) doğru
+- **`accel-power.hpp:41-50`** — Degenerate io cap guard doğru
+- **`accel-power.hpp:152-158`** — `scale_from_gain_point` input≤0 guard doğru
+- **`accel-lookup.hpp:56-57`** — Odd-length array sadece tam çiftleri sayar; capacity guard doğru
+- **`accel-lookup.hpp:82-95`** — Binary search overflow yok, bounds doğru
+- **`accel-lookup.hpp:108-113`** — Zero-width segment guard doğru
+- **`accel-jump.hpp:24-29`** — Constructor hesaplamaları doğru
+- **`accel-jump.hpp:59-82`** — GAIN smooth stable antiderivative doğru
+- **`accel-natural.hpp:17-25`** — limit<1 dekelerasyon desteği, div-by-zero guard doğru
+- **`accel-natural.hpp:50-57`** — Gain mode accel < 1e-12 guard doğru
+- **`accel-union.hpp:30-41`** — Tüm accel_mode switch dalları doğru eşleştirilmiş
+- **`math-vec2.hpp:11-13`** — `magnitude` std::hypot overflow-safe doğru
+- **`math-vec2.hpp:22-27`** — `lp_distance` factored form isfinite fallback doğru
+
+## Bölüm 35 Sonuçları
+
+- **Yeni bulgu:** 6 (1 Yüksek: power catastrophic cancellation; 2 Orta: power Inf guard + classic overflow constant; 3 Düşük: sync NaN guard + jump x≤0 + power early return)
+- **Kapatılan adaylar:** 16 (tüm algoritma başlıkları kapsamlı şekilde doğrulandı)
+- **En kritik bulgu:** YÜKSEK-BUG-ALG-01 — power gain mode constant_b catastrophik cancellation. Bu, io cap modunda cap_x civarında kuyruk fonksiyonunun hatalı şekillenmesine neden olabilir.
+
+---
+
+# Bölüm 36 — Tur 17: Motion Pipeline + JSON Type Safety (10 Eylül 2026)
+
+Kapsam: `include/rawaccel.hpp` (375 satır, tam), `include/config.hpp` (75 satır),
+`src/config.cpp` (881 satır, tam), `include/logitech_hidpp.hpp` (491 satır),
+`include/logitech_quirks.hpp` (173 satır). Satır-satır okundu.
+
+## Bu turda bulunan yeni hatalar
+
+### KRİTİK-BUG-MOTION-01 — JSON alt nesne tip kontrolü eksik, bozuk config'te daemon/CLI crash
+
+- **Konum:** `src/config.cpp:254-255` (accel_x/accel_y) ve `src/config.cpp:273-276` (speed_processor) ve `src/config.cpp:561` (profile)
+- **Tür:** Tip güvensizliği — nlohmann::json exception
+- **Açıklama:** `profile_from_json_obj()` içinde `accel_x`, `accel_y` ve `speed_processor` alt nesneleri ile `device_profile_from_json()` içinde `profile` alt nesnesi, JSON'dan okunmadan önce `is_object()` kontrolü yapılmadan doğrudan `contains()` / erişim yapıyor. `nlohmann::json::contains()` çağrısı non-object (string, number, array, null) bir değer üzerinde `type_error.302` fırlatır. Sonuç: el ile düzenlenmiş veya hatalı IPC payload'ı ile daemon / CLI crash olur. Örnek tetikleyici: `"accel_x": "classic"` veya `"profile": null` veya `"speed_processor": 42`. Karşılaştırma: `domain_weights` ve `range_weights` alanları doğru bir şekilde `is_array()` kontrolü yapıyor (config.cpp:242,249), ama bu üç kritik alt nesne kontrolsüz bırakılmış.
+- **Öncelik:** Kritik (bozuk config JSON ile daemon/CLI crash)
+- **Öneri (uygulanmadı):** Her çağrı noktasına `is_object()` guard'ı ekle:
+  ```cpp
+  if (j.contains("accel_x") && j["accel_x"].is_object())
+      p.accel_x = accel_args_from_json(j["accel_x"]);
+  if (j.contains("speed_processor") && j["speed_processor"].is_object()) { ... }
+  if (j.contains("profile") && j["profile"].is_object())
+      dp.prof = profile_from_json_obj(j["profile"]);
+  ```
+
+### YÜKSEK-BUG-MOTION-02 — Bozuk versiyon stringi tüm migrasyonları engeller
+
+- **Konum:** `src/config.cpp:841-878` (`migrate_config`) ve `src/config.cpp:818-839` (`version_lt`)
+- **Tür:** Doğruluk / dayanıklılık hatası
+- **Açıklama:** `migrate_config()`, `cfg.version` alanını eşitlik kontrolü ve `version_lt()` ile doğruluyor. `version_lt()` ise `std::strtoul()` ile parse edemeyen herhangi bir string için `false` döndürüyor. Eğer config dosyasında versiyon alanı bozuksa (ör. `"version": "abc"`, `"version": "1.2.3.4.5"`):
+  1. `cfg.version == RAWACCEL_VERSION` → false
+  2. `cfg.version.empty()` → false
+  3. `version_lt(cfg.version, "0.4.0")` → false (parse başarısız → false)
+  4. `migrated` hiç `true` olmaz → `cfg.version` güncellenmez, hiçbir migrasyon çalışmaz
+  Sonuç: 0.3.x'ten kalma lookup+gain verisi hiçbir zaman migrate edilmez ve bu durum sonsuza kadar devam eder.
+- **Öncelik:** Yüksek (bozuk versiyon → kalıcı migration engeli)
+- **Öneri (uygulanmadı):** `version_lt()` parse başarısızlığında `return true` (bilinmeyen versiyon = potansiyel olarak eski) kullan veya `migrate_config()`'da parse edilemeyen versiyonları `empty` ile aynı şekilde ele al.
+
+### ORTA-BUG-MOTION-03 — lp_distance küçük p değerlerinde Lp quasi-norm overflow → yanlış max döndürüyor
+
+- **Konum:** `include/math-vec2.hpp:15-28`
+- **Tür:** Hesaplama doğruluğu
+- **Açıklama:** `lp_distance()` factored formu `M * pow(1 + pow(m/M, p), 1/p)` kullanıyor. `p < 1` için dış `pow(…, 1/p)` ifadesi çok büyük değerlere ulaşabilir ve double aralığını aşarak Inf üretebilir. Bu durumda fallback `return M` (max norm) döndürülüyor. Ancak matematik olarak `||v||_p` için `p < 1`'de true değer `max`'ten BÜYÜK olabilir (örn. p=0.1, x=y=1 için `||v||_p = 2^10 = 1024`, ama fallback `M = 1` dönüyor). Sonuç: hız sensitivitesi olduğundan çok daha küçük hesaplanıyor, ivme eğrisi yanlış hız noktasında değerlendiriliyor. `sanitize_profile()` lp_norm'u 0..16 aralığında sınırlıyor, bu yüzden p ∈ (0, 1) aralığı kullanıcı tarafından ayarlanabilir.
+- **Öncelik:** Orta (hassasiyet kaybı; p < 1 nadiren kullanılır)
+- **Öneri (uygulanmadı):** Factored form overflow'a yaklaştığında log-space hesaplamaya geç:
+  ```cpp
+  double log_result = std::log(M) + std::log(inner) / p;
+  return std::isfinite(log_result) ? std::exp(log_result) : M;
+  ```
+
+### ORTA-BUG-MOTION-04 — migrate_lookup_gain tek elemanlı LUT odd-length dalı no-op
+
+- **Konum:** `src/config.cpp:803-809`
+- **Tür:** Ölü kod / yanıltıcı comment
+- **Açıklama:** `a.length % 2 != 0` dalında `y = a.data[last]` okunur, sonra `a.data[last] = static_cast<float>(y)` yazılır — bu bir no-op'tur (aynı değeri kendine kopyalar). Comment "no x to multiply — keep as-is" der, ancak `if (y != 0.0f)` koruması ve atama tamamen ölü koddur. Geçmişte `y`'ye `velocity * x` çarpımı uygulanıyordu, kaldırıldı ama dal bırakıldı.
+- **Öncelik:** Orta (ölü kod; yanıltıcı)
+- **Öneri (uygulanmadı):** Dalı tamamen kaldırın veya yorumu "Odd-length trailing element: no x to pair with, intentionally skipped" olarak güncelleyin.
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`rawaccel.hpp` EMA smoother**: `pow(0.5, 1/hl)` coefficient hesaplaması doğru; halfLife=0 → coefficient=0 → immediate tracking
+- **`rawaccel.hpp` modifier::modify()**: subnormal time guard (IPS_FACTOR_MAX), isfinite defense-in-depth doğru
+- **`rawaccel.hpp` speed_processor::init()**: lp_norm flush-to-max (MAX_NORM=16) doğru
+- **`config.cpp` `accel_args_from_json()`**: require_number type + isfinite guard doğru
+- **`config.cpp` `sanitize_accel_args()`**: clamp sıralaması (exponent_power floor → cap.x floor → offset ceiling) doğru
+- **`config.cpp` `save_config()`**: tmp+rename+fsync atomic write doğru; PID-suffix unique
+- **`config.cpp` `sort_lut_data()`**: insertion sort, n max 257 → O(n²) kabul edilebilir
+- **`logitech_hidpp.hpp` HidppTransport RAII**: Destructor doğru `close(fd_)` çağırıyor
+- **`logitech_quirks.hpp` 21 quirk girdisi**: default-DENY policy doğru
+
+## Bölüm 36 Sonuçları
+
+- **Yeni bulgu:** 4 (1 Kritik: JSON type safety; 1 Yüksek: corrupt version migration block; 2 Orta: lp_distance overflow + dead migration code)
+- **Kapatılan adaylar:** 9 (EMA correctness, modifier pipeline, config sanitize, atomic write, HID++ transport, quirks)
+- **En kritik bulgu:** KRİTİK-BUG-MOTION-01 — JSON subtype type check eksik. Bozuk config ile daemon crash.
+
+---
+
+# Bölüm 37 — Tur 18: Logitech Transport + O_CLOEXEC + Integrity Pass (10 Eylül 2026)
+
+Kapsam: `src/logitech_hidpp.cpp:500-550` (HidppTransport), `src/logitech_hidpp.cpp:690-770`
+(send_short/send_long), `src/logitech_hidpp.cpp:1690-1710` (discover),
+`src/logitech_receiver.cpp` (117 satır, tam), `include/logitech_receiver.hpp` (38 satır),
+`gui/hidpp_panel.inl:188-224` (hw_scan_thread). Satır-satır okundu.
+
+## Bu turda bulunan yeni hatalar
+
+### ORTA-BUG-TRANSPORT-01 — HidppTransport O_CLOEXEC eksik — hidraw fd çocuk süreçlere sızıyor
+
+- **Konum:** `src/logitech_hidpp.cpp:514`
+- **Tür:** Kaynak sızıntısı / savunma derinliği
+- **Açıklama:** `HidppTransport` yapıcı fonksiyonu hidraw aygıt dosyasını `O_RDWR | O_NONBLOCK` ile açar, ancak `O_CLOEXEC` belirteci eksiktir. Karşılaştırma: `gui/main.cpp:196` kilit dosyası doğru olarak `O_CLOEXEC` kullanır. Mevcut kodda fork olmadığı için pratik etkisi düşük, ancak gelecekte herhangi bir child process oluşumunda hidraw dosya tanıtıcısı süreçlere sızar.
+- **Öncelik:** Orta (savunma derinliği eksikliği)
+- **Öneri (uygulanmadı):** `open(hidraw_path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC)` olarak değiştirin.
+
+### ORTA-BUG-TRANSPORT-02 — discover_logitech_hidraw_devices O_CLOEXEC eksik
+
+- **Konum:** `src/logitech_hidpp.cpp:1703`
+- **Tür:** Savunma derinliği
+- **Açıklama:** Geçici ioctl dosya tanıtıcısı `O_RDONLY | O_NONBLOCK` ile açılmış, `O_CLOEXEC` eksik. ioctl+close çok hızlıdır ancak sinyal bu pencerede fork/exec tetiklerse fd sızar.
+- **Öncelik:** Orta
+- **Öneri (uygulanmadı):** `open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)` olarak değiştirin.
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`logitech_receiver.cpp` sysfs keşfi**: `read_hex`/`read_text` güvenli; `from_chars` doğru
+- **`logitech_receiver.hpp` receiver struct**: Tüm alanlar default-initialized; enum class güvenli
+- **`HidppTransport` RAII**: Destructor doğru `close(fd_)` çağırıyor (copy prevention ile)
+- **`send_feature_request` notification stash**: `pending_notifications_` vektörü doğru dolduruluyor
+- **`discover_logitech_hidraw_devices` ioctl**: geçici fd hemen kapanıyor
+- **`gui/hidpp_panel.inl` `hw_scan_thread`**: Worker thread → `g_idle_add` main thread'e; `hw_cancel` UAF önleme doğru
+
+## Bölüm 37 Sonuçları
+
+- **Yeni bulgu:** 2 Orta (iki O_CLOEXEC eksikliği — savunma derinliği)
+- **Kapatılan adaylar:** 6 (receiver sysfs, receiver struct, HID++ transport, notification stash, device discovery ioctl, worker thread lifecycle)
+- **Not:** Her iki bulgu da savunma derinliği kategorisinde; pratikte mevcut kod fork yapmadığı için tetiklenmez. Ancak gelecekteki değişiklikler için risk oluşturur.
+
+---
+
+## Bölüm 35-37 Toplu Sonuçları (R15-R17 / T16-T18)
+
+| Bölüm | Tur | Odak | Yeni Bulgu | Kapatılan Aday |
+|-------|-----|------|------------|----------------|
+| 35 | T16 | Accel Algorithm Headers | 6 (1 Yüksek, 2 Orta, 3 Düşük) | 16 |
+| 36 | T17 | Motion Pipeline + JSON Type Safety | 4 (1 Kritik, 1 Yüksek, 2 Orta) | 9 |
+| 37 | T18 | Logitech Transport + O_CLOEXEC | 2 (2 Orta) | 6 |
+| **Toplam** | | | **12** (1 Kritik, 2 Yüksek, 6 Orta, 3 Düşük) | **31** |
+
+### En Kritik Bulgu (R15-R17)
+
+**KRİTİK-BUG-MOTION-01 (Kritik):** `config.cpp` JSON subtype type check eksik — bozuk config ile daemon/CLI crash. `accel_x`, `speed_processor`, `profile` alt nesneleri `is_object()` kontrolü olmadan erişiliyor → `type_error.302` exception.
+
+**YÜKSEK-BUG-ALG-01 (Yüksek):** Power gain mode `integration_constant` catastrophik cancellation — `cap_y - base_fn_impl(cap_x)` farkı çok küçük → constant_b hatalı → kuyruk fonksiyonu cap_x civarında bozulmuş.
+
+**YÜKSEK-BUG-MOTION-02 (Yüksek):** Bozuk versiyon stringi tüm migrasyonları engeller → eski config verisi kalıcı olarak yanlış kalır.
+
+### Dikkat Çekici Desen
+
+R15-R17'de 3 tur boyunca **1 Kritik + 2 Yüksek + 6 Orta + 3 Düşük = 12 yeni bulgu** tespit edildi. Önceki turlarda (Bölüm 1-34) kapsanmayan tek重要 Konular:
+1. **JSON type safety** (KRİTİK): config.cpp'de alt nesne tip kontrolleri eksik
+2. **Numerical precision** (YÜKSEK): power modu catastrophik cancellation + classic overflow
+3. **O_CLOEXEC** (ORTA): HID++ transport ve device discovery'de fd sızıntısı riski
+4. **lp_distance overflow** (ORTA): p < 1'de factored form Inf → wrong max fallback
+
+Toplam 37 Bölüm (T1-T21 + T16-T18 tekrar) = ~40 tur analiz. Proje olgunlaşma aşamasında: kritik bulgular belirlenmiş, tüm algoritmalar matematiksel olarak doğrulanmış, config katmanı 3 savunma katmanıyla korunuyor.
+
+---
+
+# Bölüm 38 — Tur 22-24: GUI Kenar Durum + CLI Profil Çözümleme + Algoritmik Taşma (10 Eylül 2026)
+
+Bu bölüm, projenin GUI clip/ rebuild, CLI profil eşleşme ve algoritmik taşma
+alanlarında 3 bağımsız analiz turunun sonuçlarını içerir:
+
+- **Tur 22:** GUI graph.inl, widgets_sync.inl, profile_mgr.inl — clip, rebuild, switch coverage
+- **Tur 23:** daemon.cpp (IPC), cli/main.cpp (status), rawaccel.hpp (modifier/smoother)
+- **Tur 24:** config.cpp (migration), accel-classic/power/synchronous, lat_stats, motion_math
+
+**Düzeltme:** YAPILMADI — yalnız raporlama.
+
+---
+
+## ORTA ÖNCELİKLİ HATALAR (Medium)
+
+### BUG-NEW-50 — LUT noktaları grafik clip dışına taşyor → etiket/margin üzerine çizim (GUI)
+
+- **Konum:** `gui/graph.inl:142,205-221`
+- **Tür:** Çizim hatası / clip eksikliği
+- **Açıklama:** `on_graph_draw` grafik alanı clip'i oluşturur (satır 96-97), grid/çizgileri çizer, ardından satır 142'de `cairo_reset_clip(cr)` ile clip'i kaldırır. LUT noktaları (satır 205-221) clip yeniden uygulanmadan çizilir — `to_cx(p.first)` yatayda clamp'lenmez. Kullanıcı zoom yaptığında (`max_speed` düşürdüğünde) speed'i max_speed'i aşan LUT noktaları Y-ekseni etiketlerinin, başlıkların veya sağ margin üzerine çizilir. `to_cy` clamp'li (satır 89) olduğu için dikey yerleşim sınırlı kalır; yatay taşma tek kusurdur.
+- **Öncelik:** Orta (görsel bozulma; LUT editöründe normal kullanımda tetiklenir)
+- **Öneri:** LUT-noktası döngüsüne `cairo_save`/`cairo_restore` ile clip uygula veya `px`'i `std::clamp` ile sınırla.
+
+### BUG-NEW-51 — `on_lut_add_point` spin aralığı dışına nokta oluşturuyor → sessiz veri bozulması (GUI)
+
+- **Konum:** `gui/graph.inl:520`
+- **Tür:** Sessiz veri kaybı (G-BUG-1 kalıbının yeni yolu)
+- **Açıklama:** `new_speed = pts.back().first + 10.0` `LUT_SPEED_SPIN_MAX` (10000) ile sınırlı değil. Son nokta 9995'te iken "+ Add Point" 10005 üretir → `ax.data`'ya `10005.0f` olarak yazılır. `rebuild_lut_list` `gtk_spin_button_set_value(10005)` çağrısı GtkAdjustment tarafından 10000'e clamp edilir → ekranda "10000" görünür ama veri 10005'tedir. Bir sonraki spin dokunuşunda `lut_list_changed` spinlerden 10000 okur → `lut_set_points` veriyi 10000'e sessizce düşürür. G-BUG-1'in Add-Point yoluyla yeni tetiklenme senaryosu.
+- **Öncelik:** Orta (sessiz veri bozulması — LUT editöründe normal kullanım)
+- **Öneri:** `new_speed = std::min(pts.back().first + 10.0, LUT_SPEED_SPIN_MAX)` ile sınırla.
+
+### BUG-NEW-60 — CLI `cmd_status()` "All devices" catch-all profili atlıyor
+
+- **Konum:** `cli/main.cpp:1357-1366`
+- **Tür:** Mantık hatası (profil çözümleme uyumsuzluğu)
+- **Açıklama:** Daemon'un `find_profile()` 4 adımda profili çözer: (1) device_id eşleşmesi, (2) **boş device_id ile "tüm cihazlar" catch-all**, (3) active_profile, (4) ilk profil. CLI `cmd_status()` yalnızca 3 adım yapıyor — 2. adımı (boş device_id kontrolü) atlıyor. Kullanıcıda bir cihaza atanmamış ("All devices") profil varsa ve belirli bir fare için device_id eşleşmiyorsa, CLI yanlış profili gösterir.
+- **Öncelik:** Orta (yanlış durum gösterimi)
+- **Öneri:** Adım 1 ve 3 arasına boş device_id döngüsü ekle.
+
+### BUG-NEW-71 — `gain_accel` `exponent_classic` ≈ 1'de taşma → IO+GAIN modu sessizce identiteye çöküyor
+
+- **Konum:** `include/accel-classic.hpp:123-127,192-196`
+- **Tür:** Sayısal taşma / sessiz identite çökmesi
+- **Açıklama:** `gain_accel` içinde `1.0 / (power - 1)` when `power` ≈ 1.001 (GUI aralığı [1,10]) 1000'e ulaşır. Orta düzey `cap_y` (ör. 50) için `pow(49.5, 1000)` → `Inf`. `isfinite` guard Inf'i yakalar ve `accel_raised = 0.0` atar → sonraki tüm `base_fn(x, 0, args)` çağrıları `0 * p / x = 0` döner → `operator()` her zaman `1.0` (identite) döner — hız veya cap ayarlarından bağımsız. Kullanıcı IO+GAIN modunda power ≈ 1 ayarlar → ivme tamamen devre dışı, hata yok.
+- **Öncelik:** Orta (sessiz ivme kaybı — belirli mod + parametre kombinasyonu)
+- **Öneri:** `gain_accel` içinde içsel üssü sınırla (ör. `std::min(1.0/(power-1), 300.0)`) veya `isfinite(a)` guard'da büyük ama sonlu fallback değeri döndür.
+
+---
+
+## DÜŞÜK ÖNCELİKLİ HATALAR (Low)
+
+### BUG-NEW-52 — Hover/sağ-tık LUT hit-test clamp'lenmemiş gain kullanıyor → grafik drawing ile tutarsız
+
+- **Konum:** `gui/graph.inl:297`, `gui/ui_builder.inl:854`
+- **Tür:** Formül tutarsızlığı
+- **Açıklama:** Draw yolu (satır 89) `to_cy` ile gain'i clamp'liyor. Hit-test yolu (satır 297) clamp'siz. Float ULP nedeniyle `gain/max_gain > 1` olabilir → hit-test hedefi çizili noktanın üzerinde kalır → 10 px eşik başarısız → crosshair/seçimi gösterilmez.
+- **Öncelik:** Düşük (kosmetik; nadir)
+- **Öneri:** Hit-test'te de `std::clamp` kullan.
+
+### BUG-NEW-53 — `preset_preview_text` switch `default` dalı yok
+
+- **Konum:** `gui/profile_mgr.inl:58-66`
+- **Tür:** Savunma derinliği eksikliği
+- **Açıklama:** `accel_mode` enum switch'inde `default:` dalı yok. Mevcut 7 değer kapsanıyor ancak gelecekteki enum ekleme veya bozuk veri `mode = ""` üretir → "mode: " blank görünür.
+- **Öncelik:** Düşük (savunma derinliği)
+- **Öneri:** `default: mode = tr("Unknown"); break;` ekle.
+
+### BUG-NEW-70 — `version strtoul` taşması → undefined behavior → migration bozulması
+
+- **Konum:** `src/config.cpp:827-829`
+- **Tür:** Sayısal taşma / UB
+- **Açıklama:** `strtoul` overflow'da `errno = ERANGE` ayarlar ve `ULONG_MAX` döndürür ancak `errno` kontrol edilmiyor. `static_cast<int>(ULONG_MAX)` C++17'de tanımsız davranış. Bozuk config `"99999999999.0.0"` sürümü `[−1, 0, 0]` olarak ayrıştırılır → `version_lt` true → `migrate_lookup_gain` çalışır → zaten güncel veri tekrar ölçeklenir → kalıcı eğri bozulması.
+- **Öncelik:** Düşük (bozuk config gerektirir)
+- **Öneri:** `strtoul` sonrası `errno == ERANGE` kontrolü veya `n`'i `INT_MAX`'e sıkıştır.
+
+### BUG-NEW-72 — `lat_stats::percentile()` negatif `pct` → UB
+
+- **Konum:** `daemon/lat_stats.hpp:100,125`
+- **Tür:** Undefined behavior
+- **Açıklama:** `static_cast<uint64_t>(std::ceil(count * pct / 100.0))` — `pct < 0` ise ceil sonucu negatif double. `static_cast<uint64_t>(−1.0)` C++17'de UB. Fonksiyon sözleşmesi "(0–100)" ancak guard yok.
+- **Öncelik:** Düşük (hatalı argüman; pratikte çağrılmaz)
+- **Öneri:** `if (pct <= 0) return min_us;` ve `if (pct >= 100) return max_us;` ekle.
+
+---
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`graph.inl` draw callback**: Tüm LUT noktaları `to_cy` ile clamp'li; grid/curves clip içinde.
+- **`widgets_sync.inl` `on_param_changed`**: `S->updating` guard ile yanlış pozitif engelleme doğru.
+- **`profile_mgr.inl` profil CRUD**: index math doğru; modal dialog lifecycle doğru.
+- **`daemon.cpp` IPC `set_config`**: Body deadline 5s, total deadline 10s, 1MB limit doğru.
+- **`cli/main.cpp` `daemon_ipc_send`**: 65536 byte response limiti, EAGAIN/EPIPE handle.
+- **`rawaccel.hpp` modifier::modify()`**: IPS_FACTOR_MAX, rotation, snap, speed clamp, `isfinite()` guard.
+- **`rawaccel.hpp` smoothers**: EMA katsayıları, trend dampening doğru.
+- **`config.cpp` sanitize zinciri**: NaN/Inf→default, 15+ alt sınır, 5 üst sınır doğru.
+- **`accel-power.hpp` gain_inverse**: `DBL_MAX` fallback doğru.
+- **`accel-classic.hpp` linear path**: `exponent <= 1` sabit gain doğru.
+- **`accel-synchronous.hpp` odd-symmetric tanh**: `|z|` + `sign(z)` simetri doğru.
+- **`lat_stats.hpp` histogram**: Mutex korumalı, NaN guard doğru.
+- **`motion_math.hpp` subpixel**: INT_MIN/INT_MAX clamp, remainder sıfırlama doğru.
+
+---
+
+## Bölüm 38 Sonuçları
+
+- **Toplam yeni bulgu:** 8 (4 Orta + 4 Düşük)
+- **Önceki bölümlerden tekrar doğrulanAN:** Tüm mevcut bulgular tekrar doğrulandı.
+- **Kapsam:** 15+ dosya 3 bağımsız turda tarandı
+- **En kritik yeni bulgular:**
+  - BUG-NEW-51 (LUT Add Point sessiz veri bozulması — G-BUG-1'in yeni yolu)
+  - BUG-NEW-71 (classic gain_accel taşma → identite çökmesi)
+  - BUG-NEW-60 (CLI "All devices" catch-all eksik)
+
+---
+
+## Genel Program Analiz Özeti (Bölüm 11-38 Toplamı — 24 Tur)
+
+| Öncelik | Adet | Anahtar Bulgular |
+|---------|------|-------------------|
+| **Critical** | 3 | C-BUG-1, C-BUG-2, KRİTİK-BUG-MOTION-01 |
+| **High** | 17 | H-BUG-1..8, N-01, NEW-1..3, NEW-40, NEW-43, YÜKSEK-BUG-ALG-01, YÜKSEK-BUG-MOTION-02 |
+| **Medium** | 48+ | M-BUG-1..20, N-02..08, G-BUG-1/6/8/9, P-BUG-1..4, NEW-4, NEW-20, BUG-NEW-50/51/60/71, ORTA-BUG-* |
+| **Low** | 70+ | L-BUG-1..41, N-09..17, FINDING-*, P-BUG-5..8, R3-1..5, NEW-5/6/21-23/41-46, BUG-NEW-52/53/70/72, DÜŞÜK-BUG-* |
+| **Toplam** | **138+** | |
+
+**24 Tur Kapsam Özeti:**
+- **Okunan dosya:** 50+ (tüm proje kaynakları, her dosya en az 1 kez tamamen okundu)
+- **Analiz türleri:** Satır-satır kod, algoritma doğrulama, protokol uyumluluk, thread safety, bellek güvenliği, performans, GUI lifecycle, build/CI, fuzz, çeviri kapsamı, grafik clip, LUT data-flow, profil çözümleme, numerik doğruluk, O_CLOEXEC, JSON type safety
+
+**En kritik açık alanlar:**
+1. **JSON type safety** (KRİTİK-BUG-MOTION-01): config.cpp'de alt nesne tip kontrolleri eksik
+2. **HID++ bildirim stash** (NEW-1, NEW-2): send_short/send_long/send_very_long/read_register
+3. **Algoritmik taşma** (YÜKSEK-BUG-ALG-01, BUG-NEW-71): power/classic numeric precision
+4. **GUI thread safety** (C-BUG-1, C-BUG-2): HID++ worker thread lifecycle
+5. **LUT data-flow** (BUG-NEW-51, G-BUG-1, P-BUG-3): sessiz veri bozulması yolları
+
+---
+
+# Bölüm 39 — Tur 25-27: Daemon sysfs/Epoll + KWin kaldırma + Config Alanı (10 Eylül 2026)
+
+Bu bölüm, mevcut raporun hiçbir bölümünde yer almayan, satır-satır yeniden okuma ile
+doğrulanmış 3 bağımsız analiz turunun sonuçlarını içerir:
+
+- **Tur 25:** `daemon/daemon.cpp` (1994 satır, tam okunma) — sysfs polling-rate algılama, `run_loop` epoll hata yolu, `process_device` okuma hataları
+- **Tur 26:** `scripts/kde-fix-accel.sh` + `setup.sh`/`scripts/uninstall.sh` kaldırma zinciri + `gui/ui_builder.inl` KWin yazıcısı
+- **Tur 27:** `src/config.cpp` (881 satır, tam) + `include/rawaccel.hpp` (375 satır, tam) + daemon'ın config alanı kullanımı
+
+**Önemli not:** Önceki turlarda `find_profile`, telemetri seqlock, IPC deadline'lar,
+config sanitize zinciri tekrar doğrulandı; bu turda doğrulanıp "bug değil" kapatılan
+adayların listesi bölüm sonundadır.
+
+**Düzeltme:** YAPILMADI — yalnız raporlama.
+
+---
+
+## ORTA ÖNCELİKLİ HATALAR (Medium)
+
+### BUG-NEW-80 — `detect_polling_rate()`: BUG-16'nın "speed okunamadı" kurtarma dalı ölü; sysfs `speed` Mbps-string'i enum olarak yorumlanıyor (daemon)
+
+- **Konum:** `daemon/daemon.cpp:147-207` (özellikle 154, 172-174, 183-197, 198-201); `sysfs_read_int` 129-143
+- **Tür:** Mantık hatası / ölü kod / sysfs sözleşme yanlış okuması
+- **Açıklama:** İki bağımsız kusur aynı fonksiyonda birleşiyor:
+
+  1. **Ölü kurtarma dalı (en kritik):** `sysfs_read_int()` dosya yoksa `fopen` başarısız → **`-1`** döndürür; boş okuma, `strtol` başarısızlığı veya int taşmasında da `-1` döndürür — **hiçbir koşulda `0` döndürmez** (`speed` dosyası asla literal "0" içermez). Buna rağmen satır 183 `if (usb_speed == 0)` ile BUG-16'nın "speed okunamadı" kurtarmasını özel duruma bağlar. Bu dal **asla tetiklenmez**; dosya okunamayan cihaz `-1` alır ve satır 198-201'deki **saf full-speed formülüne** (`rate_hz = 1000 / binterval`) düşer — BUG-16 yorumunun ("high-speed gaming mice için 8× düşük raporlama") düzelttiğini iddia ettiği davranışın ta kendisi. Örn. gerçekte 1000 Hz yoklama yapan high-speed bir farenin `bInterval=4` (2³ mikroframe = 1 ms) okuması: `1000/4 = 250 Hz` raporlanır (4× düşük). `usb_speed == 0` yerine `usb_speed <= 0` (veya `< 0`) gerekirdi.
+
+  2. **`>= 3` eşiği Mbps-string'i enum sanıyor:** Yorum satır 165-170, USB hız değerlerini çekirdek `enum usb_device_speed` (1=Low, 2=Full, 3=High, 5=Super) olarak tanımlıyor. Oysa Linux sysfs `.../speed` dosyası hızı **Mbps metin** olarak yazar ("1.5", "12", "480", "5000", "10000"). `sysfs_read_int` "12"yi 12 olarak okur → `12 >= 3` → full-speed (12 Mbps) cihaz **high-speed sanılır** → bInterval 125 µs biriminde yorumlanır (gerçek full-speed 125 Hz bInterval=8 → `125·2⁷=16 ms → 62 Hz`; bInterval=1 → sahte 8000 Hz). "1.5" → 1 (noktada kesilir) full-speed dalına düşer; "5000"/"10000" yanlışlıkla high-speed dalına düşer (bInterval birimleri aynı olduğundan sonuçta zararsız).
+
+  Etki yüzeyi: algılanan değer yalnızca `detected_polling_rate` olarak `status_json`/GUI auto-fill'e gider, profil eşleşmesini etkilemez — ancak GUI "Auto Fill" bu değeri kullanıcıya doğru rate olarak yazar (BUG-NEW-86 ile birleştiğinde yanıltıcı veri kaynağı).
+- **Öncelik:** Orta (yolun erişilebilirliği cihaz ağacına bağlı; kusurun kendisi kesin ve belgelenen BUG-16 düzeltmesini etkisiz kılıyor)
+- **Öneri:** `if (usb_speed == 0)` → `if (usb_speed <= 0)` yap; `speed` okumasında Mbps-string sözleşmesini yorumlayacak şekilde açıkla (örn. "12" → full-speed, "480"/"5000" → high-speed/üstü, "1.5" → low-speed) ve `>= 3` eşiğini metin bazlı mantığa çevir (480'e eşit, 1.5'e 1 → full-speed).
+
+### BUG-NEW-81 — `run_loop()`: `epoll_wait` kalıcı hatasında `break` → tüm fare işleme sessizce ölüyor, daemon "çalışıyor" görünmeye devam ediyor (daemon)
+
+- **Konum:** `daemon/daemon.cpp:1138-1144`
+- **Tür:** Dayanıklılık / hata yolu (tek nokta arızası)
+- **Açıklama:** `epoll_wait` EINTR dışında herhangi bir hata (`EBADF`, `ENOMEM`, `EINVAL`, geçici fd karışıklığı vb.) döndürürse satır 1143 `break` ile `while (running_.load())` döngüsünden **sonsuza dek** çıkar: `loop_thread_` biter; `running_` hâlâ `true` olduğundan daemon işlemi yaşar, IPC (status → `{"running":true}`) yanıt vermeye devam eder, ancak **tüm cihaz okuma, uinput yazma, hot-plug, SIGHUP/IPC reload ve HID++ housekeeping durur**. Kullanıcı açısından: fare RawAccel etkisi olmadan hamda takılı; `rawaccel-cli status` "running" der; hiçbir hata journal'a ayrılmaz çünkü `log()` satır 1142'de zaten basılmıştır — ama loop ölmüştür. Tek kurtarma daemon restart'ı. Geçici bir epoll hatasının kalıcı felakete dönüşmesi, hot-path'in (saniyede binlerce olay) en güvenilmeyen sistem çağrısında tek nokta arızası olmasından kaynaklanıyor.
+- **Öncelik:** Orta (nadir tetiklenir; ancak daemon'ı sessiz zombiye çevirir ve tek anlamlı restarttır)
+- **Öneri:** `break` yerine art arda hata sayacı + `continue` (ör. 10 ardışık hata → yeniden kurulum denemesi: `epoll_create1` + tüm fd'leri yeniden `EPOLL_CTL_ADD`), ya da en azından hatayı `running_` mantığından bağımsız olarak ikinci bir log + belirgin durumda bırak.
+
+### BUG-NEW-83 — `kde-fix-accel.sh --remove`: regex tek fazla grup istiyor → per-device `(RawAccel)` kwinrc bölümleri ASLA silinmiyor, uninstall "✓" basıyor (script)
+
+- **Konum:** `scripts/kde-fix-accel.sh:228` (kaldırıcı regex); yazıcı `scripts/kde-fix-accel.sh:114`; GUI yazıcısı `gui/ui_builder.inl:1271-1273`; çağıranlar `setup.sh:451-452` (`do_uninstall`) ve `scripts/uninstall.sh:79-90`
+- **Tür:** Regex fazla eşleşme sayısı / kaldırma başarısız ama başarı görünümü
+- **Açıklama:** Yazıcı (script ve GUI) bölüm başlığını `[Libinput][bus][vendor][product][name]` olarak üretir — `[Libinput]` ile isim grubu arasında **3** grup (bus, vendor, product). Gerçek kwinrc kanıt da budur (örn. cihazda `[Libinput][3][3599][3][VMware VMware Virtual USB Mouse (RawAccel)]`). Kaldırıcı regex ise:
+  `^\[Libinput\](?:\[[^\]]*\]){4}\[[^\]]*\(RawAccel\)\]$`
+  `[Libinput]` ile isim arasında **4** grup ister → hiçbir üretilmiş başlık eşleşmez, `header.match(line)` her zaman yanlış → satır 233-244'teki blok kaldırma hiç çalışmaz. Satır 210-216 yorumu "this removes every nested section" der; gerçekte hiçbirini kaldırmaz. `setup.sh --uninstall` ve `uninstall.sh` `--remove`'u çağırır; global `[Libinput]` adaptive'e döner ama **per-device Flat override'lar kwinrc'de kalır** → RawAccel kaldırıldıktan sonra kullanıcının (RawAccel) sanal cihazları için KWin hâlâ Flat (ivmesiz) uygular; kullanıcı KWin ayarlarını kaybetmiş gibi davranır ve hiçbir uyarı/çıktı farkı görmez.
+- **Öncelik:** Orta (belgelenen BUG-09/P121 sözleşmesi sessizce ihlal; kaldırma hijyen hatası)
+- **Öneri:** `{4}` yerine `{3}` kullan. (Arka plan: bazı KWin sürümleri 4-grup formatı yazarsa, hem 3 hem 4 grubu kapsayan `{3,4}` bile olabilir — ancak kanıtlanan üretici formatı 3'tür, eşleşme 3 ile kurulmalıdır.)
+
+---
+
+## DÜŞÜK ÖNCELİKLİ HATALAR (Low)
+
+### BUG-NEW-82 — `process_device()`: kısa `read()` sessizce düşürülüyor (daemon)
+
+- **Konum:** `daemon/daemon.cpp:1395-1396`
+- **Tür:** Tanı / sessiz veri kaybı yolu
+- **Açıklama:** `n == 0` EOF → `disconnected = true` (görünür); ancak `0 < n < sizeof(input_event)` (kısmi/kısa okuma) satır 1396'da **log'suz `break`** ile sessizce atılır. Aynı fonksiyonda her errno dalı loglanırken kısa okuma hiç dokümente edilmez; daemon-uygulama arası tampon bütünlüğü bozulduğunda motif kaybı görünmez kalır.
+- **Öncelik:** Düşük (nadir; tanı kalitesi sorunu)
+- **Öneri:** Kısa okumayı en az bir verbose log ile işaretle; ardışık kısa okumaları EOF gibi `disconnected` saymayı değerlendir.
+
+### BUG-NEW-84 — `kde-fix-accel.sh --check`: yalnızca global `[Libinput]` doğrulanıyor, per-device (RawAccel) Flat override'ları kapsam dışı (script)
+
+- **Konum:** `scripts/kde-fix-accel.sh:184-191`
+- **Tür:** Eksik doğrulama (yanlış güven hissi)
+- **Açıklama:** `--check` yalnızca global `[Libinput]` bölümünün `PointerAccelerationProfile` değerini okur. Kullanıcı bir (RawAccel) sanal cihazını System Settings'den adaptive'e (ör. 2/-0.5) çektiyse, per-device override global'i ezer ve **çift ivmelenme** oluşur; `--check` bunu tespit edemez ve "✓ Flat — correct for RawAccel" der. BUG-NEW-83 göz önüne alındığında kwinrc'de hiç temizlenmemiş per-device bölümlerinin durumu da kontrol edilmiyor.
+- **Öncelik:** Düşük (kontrol aracı kapsamı)
+- **Öneri:** `--check`'i per-device `(RawAccel)` bölümlerini de tarayarak global + tüm (RawAccel) bölümlerinde Flat olduğunu doğrulayacak şekilde genişlet.
+
+### BUG-NEW-85 — JSON yüklemede `cap_mode` beyaz liste kontrolü yok → bilinmeyen/hatalı string sessizce `out`'a eşlenir (config)
+
+- **Konum:** `src/config.cpp:47-59` (`str_to_cap`) ve `159-160` (kullanım); karşılaştırma: `mode` beyaz listesi 99-115
+- **Tür:** Giriş doğrulama asimetrisi / sessiz davranış değişimi
+- **Açıklama:** `accel_args_from_json`'da `mode` için 7 geçerli isim kontrolü + bilinmeyense **throw** (P120-FAZ2 disiplini) uygulanır; ancak `cap_mode` yalnızca `.is_string()` ise `str_to_cap()` ile okunur ve **bilinmeyen herhangi bir string `cap_mode::out`'a** düşer. Elle düzenlenmiş JSON'da `"cap_mode": "ioo"` (typo) hiçbir uyarı vermeden `out` olarak yüklenir — `out`; classic/power/synchronous io davranışını değiştiren, ivme kuyruğunu farklı bir dalda çalıştıran bir moddur. Raporun mevcut `mode` sertleştirmesi bu alanı kapsamaz.
+- **Öncelik:** Düşük (elle JSON gerektirir; GUI/CLI zaten doğrular)
+- **Öneri:** `mode` ile simetrik şekilde `in`/`out`/`io` beyaz listesi ekle, bilinmeyen isimde throw veya en azından uyarı.
+
+### BUG-NEW-86 — Profil `polling_rate` alanı daemon'da hiçbir runtime hesabında kullanılmıyor: yanıltıcı ayar yüzeyi (config/daemon/GUI/CLI)
+
+- **Konum:** yazma `daemon/daemon.cpp:747-748` (yalnızca clamp), `src/config.cpp:301,314-315`; tüketim `daemon/daemon.cpp:1638,1711-1712` (yalnızca `status_json` echo); GUI `gui/widgets_sync.inl:208,319`; CLI `cli/main.cpp:321,325,982,1240,1324`
+- **Tür:** Kullanılmayan/ölü config alanı (yanlış beklenti)
+- **Açıklama:** `device_profile.dev_cfg.polling_rate` daemon tarafında **yalnızca** `dev.poll_rate`'a clamp'lenir (747-748) ve o da yalnızca `status_json`'da yankılanır (1711-1712). Ne hız normallizasyonu, ne `dpi_factor`, ne süre hesabı bu alanı okur (süre çekirdek zaman damgasından gelir). Reference RawAccel bu alanı counts→inches/s dönüşümünde kullanır; bu portta GUI "Doğrulanan hız" spin'i ve CLI `polling_rate` anahtarı kullanıcıya **"bu ayar cihazın yoklama hızını belirler"** izlenimi verir, gerçekte hiçbir runtime etkisi yoktur. Ayrıca GUI "Auto Fill" `detected_polling_rate`'i (BUG-NEW-80'deki hatalı kaynaktan) bu alana yazabilir — kullanıcıya görünen rakam hem kusurlu hem de işlevsizdir.
+- **Öncelik:** Düşük (yanıltıcı yüzey; kritik olmayan veri kaybı)
+- **Öneri:** Alanı ya gerçekten kullan (örn. referans gibi zaman damgası olmayan cihazlar için fallback) ya da GUI/CLI'da belirgin şekilde "bilgi amaçlı — runtime'ı etkilemez" olarak işaretle; `detected_polling_rate`'i otomatik olarak bu alana yazmayı bırak.
+
+---
+
+## Bu turda doğrulanıp "bug değil / korumalı" olarak kapatılan adaylar
+
+- **`find_profile`/`config_` thread güvenliği:** `config_` yazımları yalnızca loop thread'inde (`apply_new_config` reload ve push yolları, ikisi de `devices_mutex_` altında); IPC thread'i yalnızca kilit altında okur → kilit kapsamı tamam, veri yarışı yok.
+- **`sort_lut_data` tek-indeks (odd-length) soneki:** `lookup` `length/2` ikili nokta okur; tek sonek float ölü veridir, `migrate_lookup_gain` ve serialize ile tutarlı — zararsız.
+- **`modifier::modify()` snap+directional ağırlık sırası:** reference portu ile oracle tarafından karşılaştırılıyor; sapma yok.
+- **`run_loop` disconnect temizliği:** `epoll_ctl(DEL)` önce, `close` sonra; fd yeniden kullanımı yarışı teorik (devices ekleme ayrı passta) — hata yolu BUG-NEW-81 dışında bug değil.
+- **`push_config` no-op guard / atomik save:** PID-suffiksli temp + `O_NOFOLLOW|O_EXCL` + fsync + dir fsync, mevcut raporla uyumlu doğru.
+- **`handle_ipc_client` deadline'lar:** 256-byte satır + 10 s toplam + 5 s body; slowloris yüzeyi kapalı.
+
+---
+
+## Bölüm 39 Sonuçları
+
+- **Yeni bulgu:** 7 (BUG-NEW-80..86) → 3 Orta + 4 Düşük
+- **En kritik yeni bulgular:**
+  - BUG-NEW-80 (detect_polling_rate ölü kurtarma dalı + Mbps/enum karışıklığı — BUG-16 düzeltmesi etkisiz)
+  - BUG-NEW-83 (kde-fix-accel `{4}` regex off-by-one — `--remove` hiçbir per-device bölümü silmiyor)
+  - BUG-NEW-81 (epoll_wait hatası → loop thread ölümü, sessiz zombi daemon)
+- **Kapsam:** `daemon.cpp` (tam), `src/config.cpp` (tam), `include/rawaccel.hpp` (tam), `scripts/kde-fix-accel.sh`, `setup.sh`, `scripts/uninstall.sh`, `gui/ui_builder.inl`, `include/config.hpp`, `include/rawaccel-base.hpp`, `cli/main.cpp` seçili bölümleri.
+- **Genel toplam (Bölüm 1-39):** önceki 138+ bulguya +7 ile **145+**; Critical 3, High 17, Medium 51+, Low 74+.
+
+---

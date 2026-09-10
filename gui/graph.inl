@@ -294,7 +294,10 @@ void on_graph_motion(GtkEventControllerMotion*, double cx, double cy, gpointer u
     for (auto& [spd, stored] : pts) {
         double gain = lut_stored_to_gain(spd, stored, vel);
         double px = GRAPH_ML + (spd / max_speed) * PW;
-        double py = GRAPH_MT + (1.0 - gain / max_gain) * PH;
+        // BUG-NEW-52: hit-test must clamp like draw's to_cy (graph.inl:89), or
+        // gain/max_gain > 1 (float ULP) pushes the target off-dot and the
+        // crosshair never appears.
+        double py = GRAPH_MT + (1.0 - std::clamp(gain / max_gain, 0.0, 1.0)) * PH;
         double d2 = (cx - px) * (cx - px) + (cy - py) * (cy - py);
         if (d2 < 10.0 * 10.0) { near = true; break; }
     }
@@ -517,7 +520,14 @@ void on_lut_add_point(GtkButton*, gpointer user_data) {
         return;
     }
     // Insert a new point just beyond the current last point
-    double new_speed = pts.empty() ? 10.0 : pts.back().first + 10.0;
+    // BUG-NEW-51: cap the new speed at LUT_SPEED_SPIN_MAX (10000) so the point
+    // can never exceed the spin range.  Previously a last point ≥ 9995 produced
+    // 10005, which GtkAdjustment silently clamped to 10000 in rebuild_lut_list
+    // while ax.data kept 10005 — the next spin tick rewrote it to 10000
+    // (silent data corruption; same family as G-BUG-1).
+    constexpr double LUT_SPEED_SPIN_MAX = 10000.0;
+    double new_speed = pts.empty() ? 10.0
+        : std::min(pts.back().first + 10.0, LUT_SPEED_SPIN_MAX);
     double new_gain  = pts.empty() ? 1.5
         : lut_stored_to_gain(pts.back().first, pts.back().second, ax.gain);
     pts.push_back({new_speed, lut_gain_to_stored(new_speed, new_gain, ax.gain)});
