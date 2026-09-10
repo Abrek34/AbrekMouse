@@ -247,7 +247,9 @@ public:
         // Guard: subnormal / extremely small time values can produce Inf ips_factor
         // which cascades into NaN through the accel pipeline.  Clamp to a sane max
         // (equivalent to ~0.001 ms poll interval, i.e. 1 MHz — well beyond any real hardware).
-        if (!std::isfinite(ips_factor)) ips_factor = 0;
+        constexpr double IPS_FACTOR_MAX = 1e6;
+        if (!std::isfinite(ips_factor) || ips_factor > IPS_FACTOR_MAX)
+            ips_factor = IPS_FACTOR_MAX;
 
         // 1. Rotation
         if (flags.apply_rotate)

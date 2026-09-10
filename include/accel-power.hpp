@@ -139,7 +139,14 @@ private:
 
     static double gain_inverse(double g, double power, double sc) {
         if (sc <= 0) return 0;
-        return std::pow(g / (power + 1), 1.0 / power) / sc;
+        // BUG-NEW-11/16 (aj4): with a tiny floored exponent (n=1e-3) and a
+        // large requested gain the true inverse ~ g^(1/n) far exceeds DBL_MAX,
+        // so pow() returns Inf and offset.x/constant become Inf.  Clamp to a
+        // finite DBL_MAX: it is still larger than any reachable speed, so the
+        // plateau (x <= offset.x → offset.y) is numerically identical, while
+        // the struct stays free of Inf (scale_from_* keep their own guard).
+        double r = std::pow(g / (power + 1), 1.0 / power) / sc;
+        return std::isfinite(r) ? r : DBL_MAX;
     }
 
     static double scale_from_gain_point(double input, double gain, double power) {

@@ -142,6 +142,8 @@ private:
     double gain_apply(double x, const accel_args& args) const {
         const float* data = args.data;
 
+        if (!std::isfinite(x) || x <= 0) return 1.0;
+
         int e = std::min(std::ilogb(x), range.stop - 1);
 
         if (e >= range.start) {

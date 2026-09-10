@@ -3054,3 +3054,30 @@ Aj1 olarak kendimi ve bu turda yaptığım düzeltmeleri log'a geçiyorum (aynı
 - **KAPANMIŞ MADDELER:** bug_raporlari.md #1/#2/#7/#16 ✅ DÜZELTİLDİ — yeniden aranmamalı. #3/#4/#5/#6/#8/#9/#10/#11/#12/#13/#15/#18 "hata değil" (gerekçeleri dosyada). #14/#17 bilinen sınırlama (değişmedi).
 - COMMIT YOK (klarla birikiyor; top-level commit Aj1 onayıyla).
 — Aj.1
+
+### Aj.1 (big-pickle) [M93] [10 Eyl 2026] [15:34] — FIX LOG: BUG-NEW-* TAMAMI + G-BUG-1/2 + bug 22/23/24/25/26
+
+R55 sonrası ikinci tur — `bug_raporlari_yeni.md` (aj4) + `bug_raporlari_aj3.md` (bölüm 11) + `bug_raporlari.md` killeri tamamlanıyor (kullanıcı: "1 tane eksik kalmasın"):
+
+- **YENİ (bug_raporlari_yeni.md BUG-NEW-*):**
+  - **07** ✅ write_text_file → `open(O_EXCL|O_NOFOLLOW|O_CLOEXEC)` + unlink + retry + fsync (gui/profile_mgr.inl; save_config disiplini)
+  - **10** ✅ HATA DEĞİL (aj1 kararı) — lookup x≤0 `0.0` referans uyumu korundu; accel-lookup.hpp:66 açıklama + oracle kısıtı
+  - **11+16** ✅ accel-power `gain_inverse` taşması → `isfinite?r:DBL_MAX` clamp (aşırı params'ta Inf yok; erişilebilir hızlarda davranış aynı)
+  - **14** ✅ on_inotify_event artık tek read'deki TÜM olayları geziyor (gui/devices.inl oturum)
+  - **15** ✅ test toleransları 0.01/0.5 → 1e-9/1e-4 (probe: 10.883883476483, sapma 1.65e-5)
+  - **17** ✅ accel-jump smooth-gain `1.0+dA/x` `!isfinite` → 1.0 (denormal x'te olay kaybı yok). 01-06/08/09/12/13 aj4'ün zaten kapattığı maddelerdi → dosyada doğrulandı: **17/17 kapalı, açık 0**.
+- **AJ3 (bölüm 11):**
+  - **G-BUG-1** ✅ LUT speed spin `0..500` → `0..LUT_SPEED_SPIN_MAX(10000)` — sessiz veri bozulma yolu kapandı (gui/graph.inl)
+  - **G-BUG-2** ✅ append_fixed ayraç virgülü bozulması → biçim `",\"%s\":"` → `"\"%s\":"`, ayraç döngü dışında; probe: nlohmann parse temiz. (bug_raporları BUG-06 ile aynı kök.)
+- **MAIN (bug_raporlari.md):**
+  - **22** ✅ HID++ request pencere notification stash'i (includes/logitech_hidpp.hpp `pending_notifications_` 16'da sınırlı; send_feature_request stash + drain flush)
+  - **23** ✅ get_polling_rate extended (0x8061) ÖNCE, legacy sonra (Solaar sırası; 2-8 kHz doğru rapor)
+  - **24** ✅ aktif batarya sorgusu 60 s (`get_battery_status`), notification'larla `apply_hidpp_battery` merge (vid:pid eşleşme; çoklu farede merge yok — koruma belgeli)
+  - **25** ✅ telemetri belge onarımı: "euclidean+weights1+snap0+smoothing0" kısıtı koşuluyla; flush_motion yorumu güncelli
+  - **26** ✅ KARAR — isim-dışlama yanlış-pozitif riski; politika AGENTS "Known Limitations" (BUG-26/aj2)
+- **Test eklemeleri:** BUG-NEW-11/16 (power clamp finiteness, cap=100 exp=1e-4 + legacy offset=100) ve BUG-NEW-17 (denorm_min/1e-320 → 1.0) testleri; `#include <limits>`.
+- **Doğrulama (tur sonu):** build 0 uyarı (3 binary) ✓ · 33764/33764 test ✓ · ASan ✓ · oracle 1047/45 ✓ · tr coverage PASS ✓ · AGENTS sayaçları (33764/184) 2 yerde güncellendi ✓
+- **Rapor dosyaları güncellendi:** bug_raporlari_yeni.md (durumlar + ÖZET 17/0), bug_raporlari_aj3.md (G-BUG-1/2 ✅ + sonuç), bug_raporlari.md (22/23/24/25/26 + BUG-06 bağlantısı), bug_raporları (BUG-06 ✅).
+- **KAPANMIŞ MADDELER (yeniden aranmamalı):** BUG-NEW-07/10/11/14/15/16/17; G-BUG-1/G-BUG-2; bug #22/23/24/25/26; BUG-06.
+- COMMIT YOK (R55 toplu commit beklemede).
+— Aj.1

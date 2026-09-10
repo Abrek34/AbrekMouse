@@ -403,7 +403,14 @@ void rebuild_lut_list(AppState* S) {
         gtk_widget_set_margin_bottom(hbox, 2);
 
         GtkWidget* lbl_s = gtk_label_new(tr("Spd:"));
-        GtkWidget* spin_s = gtk_spin_button_new_with_range(0.0, 500.0, 0.5);
+        // G-BUG-1 (aj3): the speed spin must NOT silently clamp LUT points
+        // imported/created above its range.  Previously 0..500 meant a point
+        // at e.g. 800 ips was quietly rewritten to 500 on the next spin tick
+        // (rebuild_lut_list) and persisted forever.  Allow the full practical
+        // range users hit in velocity tables (500..2000 ips is common in FPS
+        // presets); 10000 covers far beyond any real mouse speed.
+        static constexpr double LUT_SPEED_SPIN_MAX = 10000.0;
+        GtkWidget* spin_s = gtk_spin_button_new_with_range(0.0, LUT_SPEED_SPIN_MAX, 0.5);
         gtk_spin_button_set_digits(GTK_SPIN_BUTTON(spin_s), 2);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_s), pts[i].first);
         gtk_widget_set_hexpand(spin_s, TRUE);

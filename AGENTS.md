@@ -114,7 +114,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 183 test groups, 33759 runtime assertions covering: algorithms, JSON round-trips,
+- 184 test groups, 33764 runtime assertions covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -207,7 +207,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33759 assertions, 183 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (33764 assertions, 184 groups) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -234,8 +234,11 @@ compute sample staleness). Design keeps the hot path lock-free:
   sample, otherwise bounded retry (fields omitted via `telem_ok=false` if it never stabilizes).
 - **Movability** — `telem_samples` is `std::unique_ptr<std::atomic<uint64_t>>` (T30 fix) so
   `mouse_device` stays movable for the `devices_` vector (copy/move ops in `daemon.cpp`).
-- **Semantics** — `telem_in_ips` = |(dx,dy)| · dpi_factor / dt using the same normalization
-  as `modifier::modify()`; `telem_gain` = out/in (0 when in == 0). Raw 1:1 passthrough
+- **Semantics** — `telem_in_ips` = euclidean |(dx,dy)| of the RAW (pre-rotation,
+  pre-weight, pre-smoothing) deltas · dpi_factor / dt.  This matches the
+  modifier's internal speed ONLY for euclidean mode + domain_weights 1 + snap 0
+  + no smoothing (BUG-25/aj2 — deliberately: telemetry reports the physical
+  input, not the curve-equivalent coordinate); `telem_gain` = out/in (0 when in == 0). Raw 1:1 passthrough
   does NOT fill telemetry: REL_X/REL_Y are forwarded per-event inline in
   `process_device()` so `flush_motion()` is never reached → `telem_*` keep their
   previous values, `telem_ok=false`, and `lat_*` fields stay absent (P121/BUG-05 doc;
@@ -286,3 +289,9 @@ compute sample staleness). Design keeps the hot path lock-free:
 - GUI uses `.inl` file compilation (single translation unit) — GTK4 C callback ABI makes true class-based split impractical without a full rewrite
 - Test infrastructure is simple (no external framework) — no parallel test support
 - No end-to-end daemon test with real evdev/uinput (requires root — not run in CI); config/validation/multi-profile covered by integration tests
+- Device discovery (daemon + GUI) filters only on REL_X+REL_Y and physical/virtual
+  status — no name/type-based exclusion for TrackPoint / touchpad / stylus / pad.
+  Deliberate policy (BUG-26/aj2): auto-exclusion by name risks silently disabling
+  legitimate mice (false positives), and per-device profile assignment already
+  exists for users who don't want RawAccel on a given input. Revisit only if a
+  real "All devices" false-positive is reported on hardware.

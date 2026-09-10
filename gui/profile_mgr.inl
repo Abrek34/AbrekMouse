@@ -7,15 +7,39 @@
 
 /// Write a text file at `path`, atomically via a temp file + rename (same
 /// discipline as save_config). Returns true on success, false on I/O failure.
+///
+/// BUG-NEW-07 (aj4): the temp file is opened with O_EXCL|O_NOFOLLOW so an
+/// attacker pre-placing a symlink at "path.tmp" cannot redirect the write
+/// onto an arbitrary target (save_config uses the same protection).
 static bool write_text_file(const char* path, const std::string& content) {
     std::string tmp = std::string(path) + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return false;
-        f.write(content.data(), (std::streamsize)content.size());
-        f.flush();
-        if (!f) return false;
+    // Unlink a stale temp from an earlier aborted export before retrying once;
+    // O_NOFOLLOW guarantees we never follow an attacker's symlink here either.
+    ::unlink(tmp.c_str());
+    int fd = ::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        ::unlink(tmp.c_str());
+        fd = ::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
     }
+    if (fd < 0) return false;
+    const char* p = content.data();
+    size_t left = content.size();
+    while (left > 0) {
+        ssize_t w = ::write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            ::close(fd); ::unlink(tmp.c_str());
+            return false;
+        }
+        p += w; left -= (size_t)w;
+    }
+    if (::fsync(fd) != 0) {
+        ::close(fd); ::unlink(tmp.c_str());
+        return false;
+    }
+    ::close(fd);
     if (::rename(tmp.c_str(), path) != 0) {
         ::unlink(tmp.c_str());
         return false;

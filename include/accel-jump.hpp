@@ -73,7 +73,13 @@ struct jump {
         } else {
             dA = step.y * ((x - step.x) + (S - smooth_log0) / smooth_rate);
         }
-        return 1.0 + dA / x;
+        // BUG-NEW-17 (aj4): a denormal `x` (post-smoothing ~1e-320) makes
+        // dA/x overflow to ±Inf; the gain would then be zeroed downstream and
+        // the event silently lost.  Fall back to identity like every other mode
+        // does for non-representable output (x<=0 already returns 1.0 above).
+        double gain = 1.0 + dA / x;
+        if (!std::isfinite(gain)) return 1.0;
+        return gain;
     }
 };
 

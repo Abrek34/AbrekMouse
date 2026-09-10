@@ -628,8 +628,15 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
         if (len != 7 && len != 20 && len != 64) continue;
         if (buf[1] != request_device || buf[2] != feature_index ||
             (buf[3] >> 4) != wire_function ||
-            (buf[3] & 0x0F) != request_sw_id)
+            (buf[3] & 0x0F) != request_sw_id) {
+            // BUG-22 (aj4): a notification that arrives in the response wait
+            // window is not the request's answer — stash it (bounded) instead
+            // of discarding it, so drain_notifications() can still deliver it.
+            if (auto notif = hidpp_notification::from_bytes(buf, len))
+                if (pending_notifications_.size() < 16)
+                    pending_notifications_.push_back(std::move(*notif));
             continue;
+        }
         const size_t payload_len = len - 4;
         return std::vector<uint8_t>(buf + 4, buf + 4 + payload_len);
     }
@@ -934,6 +941,23 @@ std::vector<hidpp_notification> HidppTransport::drain_notifications(
     if (max_count == 0 || fd_ < 0) return notifications;
     notifications.reserve(std::min<size_t>(max_count, 32));
     std::lock_guard lock(request_mutex_);
+    // BUG-22 (aj4): flush any notifications stashed by send_feature_request()
+    // from inside earlier request wait-windows before reading live packets.
+    {
+        size_t take = std::min(max_count - notifications.size(),
+                               pending_notifications_.size());
+        if (take > 0) {
+            notifications.insert(notifications.end(),
+                                 pending_notifications_.begin(),
+                                 pending_notifications_.begin() +
+                                     static_cast<ptrdiff_t>(take));
+            pending_notifications_.erase(
+                pending_notifications_.begin(),
+                pending_notifications_.begin() +
+                    static_cast<ptrdiff_t>(take));
+        }
+    }
+    if (notifications.size() >= max_count) return notifications;
     const auto deadline = std::chrono::steady_clock::now() +
         (timeout.count() <= 0 ? std::chrono::milliseconds(1) : timeout);
     auto read_one = [&](std::chrono::milliseconds wait)
@@ -1397,8 +1421,10 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
                 if (step != 0 && !info.dpi_levels.empty() &&
                     last > info.dpi_levels.back()) {
                     uint32_t next = static_cast<uint32_t>(info.dpi_levels.back()) + step;
-                    for (; next <= last; next += step)
+                    for (; next <= last; next += step) {
+                        if (next > 0xFFFF) break; // guard against uint32→uint16 truncation
                         info.dpi_levels.push_back(static_cast<uint16_t>(next));
+                    }
                 }
                 i += 2;
             } else {
@@ -1573,14 +1599,10 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
 }
 
 std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_index) {
-    if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
-                                           target_device_index)) {
-        if (auto reply = send_feature_request(*index, 0x1, nullptr, 0,
-                                              std::chrono::milliseconds(500),
-                                              target_device_index);
-            reply && !reply->empty())
-            if (auto hz = rate_code_to_hz(false, (*reply)[0])) return hz;
-    }
+    // BUG-23 (aj2): query EXTENDED_ADJUSTABLE_REPORT_RATE FIRST.  A device that
+    // advertises both 0x8060 and 0x8061 may have been configured to >1000 Hz
+    // through the extended feature; the legacy REPORT_RATE read can only return
+    // code 1 (1000 Hz), silently under-reporting.  Solaar probes extended first.
     if (auto index = resolve_feature_index(
             hidpp_feature_index::extended_adjustable_report_rate,
             target_device_index)) {
@@ -1589,6 +1611,14 @@ std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_i
                                               target_device_index);
             reply && !reply->empty())
             return rate_code_to_hz(true, (*reply)[0]);
+    }
+    if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
+                                            target_device_index)) {
+        if (auto reply = send_feature_request(*index, 0x1, nullptr, 0,
+                                              std::chrono::milliseconds(500),
+                                              target_device_index);
+            reply && !reply->empty())
+            if (auto hz = rate_code_to_hz(false, (*reply)[0])) return hz;
     }
     return std::nullopt;
 }

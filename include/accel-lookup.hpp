@@ -63,6 +63,13 @@ struct lookup {
 
         const float* pts = args.data; // pairs [x0,y0, x1,y1, ...]
 
+        // BUG-NEW-10 (aj4): x <= 0 returns 0.0 — DELIBERATE reference parity
+        // (Windows RawAccel strict positive domain), pinned by the differential
+        // oracle's lookup rows at speed 0.  Other modes short-circuit 1.0 here,
+        // so whole+weight mode would compute scale = 1 - weight for a *zero*
+        // velocity; that only multiplies a (0,0) vector, i.e. no motion either
+        // way, so it is harmless and must NOT be changed without an oracle
+        // deviation entry.  Keep 0.0.
         if (x <= 0) return 0.0; // reference: strictly positive domain
 
         int lo = 0;

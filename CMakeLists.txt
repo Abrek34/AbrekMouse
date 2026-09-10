@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CheckCXXSourceCompiles)
+include(GNUInstallDirs)
 
 # ── Build options ─────────────────────────────────────────────────────────────
 option(BUILD_GUI    "Build GTK4 GUI"    ON)
@@ -101,7 +102,7 @@ if(BUILD_DAEMON)
         pthread
     )
 
-    install(TARGETS rawaccel-daemon DESTINATION /usr/local/bin)
+    install(TARGETS rawaccel-daemon DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ if(BUILD_CLI)
         rawaccel-config
     )
 
-    install(TARGETS rawaccel-cli DESTINATION /usr/local/bin)
+    install(TARGETS rawaccel-cli DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -134,7 +135,7 @@ if(BUILD_GUI)
         dl
     )
 
-    install(TARGETS rawaccel-gui DESTINATION /usr/local/bin)
+    install(TARGETS rawaccel-gui DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     # Desktop file
     install(FILES scripts/rawaccel.desktop

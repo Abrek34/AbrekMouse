@@ -272,8 +272,9 @@ static int detect_battery_level(const std::string& event_path) {
             size_t len = strlen(cbuf);
             while (len > 0 && (cbuf[len-1] == '\n' || cbuf[len-1] == '\r'))
                 cbuf[--len] = '\0';
-            val = std::atoi(cbuf);
-            if (val < 0 || val > 100) val = -1;
+            char* end = nullptr;
+            long parsed = std::strtol(cbuf, &end, 10);
+            if (end != cbuf && parsed >= 0 && parsed <= 100) val = static_cast<int>(parsed);
         }
         fclose(cf);
         if (val >= 0) { closedir(dir); return val; }
@@ -934,6 +935,47 @@ void AccelDaemon::run_hidpp_worker() {
     }
 }
 
+/// BUG-24 (aj2): a HID++ battery reading (live notification or active query)
+/// is merged into the evdev mouse_device whose stable id matches the hidpp
+/// device's vendor:product.  When several mice share the id (typical for mice
+/// behind one Unifying receiver) we deliberately label nothing rather than
+/// risk painting the wrong device; the reading is still logged.
+void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
+                                      const hidpp_battery_info& b) {
+    if (b.level == 255) return; // unknown level — nothing meaningful to merge
+    char needle[16] = {};
+    char needle_dash[16] = {};
+    std::snprintf(needle, sizeof(needle), "%04x:%04x", dev.vendor_id, dev.product_id);
+    std::snprintf(needle_dash, sizeof(needle_dash), "%04x-%04x",
+                  dev.vendor_id, dev.product_id);
+    std::string haystack = std::string(needle) + "/" + needle_dash;
+
+    std::lock_guard<std::mutex> lk(devices_mutex_);
+    mouse_device* match = nullptr;
+    int match_count = 0;
+    for (auto& m : devices_) {
+        if (m.device_id.find(needle) != std::string::npos ||
+            m.device_id.find(needle_dash) != std::string::npos) {
+            match = &m;
+            match_count++;
+        }
+    }
+    if (match_count == 1) {
+        if (match->detected_battery != static_cast<int>(b.level)) {
+            match->detected_battery = static_cast<int>(b.level);
+            log("HID++ battery: " + match->name + " = " +
+                    std::to_string(static_cast<int>(b.level)) + "%", true);
+        }
+    } else if (match_count == 0) {
+        log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
+                "% (no evdev mouse matched vid:pid " + haystack + ")", true);
+    } else {
+        log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
+                "% (multiple mice share vid:pid " + haystack +
+                " — not merged)", true);
+    }
+}
+
 /// Between drain iterations, keep tabs on queued HID++ notifications without
 /// ever blocking the event loop: each drain opens the hidraw node, consumes a
 /// bounded number of notifications (0 ms poll), classifies them against the
@@ -978,7 +1020,7 @@ void AccelDaemon::poll_hidpp_notifications() {
     if (t < hidpp_drain_ms_) return;
     hidpp_drain_ms_ = t + 1000.0;
 
-    for (const auto& dev : hidpp_devs_) {
+    for (auto& dev : hidpp_devs_) {
         auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
         if (!transport_ptr || !transport_ptr->is_open()) {
             transport_ptr = std::make_unique<HidppTransport>(dev.hidraw_path);
@@ -988,10 +1030,14 @@ void AccelDaemon::poll_hidpp_notifications() {
         transport_ptr->set_device_index(dev.device_index);
         drain_hidpp_notifications(
             *transport_ptr, dev, 8,
-            [this](const hidpp_notification_event& event) {
+            [this, &dev](const hidpp_notification_event& event) {
                 switch (event.kind) {
                 case hidpp_notification_event_kind::battery:
                     if (event.battery) {
+                        // BUG-24 (aj2): surface live battery notifications on
+                        // the mouse device, not just the log line.
+                        dev.battery_level = event.battery->level;
+                        apply_hidpp_battery(dev, *event.battery);
                         const std::string level = event.battery->level == 255
                             ? "unknown" : std::to_string(event.battery->level) + "%";
                         log("HID++ battery: dev " +
@@ -1015,6 +1061,18 @@ void AccelDaemon::poll_hidpp_notifications() {
                     break;
                 }
             });
+
+        // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.  Wireless
+        // receivers/pairings that advertise neither a sysfs power-supply tree
+        // nor (live) battery notifications would otherwise stay "unknown (-1)"
+        // forever although the device answers a get_battery_status() request.
+        if (now_ms() - static_cast<double>(dev.last_battery_ms) >= 60000.0) {
+            dev.last_battery_ms = static_cast<uint64_t>(now_ms());
+            if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
+                dev.battery_level = b->level;
+                apply_hidpp_battery(dev, *b);
+            }
+        }
     }
 }
 
@@ -1248,10 +1306,13 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
 
     if (!uinput_write_rel(uidev, out_x, out_y)) return false;
 
-    // Live telemetry (T30): last-motion sample. IPS = magnitude(delta counts) *
-    // (dpi_factor / time_ms) — same normalization the modifier uses. Atomic
-    // fields plus the generation counter let the IPC reader take a
-    // seqlock-style snapshot without a hot-path mutex.
+    // Live telemetry (T30): last-motion sample. IPS = euclidean magnitude of
+    // the RAW (pre-rotation) deltas × (dpi_factor / time_ms).  This equals the
+    // modifier's internal speed ONLY for euclidean mode + domain_weights 1 +
+    // snap 0 + no smoothing (BUG-25/aj2 — deliberate: telemetry reports the
+    // physical input, not the curve-equivalent coordinate).  Atomic fields plus
+    // the generation counter let the IPC reader take a seqlock-style snapshot
+    // without a hot-path mutex.
     double ips_factor = dev.dpi_factor / time_ms;
     double in_ips     = magnitude({ dx, dy }) * ips_factor;
     double out_ips    = magnitude({ static_cast<double>(out_x), static_cast<double>(out_y) }) * ips_factor;
@@ -1499,13 +1560,21 @@ static inline void append_fixed(std::string& o, const char* key, double v,
                                 int prec) {
     if (!std::isfinite(v)) v = 0.0;
     char nb[64];
-    int n = snprintf(nb, sizeof nb, ",\"%s\":%.*f", key, prec, v);
+    // Leading field separator emitted separately (push below) so the
+    // decimal-separator repair loop can never corrupt a key or the comma.
+    // Previously the format began with ',' which the loop below converted
+    // to '.' — producing `"lat_samples":1234."lat_avg_us":...` invalid JSON.
+    // (aj3 G-BUG-2 / bug_raporları BUG-06.)
+    int n = snprintf(nb, sizeof nb, "\"%s\":%.*f", key, prec, v);
     if (n > 0) {
-        // Guarantee JSON-standard '.' decimal separator regardless of LC_NUMERIC
-        for (int i = 0; i < n; ++i) {
+        // Guarantee JSON-standard '.' decimal separator regardless of LC_NUMERIC.
+        // The only commas this buffer can now contain are decimal separators
+        // inside the numeric value (keys are fixed constants with no ',').
+        for (int i = 0; i < n && (size_t)i < sizeof nb; ++i) {
             if (nb[i] == ',') nb[i] = '.';
         }
-        o.append(nb, static_cast<size_t>(n));
+        o.push_back(',');
+        o.append(nb, static_cast<size_t>(std::min(n, (int)sizeof nb - 1)));
     }
 }
 

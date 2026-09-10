@@ -230,14 +230,20 @@ void widgets_to_profile(AppState* S) {
     if (S->device_id_combo) {
         int sel = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->device_id_combo));
         if (sel <= 0 || sel - 1 >= (int)S->mice_list.size()) {
-            // "All devices" — but ONLY commit that when the stored binding is
-            // already "all devices".  refresh_mice_combo() forces the combo to
-            // index 0 when the profile's mouse is merely unplugged (not present
-            // in the current list); writing "" here would silently and
-            // permanently wipe the stored device_id on the next unrelated edit.
-            // Keep the binding until the device reappears (or the user really
-            // picks "All devices" while it IS listed).
-            if (dp.device_id.empty()) dp.device_id = "";
+            // "All devices" selected (or invalid index).
+            // Clear the binding ONLY when the stored device is currently listed
+            // (user deliberately chose "All devices" while the mouse is present).
+            // When the stored device is NOT in the list (unplugged), the combo
+            // was forced to index 0 — keep the binding so it re-attaches on
+            // re-plug.
+            bool stored_device_present = false;
+            if (!dp.device_id.empty()) {
+                for (auto& m : S->mice_list) {
+                    std::string sid = m.stable_id.empty() ? m.event_node : m.stable_id;
+                    if (sid == dp.device_id) { stored_device_present = true; break; }
+                }
+            }
+            if (stored_device_present) dp.device_id = "";
         } else {
             auto& m = S->mice_list[sel - 1];
             dp.device_id = m.stable_id.empty() ? m.event_node : m.stable_id;

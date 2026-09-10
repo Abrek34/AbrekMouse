@@ -778,6 +778,13 @@ static void migrate_lookup_gain(app_config& cfg) {
                 if (!(x > 0)) continue; // first point at speed 0 stays (velocity division is guarded)
                 a.data[i * 2 + 1] = static_cast<float>(y * x);
             }
+            // Odd-length LUT: migrate the trailing unpaired element too
+            if (a.length % 2 != 0) {
+                int last = a.length - 1;
+                double y = a.data[last];
+                if (y != 0.0f) // only if non-zero (avoid clobbering sentinel)
+                    a.data[last] = static_cast<float>(y); // no x to multiply — keep as-is
+            }
         };
         fix(dp.prof.accel_x);
         fix(dp.prof.accel_y);

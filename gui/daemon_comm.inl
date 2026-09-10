@@ -152,14 +152,18 @@ static std::string daemon_ipc_send_raw(const std::string& req, int timeout_ms = 
             close(fd); continue; // try the next candidate
         }
 
-        // Send the full request, tolerating partial sends (loop until done or error).
+        // Send the full request, tolerating partial sends and EINTR (loop until done or real error).
         // An incomplete payload would otherwise be rejected by the daemon's
         // "incomplete config payload" guard even though retrying here is trivial.
         const char* p = req.data();
         size_t left = req.size();
         while (left > 0) {
             ssize_t w = send(fd, p, left, MSG_NOSIGNAL);
-            if (w <= 0) break; // error / timeout / peer closed
+            if (w < 0) {
+                if (errno == EINTR) continue; // interrupted — retry
+                break; // real error / timeout / peer closed
+            }
+            if (w == 0) break; // peer closed
             p += w;
             left -= (size_t)w;
         }

@@ -231,6 +231,11 @@ private:
     double hidpp_rescan_ms_ = 0;    // next hidraw re-scan time
     double hidpp_drain_ms_  = 0;    // next notification drain time
 
+    // BUG-24 (aj2): merge a HID++ battery event / active query into the single
+    // matching evdev mouse (matched by vid:pid).  Ambiguous matches (several
+    // mice behind one receiver) merge nothing — only log.  Hidpp-worker thread.
+    void apply_hidpp_battery(const hidpp_device& dev, const hidpp_battery_info& b);
+
     // Config push slot: filled by the IPC thread (push_config), consumed by the
     // loop thread.  push_cfg_ is fully parsed+sanitized before being stored, so
     // the loop thread never throws on it.

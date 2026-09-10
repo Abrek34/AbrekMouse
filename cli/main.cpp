@@ -127,8 +127,8 @@ static std::string daemon_ipc_send(const std::string& request) {
         while (true) {
             ssize_t n = recv(fd, buf, sizeof(buf), 0);
             if (n <= 0) break;
+            if (resp.size() + (size_t)n > 65536) break; // check before append
             resp.append(buf, (size_t)n);
-            if (resp.size() > 65536) break;
         }
         close(fd);
         return resp;
@@ -1272,7 +1272,10 @@ static int cmd_status_json(const std::string& config_path) {
     }
     std::cout << out.dump(2) << "\n";
     // P115-A5-07: config_error must be a failure exit, not daemon-status-only.
-    return (running && config_ok) ? 0 : 1;
+    // Exit 0 = daemon running + config OK; 1 = config error; 2 = daemon stopped.
+    if (!config_ok) return 1;
+    if (!running)   return 2;
+    return 0;
 }
 
 static int cmd_status(const std::string& config_path) {
@@ -1398,7 +1401,9 @@ static int cmd_status(const std::string& config_path) {
     // P115-A5-07: a broken config used to print to STDOUT and exit 0 whenever
     // the daemon happened to be running — scripts saw "success" while the
     // effective config was actually unreachable.  Report on stderr and fail.
-    return (running && config_ok) ? 0 : 1;
+    if (!config_ok) return 1;
+    if (!running)   return 2;
+    return 0;
 }
 
 static int cmd_receivers() {

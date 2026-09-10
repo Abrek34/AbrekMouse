@@ -23,6 +23,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <cstdlib>
 #include <sys/stat.h>
 #include <cstring>
@@ -777,6 +778,20 @@ static void test_jump() {
     EXPECT_NEAR(jgh(1.0,  args_gh), 1.0, 1e-9);
     EXPECT_NEAR(jgh(30.0, args_gh), 1.25, 1e-9);
     EXPECT_NEAR(jgh(500.0, args_gh), 1.485, 1e-9);
+
+    SECTION("jump — BUG-NEW-17 denormal x guard (dA/x overflow → identity)");
+    // With smoothing on, a post-smoothing x ≈ 1e-321 (denormal) made dA/x
+    // overflow to ±Inf → the gain would be zeroed downstream (silent event
+    // loss).  The guard returns 1.0 (identity) for any non-finite result,
+    // mirroring every other mode's non-representable-output fallback.
+    accel_args args_dn = args;            // gain + smooth enabled baseline
+    jump jdn(args_dn);
+    EXPECT(std::isfinite(jdn(std::numeric_limits<double>::denorm_min(), args_dn)));
+    EXPECT(std::isfinite(jdn(1e-320, args_dn)));
+    EXPECT_NEAR(jdn(std::numeric_limits<double>::denorm_min(), args_dn), 1.0, 1e-12);
+    EXPECT_NEAR(jdn(1e-320, args_dn), 1.0, 1e-12);
+    // x <= 0 short-circuits to 1.0 anyway
+    EXPECT_NEAR(jdn(-1.0, args_dn), 1.0, 1e-12);
 }
 
 // ── Test 5: synchronous ──────────────────────────────────────────────────────
@@ -3527,7 +3542,7 @@ static void test_subpixel_tiny_deltas() {
     // so the count may be slightly off (e.g. 91 instead of 100 due to rounding).
     // The key invariant: total_x + remainder_x ≈ 100.0 (no counts lost or created).
     double reconstructed = (double)total_x + rx;
-    EXPECT_NEAR(reconstructed, 100.0, 0.01);
+    EXPECT_NEAR(reconstructed, 100.0, 1e-9); // BUG-NEW-15: 0.01 → 1e-9 (real FP drift is ~1e-14)
     EXPECT(total_y == 0);
     EXPECT(std::fabs(rx) < 1.0); // leftover remainder is sub-pixel
     EXPECT(std::fabs(ry) < 1e-9); // no Y movement at all
@@ -3781,6 +3796,36 @@ static void test_power_extreme_params() {
         if (!std::isfinite(r)) bad++;
         r = p(10.0, args);
         if (!std::isfinite(r)) bad++;
+    }
+
+    // BUG-NEW-11/16 (aj4): tiny floored exponent + large cap / offset used to
+    // make gain_inverse() overflow to Inf (offset.x = Inf, constant = Inf).
+    // The clamp keeps every intermediate double finite, so the gain stays
+    // finite AND identical for reachable speeds (x <= offset.x → offset.y).
+    {
+        accel_args args = make_args(accel_mode::power);
+        args.scale = 1.0;
+        args.exponent_power = 1e-4;   // floors to 1e-3 in the power ctor
+        args.cap_mode_val = cap_mode::out;
+        args.cap.x = 15.0;
+        args.cap.y = 100.0;           // g/(n+1) ^ (1/n) ≈ 99.9^1000 → overflows
+        power p(args);
+        const double xs_gain[] = {0.0, 1e-9, 0.001, 0.1, 1.0, 10.0, 100.0, 1e5, 1e10};
+        for (double x : xs_gain)
+            if (!std::isfinite(p(x, args))) bad++;
+    }
+    {
+        // Legacy + huge output_offset → constant = offset.x·offset.y·n/(n+1)
+        // would overflow to Inf before the clamp; now finite everywhere.
+        accel_args args = make_args(accel_mode::power);
+        args.gain = false;
+        args.scale = 1.0;
+        args.exponent_power = 1e-4;
+        args.output_offset = 100.0;
+        power p(args);
+        const double xs_leg[] = {0.001, 0.1, 1.0, 100.0, 1e6};
+        for (double x : xs_leg)
+            if (!std::isfinite(p(x, args))) bad++;
     }
 
     EXPECT(bad == 0);
@@ -6073,8 +6118,8 @@ static void test_modifier_directional_weight_blend() {
     mod.modify(d, sp, settings, 1.0, 1.0);
     EXPECT(std::isfinite(d.x));
     EXPECT(std::isfinite(d.y));
-    EXPECT_NEAR(d.x, 10.8839, 0.5);
-    EXPECT_NEAR(d.y, 10.8839, 0.5);
+    EXPECT_NEAR(d.x, 10.8839, 1e-4); // BUG-NEW-15: 0.5 → 1e-4 (measured 10.883883)
+    EXPECT_NEAR(d.y, 10.8839, 1e-4);
 }
 
 static void test_classic_io_sign_with_cap() {

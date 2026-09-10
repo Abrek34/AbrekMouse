@@ -209,16 +209,20 @@ gboolean on_inotify_event(GIOChannel* chan, GIOCondition /*cond*/, gpointer user
         if (err) { g_error_free(err); break; }
         if (st != G_IO_STATUS_NORMAL || bytes_read < sizeof(struct inotify_event)) break;
 
-        const struct inotify_event* ev =
-            reinterpret_cast<const struct inotify_event*>(buf);
-        // Only process nodes starting with "event"
-        if (ev->len > 0 && std::strncmp(ev->name, "event", 5) == 0) {
-            // O8: skip refresh if the profile list is not yet loaded
-            if (!S->config.profiles.empty())
-                refresh_mice_combo(S, /*is_auto=*/true);
-            break; // one refresh per callback is enough (batches consecutive events)
+        // BUG-NEW-14 (aj4): a single read() may pack several inotify events;
+        // walk them all (fixed header + variable name), not just the first.
+        size_t off = 0;
+        while (off + sizeof(struct inotify_event) <= bytes_read) {
+            const auto* ev = reinterpret_cast<const struct inotify_event*>(buf + off);
+            off += sizeof(struct inotify_event) + ev->len;
+            // Only process nodes starting with "event"
+            if (ev->len > 0 && std::strncmp(ev->name, "event", 5) == 0) {
+                // O8: skip refresh if the profile list is not yet loaded
+                if (!S->config.profiles.empty())
+                    refresh_mice_combo(S, /*is_auto=*/true);
+                return TRUE; // one refresh per callback is enough (batches consecutive events)
+            }
         }
-
     }
     return TRUE; // keep the source active
 }

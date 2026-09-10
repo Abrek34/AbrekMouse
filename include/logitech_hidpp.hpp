@@ -248,6 +248,12 @@ struct hidpp_device {
     std::vector<std::pair<uint16_t, uint8_t>> features;
     std::vector<hidpp_feature_metadata> feature_metadata;
     bool connected = false;
+    // BUG-24 (aj2): last known battery level (0..100, 255 = unknown) from
+    // either a live notification or the periodic ACTIVE get_battery_status()
+    // query (60 s cadence in the daemon's hidpp worker).  Daemon merges this
+    // into the matching evdev mouse's detected_battery.  Worker-thread only.
+    int      battery_level = -1;
+    uint64_t last_battery_ms = 0; // CLOCK_MONOTONIC_RAW ms of last active query
 
     std::optional<uint8_t> feature_index(uint16_t feature_id) const;
     std::optional<uint16_t> feature_id(uint8_t dynamic_index) const;
@@ -394,6 +400,14 @@ private:
         uint8_t feature_index, uint8_t function_id,
         const uint8_t* params, size_t param_len,
         std::chrono::milliseconds timeout, uint8_t target_device_index);
+
+    // BUG-22 (aj4): notifications that arrive inside a feature-request wait
+    // window are parsed and stashed here instead of being discarded by
+    // send_feature_request(); drain_notifications() flushes the stash first so
+    // a burst of identify() requests can no longer silently swallow battery /
+    // link notifications.  Bounded (16) — guarded by request_mutex_, which both
+    // producers and consumers already hold.
+    std::vector<hidpp_notification> pending_notifications_;
 };
 
 // ── High-level notification handler (SOLAAR FAZ-B / P168) ───────────────────
