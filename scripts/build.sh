@@ -1,6 +1,7 @@
 #!/bin/bash
 # Quick build script (no cmake required) && cmake build wrapper
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."

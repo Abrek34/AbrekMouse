@@ -686,7 +686,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         // Small informational label
         GtkWidget* hint = trmlbl(
             "<small>This profile applies only to the selected mouse.\n"
-            "The daemon uses the event node as device_id.</small>");
+            "The daemon uses a stable USB composite ID as device_id.</small>");
         gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
         gtk_label_set_wrap(GTK_LABEL(hint), TRUE);
         gtk_widget_set_margin_top(hint, 2);
@@ -970,6 +970,8 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                 g_source_remove(S2->hidpp_notify_poll_id);
                 S2->hidpp_notify_poll_id = 0;
             }
+            // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
+            S2->hw_cancel = true;
         }), S);
 
     gtk_window_present(GTK_WINDOW(S->window));
@@ -1193,15 +1195,19 @@ static void kde_upsert_section(std::vector<std::string>& lines,
 static bool kde_atomic_write(const std::string& path,
                              const std::vector<std::string>& lines) {
     std::string tmp = path + ".tmp";
-    FILE* fw = fopen(tmp.c_str(), "w");
-    if (!fw) return false;
+    // O_NOFOLLOW: never follow a symlink (prevents symlink-follow attack).
+    // O_EXCL:     fail if tmp already exists (prevents two-writer race).
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) return false;
+    FILE* fw = fdopen(fd, "w");
+    if (!fw) { close(fd); unlink(tmp.c_str()); return false; }
     for (auto& l : lines) {
         if (fputs(l.c_str(), fw) == EOF || fputc('\n', fw) == EOF) {
             fclose(fw); unlink(tmp.c_str());
             return false;
         }
     }
-    if (fflush(fw) != 0 || ferror(fw) || fclose(fw) != 0) {
+    if (fflush(fw) != 0 || ferror(fw) || fsync(fileno(fw)) != 0 || fclose(fw) != 0) {
         unlink(tmp.c_str());
         return false;
     }
@@ -1284,8 +1290,7 @@ static bool kde_write_kwinrc_accel(const char* profile, const char* accel) {
                              std::to_string(d.product) + "][" + d.name + "]";
         kde_upsert_section(kcm_lines, header, kv_kcm);
     }
-    kde_atomic_write(kcm_path, kcm_lines); // best-effort
-    return true;
+    return kde_atomic_write(kcm_path, kcm_lines);
 }
 
 // Forward declaration — defined below
@@ -1370,7 +1375,7 @@ static void on_kde_fix_clicked(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     bool ok = kde_write_flat_accel();
     if (ok) {
-        kde_reload_input_settings();
+        // kde_write_flat_accel() already calls kde_reload_input_settings()
         S->kde_accel_ok = true;
         // Hide the warning bar
         if (S->kde_warn_bar) gtk_widget_set_visible(S->kde_warn_bar, FALSE);

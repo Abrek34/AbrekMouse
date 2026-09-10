@@ -302,17 +302,19 @@ void show_input_dialog(AppState* S,
 void on_rename_profile(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (S->config.profiles.empty()) return;
+    const int prof_idx = S->current_profile_idx;
     std::string old_name = cur_prof(S).name;
     show_input_dialog(S, tr("Rename Profile"), tr("New name"), old_name.c_str(),
-        [S, old_name](const std::string& name) {
+        [S, old_name, prof_idx](const std::string& name) {
             if (name.empty()) return;
+            if (prof_idx < 0 || prof_idx >= (int)S->config.profiles.size()) return;
             // Duplicate check
             for (auto& p : S->config.profiles)
                 if (p.name == name && p.name != old_name) {
                     set_status(S, tr("A profile with that name already exists."));
                     return;
                 }
-            cur_prof(S).name = name;
+            S->config.profiles[prof_idx].name = name;
             // Update active_profile if we renamed the active one
             if (S->config.active_profile == old_name)
                 S->config.active_profile = name;
@@ -396,6 +398,7 @@ void on_duplicate_profile(GtkButton*, gpointer user_data) {
     copy.device_id.clear();
     S->config.profiles.push_back(copy);
     S->current_profile_idx = (int)S->config.profiles.size() - 1;
+    S->config.active_profile = name;
     rebuild_profile_combo(S);
     save_config_now(S);
 }

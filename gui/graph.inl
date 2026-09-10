@@ -363,6 +363,7 @@ void on_lut_row_delete(GtkButton*, gpointer row_ptr) {
         pts.erase(pts.begin() + idx);
         lut_set_points(ax, pts);
         if (S->xy_linked) cur_prof(S).prof.accel_y = ax;
+        S->unsaved = true;
         rebuild_lut_list(S);
         gtk_widget_queue_draw(S->graph_area);
     }
@@ -372,8 +373,11 @@ void on_lut_row_delete(GtkButton*, gpointer row_ptr) {
 void on_lut_spin_changed(GtkSpinButton* spin, gpointer) {
     // Walk up the widget tree to find the list_box that has the AppState attached
     GtkWidget* w = gtk_widget_get_parent(GTK_WIDGET(spin)); // hbox
+    if (!w) return;
     w = gtk_widget_get_parent(w); // GtkListBoxRow
+    if (!w) return;
     w = gtk_widget_get_parent(w); // GtkListBox
+    if (!w) return;
     auto* S = static_cast<AppState*>(g_object_get_data(G_OBJECT(w), "app-state"));
     if (!S || S->updating) return;
     lut_list_changed(S);
@@ -416,7 +420,8 @@ void rebuild_lut_list(AppState* S) {
         gtk_widget_set_hexpand(spin_s, TRUE);
 
         GtkWidget* lbl_g = gtk_label_new(tr("Gain:"));
-        GtkWidget* spin_g = gtk_spin_button_new_with_range(0.01, 50.0, 0.01);
+        static constexpr double LUT_GAIN_SPIN_MAX = 10000.0;
+        GtkWidget* spin_g = gtk_spin_button_new_with_range(0.01, LUT_GAIN_SPIN_MAX, 0.01);
         gtk_spin_button_set_digits(GTK_SPIN_BUTTON(spin_g), 3);
         gtk_spin_button_set_value(GTK_SPIN_BUTTON(spin_g), gain);
         gtk_widget_set_hexpand(spin_g, TRUE);
@@ -459,10 +464,14 @@ void lut_list_changed(AppState* S) {
         GtkWidget* hbox  = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(row_widget));
         // hbox children: lbl_s, spin_s, lbl_g, spin_g, del_btn
         GtkWidget* c = gtk_widget_get_first_child(hbox);
+        if (!c) { row_widget = gtk_widget_get_next_sibling(row_widget); continue; }
         c = gtk_widget_get_next_sibling(c); // spin_s
+        if (!c) { row_widget = gtk_widget_get_next_sibling(row_widget); continue; }
         double spd  = gtk_spin_button_get_value(GTK_SPIN_BUTTON(c));
         c = gtk_widget_get_next_sibling(c); // lbl_g
+        if (!c) { row_widget = gtk_widget_get_next_sibling(row_widget); continue; }
         c = gtk_widget_get_next_sibling(c); // spin_g
+        if (!c) { row_widget = gtk_widget_get_next_sibling(row_widget); continue; }
         double gain = gtk_spin_button_get_value(GTK_SPIN_BUTTON(c));
         pts.push_back({spd, lut_gain_to_stored(spd, gain, vel)});
         row_widget = gtk_widget_get_next_sibling(row_widget);
@@ -514,6 +523,7 @@ void on_lut_add_point(GtkButton*, gpointer user_data) {
     pts.push_back({new_speed, lut_gain_to_stored(new_speed, new_gain, ax.gain)});
     lut_set_points(ax, pts);
     if (S->xy_linked) cur_prof(S).prof.accel_y = ax;
+    S->unsaved = true;
     rebuild_lut_list(S);
     gtk_widget_queue_draw(S->graph_area);
 }

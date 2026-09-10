@@ -369,8 +369,10 @@ int main(int argc, char* argv[]) {
             // Use a basic ISO8601 timestamp
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_buf;
+            gmtime_r(&ts.tv_sec, &tm_buf);
             char timebuf[32];
-            strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", gmtime(&ts.tv_sec));
+            strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
             std::cout << "{\"timestamp\":\"" << timebuf << "." << std::setfill('0') << std::setw(3) << (ts.tv_nsec / 1000000)
                       << "Z\",\"level\":\"info\",\"message\":\"" << json_escape(msg) << "\"}" << std::endl;
         } else {

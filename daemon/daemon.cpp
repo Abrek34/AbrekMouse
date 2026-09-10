@@ -1233,8 +1233,19 @@ static inline bool uinput_write_rel(libevdev_uinput* uidev, int x, int y) {
     const int fd = libevdev_uinput_get_fd(uidev);
     if (fd < 0) return false;
     const ssize_t want = static_cast<ssize_t>(n) * sizeof(struct input_event);
-    const ssize_t got  = write(fd, evs, want);
-    return got == want;
+    ssize_t written = 0;
+    while (written < want) {
+        const void* p = static_cast<const void*>(evs);
+        ssize_t got = write(fd, static_cast<const char*>(p) + written,
+                            want - written);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (got == 0) return false; // 0-length write: treat as failure
+        written += got;
+    }
+    return true;
 }
 
 /// Apply acceleration to accumulated (dx,dy) and write REL events to uidev.

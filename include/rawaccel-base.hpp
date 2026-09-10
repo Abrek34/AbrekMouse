@@ -15,7 +15,6 @@ inline constexpr int    POLL_RATE_MAX        = 8000;
 inline constexpr milliseconds DEFAULT_TIME_MIN = 1000.0 / POLL_RATE_MAX / 2;
 inline constexpr milliseconds DEFAULT_TIME_MAX = 100;
 inline constexpr milliseconds WRITE_DELAY     = 1000;
-inline constexpr size_t MAX_DEV_ID_LEN       = 200;
 inline constexpr size_t MAX_NAME_LEN         = 256;
 inline constexpr size_t LUT_RAW_DATA_CAPACITY = 514;
 inline constexpr size_t LUT_POINTS_CAPACITY  = LUT_RAW_DATA_CAPACITY / 2;

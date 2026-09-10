@@ -192,6 +192,7 @@ static gpointer hw_scan_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
+        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_busy = false;
         S->hidpp_devs = std::move(r->devs);
         if (S->hw_dev_combo) {
@@ -268,6 +269,7 @@ static gpointer hw_query_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
+        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_busy = false;
         const int selected = S->hw_dev_combo
             ? (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo))
@@ -361,6 +363,7 @@ static gpointer hw_apply_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
+        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_busy = false;
 
         std::string parts;
@@ -441,11 +444,13 @@ static gpointer hw_notification_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
+        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_notify_busy = false;
         const int selected = S->hw_dev_combo
             ? (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo))
             : -1;
-        if (selected == r->idx && r->battery) {
+        if (selected == r->idx && r->battery &&
+            r->idx >= 0 && r->idx < (int)S->hidpp_devs.size()) {
             const std::string level = r->battery->level == 255
                 ? tr("unknown") : std::to_string(r->battery->level) + "%";
             hw_set_status(S, trf("Notification: battery %s%s",
@@ -467,7 +472,7 @@ static gpointer hw_notification_thread(gpointer data) {
 
 static gboolean hw_notification_tick(gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
-    if (S->hw_busy || S->hw_notify_busy || !S->hw_dev_combo ||
+    if (S->hw_cancel || S->hw_busy || S->hw_notify_busy || !S->hw_dev_combo ||
         S->hidpp_devs.empty())
         return G_SOURCE_CONTINUE;
     const int idx = (int)gtk_drop_down_get_selected(

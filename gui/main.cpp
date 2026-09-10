@@ -51,15 +51,21 @@ void save_config_now(AppState* S) {
         // Fall back to SIGHUP for old daemons that predate the IPC RPC.
         std::string json = app_config_to_json(S->config);
         bool applied = daemon_ipc_push_config(json);
+        bool sighup_fallback = false;
         if (!applied) {
             std::string sig_err;
             applied = daemon_send_signal(SIGHUP, &sig_err);
+            sighup_fallback = applied;
         }
         // Check for duplicate device IDs and prepend warning to status
         std::string dup_warn = check_duplicate_device_ids(S->config);
         std::string status_msg;
-        if (applied) {
+        if (applied && !sighup_fallback) {
             status_msg = trf("Applied & reloaded: %s", S->config_path.c_str());
+        } else if (applied && sighup_fallback) {
+            // SIGHUP only makes the daemon re-read its OWN config at
+            // /etc/rawaccel/settings.json — not the GUI's config file.
+            status_msg = trf("Saved locally & signaled daemon (reload only): %s", S->config_path.c_str());
         } else {
             // Distinguish "daemon is down" from "daemon is up but rejected the
             // config" — both mean the running daemon still has the OLD config.

@@ -244,9 +244,14 @@ gboolean on_hidraw_inotify_event(GIOChannel* chan, GIOCondition /*cond*/,
         if (st != G_IO_STATUS_NORMAL ||
             bytes_read < sizeof(struct inotify_event))
             break;
-        const auto* ev = reinterpret_cast<const struct inotify_event*>(buf);
-        if (ev->len > 0 && std::strncmp(ev->name, "hidraw", 6) == 0)
-            changed = true;
+        // Walk all packed inotify events in the buffer
+        size_t offset = 0;
+        while (offset + sizeof(struct inotify_event) <= bytes_read) {
+            const auto* ev = reinterpret_cast<const struct inotify_event*>(buf + offset);
+            if (ev->len > 0 && std::strncmp(ev->name, "hidraw", 6) == 0)
+                changed = true;
+            offset += sizeof(struct inotify_event) + ev->len;
+        }
     }
     if (changed) hw_start_scan(S);
     return TRUE;

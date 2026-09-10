@@ -158,9 +158,9 @@ static const char* tr(const char* key) {
              "<small>YO = ms cinsinden EMA yarı ömrü. 0 = yumuşatma kapalı.\n"
              "Ayrı: X ve Y kendi eksenleriyle ayrı işlenir.</small>"},
             {"<small>This profile applies only to the selected mouse.\n"
-             "The daemon uses the event node as device_id.</small>",
+             "The daemon uses a stable USB composite ID as device_id.</small>",
              "<small>Bu profil yalnızca seçilen fare için geçerlidir.\n"
-             "Daemon, cihaz kimliği olarak event düğümünü kullanır.</small>"},
+             "Daemon, cihaz kimliği olarak stabil bir USB bileşen kimliği kullanır.</small>"},
             {"<b>KDE: Mouse acceleration is NOT disabled!</b>  "
              "KDE will apply its own curve on top of RawAccel → double acceleration.",
              "<b>KDE: Fare ivmesi devre dışı DEĞİL!</b>  "
@@ -482,6 +482,8 @@ static const char* tr(const char* key) {
              {"Saved & reloaded: %s",       "Kaydedildi ve yeniden yüklendi: %s"},
              {"Saved: %s",                  "Kaydedildi: %s"},
              {"Applied & reloaded: %s",     "Daemon'a uygulandı ve yeniden yüklendi: %s"},
+             {"Saved locally & signaled daemon (reload only): %s",
+                                             "Yerel olarak kaydedildi ve daemon sinyallendi (yalnızca yeniden yükleme): %s"},
              {"Saved locally, but the daemon was not updated: %s",
                                              "Yerel olarak kaydedildi, ancak daemon güncellenemedi: %s"},
              {"Saved locally, but the daemon is not running: %s",
@@ -558,12 +560,20 @@ static int load_lang_override(const std::string& path) {
 }
 
 static void save_lang_pref(const std::string& path, int ov) {
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) return;
+    // Atomic write: write to a temp file then rename to prevent corruption
+    // if the process crashes mid-write.  O_NOFOLLOW+O_EXCL prevent symlink
+    // following and two-writer races (same policy as kde_atomic_write).
+    std::string tmp_path = path + ".tmp";
+    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    FILE* f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp_path.c_str()); return; }
     if (ov <= -1) fputs("auto\n", f);
     else if (ov == 0) fputs("en\n", f);
     else              fputs("tr\n", f);
-    fclose(f);
+    if (fclose(f) != 0 || rename(tmp_path.c_str(), path.c_str()) != 0) {
+        unlink(tmp_path.c_str());
+    }
 }
 
 static bool sys_locale_is_turkish() {

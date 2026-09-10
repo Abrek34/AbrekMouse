@@ -895,21 +895,12 @@ bool HidppTransport::write_register(
     const size_t request_len = report_id == 0x11 ? request.size() : 7;
     if (!write_packet(request.data(), request_len)) return false;
 
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    uint8_t buf[64];
-    while (std::chrono::steady_clock::now() < deadline) {
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-        if (remaining.count() <= 0) break;
-        size_t len = 0;
-        if (!read_packet(buf, sizeof(buf), len, remaining)) continue;
-        if (is_hidpp_error(buf, len)) return false;
-        if ((len != 7 && len != 20) || buf[1] != target ||
-            buf[2] != request[2] || buf[3] != request[3])
-            continue;
-        return true;
-    }
-    return false;
+    // HID++ 1.0 register writes (0x80RR) are fire-and-forget: no ACK is sent
+    // by the device.  Waiting the full deadline below would time out on EVERY
+    // write and report false even though the write succeeded.  Return success
+    // immediately after a successful write_packet (the kernel accepted the
+    // report).
+    return true;
 }
 
 std::optional<hidpp_notification> HidppTransport::receive_notification(

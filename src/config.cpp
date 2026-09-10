@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <vector>
+#include <array>
 #include <pwd.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -83,7 +84,7 @@ static json accel_args_to_json(const accel_args& a) {
     // lookup points (clobbering a previously saved lookup curve on reload).
     if (a.mode == accel_mode::lookup && a.length > 0) {
         json pts = json::array();
-        for (int i = 0; i < a.length; i++)
+        for (int i = 0; i < a.length && i < (int)LUT_RAW_DATA_CAPACITY; i++)
             pts.push_back(a.data[i]);
         j["lut_data"] = pts;
         j["lut_length"] = a.length;
@@ -95,8 +96,23 @@ static accel_args accel_args_from_json(const json& j) {
     accel_args a;
     // B4 (P43): type-guard string fields so malformed JSON (wrong type) yields
     // a default instead of a nlohmann::json::type_error exception.
-    if (j.contains("mode") && j["mode"].is_string())
-        a.mode = str_to_mode(j["mode"].get<std::string>());
+    if (j.contains("mode") && j["mode"].is_string()) {
+        const std::string mode_str = j["mode"].get<std::string>();
+        const accel_mode m = str_to_mode(mode_str);
+        // str_to_mode() falls back to noaccel for unknown strings — reject
+        // anything that isn't one of the seven valid mode names instead of
+        // silently falling back to 1:1 passthrough (which would read as
+        // "acceleration disabled" with no explanation).
+        static const char* VALID_MODES[] = {
+            "noaccel", "classic", "power", "natural", "jump",
+            "synchronous", "lookup", nullptr };
+        bool known = false;
+        for (int i = 0; VALID_MODES[i] != nullptr; ++i)
+            if (mode_str == VALID_MODES[i]) { known = true; break; }
+        if (!known)
+            throw std::runtime_error("unknown accel mode: '" + mode_str + "'");
+        a.mode = m;
+    }
     if (j.contains("gain") && j["gain"].is_boolean())
         a.gain = j["gain"].get<bool>();
     // P120-FAZ2 (A5-02): the 12 numeric accel_args fields are strictly
@@ -407,6 +423,9 @@ static void sanitize_accel_args(accel_args& a) {
     // the load->save round-trip.
     if (a.scale           > SCALE_MAX)         a.scale          = SCALE_MAX;
     if (a.exponent_power  > EXP_POWER_MAX)     a.exponent_power = EXP_POWER_MAX;
+    // Clamp input_offset first so the cap.x >= input_offset lower bound can
+    // never be violated by the CAP_X_MAX upper bound below (BUG re-break):
+    if (a.input_offset    > CAP_X_MAX)         a.input_offset   = CAP_X_MAX;
     if (a.cap.x           > CAP_X_MAX)         a.cap.x          = CAP_X_MAX;
     if (a.cap.y           > CAP_Y_MAX)         a.cap.y          = CAP_Y_MAX;
     if (a.output_offset   > OUTPUT_OFFSET_MAX) a.output_offset  = OUTPUT_OFFSET_MAX;
@@ -565,8 +584,9 @@ static app_config app_config_from_json_obj(const json& j) {
     if (j.contains("use_raw_input") && j["use_raw_input"].is_boolean())
         cfg.use_raw_input = j["use_raw_input"].get<bool>();
 
-    if (j.contains("profiles")) {
+    if (j.contains("profiles") && j["profiles"].is_array()) {
         for (auto& pj : j["profiles"]) {
+            if (!pj.is_object()) continue;
             cfg.profiles.push_back(device_profile_from_json(pj));
         }
     }
@@ -590,7 +610,9 @@ std::string app_config_to_json(const app_config& cfg) {
 
 app_config app_config_from_json(const std::string& json_str) {
     // device_profile_from_json already sanitizes each profile on the way in.
-    return app_config_from_json_obj(json::parse(json_str));
+    app_config cfg = app_config_from_json_obj(json::parse(json_str));
+    migrate_config(cfg);
+    return cfg;
 }
 
 app_config load_config(const std::string& path) {
@@ -791,8 +813,35 @@ static void migrate_lookup_gain(app_config& cfg) {
     }
 }
 
+/// Simple semantic-version "older than" comparison for "0.0.0"-style strings.
+/// Returns true when lhs < rhs (missing/unknown components count as 0).
+static bool version_lt(const std::string& lhs, const std::string& rhs) {
+    auto parse = [](const std::string& v, std::array<int,3>& out) {
+        size_t start = 0, pos = 0;
+        int part = 0;
+        while (part < 3 && pos != std::string::npos) {
+            pos = v.find('.', start);
+            const std::string tok = (pos == std::string::npos) ? v.substr(start) : v.substr(start, pos - start);
+            if (tok.empty()) return false;
+            char* end = nullptr;
+            const unsigned long n = std::strtoul(tok.c_str(), &end, 10);
+            if (end && *end != '\0') return false;
+            out[part++] = static_cast<int>(n);
+            if (pos != std::string::npos) start = pos + 1;
+        }
+        return part > 0;
+    };
+    std::array<int,3> a = {0,0,0}, b = {0,0,0};
+    if (!parse(lhs, a) || !parse(rhs, b)) return false;
+    if (a[0] != b[0]) return a[0] < b[0];
+    if (a[1] != b[1]) return a[1] < b[1];
+    return a[2] < b[2];
+}
+
 bool migrate_config(app_config& cfg) {
-    // If version is already current, no migration needed
+    // A blank or unknown stored version is treated as "older than current":
+    // compare semver-style so stale/downgraded configs are always migrated,
+    // no matter what the exact version string was.
     if (cfg.version == RAWACCEL_VERSION) {
         return false;
     }
@@ -816,8 +865,7 @@ bool migrate_config(app_config& cfg) {
     }
 
     // Migration from 0.3.x to 0.4.0 — lookup+gain data semantics changed.
-    if (cfg.version.empty() || cfg.version == "0.2.0" || cfg.version == "0.2.1" ||
-        cfg.version == "0.3.0") {
+    if (cfg.version.empty() || version_lt(cfg.version, "0.4.0")) {
         migrate_lookup_gain(cfg);
         migrated = true;
     }

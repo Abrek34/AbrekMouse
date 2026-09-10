@@ -13,6 +13,7 @@
 #include <string>
 #include <unistd.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/inotify.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -56,7 +57,7 @@ struct InputDeviceInfo {
     bool        is_rawaccel = false;
 
     bool operator==(const InputDeviceInfo& o) const {
-        return event_node == o.event_node && name == o.name;
+        return event_node == o.event_node && name == o.name && stable_id == o.stable_id;
     }
 };
 
@@ -197,6 +198,7 @@ struct AppState {
     GtkWidget* hw_status_lbl    = nullptr;    // read-only current/result label
     bool       hw_busy          = false;      // a scan/apply thread is running
     bool       hw_notify_busy   = false;      // bounded notification poll worker
+    bool       hw_cancel        = false;      // set on destroy: idle callbacks must bail
     // P169 — battery / capability rows (read-only, updated by the same worker
     // threads that run the scan/query/notification loops).
     GtkWidget* hw_battery_lbl   = nullptr;    // live level/charging/online + family
