@@ -17,8 +17,9 @@ Aşağıdaki bulgular **aj1** tarafından incelenmiş, gerçek bug olduğu doğr
 | 2 | `getpwnam_r` ERANGE kontrolü yok | `daemon/main.cpp:112-116` → `ERANGE`'te 2× boyutlu tamponla yeniden dene |
 | 7 | classic GAIN/io `cap.x < input_offset` dejenere eğri çökmesi | `include/accel-classic.hpp:114-116` cap_x'i input_offset'e sabitle + `src/config.cpp:394-395` sanitize kısıtı (`cap.x >= input_offset`) |
 | 16 | `detect_polling_rate` speed sysfs okunamazsa yanlış (8× düşük) rapor | `daemon/daemon.cpp:175-191` → `usb_speed == 0` iken önce high-speed yorumunu dene, geçerli aralıktaysa onu kullan |
+| 67 | LUT editor velocity modunda sağ-tık silme hit-test'i ham stored değere bakıyor (grafik gain y=x iddiasında) | `gui/ui_builder.inl` → silme hit-test'i `lut_stored_to_gain()` ile gain koordinatına çevrildi; ek aynı kök neden: sol-tık ekleme `lut_gain_to_stored(spd, gain, ax.gain)` ile stored'a çevriliyor (on_lut_spin_changed/on_lut_add_point ile tutarlı) |
 
-Doğrulama: 33746/33746 birim test ✓, oracle (1047 satır / 45 bilinen sapma) ✓, 0 derleme uyarısı ✓.
+Doğrulama (BUG-67 fix sonrası): 33746/33746 birim test ✓, oracle (1047 satır / 45 bilinen sapma) ✓, tr coverage PASS ✓, build 0 uyarı ✓.
 
 ---
 
@@ -167,16 +168,62 @@ return daemon_ipc_send_raw(req, 5000)
 
 - `on_lut_row_delete` AppState'i `g_object_get_data(G_OBJECT(list_box), "app-state")` ile alır; `on_lut_spin_changed` list_box'a 3 üstten ulaşır. **Doğrulandı (18B):** `ui_builder.inl:358` `g_object_set_data(G_OBJECT(S->lut_list_box), "app-state", S)` — qdata doğru, kayıp yok. Kalan tek risk `on_lut_spin_changed:374-376`'nın sabit ağaç derinliği varsayımı (hbox sarmalayıcı eklenirse sessizce kırılır) — bakım riski, aktif hata değil.
 
+## 19) `tests/test_accel.cpp:4109-4112` — "BUG-7 fix" yorumu vs kod: clamp yoktu → ✅ DÜZELTİLDİ (aj1, madde 7 ile birlikte)
+
+> **Zaman çizelgesi notu:** Bu bulgu, aj1'in düzeltmesi koda düşmeden ÖNCE (bu oturumun ilk taramasında) doğrulandı:
+> `include/accel-classic.hpp:110-123` `cap_x`'i `input_offset`'e clamp ETMİYORDU; test assert'leri yalnızca `finite`+monoton+tanımlı tavan kontrol ettiğinden `cap_y·(1 − cap_x/x)` tesadüfen geçiyordu ve oracle bu bölgeyi (referans NaN üretir, `NaN > tol` asla doğru olmaz) test edemiyordu → **"regression koruması" fiilen yoktu.**
+
+- **Mevcut durum (sonraki kontrol):** aj1 madde 7 kapsamında koda clamp ekledi:
+  - `accel-classic.hpp:119` → `if (cap_x < args.input_offset) cap_x = args.input_offset;`
+  - `config.cpp:398` → sanitize `if (a.cap.x < a.input_offset) a.cap.x = a.input_offset;`
+  - Test yorumu ile gerçek kod artık UYUMLU; `test_classic_io_degenerate_cap` (R7) geçerli korumayı doğruluyor. **YENİDEN ARAMAYA GEREK YOK.**
+- Kalıntı semantik not (hata değil): clamp sonrası `x >= input_offset` için eğri hâlâ `cap_y·(1 − input_offset/x)` — yani `base_fn(input_offset)=pow(0,exp)=0` olduğundan eğri kullanıcının tam `base_fn(x)` biçimi DEĞİL, tek parametreli asimptotik kuyruk. Bu io mode formülünün doğası (referansla aynı); güvenli ve monoton, negatif gain imkânsız — kabul edilebilir.
+
+## 20) `tests/test_accel.cpp:5255-5260` — T24 sim "motion batch sonunda kaybolur" diyor; daemon sentetik SYN ile FLUSH ediyor (test modeli bayat)
+
+```cpp
+void end_batch() {
+    // Motion that never reached a SYN_REPORT is lost (daemon locals
+    // dx/dy live inside one process_device() invocation).
+    dx = dy = 0;  has_motion = false;
+}
+```
+
+- Test bölümü (5362-5371): `[REL_X=8]` → `end_batch()` → `out` yalnızca sonraki SYN'i içerir, **motion kaybolur** der.
+- Gerçek daemon (`daemon.cpp:1376-1380`): `if (!has_syn) { flush_pending_motion(); if (wrote_unsynced_event) uinput_write(SYN_REPORT); }` — yani **batch sonunda beklemede kalan hareket SENTETİK SYN ile KAYBEDİLMEZ**, ileriye yazılır.
+- `t24syn::sim` bu kuyruk davranışını modellemiyor → **daemon'un sentetik-SYN kuyruğu birim testle hiç kapsanmıyor**; üstelik yorum ve test adı ("motion without SYN_REPORT is lost") sevk edilen gerçek davranışla (flush) çelişiyor. Test bayat (eski bir daemon sürümünü modellemiş) veya senaryo yanlış adlandırılmış; hangisi olursa olsun **daemon davranışı belgelenenden FARKLI** — regresyon riski: gelecekte biri kuyruğu kaldırırsa test yine "geçer" çünkü zaten kaybı bekliyor.
+- Tespit: `daemon.cpp:1376-1380` satırları için gerçek-uyumlu test yok (yalnızca bazı "flushed on SYN" senaryoları var).
+
+## 21) `AGENTS.md` — test sayacı sürüklenmesi (belge sapması, işlevsel değil)
+
+- AGENTS.md "33738 runtime assertion / 183 grup" der; `tests/run_tests.sh` çıktısı **33746/33746** geçti (183 grup doğrulandı). Logitech HID++ piller testleri (P131 dönemi) eklenmiş; AGENTS.md sayacı güncellenmemiş.
+- Kapsam: sadece belge.
+
+---
+
+### Test koşusu (2026-09-10) — tümü TEMİZ
+
+| Süit | Sonuç |
+|------|-------|
+| `tests/run_tests.sh` | 33746/33746 PASS, CLI kapıları (P83/P99/P107) ✓ |
+| `tests/run_tests_asan.sh` (ASan+UBSan) | 33746/33746 PASS, sanitizer hatası yok |
+| `tests/run_tr_coverage.sh` | `Result: PASS` (eksik TR anahtar yok) |
+| `tests/oracle/run_oracle.sh` | OK — 1047 satır / 45 bilinen sapma, sapma yok |
+| `bash scripts/build.sh` (warning gate) | 0 warning, 0 error |
+| `tests/run_fuzz.sh 30` | her iki harness (config+accel) crash yok |
+
+**Yorum:** Tüm süitler yeşil ve aj1'in 1/2/7/16 düzeltmeleri koddan geçerli (son kontrol 2026-09-10'da doğrulandı). Açık kalan kör nokta: **madde 20** — daemon'un sentetik-SYN kuyruğu (daemon.cpp:1390-1391) gerçek-uyumlu birim testle kapsanmıyor ve T24 sim testi/dokümantasyonu sevk edilen davranışla çelişiyor.
+
 ---
 
 ### İlerleme notları
 - [x] GUI `graph.inl` (LUT editör) — madde 12/18
 - [x] daemon `run_loop` / epoll döngüsü + `daemon/main.cpp` PID/sinyal — madde 15
+- [x] Test süitleri tam tur (unit / ASan / tr / oracle / build / fuzz) — maddeler 19-21, tablo
 - [ ] `cli/main.cpp` set-param/PRESET yolları (satır 420-2195)
 - [ ] `include/accel-lookup.hpp` derleme detayı (LUT sıralama, interpolasyon)
 - [ ] `src/logitech_hidpp.cpp` (sensör/hidraw iletişimi; 1865 satır)
-- [ ] `gui/widgets_sync.inl` kalan bölümler + `profile_mgr.inl` + `app-state` qdata doğrulaması (madde 18)
-- [ ] `tests/` son durum (oracle grid, tr kapsama)
+- [ ] `gui/widgets_sync.inl` kalan bölümler + `profile_mgr.inl` (madde 18 qdata doğrulandı ✓)
 - [ ] `setup.sh` / `scripts/` kurulum bağımlılıkları
 
-**Durum:** İlk dalga tamamlandı (denetim devam ediyor). Bulgular dosyaya aktarılırken bulunan diğer konular eklenecek; **madde 1/2/7/16 aj1 tarafından düzeltildi** (yukarıdaki tablo).
+**Durum:** İlk dalga + test turu tamamlandı (denetim devam ediyor). Madde 1/2/7/16 **ve BUG-67 (LUT velocity hit-test)** aj1 tarafından düzeltildi ve koddan doğrulandı (yukarıdaki tablo). Yeni bulgular 19-21 eklendi; 19 (clamp) aj1'in düzeltmesiyle çözüldü, **20 açık** (T24 sim ↔ daemon sentetik-SYN çelişkisi). BUG-01 "hata değil" (referansla birebir + oracle temiz).

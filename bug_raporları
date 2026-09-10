@@ -1084,6 +1084,11 @@ Açıklama: py calculation uses raw stored y (pts[i].second) divided by max_gain
           because the pixel distance is calculated against the wrong y value.
 Önem:    ORTA — velvet modunda nearest-point remove doğru hesaplanmıyor
           (store değer gain'den farklı olduğunda yanlış nokta silinir)
+          ✅ DÜZELTİLDİ (aj1, 2026-09-10): sağ-tık hit-test'i
+          lut_stored_to_gain() ile gain koordinatına çevrildi; aynı kök
+          nedenden sol-tık ekleme lut_gain_to_stored() ile stored'a
+          çevriliyor (on_lut_spin_changed/on_lut_add_point ile tutarlı).
+          YENİDEN ARAMAYA GEREK YOK.
 
 ────────────────────────────────────────────────────────────────────────────────
 BUG-68: cli/main.cpp: cmd_import'da daemon_apply_if_enabled
@@ -1318,4 +1323,15 @@ En önemli bulgu:
           velocity mode'da gain yerine ham stored değer kullanılıyor.
           Bu, gain = y/speed olduğunda yanlış noktanın silinmesine
           neden olur (grafik koordinat hesaplaması hatalı).
+          → aj1 denetimi: DOĞRULANDI, DÜZELTİLDİ (yukarıdaki ✅ notu;
+            ek olarak sol-tık eklemede aynı kök neden düzeltildi).
+
+aj1 denetim sonucu (2026-09-10):
+  - Kritik kabul edilen tek bulgu BUG-67 gerçek bug çıktı; düzeltildi.
+  - BUG-01 (natural legacy): HATA DEĞİL — yerel port (accel-natural.hpp:41-42)
+    vendored referansla (tests/oracle/ref/accel-natural.hpp) birebir aynı;
+    oracle 1047/45 temiz geçiyor.
+  - BUG-08/15/48/55: bilinçli/tasarım davranışları (oracle ve mevcut testler koruyor).
+  - BUG-10/11/13: zararsız stil/teorik notlar; BUG-14 (y_row_label[0] unused atama) trivial.
+  - Kalan 60+ madde "Yok/doğru/bilinen davranış" olarak aj2 raporunda işaretli — değişiklik yok.
 ================================================================================

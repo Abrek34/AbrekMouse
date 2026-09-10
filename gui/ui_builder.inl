@@ -806,7 +806,11 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                 return;
             }
             auto pts = lut_get_points(ax);
-            pts.push_back({spd, gain});
+            // BUG-67: in velocity mode the stored value is an output speed,
+            // not the gain the graph/edit shows — store gain·speed so the
+            // point lands exactly where the user clicked (graph.inl draws
+            // stored/speed).  Matches on_lut_spin_changed / on_lut_add_point.
+            pts.push_back({spd, lut_gain_to_stored(spd, gain, ax.gain)});
             lut_set_points(ax, pts);
             if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
             rebuild_lut_list(S2);
@@ -837,12 +841,19 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             auto  pts = lut_get_points(ax);
             if (pts.empty()) return;
 
-            // Find the LUT point nearest to the clicked pixel position
+            // Find the LUT point nearest to the clicked pixel position.
+            // BUG-67: the graph draws points at *gain* (graph.inl:211 uses
+            // lut_stored_to_gain), so the hit-test must compare against the
+            // gain coordinate too — in velocity mode stored y is an output
+            // speed and raw stored/max_gain lands on the wrong pixel.
             int best_idx = -1;
             double best_dist2 = 20.0 * 20.0; // 20px threshold
+            bool vel_hit = ax.gain;
             for (int i = 0; i < (int)pts.size(); i++) {
                 double px = GRAPH_ML + (pts[i].first  / max_speed) * PW;
-                double py = GRAPH_MT + PH - (pts[i].second / max_gain) * PH;
+                double py = GRAPH_MT + PH - (lut_stored_to_gain(pts[i].first,
+                                                               pts[i].second,
+                                                               vel_hit) / max_gain) * PH;
                 double d2 = (cx - px) * (cx - px) + (cy - py) * (cy - py);
                 if (d2 < best_dist2) { best_dist2 = d2; best_idx = i; }
             }
