@@ -2040,12 +2040,121 @@ static std::string hidraw_export_name(const std::string& path) {
     return std::string(buf);
 }
 
+namespace {
+
+// Identify a single device index on a hidraw node into a populated
+// hidpp_device, or std::nullopt if that index is not a HID++ 2.0 device.
+std::optional<hidpp_device> identify_hidpp20_target(HidppTransport& transport,
+                                                   const std::string& hidraw_path,
+                                                   uint8_t target) {
+    transport.set_device_index(target);
+    auto features = transport.get_feature_set();
+    if (features.empty()) return std::nullopt;
+    auto info = transport.get_device_info(target);
+    if (!info) return std::nullopt;
+
+    hidpp_device device;
+    device.hidraw_path = hidraw_path;
+    device.vendor_id = transport.vendor_id();
+    device.product_id = transport.product_id();
+    device.device_index = target;
+    device.info = *info;
+    device.features = std::move(features);
+    device.feature_metadata = transport.get_feature_metadata();
+    device.connected = true;
+    return device;
+}
+
+// Some firmware replies to any device index, so a directly connected device
+// can answer on both 0xFF and 0x00 and would otherwise be listed twice.
+bool same_identified_device(const hidpp_device& a, const hidpp_device& b) {
+    return a.product_id == b.product_id &&
+           a.info.serial == b.info.serial &&
+           a.info.model_id == b.info.model_id;
+}
+
+} // namespace
+
+std::vector<hidpp_device> identify_logitech_devices(const std::string& hidraw_path) {
+    std::vector<hidpp_device> out;
+    HidppTransport transport(hidraw_path);
+    if (!transport.is_open()) return out;
+
+    // Receiver node candidates first (0xFF), then the direct 0x00 endpoint,
+    // then every paired wireless device a single-interface receiver answers
+    // for on indexes 1..6 (Solaar uses the same sweep).  Probing only
+    // 0xFF/0x00 used to surface just the receiver shell — which carries no
+    // DPI/polling-rate features — and never the actual mice behind it, so the
+    // HID++ panel disabled every control.  kIdentifyBudget bounds the whole
+    // sweep for nodes that never answer.
+    static constexpr uint8_t candidates[] = {0xFF, 0x00, 0x01, 0x02, 0x03,
+                                             0x04, 0x05, 0x06};
+    for (uint8_t candidate : candidates) {
+        auto device = identify_hidpp20_target(transport, hidraw_path, candidate);
+        if (!device) continue;
+        const bool duplicate = std::any_of(
+            out.begin(), out.end(), [&device](const hidpp_device& d) {
+                return same_identified_device(d, *device);
+            });
+        if (!duplicate) out.push_back(std::move(*device));
+    }
+
+    if (!out.empty()) return out;
+
+    // No HID++ 2.0 feature index on any target.  Try the legacy HID++ 1.0
+    // protocol before giving up: older wired mice (G700/G7-era, M-series)
+    // answer register reads but never expose a feature set.  The receiver
+    // always answers on 0xFF; a direct 1.0 peripheral answers on 0x00.
+    uint8_t v10_target = 0xFF;
+    transport.set_device_index(v10_target);
+    bool v10 = transport.probe_hidpp10(v10_target);
+    if (!v10) {
+        transport.set_device_index(0x00);
+        if (transport.probe_hidpp10(0x00)) {
+            v10 = true;
+            v10_target = 0x00;
+        }
+    }
+    if (v10) {
+        hidpp_device device;
+        device.hidraw_path = hidraw_path;
+        device.vendor_id = transport.vendor_id();
+        device.product_id = transport.product_id();
+        device.device_index = v10_target;
+        device.info.protocol_version = 1;
+        device.info.target = v10_target;
+        // Kernel-exposed HID name; 1.0 register 0x0005 is not a reliable name
+        // source across devices.
+        device.info.name = hidraw_export_name(hidraw_path);
+        device.connected = true;
+        out.push_back(std::move(device));
+        return out;
+    }
+
+    // A Logitech hidraw node with neither protocol (e.g. the 046d:c542 Nano
+    // receiver, which implements no HID++ at all).  Surface it with
+    // protocol_version 0 so the GUI/CLI can explain the limitation instead of
+    // showing an empty panel.  Daemon callers filter these out.
+    hidpp_device device;
+    device.hidraw_path = hidraw_path;
+    device.vendor_id = transport.vendor_id();
+    device.product_id = transport.product_id();
+    device.info.protocol_version = 0;
+    device.info.target = 0x00;
+    device.info.name = hidraw_export_name(hidraw_path);
+    device.connected = false;
+    out.push_back(std::move(device));
+    return out;
+}
+
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path) {
     HidppTransport transport(hidraw_path);
     if (!transport.is_open()) return std::nullopt;
 
-    // Receivers normally use 0xFF, while directly connected peripherals
-    // commonly use 0x00. Probe both without assuming the endpoint topology.
+    // Fast single-endpoint probe used by the daemon (which re-checks nodes on
+    // every add and must stay cheap).  Receivers normally use 0xFF, while
+    // directly connected peripherals commonly use 0x00.  Probe both without
+    // assuming the endpoint topology.
     auto features = transport.get_feature_set();
     uint8_t target = transport.device_index();
     if (features.empty() && target != 0x00) {
@@ -2075,10 +2184,14 @@ std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_p
     // reads but never expose a feature set.  The receiver always answers on
     // 0xFF; a direct 1.0 peripheral answers on 0x00.
     uint8_t v10_target = 0xFF;
-    bool v10 = transport.probe_hidpp10(0xFF);
-    if (!v10 && transport.probe_hidpp10(0x00)) {
-        v10 = true;
-        v10_target = 0x00;
+    transport.set_device_index(v10_target);
+    bool v10 = transport.probe_hidpp10(v10_target);
+    if (!v10) {
+        transport.set_device_index(0x00);
+        if (transport.probe_hidpp10(0x00)) {
+            v10 = true;
+            v10_target = 0x00;
+        }
     }
     if (v10) {
         device.device_index = v10_target;

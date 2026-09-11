@@ -202,6 +202,12 @@ struct AppState {
     // to the physical Logitech device via /dev/hidraw* (HID++ 2.0), which
     // is independent of the software profile settings above.
     std::vector<hidpp_device> hidpp_devs;     // live discovery cache
+    // R2-08: bumped whenever S->hidpp_devs is replaced by a scan result.
+    // Notification/query workers capture the version when they start and the
+    // idle callback drops its result if it changed in the meantime, so a stale
+    // worker can never paint battery/caps onto a device that replaced the
+    // one it probed (same dropdown index, different hardware).
+    int        hw_devs_version  = 0;
     GtkWidget* hw_dev_combo     = nullptr;    // device dropdown (/dev/hidrawX)
     GtkWidget* hw_dpi_spin      = nullptr;    // onboard DPI spin
     GtkWidget* hw_rate_combo    = nullptr;    // polling/report rate combo

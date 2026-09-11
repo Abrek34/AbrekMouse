@@ -65,6 +65,13 @@ bash tests/run_tests.sh
 # Same tests under AddressSanitizer + UBSan (slower, catches memory/UB bugs)
 bash tests/run_tests_asan.sh
 
+# End-to-end: REAL daemon against synthetic uinput source/sink (needs root +
+# /dev/uinput). SIGSTOPs a running system daemon for the duration and SIGCONTs
+# it on exit (trap), so it cannot steal the synthetic source's grab.
+# accel phase: frame/SYN structure, SM-2 button buffering, LOW-1 coalesced
+# deferral, ×3 classic-linear gain. raw phase: byte-identical 1:1 passthrough.
+sudo bash tests/run_e2e.sh          # exit 0 = pass, 1 = failed check, 77 = env unusable
+
 # Translation coverage: every translatable UI string must have a Turkish entry
 bash tests/run_tr_coverage.sh
 
@@ -216,6 +223,8 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
 | `tests/run_tests.sh` | Unit test runner (compile + run) |
+| `tests/e2e_harness.cpp` | E2E harness: synthetic uinput mouse + REAL daemon + virtual sink; accel (T-A1..T-A4) + raw (T-B1) phase checks |
+| `tests/run_e2e.sh` | E2E runner (root): builds harness, SIGSTOP/SIGCONT-sensitive system-daemon isolation, runs both phases, propagates 0/1/77 |
 | `tests/run_tests_asan.sh` | Unit test runner under ASan + UBSan |
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
@@ -260,7 +269,7 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment
-- **Input validation**: `sanitize_device_profile()` clamps DPI (1–32 000), polling rate (125–8 000 Hz), rotation (0–360°), snap (0–45°), output DPI, speed_max ≥ speed_min, accel_args fields (acceleration, scale, decay_rate, exponent_power ≥ 1e-4, offsets ≥ 0, limit ≥ 0, sync_speed ≥ 1e-4, smooth ≥ 0, motivity/gamma ≥ 0, cap ≥ 0), domain/range weights 0..1e6 (P86 ceiling; absurd magnitudes like 1e300 can't push accel-LUT lookups past representable indices), smooth halflifes ≥ 0, LUT `length` 0..max capacity — called on every JSON load
+- **Input validation**: `sanitize_device_profile()` clamps DPI (1–32 000), polling rate (125–8 000 Hz), rotation (0–360°), snap (0–45°), output DPI (0 = no output-DPI normalization sentinel, else 1–32 000), speed_max ≥ speed_min, accel_args fields (acceleration, scale, decay_rate, exponent_power ≥ 1e-4, offsets ≥ 0, limit ≥ 0, sync_speed ≥ 1e-4, smooth ≥ 0, motivity/gamma ≥ 0, cap ≥ 0), domain/range weights 0..1e6 (P86 ceiling; absurd magnitudes like 1e300 can't push accel-LUT lookups past representable indices), smooth halflifes ≥ 0, LUT `length` 0..max capacity — called on every JSON load
 - **Systemd hardening**: `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_UNIX`, `ProtectKernelModules/Tunables/ControlGroups`, `LockPersonality`, `RestrictRealtime` (netlink açıkça yok: daemon hot-plug için udev/netlink DEĞİL inotify kullanıyor — `daemon.cpp` `inotify_init1`)
 - **Verbose log**: `daemon -v` shows device open/uinput creation details; `-f text|json` selects the log format (one JSON object per line when `json`)
 - **uinput_write error handling**: all `libevdev_uinput_write_event()` calls are wrapped by `uinput_write()` which checks the return value and marks the device as disconnected on failure
@@ -282,7 +291,8 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Pre-computed dpi_factor**: `mouse_device::dpi_factor` is computed once in `apply_profile()` instead of dividing on every mouse event — eliminates a floating-point division from the hot path
 - **Overflow-safe magnitude**: `magnitude()` uses `std::hypot(x,y)` instead of `sqrt(x*x+y*y)` — prevents intermediate overflow/underflow for extreme delta values
 - **Unified clock source**: both `now_ms()` and `now_ns()` use `CLOCK_MONOTONIC_RAW` — eliminates drift between timing sources and reduces the per-event `clock_gettime` read count from 3 to 2 (start + end; P100)
-- **P93 batched REL write**: `uinput_write_rel()` forwards REL_X+REL_Y in a SINGLE `write()` syscall (kernel uinput injects every `input_event` in the buffer), collapsing two per-event syscalls into one with a byte-identical event stream. Zero-valued axes are skipped (same as the old two conditional writes). Missed timestamps are untouched — `flush_motion` still reads start/end (2 × `clock_gettime`) plus the one batched write = 3 hot-path syscalls per motion event (canonical: hot-path syscall = 3, i.e. 2×`clock_gettime` + 1 batched write).
+- **P93-BATCH output (PERF, hot path)**: `process_device()` accumulates a whole frame — motion REL, any queued non-motion events, and the closing SYN_REPORT — in a small stack `write_batch` (`daemon/daemon.cpp`) and submits it in a SINGLE `write()` syscall at the real SYN_REPORT. Kernel uinput injects every `input_event` found in the write buffer, so the event stream is byte-identical to the old one-syscall-per-event path while collapsing (typically 3+) writes into 1. Zero-valued axes are skipped; a full buffer forces an early flush (nothing is dropped); overflow beyond 16 events flushes in place preserving order; non-SYN subtypes (SYN_MT_REPORT…) and raw-passthrough REL stay 1:1 per-event (libinput-feel contract, RAC-5). `flush_motion` still reads start/end (2 × `clock_gettime`, vDSO) plus 1 batched write; with batched evdev reads (below) the canonical hot-path cost per motion frame is small constant: 1 `read()` + 1 `write()` + 2×`clock_gettime`.
+- **Batched evdev reads (PERF, hot path)**: `process_device()` reads up to 32 `input_event`s per `read()` into `read_batch` instead of one struct per syscall — a typical 3-event frame (REL_X, REL_Y, SYN) costs 1 read syscall. Short/torn reads are handled as before (misaligned stream → log + drop the tail); EAGAIN/EINTR/error semantics unchanged.
 - **Y-axis unlinked field sync**: when X/Y axes are unlinked, fields without dedicated Y widgets (cap_mode, exponent_power, decay_rate, scale, output_offset, motivity, gamma, smooth, sync_speed) are copied from X to prevent stale values
 - **Widget sensitivity refactor**: raw passthrough grey-out logic extracted to `update_raw_sensitivity()` — single source of truth for 18 widget enable/disable calls
 - **GUI language resolution**: header-bar dropdown persists `auto`/`en`/`tr` to `<config_dir>/gui_lang`; an explicit preference wins (`load_lang_override`), otherwise `LANG`/`setlocale` decides (`sys_locale_is_turkish`). `tr()` returns the Turkish rendering only when the resolved language is Turkish — English is the dictionary key itself, so missing entries degrade to the source string. `refresh_language()` re-applies every registered widget in place on switch.
@@ -292,7 +302,12 @@ compute sample staleness). Design keeps the hot path lock-free:
 
 - GUI uses `.inl` file compilation (single translation unit) — GTK4 C callback ABI makes true class-based split impractical without a full rewrite
 - Test infrastructure is simple (no external framework) — no parallel test support
-- No end-to-end daemon test with real evdev/uinput (requires root — not run in CI); config/validation/multi-profile covered by integration tests
+- E2E daemon test (`tests/e2e_harness.cpp` + `tests/run_e2e.sh`) drives the REAL
+  daemon against a synthetic uinput source and a virtual sink; requires root +
+  `/dev/uinput` and is therefore **not run in CI** (CI builds/tests only). It
+  SIGSTOPs a running system daemon for the duration (trap → SIGCONT) so the
+  hot-plug scan can't steal the synthetic source's grab. Config/validation/
+  multi-profile logic stays covered by the integration tests.
 - Device discovery (daemon + GUI) filters only on REL_X+REL_Y and physical/virtual
   status — no name/type-based exclusion for TrackPoint / touchpad / stylus / pad.
   Deliberate policy (BUG-26/aj2): auto-exclusion by name risks silently disabling

@@ -44,6 +44,22 @@ static double now_ms() {
            static_cast<double>(ts.tv_nsec) / 1'000'000.0;
 }
 
+/// Kernel ev.time is filled by the input core on CLOCK_REALTIME.  We never mix
+/// it with CLOCK_MONOTONIC_RAW — only DELTAs of consecutive frame timestamps
+/// are used for the SM-1 interval, so the clock base is irrelevant.
+static inline uint64_t ev_now_us() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000ULL +
+           static_cast<uint64_t>(ts.tv_nsec / 1000);
+}
+
+/// uinput device fd from libevdev (defined early: used by create_virtual_device
+/// for the RAC-1 O_NONBLOCK flag and by the write helpers).
+static inline int uinput_fd(libevdev_uinput* uidev) {
+    return libevdev_uinput_get_fd(uidev);
+}
+
 // ── P-APP: per-application profile matching ──────────────────────────────────
 // A profile's match_app is matched case-insensitively as a SUBSTRING of the
 // focused application class (WM_CLASS class, e.g. "firefox", "org.kde.krita").
@@ -254,10 +270,10 @@ static int detect_polling_rate(const std::string& event_path) {
                     hs_rate <= static_cast<int>(POLL_RATE_MAX))
                     return std::clamp(hs_rate, (int)POLL_RATE_MIN, (int)POLL_RATE_MAX);
             }
-            rate_hz = 1000 / binterval;
+            rate_hz = static_cast<int>(std::llround(1000.0 / binterval));
         } else {
             // Full/low speed: bInterval is in 1ms units
-            rate_hz = 1000 / binterval;
+            rate_hz = static_cast<int>(std::llround(1000.0 / binterval));
         }
         if (rate_hz > 0)
             return std::clamp(rate_hz, (int)POLL_RATE_MIN, (int)POLL_RATE_MAX);
@@ -462,6 +478,8 @@ bool AccelDaemon::start(const std::string& config_path) {
             config_.profiles.push_back(dp);
             config_.active_profile = "default";
         }
+        // PAS-1: the top-level use_raw_input flag is now a real master switch.
+        raw_input_enabled_ = config_.use_raw_input;
     }
 
     // ── epoll setup ───────────────────────────────────────────────────────────
@@ -532,6 +550,17 @@ bool AccelDaemon::start(const std::string& config_path) {
             request_stop();
         }
     });
+    // R1-11: config persistence worker (drains save_q_ async).  Same
+    // exception-containment pattern as the other workers.
+    save_thread_ = std::thread([this] {
+        try {
+            save_worker();
+        } catch (const std::exception& e) {
+            log(std::string("save worker aborted: ") + e.what());
+        } catch (...) {
+            log("save worker aborted: unknown exception");
+        }
+    });
     log("Daemon started.");
     return true;
 }
@@ -540,6 +569,9 @@ void AccelDaemon::stop() {
     running_.store(false);
     if (loop_thread_.joinable()) loop_thread_.join();
     if (hidpp_thread_.joinable()) hidpp_thread_.join();
+    // Save worker drains whatever was still queued at stop time, so the last
+    // pushed config is persisted even if shutdown raced an enqueue.
+    if (save_thread_.joinable()) save_thread_.join();
     teardown_devices();
 
     if (inotify_fd_ >= 0) { close(inotify_fd_); inotify_fd_ = -1; inotify_wd_ = -1; }
@@ -554,9 +586,12 @@ bool AccelDaemon::reload() {
 }
 
 bool AccelDaemon::push_config(const std::string& json_str) {
-    // Called from the IPC thread.  Parse + sanitize + persist here so an error
-    // can be reported synchronously to the client; apply_new_config() then
-    // live-applies the pre-validated config on the loop thread.
+    // Called from the IPC thread.  Parse + sanitize + de-dup here so a parse
+    // error can be reported synchronously to the client; the actual disk write
+    // (save_config) runs on save_thread_ (R1-11) and only a successful write
+    // arms apply_new_config() on the loop thread.  Return semantics therefore
+    // change: true now means "accepted and queued for save", not "saved"; a
+    // save failure is logged by the worker and the config is not applied.
     try {
         // The IPC listener is created before start() by the executable so its
         // startup failure is non-fatal.  Do not let a client race that window
@@ -575,20 +610,56 @@ bool AccelDaemon::push_config(const std::string& json_str) {
                 return true;
             }
         }
-        // Atomic write to the daemon's own config path — a root systemd daemon
-        // can persist to /etc/rawaccel/settings.json even though the GUI/CLI
-        // can only write the user's ~/.config copy.
-        save_config(cfg, config_path_);
         {
-            std::lock_guard<std::mutex> lk(push_cfg_mu_);
-            push_cfg_        = std::move(cfg);
-            push_cfg_pending_ = true;
+            // Enqueue for the save worker.  Off the IPC thread: a slow disk
+            // must never stall a status/save IPC round-trip.
+            std::lock_guard<std::mutex> lk(save_q_mu_);
+            save_q_.emplace_back(std::move(cfg), config_path_);
         }
-        log("Config pushed over IPC (" + config_path_ + ").", true);
+        log("Config push queued for save (" + config_path_ + ").", true);
         return true;
     } catch (std::exception& e) {
         log("Config push rejected: " + std::string(e.what()));
         return false;
+    }
+}
+
+void AccelDaemon::save_worker() {
+    // Sticky-flag + sleep-poll loop (the codebase avoids condition variables).
+    // While running_ is false the queue is still drained so a config enqueued
+    // concurrently with stop() is persisted, then the loop exits.
+    for (;;) {
+        std::optional<std::pair<app_config, std::string>> item;
+        {
+            std::lock_guard<std::mutex> lk(save_q_mu_);
+            if (!save_q_.empty()) {
+                item = std::move(save_q_.front());
+                save_q_.pop_front();
+            }
+        }
+        if (item) {
+            try {
+                // Atomic write to the daemon's own config path — a root systemd
+                // daemon can persist to /etc/rawaccel/settings.json even though
+                // the GUI/CLI can only write the user's ~/.config copy.
+                save_config(item->first, item->second);
+                {
+                    // Arm the apply slot only after the file is on disk, so the
+                    // live re-apply never precedes the persisted config.
+                    std::lock_guard<std::mutex> lk(push_cfg_mu_);
+                    push_cfg_        = std::move(item->first);
+                    push_cfg_pending_ = true;
+                }
+                log("Config pushed over IPC (" + item->second + ").", true);
+            } catch (const std::exception& e) {
+                log("Config save failed: " + std::string(e.what()));
+            } catch (...) {
+                log("Config save failed: unknown exception");
+            }
+            continue;
+        }
+        if (!running_.load(std::memory_order_acquire)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 
@@ -691,6 +762,15 @@ bool AccelDaemon::create_virtual_device(mouse_device& dev) {
     }
 
     dev.uidev = uidev;
+    // RAC-1: make the uinput sink non-blocking.  A slow consumer (compositor
+    // stall, batch commit lag) then returns EAGAIN instead of blocking the
+    // loop thread — the hot path can never be held hostage by the kernel
+    // buffer.  uinput_write_retry() absorbs EAGAIN with bounded backoff.
+    const int udev_fd = uinput_fd(uidev);
+    if (udev_fd >= 0) {
+        int flags = fcntl(udev_fd, F_GETFL);
+        if (flags >= 0) fcntl(udev_fd, F_SETFL, flags | O_NONBLOCK);
+    }
     log("Created virtual device: " + vname, true); // verbose: not needed in normal operation
     return true;
 }
@@ -747,13 +827,34 @@ bool AccelDaemon::setup_devices() {
             deny_reopen(path, dev.device_id, path_deny_until_ms_, dev_deny_until_ms_);
             continue;
         }
-        if (!create_virtual_device(dev)) {
+
+        // PAS-1: honour the top-level use_raw_input master switch (formerly
+        // dormant — wired as the daemon's "intercept" gate).
+        if (!raw_input_enabled_) {
+            log("Raw-input disabled in config — skipping device: " + dev.name, true);
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
             continue;
         }
 
         const device_profile* prof = find_profile(dev.device_id);
+
+        // PAS-2: per-device disable flag — leave the device untouched so the
+        // desktop handles it normally ("safe mode", no acceleration applied).
+        if (prof && prof->dev_cfg.disable) {
+            log("Skipping disabled device: " + dev.name +
+                " [" + dev.device_id + "]", true);
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+            continue;
+        }
+
+        if (!create_virtual_device(dev)) {
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+            continue;
+        }
+
         if (prof) apply_profile(dev, *prof);
 
         // Register in epoll
@@ -894,10 +995,21 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     dev.dpi_factor = NORMALIZED_DPI / dev.dpi; // R13-perf: pre-compute
     dev.settings.prof = prof.prof;
     init_settings(dev.settings);
-    dev.sp.init(prof.prof.speed_processor_args);
-    // Reset subpixel remainders on profile change
-    dev.remainder_x = 0.0;
-    dev.remainder_y = 0.0;
+    // SM-5: reconfigure (not init) — a running smoother keeps its EMA state so
+    // a focus switch / hot reload changes the curve without tearing the
+    // smoothed speed mid-motion.  Only a smoother being turned ON for the
+    // first time is reset (avoids stale totals leaking in from halflife==0).
+    dev.sp.reconfigure(prof.prof.speed_processor_args);
+    // TEL-1: reset the telemetry generation counter on every profile apply.
+    // Without it, a switch from accel → raw (raw path never increments the
+    // counter) left a stale even counter that made old telem_* look "live" in
+    // the GUI.  Zeroing samples makes status_json() report telem_ok=false
+    // (cheap: two relaxed stores + a release; not on the per-event path, only
+    // on profile applies).
+    dev.telemetry->speed_ips.store(0.0, std::memory_order_relaxed);
+    dev.telemetry->out_ips.store(0.0, std::memory_order_relaxed);
+    dev.telemetry->gain.store(0.0, std::memory_order_relaxed);
+    dev.telemetry->samples.store(0, std::memory_order_release);
     // R3-NEW-3: re-anchor the speed interval.  last_time_ms starts at 0 and —
     // critically — is NOT updated while the previous profile was in raw
     // passthrough (flush_motion() never runs there).  Without this refresh, the
@@ -908,6 +1020,11 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     // hot reload / device-connect cases the DEFAULT_TIME_MAX clamp was bare
     // mitigation for).
     dev.last_time_ms = now_ms();
+    // The kernel-frame interval source (SM-1) must be re-anchored together with
+    // the wall clock so a raw→accel switch doesn't measure a huge stale gap.
+    if (dev.last_frame_ev_us == 0) {
+        dev.last_frame_ev_us = ev_now_us();
+    }
 }
 
 // ── Shared config apply path (SIGHUP reload + IPC config push) ────────────────
@@ -1437,44 +1554,120 @@ static inline bool uinput_write(libevdev_uinput* uidev, unsigned int type,
     return libevdev_uinput_write_event(uidev, type, code, value) == 0;
 }
 
-/// P93: batch REL_X + REL_Y into a SINGLE write() syscall instead of two
+/// Retry a uinput write after EAGAIN.  RAC-1: the uinput fd is O_NONBLOCK (set
+/// in create_virtual_device) so a slow consumer (compositor stall) can NEVER
+/// block the hot path — when the kernel buffer is full a write returns EAGAIN
+/// instead.  We retry with backoff because silently dropping the REL would lose
+/// motion; a genuinely dead device keeps failing with a real error
+/// (EPIPE/ENODEV/EBADF) that the caller turns into a disconnect.  The attempt
+/// budget is bounded so a fully-stuck consumer costs at most ~120 ms of motor
+/// stutter (dropping the tail) instead of a deadlocked loop thread.
+static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbytes) {
+    constexpr int   kMaxAttempts = 32;
+    constexpr int   kMinDelayUs  = 50;
+    constexpr int   kMaxDelayUs  = 4000;
+    int             delay        = kMinDelayUs;
+    size_t          done         = 0;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const uint8_t* p   = reinterpret_cast<const uint8_t*>(ev) + done;
+        const size_t   len = nbytes - done;
+        const ssize_t  got = write(fd, p, len);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct timespec ts;
+                ts.tv_sec  = delay / 1'000'000;
+                ts.tv_nsec = static_cast<long>(delay % 1'000'000) * 1000;
+                nanosleep(&ts, nullptr);
+                delay = (delay * 2 > kMaxDelayUs) ? kMaxDelayUs : delay * 2;
+                continue;
+            }
+            return false;
+        }
+        if (got == 0) return false;
+        done += static_cast<size_t>(got);
+        if (done >= nbytes) return true;
+    }
+    return true;
+}
+
+/// P93-BATCH (PERF): accumulate output events in a small stack buffer and submit
+/// them all in ONE write() at the real SYN_REPORT.  A typical accel frame
+/// (REL_X, REL_Y, SYN) used to cost two write() syscalls; with this accumulator
+/// the whole frame — motion REL, any queued buttons and the closing SYN — goes
+/// out in a single syscall.  Order is preserved ([motion…][buttons…][SYN]); a
+/// full buffer only forces an early flush, so no event is ever dropped.
+struct write_batch {
+    input_event evs[16];
+    size_t      n = 0;
+
+    bool add(unsigned int type, unsigned int code, int value) {
+        if (n >= 16) return false;
+        input_event& e = evs[n++];
+        e       = {};
+        e.type  = type;
+        e.code  = code;
+        e.value = value;
+        return true;
+    }
+
+    /// Add, flushing the current buffer first if it would overflow.  Returns
+    /// false only on a hard uinput write error (caller disconnects the device).
+    bool add_flush_if_full(libevdev_uinput* uidev, unsigned int type,
+                           unsigned int code, int value) {
+        if (n >= 16 && !flush(uidev)) return false;
+        return add(type, code, value);
+    }
+
+    /// Add a REL pair (zero-valued axes are skipped, as before).
+    bool add_rel(libevdev_uinput* uidev, int x, int y) {
+        if (x != 0 && !add_flush_if_full(uidev, EV_REL, REL_X, x)) return false;
+        if (y != 0 && !add_flush_if_full(uidev, EV_REL, REL_Y, y)) return false;
+        return true;
+    }
+
+    /// Add the frame-closing SYN_REPORT.
+    bool add_syn(libevdev_uinput* uidev) {
+        return add_flush_if_full(uidev, EV_SYN, SYN_REPORT, 0);
+    }
+
+    /// Submit the whole buffer in ONE write() syscall and reset.  Returns false
+    /// on a hard uinput error; EAGAIN is absorbed by the bounded retry (RAC-1).
+    bool flush(libevdev_uinput* uidev) {
+        if (n == 0) return true;
+        const int fd = uinput_fd(uidev);
+        if (fd < 0) return false;
+        const bool ok = uinput_write_retry(fd, evs, n * sizeof(input_event));
+        n = 0;
+        return ok;
+    }
+};
+
+/// P93 (legacy ledger): the original "REL_X + REL_Y in one write" idea is
+/// superseded by write_batch above, which also merges the closing SYN_REPORT
+/// into the same syscall.
 /// libevdev_uinput_write_event() calls (each = one write()).  The kernel uinput
 /// driver injects every input_event struct found in the write buffer, so the
 /// event stream is byte-identical — this only collapses the two syscalls into
 /// one.  Zero-valued axes are skipped (behaves exactly like the old
 /// `if (x != 0) write; if (y != 0) write` sequence).  Returns false on any
-/// short/failed write so the caller can mark the device disconnected.
-static inline bool uinput_write_rel(libevdev_uinput* uidev, int x, int y) {
-    struct input_event evs[2];
-    int n = 0;
-    if (x != 0) { evs[n] = {}; evs[n].type = EV_REL; evs[n].code = REL_X; evs[n].value = x; n++; }
-    if (y != 0) { evs[n] = {}; evs[n].type = EV_REL; evs[n].code = REL_Y; evs[n].value = y; n++; }
-    if (n == 0) return true; // nothing to forward
-    const int fd = libevdev_uinput_get_fd(uidev);
-    if (fd < 0) return false;
-    const ssize_t want = static_cast<ssize_t>(n) * sizeof(struct input_event);
-    ssize_t written = 0;
-    while (written < want) {
-        const void* p = static_cast<const void*>(evs);
-        ssize_t got = write(fd, static_cast<const char*>(p) + written,
-                            want - written);
-        if (got < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (got == 0) return false; // 0-length write: treat as failure
-        written += got;
-    }
-    return true;
-}
-
+/// hard write error so the caller can mark the device disconnected (EAGAIN is
+/// absorbed by the bounded retry, never a disconnect — RAC-1).
 /// Apply acceleration to accumulated (dx,dy) and write REL events to uidev.
 /// Updates dev timing and subpixel remainder. Does NOT write SYN.
-/// Measures processing latency (time from the start of the process_device()
-/// read batch — including button/wheel work — to last uinput write) in µs.
+/// Measures processing latency in µs as time from lat_anchor_ns (initially the
+/// process_device() read-batch start) to this last write; the anchor is then
+/// moved up to t_now so a SECOND flush in the same batch quantifies its own
+/// work instead of re-measuring the whole batch (MED-4).
+/// frame_ev_us = kernel ev.time (µs, CLOCK_REALTIME) of the SYN_REPORT that
+/// closed this frame — the SM-1 interval is measured as
+/// DELTA(last_frame_ev_us → frame_ev_us), the true USB poll period.  Wall
+/// clock (last_time_ms) remains the fallback for the first frame and for the
+/// raw path, and stays in sync so a later raw→accel switch re-anchors cleanly.
 /// Returns false if a uinput write fails (caller should mark dev as disconnected).
 static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
-                         double dx, double dy, uint64_t batch_start_ns) {
+                         double dx, double dy, uint64_t& lat_anchor_ns,
+                         uint64_t frame_ev_us, write_batch& out) {
     const uint64_t t_now = now_ns(); // interval / telemetry timestamp
 
     // Raw passthrough: bypass the entire acceleration pipeline.
@@ -1492,8 +1685,9 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         if (!std::isfinite(dy)) dy = 0;
         int ix = static_cast<int>(std::clamp(dx, INT_LO, INT_HI));
         int iy = static_cast<int>(std::clamp(dy, INT_LO, INT_HI));
-        if (!uinput_write_rel(uidev, ix, iy)) return false;
-        double lat_us = static_cast<double>(t_now - batch_start_ns) / 1000.0;
+        if (!out.add_rel(uidev, ix, iy)) return false;
+        double lat_us = static_cast<double>(t_now - lat_anchor_ns) / 1000.0;
+        lat_anchor_ns = t_now;
         dev.lat.record(lat_us);
         // Live telemetry: raw-passthrough path (no modifier). Fill counters and
         // deltas only — speeds are undefined without the speed pipeline.
@@ -1514,25 +1708,44 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     }
 
     // P93-perf: derive the interval timestamp from the latency-start read
-    // (t_now) instead of calling now_ms() again.  This keeps the per-event
-    // clock_gettime read count at 2 inside flush_motion (start + end).  The
-    // interval is measured start-to-start on the same CLOCK_MONOTONIC_RAW
-    // source (AGENTS.md contract).  (D-4: latency itself is measured against
-    // batch_start_ns so the read/parse phase is included too.)
+    // (t_now) instead of calling now_ms() again.  The interval is measured
+    // start-to-start on the same CLOCK_MONOTONIC_RAW source when the SM-1
+    // kernel ev.time path is unavailable (first frame / pre-grab-anchor).
     double now = static_cast<double>(t_now) / 1'000'000.0; // ns -> ms, same clock source
-    milliseconds time_ms = now - dev.last_time_ms;
+    double time_ms;
+    // SM-1: prefer the kernel frame-interval.  ev.time deltas are stamped by
+    // the input core at each SYN_REPORT, so a coalesced read batch (loop
+    // stall, scheduler preempt, wayland hiccup) can no longer shrink time_ms
+    // toward zero and spike the gain — the poll period is what the device
+    // actually reported, not what the process got around to.
+    if (dev.last_frame_ev_us != 0 && frame_ev_us != 0 && frame_ev_us > dev.last_frame_ev_us) {
+        time_ms = static_cast<double>(frame_ev_us - dev.last_frame_ev_us) / 1000.0;
+    } else {
+        // Fallback / first frame: wall clock.  last_time_ms==0 on the first
+        // call, so time_ms is huge → clamped to DEFAULT_TIME_MAX — correct.
+        time_ms = now - dev.last_time_ms;
+    }
     // D6: modify() returns early when time<=0 (no motion applied).
     // flush_motion follows the same strategy: don't send motion for zero/negative intervals.
-    // On the first call last_time_ms==0, so time_ms will be very large and gets clamped to DEFAULT_TIME_MAX — correct.
-    if (time_ms <= 0) time_ms = DEFAULT_TIME_MIN; // clamp to minimum window instead of zero
+    // SM-8: floor the ENTIRE (0, DEFAULT_TIME_MIN] band (not just <=0) — a
+    // sub-minimum interval would otherwise slip through and inflate
+    // speed = |d|·dpi_factor/time toward infinity for the clamp's own gain
+    // spike.  DEFAULT_TIME_MIN is half a floor-frame at the max poll rate.
+    if (time_ms < DEFAULT_TIME_MIN) time_ms = DEFAULT_TIME_MIN;
     if (time_ms > DEFAULT_TIME_MAX) time_ms = DEFAULT_TIME_MAX;
     dev.last_time_ms = now;
+    // Advance the kernel-frame anchor so consecutive frames measure their own
+    // true intervals (the SYN that closed this frame is the next frame's base).
+    if (frame_ev_us != 0) dev.last_frame_ev_us = frame_ev_us;
 
     int out_x = 0, out_y = 0;
     apply_motion_math(dev.mod, dev.sp, dev.settings, dev.dpi_factor, time_ms,
                       dx, dy, dev.remainder_x, dev.remainder_y, out_x, out_y);
 
-    if (!uinput_write_rel(uidev, out_x, out_y)) return false;
+    // P93-BATCH: defer the write — the closing SYN_REPORT is merged into the
+    // same buffer and the whole frame goes out in ONE write() at the real
+    // frame boundary (process_device SYN_REPORT handler).
+    if (!out.add_rel(uidev, out_x, out_y)) return false;
 
     // Live telemetry (T30): last-motion sample. IPS = euclidean magnitude of
     // the RAW (pre-rotation) deltas × (dpi_factor / time_ms).  This equals the
@@ -1555,10 +1768,12 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // bump counter to even (write complete)
     dev.telemetry->samples.fetch_add(1, std::memory_order_release);
 
-    // Record processing latency (µs): time from the process_device() read-batch
-    // start (button/wheel work included) to this last write.
-    // This covers: event parse + modifier math + uinput write (no kernel→user round-trip).
-    double lat_us = static_cast<double>(t_now - batch_start_ns) / 1000.0;
+    // Record processing latency (µs): time from the latency anchor (initially
+    // the process_device() read-batch start — button/wheel work included — to
+    // this last write).  A subsequent flush in the same batch is measured from
+    // this write instead (MED-4), so each flush quantifies only its own work.
+    double lat_us = static_cast<double>(t_now - lat_anchor_ns) / 1000.0;
+    lat_anchor_ns = t_now;
     dev.lat.record(lat_us);
     return true;
 }
@@ -1566,9 +1781,15 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
 void AccelDaemon::process_device(mouse_device& dev) {
     auto* uidev = dev.uidev;
     if (!uidev) return;
-    // D-4: latency is anchored at the start of this read batch so button /
-    // wheel events processed before the motion SYN are counted too.
-    const uint64_t batch_start_ns = now_ns();
+    // D-4/MED-4: latency is anchored at the start of this read batch so button
+    // / wheel events processed before the motion SYN are counted too.
+    // flush_motion() measures against it and slides it forward after each
+    // flush so a second flush in a batch quantifies only its own work.
+    uint64_t lat_anchor_ns = now_ns();
+    // P93-BATCH: per-frame output accumulator — see struct write_batch above.
+    // Everything a frame produces (motion REL, queued buttons, SYN) flushes in
+    // ONE write() at the real SYN_REPORT instead of one syscall per event.
+    write_batch out;
 
     // R1-08: a pathological/foreign device that never signals EAGAIN could
     // spin this drain loop forever and hold the whole loop thread.  Cap each
@@ -1577,31 +1798,75 @@ void AccelDaemon::process_device(mouse_device& dev) {
     constexpr int kMaxDrainPerBatch = 4096;
     int drained = 0;
 
-    input_event ev;
+    // P93-PERF: batched event reads — a typical frame (REL_X, REL_Y, SYN = 3
+    // events) now needs ONE read() syscall instead of three.  The per-event
+    // processing body below iterates read_batch via the inner for loop.
+    std::array<input_event, 32> read_batch;
 
     // Accumulate relative motion in this batch
     double dx = 0, dy = 0;
     bool has_motion  = false;
     bool wrote_unsynced_event = false;
+    // SM-2: non-motion events (buttons, wheel, tilt) arriving between a motion
+    // frame and its SYN must NOT trigger a premature flush_motion() — doing so
+    // split one hardware frame across two output frames and halved/quartered
+    // the measured time_ms (→2×–4× speed → spiked gain).  They are buffered and
+    // written once as a group at the frame's real SYN_REPORT, preserving the
+    // kernel's own frame grouping.
+    std::array<input_event, 16> queued_events;
+    size_t queued_count = 0;
+
     // BUG-18: syn_dropped is now a device-state field (mouse_device::syn_dropped)
     // so a SYN_DROPPED event in one read batch is correctly remembered until
     // the matching SYN_REPORT arrives in the next process_device() invocation.
     bool& syn_dropped = dev.syn_dropped;
-    auto flush_pending_motion = [&]() -> bool {
+
+    auto flush_pending_motion = [&](uint64_t frame_ev_us) -> bool {
         if (!has_motion) return true;
-        if (!flush_motion(dev, uidev, dx, dy, batch_start_ns)) {
+        if (!flush_motion(dev, uidev, dx, dy, lat_anchor_ns, frame_ev_us, out)) {
             dev.disconnected = true;
             return false;
         }
-        wrote_unsynced_event = true;
         dx = dy = 0;
         has_motion = false;
         return true;
     };
 
-    // Read all pending events
+    auto flush_queued = [&]() -> bool {
+        for (size_t i = 0; i < queued_count; ++i) {
+            const input_event& e = queued_events[i];
+            // P93-BATCH: accumulate into `out` — the frame SYN flushes the whole
+            // buffer in one write().  On overflow flush in place so nothing is
+            // dropped and event order is preserved.
+            if (!out.add(e.type, e.code, e.value)) {
+                if (!out.flush(uidev)) { dev.disconnected = true; return false; }
+                if (!out.add(e.type, e.code, e.value)) { dev.disconnected = true; return false; }
+            }
+        }
+        queued_count = 0;
+        return true;
+    };
+
+    // LOW-1 / BUG-CRIT-1: merge a motion tail + its non-motion companions that
+    // a previous batch ended with (no SYN).  They flush at THIS batch's real
+    // SYN_REPORT, with the interval measured from the frame that opened them.
+    if (dev.has_pending_motion) {
+        dx = dev.pending_dx;
+        dy = dev.pending_dy;
+        has_motion = true;
+        if (dev.pending_ev_count > 0) {
+            for (size_t i = 0; i < dev.pending_ev_count && queued_count < queued_events.size(); ++i)
+                queued_events[queued_count++] = dev.pending_events[i];
+        }
+        dev.has_pending_motion = false;
+        dev.pending_dx = dev.pending_dy = 0.0;
+        dev.pending_ev_count = 0;
+    }
+
+    // Read all pending events (batched — see read_batch above).
     while (drained++ < kMaxDrainPerBatch) {
-        ssize_t n = read(dev.fd_in, &ev, sizeof(ev));
+        const ssize_t n = read(dev.fd_in, read_batch.data(),
+                               static_cast<size_t>(read_batch.size()) * sizeof(input_event));
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break; // normal: no more events
             if (errno == EINTR) continue;
@@ -1620,17 +1885,21 @@ void AccelDaemon::process_device(mouse_device& dev) {
             break;
         }
         if (n == 0) { dev.disconnected = true; break; } // EOF — treat as disconnect
-        if (n < (ssize_t)sizeof(ev)) {
+        const size_t read_count = static_cast<size_t>(n) / sizeof(input_event);
+        if (read_count == 0) {
             // BUG-NEW-82: a short read is not a recoverable partial event —
             // the input-event stream is word-sized and any partial read leaves
             // the stream misaligned.  Log it (verbose) so silent data loss on
             // a torn read is at least diagnosable, then drop the tail.
             log("read() short read (" + std::to_string(n) + " of " +
-                std::to_string(sizeof(ev)) + " bytes) on " + dev.name, true);
+                std::to_string(static_cast<size_t>(read_batch.size()) * sizeof(input_event)) +
+                " bytes) on " + dev.name, true);
             break;
         }
 
-        if (ev.type == EV_SYN) {
+for (size_t i = 0; i < read_count; ++i) {
+            const input_event& ev = read_batch[i];
+            if (ev.type == EV_SYN) {
             if (ev.code == SYN_DROPPED) {
                 // Kernel dropped events due to buffer overflow.
                 // Per the Linux input protocol, ALL events between SYN_DROPPED
@@ -1650,16 +1919,53 @@ void AccelDaemon::process_device(mouse_device& dev) {
             // subtypes inside the window stay in the dropped state (and are
             // themselves discarded).
             if (syn_dropped) {
-                if (ev.code == SYN_REPORT)
+                if (ev.code == SYN_REPORT) {
                     syn_dropped = false;
+                    // RAC-4: re-anchor the SM-1 frame-interval base at the END
+                    // of the dropped window.  Kernel timestamps of the window
+                    // events are unreliable; counting from the pre-drop base
+                    // would make the first post-drop frame measure a huge (or
+                    // inverted) interval.  This SYN's ev.time is the true start
+                    // of the fresh frame.
+                    if (ev.time.tv_sec != 0 || ev.time.tv_usec != 0) {
+                        const uint64_t t = static_cast<uint64_t>(ev.time.tv_sec) * 1'000'000ULL +
+                                           static_cast<uint64_t>(ev.time.tv_usec);
+                        if (t != dev.last_frame_ev_us)
+                            dev.last_frame_ev_us = t;
+                    }
+                    dev.last_time_ms = now_ms();
+                }
                 // Do NOT flush any motion or forward this SYN (the dropped
                 // window ends here; fresh data starts from the next event batch).
                 continue;
             }
-            if (!flush_pending_motion()) return;
-            // Forward SYN
-            if (!uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
-                { dev.disconnected = true; return; }
+            if (ev.code != SYN_REPORT) {
+                // RAC-5: only a genuine SYN_REPORT delimits an output frame.
+                // Other SYN subtypes (SYN_MT_REPORT, SYN_CONFIG…) are forwarded
+                // unchanged between events WITHOUT flushing accumulated motion —
+                // they do not close a frame, so flushing here would split it.
+                if (!uinput_write(uidev, ev.type, ev.code, ev.value))
+                    { dev.disconnected = true; return; }
+                wrote_unsynced_event = true;
+                continue;
+            }
+            // ── Genuine SYN_REPORT: real frame boundary ──
+            // SM-1: capture the kernel frame timestamp.  Deltas of these (not
+            // the wall clock) measure the true USB poll period, immune to
+            // loop-thread stalls and clock-base quirks.
+            uint64_t frame_ev_us = 0; // 0 → flush_motion falls back to wall clock
+            if (ev.time.tv_sec != 0 || ev.time.tv_usec != 0) {
+                frame_ev_us = static_cast<uint64_t>(ev.time.tv_sec) * 1'000'000ULL +
+                              static_cast<uint64_t>(ev.time.tv_usec);
+            }
+            if (!flush_pending_motion(frame_ev_us)) return;
+            if (!flush_queued()) return;
+            // P93-BATCH: close this frame with ONE write() syscall — the motion
+            // REL plus any queued non-motion events and the closing SYN_REPORT
+            // are all in the same buffer (the kernel injects every input_event
+            // found in a write).  Byte order: [motion…][buttons…][SYN].
+            if (!out.add_syn(uidev)) { dev.disconnected = true; return; }
+            if (!out.flush(uidev)) { dev.disconnected = true; return; }
             wrote_unsynced_event = false;
         } else if (syn_dropped) {
             // R12: discard all non-SYN events while in SYN_DROPPED state.
@@ -1685,33 +1991,63 @@ void AccelDaemon::process_device(mouse_device& dev) {
                     dy += ev.value; has_motion = true;
                 }
             } else {
-                // Pass through other REL events (wheel, tilt, etc.)
-                if (!flush_pending_motion()) return;
+                // Wheel / tilt / other relative axes — SM-2: buffer and write
+                // at the frame SYN instead of flushing the motion early.
+                if (queued_count < queued_events.size()) {
+                    queued_events[queued_count++] = ev;
+                } else {
+                    // A run of >16 pre-SYN non-motion events is pathological;
+                    // write the backlog now rather than drop buttons (SM-2 only
+                    // forbids flushing MOTION before the SYN — forwarding the
+                    // non-motion group early changes no interval).
+                    if (!flush_queued()) return;
+                    if (!out.flush(uidev)) { dev.disconnected = true; return; }
+                    if (!uinput_write(uidev, ev.type, ev.code, ev.value))
+                        { dev.disconnected = true; return; }
+                    wrote_unsynced_event = true;
+                }
+            }
+        } else {
+            // Buttons / misc — SM-2: buffer and write at the frame SYN instead
+            // of flushing the motion early.
+            if (queued_count < queued_events.size()) {
+                queued_events[queued_count++] = ev;
+            } else {
+                if (!flush_queued()) return;
+                if (!out.flush(uidev)) { dev.disconnected = true; return; }
                 if (!uinput_write(uidev, ev.type, ev.code, ev.value))
                     { dev.disconnected = true; return; }
                 wrote_unsynced_event = true;
             }
-        } else {
-            // Forward all other events (buttons, misc, etc.)
-            if (!flush_pending_motion()) return;
-            if (!uinput_write(uidev, ev.type, ev.code, ev.value))
-                { dev.disconnected = true; return; }
-            wrote_unsynced_event = true;
         }
-    }
+        } // for (read_batch events)
+    } // while
 
-    // Close the frame at batch end whenever anything is still pending.
-    // BUG-CRIT-1: the old guard was `!has_syn`, which dropped motion that
-    // accumulated AFTER a mid-batch SYN_REPORT — the kernel coalesced a second
-    // frame ([REL_X:+5, SYN, REL_X:+3]) and read() hit EAGAIN before that
-    // frame's own SYN_REPORT was queued.  The tail +3 was silently lost
-    // because has_syn=true skipped this block.  Constrain on pending state
-    // instead: flush leftover motion, then close the unterminated frame with
-    // a synthetic SYN_REPORT (a no-op when nothing was written unsynced).
-    if (has_motion || wrote_unsynced_event) {
-        if (!flush_pending_motion()) return;
+    // End of batch.  LOW-1 / BUG-CRIT-1: the kernel coalesced a second frame
+    // ([REL_X:+5, SYN, REL_X:+3]) and read() hit EAGAIN before that frame's
+    // own SYN_REPORT was queued.  The old code flushed the +3 and closed it
+    // with a SYNTHETIC SYN_REPORT — a frame boundary the kernel never
+    // reported, which now (SM-1) would mangle the interval and produce a
+    // double-SYN step.  Instead the unterminated frame (motion + any queued
+    // non-motion) is DEFERRED to the device and merged into the next
+    // process_device()'s frame, flushed at that REAL SYN.  The move is purely
+    // internal; the deferred +3 is delayed by one poll frame at most.
+    if (has_motion || queued_count > 0) {
+        dev.pending_dx   += dx;
+        dev.pending_dy   += dy;
+        dev.has_pending_motion = true;
+        dev.pending_ev_count = 0;
+        for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
+            dev.pending_events[dev.pending_ev_count++] = queued_events[i];
+    }
+    // Close any frame that accumulated WRITTEN events (raw passthrough REL or
+    // forwarded SYN subtypes) but never saw a SYN.  This is the only remaining
+    // place a synthetic SYN_REPORT is emitted — for non-motion data only, where
+    // no interval semantics are affected.
+    if (wrote_unsynced_event) {
         if (!uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
             { dev.disconnected = true; return; }
+        wrote_unsynced_event = false;
     }
 }
 

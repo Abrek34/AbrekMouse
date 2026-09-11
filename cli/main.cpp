@@ -666,8 +666,8 @@ static int cmd_validate(const std::string& config_path) {
                 std::cerr << "WARNING: speed_min > speed_max in profile '" << dp.name << "'\n";
                 has_warnings = true;
             }
-            if (p.output_dpi < 1 || p.output_dpi > 32000) {
-                std::cerr << "WARNING: output_dpi out of range [1, 32000] in profile '" << dp.name << "'\n";
+            if (p.output_dpi < 0 || p.output_dpi > 32000) {
+                std::cerr << "WARNING: output_dpi out of range [0, 32000] in profile '" << dp.name << "'\n";
                 has_warnings = true;
             }
             if (dp.dev_cfg.dpi < 1 || dp.dev_cfg.dpi > 32000) {
@@ -914,8 +914,9 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     } else if (key == "output_dpi") {
         // P156: output_dpi is a double field in the config schema — an integer
         // coercion rejected legitimate fractional values (e.g. DPI != 1).  The
-        // sanitizer clamps the range anyway; only the range is meaningful here.
-        if (!range_ok("output_dpi", 1, 32000)) return 1;
+        // sanitizer clamps the range anyway; 0 = "no output-DPI normalization"
+        // (CFG-1) is now a valid sentinel, so the domain is [0, 32000].
+        if (!range_ok("output_dpi", 0, 32000)) return 1;
     } else if (key == "polling_rate") {
         if (!int_ok("polling_rate", POLL_RATE_MIN, POLL_RATE_MAX)) return 1;
     } else if (key == "snap") {
@@ -1442,9 +1443,16 @@ static int cmd_status(const std::string& config_path) {
         std::cout << "Active:  " << cfg.active_profile << "\n";
         // P115-A5-09: surface the global raw-input mode; it silently stayed
         // hidden when set (status only showed per-profile fields before).
-        if (cfg.use_raw_input)
-            std::cout << "Raw-input passthrough flag: true  (stored flag — dormant: daemon hot path "
-                         "ignores it; real 1:1 raw = set-param <profile> raw true)\n";
+        // PAS-1: the flag is no longer dormant — it is the daemon's master
+        // "intercept" switch: false = the daemon grabs no mice at all (the
+        // desktop handles them, i.e. OS-level raw pass-through).  Per-profile
+        // 1:1 raw is still set-param <profile> raw true.
+        if (!cfg.use_raw_input)
+            std::cout << "Raw-input: off (use_raw_input=false — daemon grabs NO "
+                         "devices; the desktop receives raw mouse input)\n";
+        else
+            std::cout << "Raw-input: on (use_raw_input=true — daemon intercepts "
+                         "devices; per-profile raw 1:1 = set-param <profile> raw true)\n";
         std::cout << "Profiles (" << cfg.profiles.size() << "):\n";
         for (auto& p : cfg.profiles) {
             bool is_active = (p.name == cfg.active_profile);
@@ -1604,40 +1612,46 @@ static int cmd_hidpp() {
     if (g_json) {
         nlohmann::json out = nlohmann::json::array();
         for (const auto& path : hidraw_devices) {
-            nlohmann::json entry;
-            entry["hidraw_path"] = path;
-            if (auto dev = identify_logitech_device(path)) {
-                entry["connected"] = dev->connected;
-                entry["protocol_version"] = dev->info.protocol_version;
-                if (dev->info.protocol_version == 0) {
-                    // No HID++ at all (e.g. 046d:c542 Nano receiver): display
-                    // shell only — battery/DPI/rate queries cannot apply.
-                    entry["name"] = dev->info.name;
+            auto devs = identify_logitech_devices(path);
+            if (devs.empty()) {
+                nlohmann::json entry;
+                entry["hidraw_path"] = path;
+                entry["connected"] = false;
+                out.push_back(entry);
+                continue;
+            }
+            for (auto& dev : devs) {
+                nlohmann::json entry;
+                entry["hidraw_path"] = path;
+                entry["connected"] = dev.connected;
+                entry["protocol_version"] = dev.info.protocol_version;
+                if (dev.info.protocol_version == 0) {
+                    entry["name"] = dev.info.name;
                     entry["hidpp_not_implemented"] = true;
                     out.push_back(entry);
                     continue;
                 }
-                entry["vendor_id"] = dev->vendor_id;
-                entry["product_id"] = dev->product_id;
-                entry["device_index"] = dev->device_index;
-                entry["name"] = dev->info.name;
-                entry["friendly_name"] = dev->info.friendly_name;
-                entry["serial"] = dev->info.serial;
-                entry["firmware_version"] = dev->info.firmware_version;
-                entry["firmware_name"] = dev->info.firmware_name;
-                entry["firmware_major"] = dev->info.firmware_major;
-                entry["firmware_minor"] = dev->info.firmware_minor;
-                entry["firmware_build"] = dev->info.firmware_build;
-                entry["unit_id"] = dev->info.unit_id;
-                entry["model_id"] = dev->info.model_id;
-                entry["transport_flags"] = dev->info.transport_flags;
-                entry["device_kind"] = dev->info.device_kind;
-                entry["bluetooth_id"] = dev->info.bluetooth_id;
-                entry["bluetooth_le_id"] = dev->info.bluetooth_le_id;
-                entry["wireless_pid"] = dev->info.wireless_pid;
-                entry["usb_id"] = dev->info.usb_id;
+                entry["vendor_id"] = dev.vendor_id;
+                entry["product_id"] = dev.product_id;
+                entry["device_index"] = dev.device_index;
+                entry["name"] = dev.info.name;
+                entry["friendly_name"] = dev.info.friendly_name;
+                entry["serial"] = dev.info.serial;
+                entry["firmware_version"] = dev.info.firmware_version;
+                entry["firmware_name"] = dev.info.firmware_name;
+                entry["firmware_major"] = dev.info.firmware_major;
+                entry["firmware_minor"] = dev.info.firmware_minor;
+                entry["firmware_build"] = dev.info.firmware_build;
+                entry["unit_id"] = dev.info.unit_id;
+                entry["model_id"] = dev.info.model_id;
+                entry["transport_flags"] = dev.info.transport_flags;
+                entry["device_kind"] = dev.info.device_kind;
+                entry["bluetooth_id"] = dev.info.bluetooth_id;
+                entry["bluetooth_le_id"] = dev.info.bluetooth_le_id;
+                entry["wireless_pid"] = dev.info.wireless_pid;
+                entry["usb_id"] = dev.info.usb_id;
                 nlohmann::json firmware_records = nlohmann::json::array();
-                for (const auto& record : dev->info.firmware_records) {
+                for (const auto& record : dev.info.firmware_records) {
                     firmware_records.push_back({
                         {"level", record.level},
                         {"name", record.name},
@@ -1652,7 +1666,7 @@ static int cmd_hidpp() {
                 }
                 entry["firmware_records"] = firmware_records;
                 nlohmann::json feature_json = nlohmann::json::array();
-                for (const auto& feature : dev->feature_metadata) {
+                for (const auto& feature : dev.feature_metadata) {
                     const auto feature_id = feature.feature_id;
                     feature_json.push_back({
                         {"id", feature_id},
@@ -1676,16 +1690,15 @@ static int cmd_hidpp() {
                 }
                 entry["features"] = feature_json;
 
-                // Query additional info using a transport with the correct device index
                 HidppTransport transport(path);
                 if (transport.is_open()) {
-                    transport.set_device_index(dev->device_index);
-                    if (auto battery = transport.get_battery_status(dev->device_index)) {
+                    transport.set_device_index(dev.device_index);
+                    if (auto battery = transport.get_battery_status(dev.device_index)) {
                         entry["battery"]["level"] = battery->level;
                         entry["battery"]["charging"] = battery->charging;
                         entry["battery"]["online"] = battery->online;
                     }
-                    if (auto dpi = transport.get_dpi_info(dev->device_index)) {
+                    if (auto dpi = transport.get_dpi_info(dev.device_index)) {
                         entry["dpi"]["min"] = dpi->dpi_min;
                         entry["dpi"]["max"] = dpi->dpi_max;
                         entry["dpi"]["default"] = dpi->dpi_default;
@@ -1698,10 +1711,10 @@ static int cmd_hidpp() {
                             entry["dpi"]["lift_off_distance"] = dpi->lift_off_distance;
                         entry["dpi"]["levels"] = dpi->dpi_levels;
                     }
-                    if (auto rate = transport.get_polling_rate(dev->device_index))
+                    if (auto rate = transport.get_polling_rate(dev.device_index))
                         entry["polling_rate_hz"] = *rate;
                     if (auto onboard = transport.get_onboard_profile_info(
-                            dev->device_index)) {
+                            dev.device_index)) {
                         entry["onboard_profiles"]["memory"] = onboard->memory;
                         entry["onboard_profiles"]["active_profile"] =
                             onboard->active_profile;
@@ -1718,7 +1731,7 @@ static int cmd_hidpp() {
                         entry["onboard_profiles"]["shift"] = onboard->shift;
                         nlohmann::json headers = nlohmann::json::array();
                         for (const auto& header : transport.get_onboard_profile_headers(
-                                 dev->device_index)) {
+                                 dev.device_index)) {
                             headers.push_back({
                                 {"profile", header.profile},
                                 {"sector", header.sector},
@@ -1727,7 +1740,6 @@ static int cmd_hidpp() {
                         }
                         entry["onboard_profiles"]["headers"] = headers;
                     }
-                    // Pairing info is queried on the receiver (0xFF)
                     auto slots = transport.get_pairing_info(0xFF);
                     nlohmann::json slots_json = nlohmann::json::array();
                     for (const auto& slot : slots) {
@@ -1742,10 +1754,8 @@ static int cmd_hidpp() {
                     }
                     entry["pairing_slots"] = slots_json;
                 }
-            } else {
-                entry["connected"] = false;
+                out.push_back(entry);
             }
-            out.push_back(entry);
         }
         std::cout << out.dump(2) << "\n";
         return 0;
@@ -1757,37 +1767,43 @@ static int cmd_hidpp() {
     }
 
     for (const auto& path : hidraw_devices) {
-        std::cout << "Device: " << path << "\n";
-        if (auto dev = identify_logitech_device(path)) {
-            if (dev->info.protocol_version == 0) {
-                std::cout << "  Name: " << dev->info.name << "\n"
-                          << "  (Logitech hidraw node without HID++ — neither\n"
-                          << "   HID++ 2.0 nor HID++ 1.0 is implemented by this\n"
-                          << "   hardware, so onboard DPI/rate/LOD are unavailable)\n";
-                std::cout << "\n";
-                continue;
-            }
-            std::cout << "  Name: " << dev->info.name << "\n"
-                      << "  Friendly name: " << dev->info.friendly_name << "\n"
-                      << "  Serial: " << dev->info.serial << "\n"
+        if (auto devs = identify_logitech_devices(path); !devs.empty()) {
+            bool first = true;
+            for (auto& dev : devs) {
+                if (!first) std::cout << "\n";
+                first = false;
+                std::cout << "Device: " << path << "  (target 0x" << std::hex
+                          << std::setw(2) << std::setfill('0')
+                          << static_cast<int>(dev.device_index) << ")\n" << std::dec
+                          << std::setfill(' ');
+                if (dev.info.protocol_version == 0) {
+                    std::cout << "  Name: " << dev.info.name << "\n"
+                              << "  (Logitech hidraw node without HID++ — neither\n"
+                              << "   HID++ 2.0 nor HID++ 1.0 is implemented by this\n"
+                              << "   hardware, so onboard DPI/rate/LOD are unavailable)\n";
+                    continue;
+                }
+                std::cout << "  Name: " << dev.info.name << "\n"
+                      << "  Friendly name: " << dev.info.friendly_name << "\n"
+                      << "  Serial: " << dev.info.serial << "\n"
                       << "  VID:PID = " << std::hex << std::setfill('0')
-                      << std::setw(4) << dev->vendor_id << ":"
-                      << std::setw(4) << dev->product_id << std::dec << "\n"
-                      << "  Firmware: " << dev->info.firmware_version << "\n"
-                      << "  Firmware record: " << dev->info.firmware_name
-                      << " " << static_cast<int>(dev->info.firmware_major)
-                      << "." << static_cast<int>(dev->info.firmware_minor)
-                      << " build=" << dev->info.firmware_build << "\n"
-                      << "  Unit/model: " << dev->info.unit_id << "/"
-                      << dev->info.model_id << "\n"
-                      << "  Transport IDs: BT=" << dev->info.bluetooth_id
-                      << " BLE=" << dev->info.bluetooth_le_id
-                      << " WPID=" << dev->info.wireless_pid
-                      << " USB=" << dev->info.usb_id << "\n"
-                      << "  Protocol: " << static_cast<int>(dev->info.protocol_version) << "\n";
-             if (!dev->features.empty()) {
+                      << std::setw(4) << dev.vendor_id << ":"
+                      << std::setw(4) << dev.product_id << std::dec << "\n"
+                      << "  Firmware: " << dev.info.firmware_version << "\n"
+                      << "  Firmware record: " << dev.info.firmware_name
+                      << " " << static_cast<int>(dev.info.firmware_major)
+                      << "." << static_cast<int>(dev.info.firmware_minor)
+                      << " build=" << dev.info.firmware_build << "\n"
+                      << "  Unit/model: " << dev.info.unit_id << "/"
+                      << dev.info.model_id << "\n"
+                      << "  Transport IDs: BT=" << dev.info.bluetooth_id
+                      << " BLE=" << dev.info.bluetooth_le_id
+                      << " WPID=" << dev.info.wireless_pid
+                      << " USB=" << dev.info.usb_id << "\n"
+                      << "  Protocol: " << static_cast<int>(dev.info.protocol_version) << "\n";
+             if (!dev.features.empty()) {
                  std::cout << "  Features:";
-                 for (const auto& feature : dev->feature_metadata)
+                 for (const auto& feature : dev.feature_metadata)
                      std::cout << " " << hidpp_feature_name(feature.feature_id)
                               << "=0x" << std::hex << std::setw(4)
                               << std::setfill('0') << feature.feature_id
@@ -1800,13 +1816,13 @@ static int cmd_hidpp() {
 
             HidppTransport transport(path);
             if (transport.is_open()) {
-                transport.set_device_index(dev->device_index);
-                if (auto battery = transport.get_battery_status(dev->device_index)) {
+                transport.set_device_index(dev.device_index);
+                if (auto battery = transport.get_battery_status(dev.device_index)) {
                     std::cout << "  Battery: " << (battery->level == 255 ? "unknown" : std::to_string(battery->level) + "%")
                               << (battery->charging ? " (charging)" : "")
                               << (battery->online ? "" : " (offline)") << "\n";
                 }
-                if (auto dpi = transport.get_dpi_info(dev->device_index)) {
+                if (auto dpi = transport.get_dpi_info(dev.device_index)) {
                     std::cout << "  DPI: current=" << dpi->dpi_current
                               << " default=" << dpi->dpi_default
                               << " range=[" << dpi->dpi_min << "," << dpi->dpi_max << "]\n";
@@ -1825,10 +1841,10 @@ static int cmd_hidpp() {
                         std::cout << "  Lift-off distance: " << lod << "\n";
                     }
                 }
-                if (auto rate = transport.get_polling_rate(dev->device_index))
+                if (auto rate = transport.get_polling_rate(dev.device_index))
                     std::cout << "  Polling rate: " << *rate << " Hz\n";
                 if (auto onboard = transport.get_onboard_profile_info(
-                        dev->device_index)) {
+                        dev.device_index)) {
                     std::cout << "  Onboard profiles: count="
                               << static_cast<int>(onboard->profile_count)
                               << " active="
@@ -1837,7 +1853,7 @@ static int cmd_hidpp() {
                               << static_cast<int>(onboard->sector_count)
                               << " size=" << onboard->profile_size << " bytes\n";
                     for (const auto& header :
-                         transport.get_onboard_profile_headers(dev->device_index))
+                         transport.get_onboard_profile_headers(dev.device_index))
                         std::cout << "    Profile "
                                   << static_cast<int>(header.profile)
                                   << ": sector=" << header.sector
@@ -1863,6 +1879,7 @@ static int cmd_hidpp() {
                         std::cout << "\n";
                     }
                 }
+            }
             }
         } else {
             std::cout << "  (Not a HID++ device or unable to communicate)\n";
@@ -1896,11 +1913,20 @@ static std::optional<uint8_t> hidpp_target_from_args(const std::string& path,
             return static_cast<uint8_t>(value);
         return std::nullopt;
     }
-    // Directly connected mice normally use 0x00.  A receiver is better
-    // handled with an explicit paired-device index, but use the first target
-    // returned by the normal identification probe when available.
-    if (auto device = identify_logitech_device(path))
-        return device->device_index;
+    // Directly connected mice normally use 0x00.  Behind a single-interface
+    // receiver, the paired mouse lives on an index between 1 and 6 and the
+    // receiver itself (0xFF) has no DPI/rate features — so prefer the first
+    // identified device that actually carries a DPI feature when probing is
+    // needed.  Only when nothing DPI-capable exists fall back to the first
+    // identified endpoint.
+    auto devices = identify_logitech_devices(path);
+    for (const auto& d : devices) {
+        if (d.supports_feature(static_cast<uint16_t>(hidpp_feature_index::adjustable_dpi)) ||
+            d.supports_feature(static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_dpi)))
+            return d.device_index;
+    }
+    if (!devices.empty())
+        return devices.front().device_index;
     return 0x00;
 }
 
@@ -2097,7 +2123,8 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
   speed_min         Minimum speed clamp (ips). Domain ≥ 0. Default 0 (off).
   speed_max         Maximum speed clamp (ips). Domain ≥ 0; if both set, max ≥ min.
                     Default 0 (off).
-  output_dpi        Output DPI normalization value. Domain 1–32000. Default 1000.
+  output_dpi        Output DPI normalization value. Domain 0–32000; 0 disables
+                    output-DPI normalization (1:1 counts). Default 1000.
   lr_ratio          Left/right output DPI ratio. Domain 0.01–100. Default 1 (off).
   ud_ratio          Up/down output DPI ratio. Domain 0.01–100. Default 1 (off).
   yx_ratio          Y-axis output DPI ratio (relative to X). Domain 0.01–100. Default 1.

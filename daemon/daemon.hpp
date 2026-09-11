@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <deque>
 #include <functional>
 #include <set>
 #include <unordered_map>
@@ -56,6 +57,28 @@ struct mouse_device {
     double remainder_y   = 0.0;
     // Set to true when a fatal I/O error occurs; run_loop removes the device
     bool   disconnected  = false;
+
+    // LOW-1/SM-2: a motion tail that read() closed a batch on WITHOUT a
+    // terminating SYN_REPORT (the kernel coalesced [REL_X:+5, SYN, REL_X:+3]
+    // and EAGAIN fired before the second frame's SYN).  Holding it here lets
+    // the next process_device() merge it into its own frame and flush it at
+    // that frame's REAL SYN — correct interval (SM-1) and no synthetic SYN
+    // (LOW-1 double-SYN).  A deferred non-motion tail (buttons/wheel read
+    // after the last SYN) rides along in pending_events so the whole
+    // unterminated frame stays atomic and is written at the next SYN.
+    // Lines: daemon.cpp process_device().
+    double pending_dx        = 0.0;
+    double pending_dy        = 0.0;
+    bool   has_pending_motion = false;
+    std::array<input_event, 16> pending_events;
+    size_t pending_ev_count    = 0;
+
+    // SM-1: kernel ev.time (µs) of the last frame we closed with a SYN_REPORT.
+    // Running frame-to-frame intervals off the kernel timestamp instead of the
+    // processing wall clock gives the true USB poll period, so a coalesced
+    // batch (loop-thread stall, scheduler preemption) can no longer shrink
+    // time_ms toward zero and spike the gain.
+    uint64_t last_frame_ev_us = 0;
 
     // BUG-18: SYN_DROPPED state must persist across process_device() calls.
     // The Linux input protocol says all events between a SYN_DROPPED and the
@@ -253,6 +276,22 @@ private:
     app_config   push_cfg_;
     bool         push_cfg_pending_ = false;
 
+    // ── R1-11 / TS-3: async config persistence ────────────────────────────
+    // save_config() is disk I/O — never run it on the IPC thread, where a slow
+    // filesystem would stall every client round-trip (GUI save/CLI set-*).
+    // push_config() enqueues (config, path) and returns after the enqueue;
+    // save_thread_ drains the queue and, only after a successful atomic write,
+    // arms the apply slot so the loop thread can live-apply — preserving the
+    // old "persist before apply" ordering.  Save failures are logged by the
+    // worker (the client already got its "accepted" reply).  The codebase
+    // deliberately avoids condition variables (sticky-atomic-flag/sleep-poll
+    // convention), so the worker polls the queue with a bounded sleep and
+    // drains any items still queued when stop() clears running_.
+    std::mutex                                    save_q_mu_;
+    std::deque<std::pair<app_config, std::string>> save_q_;
+    std::thread                                   save_thread_;
+    void save_worker();
+
     // ── P-APP: per-application profile switching ──────────────────────────
     // Focused application (WM_CLASS class / cmdline basename, lowercased) as
     // reported by the GUI over IPC ("set_active_app <app>").  Only ever mutated
@@ -263,6 +302,13 @@ private:
     std::string  pending_app_;
     bool         active_app_dirty_ = false;
     std::string  current_app_;
+
+    // ── PAS-1: top-level use_raw_input master switch ──────────────────────
+    // Previously dormant (parsed + serialized but never read anywhere).  It is
+    // now honored as a global "intercept" gate: when false the daemon does NOT
+    // grab any mouse (devices stay owned by the desktop — raw passthrough at
+    // the OS level), so the flag is no longer misleading.  Loop thread only.
+    bool raw_input_enabled_ = true;
 
     // IPC server state
     std::thread         ipc_thread_;

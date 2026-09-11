@@ -14,10 +14,16 @@ struct simple_ema_smoother {
     double windowTotal       = 0;
     double cutoffTotal       = 0;
 
-    void init(double halfLife) {
-        windowTotal = cutoffTotal = 0;
+    void init_coeff(double halfLife) {
         windowCoefficient = halfLife > 0 ? std::pow(0.5, 1.0 / halfLife) : 0;
         cutoffCoefficient = 1.0 - std::sqrt(1.0 - windowCoefficient);
+    }
+
+    void reset() { windowTotal = cutoffTotal = 0; }
+
+    void init(double halfLife) {
+        init_coeff(halfLife);
+        reset();
     }
 
     double smooth(double speed, milliseconds time) {
@@ -31,7 +37,13 @@ struct simple_ema_smoother {
 
 /// Linear (trend-aware) EMA smoother.
 struct linear_ema_smoother {
-    static constexpr double trendDampening = 0.75;
+    static constexpr double trendDampening  = 0.75;
+    // SM-3: the trend term (gain slope, ips/ms) is bounded.  The window/cutoff
+    // trend coefficients already make the per-time ratio ~bounded, but a
+    // coalesced frame interval that survives the daemon floor could still push
+    // (Δtotal/time) far outside any physical slope — clamp it so a single
+    // pathological sample cannot poison the trend accumulator.
+    static constexpr double kMaxTrendSlope  = 1e6;
 
     double windowCoefficient      = 0;
     double cutoffCoefficient      = 0;
@@ -43,12 +55,20 @@ struct linear_ema_smoother {
     double windowTrendTotal = 0;
     double cutoffTrendTotal = 0;
 
-    void init(double halfLife, double trendHalfLife) {
-        windowTotal = cutoffTotal = windowTrendTotal = cutoffTrendTotal = 0;
+    void init_coeff(double halfLife, double trendHalfLife) {
         windowCoefficient      = halfLife > 0      ? std::pow(0.5, 1.0 / halfLife)      : 0;
         windowTrendCoefficient = trendHalfLife > 0 ? std::pow(0.5, 1.0 / trendHalfLife) : 0;
         cutoffCoefficient      = 1.0 - std::sqrt(1.0 - windowCoefficient);
         cutoffTrendCoefficient = 1.0 - std::sqrt(1.0 - windowTrendCoefficient);
+    }
+
+    void reset() {
+        windowTotal = cutoffTotal = windowTrendTotal = cutoffTrendTotal = 0;
+    }
+
+    void init(double halfLife, double trendHalfLife) {
+        init_coeff(halfLife, trendHalfLife);
+        reset();
     }
 
     double smooth(double speed, milliseconds time) {
@@ -61,6 +81,14 @@ struct linear_ema_smoother {
 
         windowTrendTotal *= trendDampening;
         cutoffTrendTotal *= trendDampening;
+        if (speed <= windowTotal && speed <= cutoffTotal) {
+            // SM-6: the input is decelerating or stopped (new sample is at or
+            // below the current estimates).  Damp the trend extra hard so the
+            // speed prediction doesn't overshoot into a few "ghost" frames
+            // after the mouse stops or reverses direction.
+            windowTrendTotal *= trendDampening;
+            cutoffTrendTotal *= trendDampening;
+        }
         windowTotal += windowTrendTotal * time;
         cutoffTotal += cutoffTrendTotal * time;
 
@@ -74,6 +102,8 @@ struct linear_ema_smoother {
 
         double nwt = time > 0 ? (windowTotal - oldW) / time : 0;
         double nct = time > 0 ? (cutoffTotal - oldC) / time : 0;
+        if (!std::isfinite(nwt) || nwt < -kMaxTrendSlope || nwt > kMaxTrendSlope) nwt = 0;
+        if (!std::isfinite(nct) || nct < -kMaxTrendSlope || nct > kMaxTrendSlope) nct = 0;
         windowTrendTotal += twtc * (nwt - windowTrendTotal);
         cutoffTrendTotal += tctc * (nct - cutoffTrendTotal);
 
@@ -114,7 +144,12 @@ struct speed_processor {
 
     speed_processor() = default;
 
-    void init(const speed_args& in_args) {
+    // Recompute the distance mode, smoothing flags and per-smoother
+    // coefficients from in_args.  Does NOT touch the accumulator state —
+    // used by init() (which then also resets) and by reconfigure() (which
+    // preserves running smoothers so live profile/focus switches don't tear
+    // the speed estimate mid-motion — SM-5).
+    void init_coeff(const speed_args& in_args) {
         args = in_args;
 
         if (!in_args.whole) {
@@ -133,16 +168,53 @@ struct speed_processor {
         speed_flags.should_smooth_output = in_args.output_speed_smooth_halflife  > 0;
 
         if (speed_flags.should_smooth_input) {
-            smoother_x.input_speed_smoother.init(in_args.input_speed_smooth_halflife, input_trend_halflife);
-            smoother_y.input_speed_smoother.init(in_args.input_speed_smooth_halflife, input_trend_halflife);
+            smoother_x.input_speed_smoother.init_coeff(in_args.input_speed_smooth_halflife, input_trend_halflife);
+            smoother_y.input_speed_smoother.init_coeff(in_args.input_speed_smooth_halflife, input_trend_halflife);
         }
         if (speed_flags.should_smooth_scale) {
-            smoother_x.scale_smoother.init(in_args.scale_smooth_halflife);
-            smoother_y.scale_smoother.init(in_args.scale_smooth_halflife);
+            smoother_x.scale_smoother.init_coeff(in_args.scale_smooth_halflife);
+            smoother_y.scale_smoother.init_coeff(in_args.scale_smooth_halflife);
         }
         if (speed_flags.should_smooth_output) {
-            smoother_x.output_speed_smoother.init(in_args.output_speed_smooth_halflife, output_trend_halflife);
-            smoother_y.output_speed_smoother.init(in_args.output_speed_smooth_halflife, output_trend_halflife);
+            smoother_x.output_speed_smoother.init_coeff(in_args.output_speed_smooth_halflife, output_trend_halflife);
+            smoother_y.output_speed_smoother.init_coeff(in_args.output_speed_smooth_halflife, output_trend_halflife);
+        }
+    }
+
+    void reset_smoothers() {
+        smoother_x.input_speed_smoother.reset();
+        smoother_y.input_speed_smoother.reset();
+        smoother_x.scale_smoother.reset();
+        smoother_y.scale_smoother.reset();
+        smoother_x.output_speed_smoother.reset();
+        smoother_y.output_speed_smoother.reset();
+    }
+
+    void init(const speed_args& in_args) {
+        init_coeff(in_args);
+        reset_smoothers();
+    }
+
+    // SM-5: like init(), but only resets a smoother that is being turned ON
+    // for the first time (halflife was 0 before).  Smoothers that are already
+    // active keep their EMA state so a focus switch or hot reload changes the
+    // curve/parameters without tearing the smoothed speed mid-motion.
+    void reconfigure(const speed_args& in_args) {
+        const bool prev_input  = speed_flags.should_smooth_input;
+        const bool prev_scale  = speed_flags.should_smooth_scale;
+        const bool prev_output = speed_flags.should_smooth_output;
+        init_coeff(in_args);
+        if (speed_flags.should_smooth_input  && !prev_input) {
+            smoother_x.input_speed_smoother.reset();
+            smoother_y.input_speed_smoother.reset();
+        }
+        if (speed_flags.should_smooth_scale  && !prev_scale) {
+            smoother_x.scale_smoother.reset();
+            smoother_y.scale_smoother.reset();
+        }
+        if (speed_flags.should_smooth_output && !prev_output) {
+            smoother_x.output_speed_smoother.reset();
+            smoother_y.output_speed_smoother.reset();
         }
     }
 
@@ -363,6 +435,9 @@ public:
         // 5. Output DPI normalization + directional DPI multipliers
         // Reference: dpi_adjustment = (output_dpi / NORMALIZED_DPI) * dpi_factor;
         // applied to X, and to Y scaled further by the Y/X output-DPI ratio.
+        // CFG-1: output_dpi = 0 is the "no output-DPI normalization" sentinel —
+        // the guard below skips dpi_adjustment entirely (1:1 counts).  sanitize
+        // preserves 0 for exactly this reason.
         if (args.output_dpi > 0 && dpi_factor > 0) {
             double dpi_adjustment = (args.output_dpi / NORMALIZED_DPI) * dpi_factor;
             in.x *= dpi_adjustment;

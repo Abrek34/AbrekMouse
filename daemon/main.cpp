@@ -76,9 +76,40 @@ static void remove_pid() {
     }
 }
 
+// R1-14: verify that a PID recorded in a PID file actually belongs to OUR
+// daemon.  kill(pid,0) alone treats a recycled PID (kernel reused the number
+// after a crash) as "live", so a stale file can block startup forever.  The
+// kernel caps comm at TASK_COMM_LEN (15 bytes); "rawaccel-daemon" fits.
+// Best-effort: a failed /proc read returns false and the caller decides how
+// conservative to be.
+static bool proc_comm_matches(pid_t pid, const char* expected) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/comm", static_cast<int>(pid));
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[64];
+    const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    char* nl = std::strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    // Linux caps comm at TASK_COMM_LEN (16 bytes incl. NUL → 15 chars); the
+    // constant is not exported to userspace, so keep the bound local.
+    constexpr size_t kTaskCommLen = 15;
+    if (std::strlen(expected) > kTaskCommLen) return false;
+    return std::strcmp(buf, expected) == 0;
+}
+
 // K3: atomic flag for SIGUSR1 — dump_latency_stats() is not async-signal-safe
 // (it uses cout), so we set a flag in the handler and call it from the main loop.
 static std::atomic<bool> g_dump_latency { false };
+// R1-13: unconditional stop-request latch set by the signal handler.  It
+// closes the two startup races a running_-flag alone cannot:
+//   1. SIGTERM before g_daemon.store() would hit a null daemon pointer.
+//   2. SIGTERM during start() would be overwritten by running_.store(true).
+// Values are only ever written in the handler; main reads them at safe points.
+static std::atomic<bool> g_stop_requested { false };
 
 static void handle_signal(int sig) {
     // Signal handlers must only call async-signal-safe functions.
@@ -87,14 +118,17 @@ static void handle_signal(int sig) {
     // Solution: set running_ = false here; the main loop detects it and calls stop().
     // K2: g_daemon is atomic — load() from signal handler is safe.
     rawaccel::AccelDaemon* d = g_daemon.load();
-    if (!d) return;
     if (sig == SIGHUP) {
-        d->reload();
+        if (d) d->reload();
     } else if (sig == SIGUSR1) {
         // K3: set flag; actual dump happens in the main loop (safe to use cout there)
         g_dump_latency.store(true);
     } else {
-        d->request_stop(); // sets running_ = false, does NOT join
+        // K2/R1-13: latch the stop request unconditionally (async-signal-safe
+        // store), then — when the daemon object exists — pass it on so the
+        // loop thread is told to wrap up.
+        g_stop_requested.store(true);
+        if (d) d->request_stop(); // sets running_ = false, does NOT join
     }
 }
 
@@ -172,6 +206,17 @@ static bool validate_config_path(const std::string& path) {
             std::cerr << "[rawaccel] Config path '" << rp
                       << "' does not have a .json extension.\n";
             return false;
+        }
+        // R5-S-9: the /proc/ /sys/ /dev/ prefix ban was only applied on the
+        // "file does not exist" branch; an EXISTING file inside those trees
+        // (or one reachable through a symlink that resolves there) slipped
+        // past it.  Apply the same check to the canonical path.
+        for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
+            if (rp.rfind(bad, 0) == 0) {
+                std::cerr << "[rawaccel] Config path '" << rp
+                          << "' is in a disallowed directory.\n";
+                return false;
+            }
         }
     } else {
         // File does not yet exist — validate the path string itself
@@ -316,6 +361,16 @@ int main(int argc, char* argv[]) {
                 unlink(path);
                 return true;
             }
+            // R1-14: PID alive but its comm is not rawaccel-daemon — the PID
+            // was recycled by the kernel after a crash and now belongs to some
+            // other program, so this file can never belong to a live copy of
+            // us.  Clear it.  A comm that cannot be read (unverifiable) is
+            // deliberately NOT cleared here — stay on the conservative side.
+            if (pid > 0 && kill(pid, 0) == 0 &&
+                !proc_comm_matches(pid, "rawaccel-daemon")) {
+                unlink(path);
+                return true;
+            }
             return false; // process is still running
         };
 
@@ -336,8 +391,18 @@ int main(int argc, char* argv[]) {
             long val = std::strtol(buf, &end, 10);
             if (end == buf || errno != 0 || val <= 0 || val > INT_MAX)
                 return false;
-            if (kill(static_cast<pid_t>(val), 0) == 0) return true;
-            return errno != ESRCH; // EPERM also means the process exists.
+            // R1-14: only count a live process as "another instance" when it
+            // is actually rawaccel-daemon.  kill(pid,0) alone would mark a
+            // recycled, unrelated PID as alive and refuse every future boot.
+            const int rc = kill(static_cast<pid_t>(val), 0);
+            if (rc == 0 || errno == EPERM) {
+                if (proc_comm_matches(static_cast<pid_t>(val),
+                                      "rawaccel-daemon"))
+                    return true; // our daemon really is up → refuse
+                if (rc == 0) return false; // alive but not us → stale/clearable
+                return true;      // live but comm unreadable → stay conservative
+            }
+            return false; // ESRCH or error: not a live process
         };
         const bool another_alive =
             (!xdg_pid.empty() && pid_file_is_live(xdg_pid.c_str())) ||
@@ -363,6 +428,16 @@ int main(int argc, char* argv[]) {
     rawaccel::AccelDaemon daemon;
     // K2: atomic store — allows safe load() from the signal handler
     g_daemon.store(&daemon);
+
+    // R1-13: a stop signal that arrived before g_daemon.store() would have
+    // been dropped (the handler saw a null pointer).  Abort cleanly instead
+    // of running with no way to stop.
+    if (g_stop_requested.load()) {
+        std::cout << "[rawaccel] Stop signal received during startup; exiting.\n";
+        g_daemon.store(nullptr);
+        remove_pid();
+        return 0;
+    }
 
     // Always log to stdout (systemd journal captures it), verbose = also show debug
     bool json_logs = (log_format == "json");
@@ -486,6 +561,12 @@ int main(int argc, char* argv[]) {
     // BUG-4: input-group users can't kill(root_daemon, SIGUSR1) — they get EPERM.
     // The IPC server (input-group writable socket) accepts a "latency" command
     // that sets daemon.latency_dump_flag_; we drain it here on the same path.
+    // R1-13: if a stop signal fired while start() was bringing the daemon up,
+    // request_stop() was answered but start()'s running_.store(true) swallowed
+    // it.  Re-assert so the loop exits on the first iteration and stop() joins
+    // the (now started) worker threads cleanly.
+    if (g_stop_requested.load())
+        daemon.request_stop();
     while (daemon.is_running()) {
         sleep(1);
         if (g_dump_latency.exchange(false) ||

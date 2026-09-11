@@ -47,6 +47,12 @@ struct classic {
         if (args.exponent_classic <= 1.0)
             return 1.0 + minsd(accel_raised, cap);
 
+        // CUR-2 (deliberately NOT changed — reference behavior): cap.y < 1 in
+        // io mode sets sign = -1, which yields gain < 1 (deceleration).  This
+        // mirrors the official RawAccel classic curves and is locked in by the
+        // P105/P106 cap-limit tests and the differential oracle — "fixing" it
+        // would diverge from the reference.  Documented in Bug Hata Raporları
+        // (TUR 18 CUR-2) as a deliberate non-change.
         if (!gain_mode)
             return sign * minsd(base_fn(x, accel_raised, args), cap) + 1.0;
 
@@ -125,17 +131,20 @@ private:
                     ? std::pow(a, args.exponent_classic - 1)
                     : 0.0;
             }
-            // ORTA-BUG-ALG-03: base_fn(cap_x) can trip its own overflow guard
-            // (pow(·) → Inf → returns 0.0) even when accel_raised > 0.  The
-            // constant (0 - cap_y)·cap_x then produces a mis-shaped tail
-            // (cap_y·(1 − cap_x/x)) that no longer matches the analytic curve
-            // — a C1 break at cap_x.  Degrade cap_y+constant to 0 so both the
-            // body and the tail stay "identity" instead of a wrong curve.
+            // ORTA-BUG-ALG-03/CUR-1: base_fn(cap_x) can trip its own overflow guard
+            // (pow(·) → Inf → returns 0.0) even when accel_raised > 0, so the
+            // analytic C1 break is unrepresentable at this point.  The OLD
+            // guard then degraded cap_y=constant=0 — output snapped from the
+            // real rising body to identity at cap_x (a C0 hard edge).  Instead
+            // keep the analytic cap_y and anchor the tail to base_fn's guarded
+            // value 0:  tail = cap_y·(1 − cap_x/x), which starts exactly at the
+            // (also guarded) body end, is continuous, stays monotone non-
+            // decreasing, never exceeds cap.y (P105: g <= cap.y + 1e-9), and
+            // never collapses to 1:1.
             {
                 const double bf = base_fn(cap_x, accel_raised, args);
                 if (bf == 0.0 && accel_raised > 0.0) {
-                    cap_y = 0;
-                    constant = 0;
+                    constant = (0.0 - cap_y) * cap_x;
                 } else {
                     constant = (bf - cap_y) * cap_x;
                 }
@@ -166,11 +175,13 @@ private:
                     if (cap_y < 0) { cap_y = -cap_y; sign = -sign; }
                     cap_x = gain_inverse(cap_y, args.acceleration,
                                          args.exponent_classic, args.input_offset);
-                    // ORTA-BUG-ALG-03: same guard as the io branch.
+                    // ORTA-BUG-ALG-03/CUR-1: same guard as the io branch — the
+                    // C0 identity collapse is replaced by a continuous tail
+                    // anchored to base_fn's guarded 0 (cap_y·(1 − cap_x/x)),
+                    // which is monotone, <= cap.y, and never 1:1.
                     const double bf2 = base_fn(cap_x, accel_raised, args);
                     if (bf2 == 0.0 && accel_raised > 0.0) {
-                        cap_y = 0;
-                        constant = 0;
+                        constant = (0.0 - cap_y) * cap_x;
                     } else {
                         constant = (bf2 - cap_y) * cap_x;
                     }

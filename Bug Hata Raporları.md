@@ -794,3 +794,243 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 
 ### DÜŞÜK:
 31+: BUG-LOW-1/2, ERR-4..7, SEC-2/3/9, G-3/5/6, B3-B8, C-7/8, BS-12, TH-5/6/7
+
+---
+
+# TUR 18 — Raw Passthrough + Hareket Pürüzsüzlüğü Derinlemesine Analizi (2026-09-11)
+
+Analiz tarihi: 2026-09-11 (üçüncü tur)
+Kapsam: Raw passthrough yolu (`daemon/daemon.cpp` inline REL iletimi) + accel hattının zamanlama/EMA/süreklilik davranışı (`daemon.cpp` flush_motion, `daemon/motion_math.hpp`, `include/rawaccel.hpp`, `include/accel-*.hpp`, `gui/widgets_sync.inl`)
+Yöntem: Kaynak kod satır satır + canlı telemetri seqlock kontratı + referans formüllerle karşılaştırma
+Durum: Güncelleme (2026-09-11) — aşağıdaki maddeler **düzeltildi** veya **kasıtlı değişiklik yapılmadı** olarak işaretlenmiştir. Önceki seviyede bunlar yalnızca loglanıyordu.
+
+**DÜZELTME ÖZETİ (TUR 18 turu):**
+- `daemon/daemon.cpp` — SM-1/SM-8: `time_ms` artık kernel SYN_REPORT `ev.time` DELTASI ile ölçülüyor (`last_frame_ev_us`); duvar saati yalnız ilk frame/raw fallback. SM-8: tüm `(0, DEFAULT_TIME_MIN]` bandı floor'landı (`time_ms < DEFAULT_TIME_MIN → DEFAULT_TIME_MIN`).
+- SM-2: buton/tekerlek/SYN-alt tipi ara olayları `queued_events` (16) buffer'ında biriktirilip frame'in gerçek SYN_REPORT'unda yazılıyor — frame artık bölünmüyor; overflow'da backlog erken yazılır (düşürme yok).
+- LOW-1 + BUG-CRIT-1: SYN'siz motion kuyruğu `dev.pending_dx/dy` + `pending_events`'a ertelenip sonraki batch'in gerçek SYN'inde flush ediliyor — sentetik SYN yalnız `wrote_unsynced_event` (motion dışı) için.
+- RAC-5: SYN_REPORT dışı SYN alt tipleri (SYN_MT_REPORT, SYN_CONFIG…) aynen iletilir, motion flush'ı tetiklemez. RAC-4: SYN_DROPPED'i bitiren SYN'de `last_frame_ev_us` + `last_time_ms` re-anchor.
+- MED-4: `flush_motion`'a `lat_anchor_ns` referansı — her flush kendi işlem süresini ölçer.
+- SM-5: `speed_processor::reconfigure()` — EMA + remainder korunur, yalnız yeni açılan (0→pozitif) smoother resetlenir. TEL-1: `apply_profile` telemetri sayaçlarını sıfırlar → `telem_ok=false` doğru.
+- SM-3: EMA `nwt/nct` trend'i `±1e6` + non-finite clamp. SM-6: deceleration/stop'da ekstra trend sönümlemesi.
+- SM-7: half-life üst sınırı 31.7 yıl (`1e9`) → 17 dk (`1e6`); P107 domain kontratı `1e6`'nın geçmesini zorunlu kıldığından 10 sn'ye inilmedi.
+- CUR-1: classic GAIN overflow guard'ı C0 "identity çöküşü" yerine sürekli kuyruk (`cap_y·(1 − cap_x/x)`); P105 `g ≤ cap.y` kontratı korunuyor.
+- CUR-2: **kasıtlı değişiklik YOK** — `cap.y<1 → sign=-1` (gain<1, deceleration) referral RawAccel eğrisinin davranışı; P105/P106 testleri + orakel bunu kontrat yapıyor.
+- RAC-1: uinput fd `O_NONBLOCK` + EAGAIN'de sınırlı backoff retry; EAGAIN artık cihaz ölümü sayılmaz, asla disconnect yok.
+- RAC-2: belgeli (housekeeping zaten flag-gated; ev.time hesabı semptomu çözdü). RAC-3: **kasıtlı değişiklik YOK** — systemd `RestrictRealtime` korunur; semptom ev.time ile giderildi.
+- PAS-1: `use_raw_input=false` → daemon HİÇBİR cihazı yakalamaz (master intercept anahtarı). PAS-2: `dev_cfg.disable` → cihaz yakalanmaz (güvenli mod). PAS-3: raw'da `output_dpi_spin` de grey-out. CLI `status` metni güncellendi ("dormant" ibaresi kaldırıldı).
+
+**Durum gösterimi:** `[DÜZELTİLDİ]` = kodda uygulandı, test+oracle+tr_coverage+ASan doğrulandı (33786/33786, orakel 1071/68). `[KASITLI]` = kontrat testleri/orakel nedeniyle bilinçli değiştirilmedi.
+
+---
+
+## A. RAW PASSTHROUGH — KULLANICIYA DÖNÜK KÖK SORUNLAR
+
+**PAS-1 · ORTA · `use_raw_input` config bayrağı tamamen ölü kod** — **[DÜZELTİLDİ]**
+- Konum: `include/config.hpp:47` (tanım), `src/config.cpp:607-608` (okuma), `src/config.cpp:628` (yazma)
+- Kategori: Arayüz/behaviour
+- Açıklama: `use_raw_input` (varsayılan `true`) JSON'da parse/serialize ediliyor ama `daemon/` içinde **sıfır referans**. Böyle bir üst düzey bayrağı 1:1 raw yakalama istediğiyle işaretleyen kullanıcı ya da GUI ayarı hiçbir şey yapmıyor; daemon yalnızca per-profil `dev.settings.prof.raw_passthrough`'u onurlandırıyor.
+- Öneri: Bayrağı kaldır (yanıltıcı) veya tüm profiller için global raw geçişine bağla ve dökümanda belirt.
+
+**PAS-2 · ORTA · `device_config::disable` bayrağı da ölü kod** — **[DÜZELTİLDİ]**
+- Konum: `include/config.hpp:25`, `src/config.cpp:581-582` (parse), `src/config.cpp:317` (serialize)
+- Kategori: Arayüz/behaviour
+- Açıklama: `disable=true` işaretli bir cihaz yine de yakalanıp işleniyor; daemon yalnızca `prof.dev_cfg.dpi` ve `polling_rate` okuyor (`daemon.cpp:889-890`). "Disable" profili kullanıcıyı yanıltır (grep doğrulandı).
+- Öneri: `dev_cfg.disable` okunup cihaz gölge/güvenli moda alınmalı ya da bayrak kaldırılmalı.
+
+**PAS-3 · DÜŞÜK · Raw modda `output_dpi_spin` hâlâ aktif — etkisiz ayar yanılgısı** — **[DÜZELTİLDİ]**
+- Konum: `gui/widgets_sync.inl:6-24` (`update_raw_sensitivity`)
+- Kategori: UI hata
+- Açıklama: Raw passthrough'ta 17 pipeline widget'ı grey-out ediliyor ama `output_dpi_spin` (DPI normalize, `rawaccel.hpp:366-370`) raw modda baypas edildiği hâlde **aktif kalıyor**. Kullanıcı "Output DPI" düzenler, kullanıcıya hiçbir etkisi olmaz. (kozmetik — düzgünlük değil)
+
+**PAS-4 · DÜŞÜK · Raw 1:1 iddiası zaman damgaları için geçerli değil** — **[DEĞİŞMEDİ — katman kısıtı, belgeleme maddesi]**
+- Konum: `daemon/daemon.cpp:1731-1734` (inline forward) → `uinput_write()` → `libevdev_uinput_write_event`
+- Kategori: Belgeleme
+- Açıklama: Raw yolu `type/code/value` + SYN yerleşimi açısından byte-identical; ama `ev.time` artık **yeniden damgalanıyor** (write anında + kernel uinput enjeksiyonunda). Özgün evdev zaman damgaları aşağı yönlü tüketiciye (örn. uinput cihazındaki libinput adaptive accel) ulaşmıyor. Stall sonrası tüm drained batch tek µs'lik burst gibi görünür. Kullanıcı arayüzündeki "bit-identical" ifadesi zaman damgaları için yanıltıcı — düzeltilemez katman kısıtı, dökümana işlenmeli.
+
+---
+
+## B. ZAMANLAMA / HARAKET DÜZGÜNLÜĞÜ — EN KRİTİK BULGULAR
+
+**SM-1 · KRİTİK · Coalesced-frame near-zero interval → gain spike (hareket sıçraması)** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1570-1582` (flush_motion zamanlama)
+- Kategori: Düzgünlük (smoothness)
+- Açıklama: `time_ms`, `now - dev.last_time_ms` ile **işleme duvar saati** üzerinden hesaplanıyor; kernel olay zaman damgası (`ev.time`) hiç okunmuyor. Loop thread gecikince (epoll dispatch, scheduler stall, housekeeping) bir batch N kadar kernel frame'ini tek seferde boşaltır. Frame 1 tüm stall'ı emer (under-gain), frame 2..N ise birkaç µs sonra `flush_motion` çağrıldığından `time_ms ≈ 0.0005 ms` gibi küçük ama pozitif bir değer alır. `<= 0` klamplaması (DEFAULT_TIME_MIN = 1000/8000/2 = 0.0625 ms, `rawaccel-base.hpp:15`) yalnızca sıfır/negatifi yakalar — **bu pencereyi kaçırır**. `ips_factor = dpi_factor/time_ms` → 800 dpi'de ~2500 → hız binlerce ips → gain cap'e vurur → 2-5× overshoot tek kare. Flick = görünür "zıplama".
+- Öneri: `time_ms`'i SYN_REPORT'un `ev.time` damgasıyla ölç (gerçek poll periyodu), min guard sonrası da `max(time_ms, DEFAULT_TIME_MIN)` şeklinde alt tavan uygula. (Aşağı tavan tek başına 1 kHz'de ~16× overshoot bırakır — gerçek çözüm frame damgası.)
+
+**SM-2 · KRİTİK · Ara cihaz olayları (buton/tekerlek) aynı frame'i bölüyor → near-zero interval spike** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1742-1753` (flush_pending_motion çağrıları)
+- Kategori: Düzgünlük
+- Açıklama: `[REL_X:+5, BTN_LEFT:1, REL_Y:+3, SYN]` gibi bir HID raporunda buton/tekerlek olayı arasında `flush_pending_motion()` çağrılıyor; bu `last_time_ms`'i güncelliyor. SYN'deki son REL_Y flush'ı yine µs-mertebesinde `time_ms` hesaplar → tek eksen gain spike. Gaming mouse'lar buton+motion'ı aynı rapora basar. Bir kernel frame'i de birden çok çıktı frame'ine bölünür.
+- Öneri: Ara olaylarda flush yerine yalnızca SYN_REPORT'ta flush et (veya frame başına tek zaman damgası kullan).
+
+**SM-3 · YÜKSEK · EMA trend accumulator near-zero interval'da patlıyor** — **[DÜZELTİLDİ]**
+- Konum: `include/rawaccel.hpp:75-78` (linear_ema_smoother::smooth)
+- Kategori: Düzgünlük
+- Açıklama: `nwt = (windowTotal - oldW)/time` — coalesced frame'de `time≈0.0005` → trend dev ~1000× büyür. `trendDampening=0.75` per-event azalttığından SM-1 patolojisi smoothed input aktifken bile sonraki normal frame'lere taşınır → kalıcı overshoot.
+- Öneri: `time` bazlı trend sönümleme veya `nwt` üst sınırı.
+
+**SM-4 · YÜKSEK · İdle sonrası ilk frame under-gain (100 ms klamplaması)** — **[KISMİ — ev.time + DEFAULT_TIME_MIN floor + RAC-4 re-anchor; duruş sonrası ilk frame için idle-tetikleme çözümü uygulanmadı (ev.time büyük boşluğu yine DEFAULT_TIME_MAX'a klamplar)]**
+- Konum: `daemon/daemon.cpp:1581` + `rawaccel-base.hpp:16` (`DEFAULT_TIME_MAX=100`)
+- Kategori: Düzgünlük
+- Açıklama: Herhangi bir duruş sonrası ilk SYN frame'i tüm boşluğu ölçer → 100 ms'e klamplanır → `speed ≈ 0 → gain ≈ 1`. "Duruş sonrası flick" bir kare geç başlar (SM-1 overshoot ile birlikte). `apply_profile` re-anchoring (R3-NEW-3) yalnızca profil anahtarlarını kapsar, doğal idle duruşlarını değil.
+
+**SM-5 · YÜKSEK · Profil/uygulama-fokus anahtarı sırasında EMA + remainder + zamanlama sıfırlanıyor** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:886-911` (`apply_profile`) → `dev.sp.init()` (`rawaccel.hpp:117-147`) + remainder sıfırlama + `last_time_ms` re-anchor
+- Kategori: Düzgünlük / geçiş
+- Açıklama: Per-uygulama profil (`apply_active_app` → `apply_profile`, `daemon.cpp:859-882`) **her alt-tab/fokus değişiminde** olay ortasında smoother durumunu 0'a çeker, alt-piksel remainder'ını düşürür, interval'i yeniden hizalar. Fare hareket hâlindeyken gain anlık kesilir ve ~bir half-life boyunca yeniden birleşir → görünür transient. Profil kaydetme/config reload'da da aynı.
+- Öneri: Fokus değişiminde yalnızca rastlanan parametreleri (mode/curve) değiştir, smoother + remainder durumunu koru.
+
+**SM-6 · ORTA · Stop/ters yönden sonra trend overshoot ("ghosting")** — **[DÜZELTİLDİ]**
+- Konum: `include/rawaccel.hpp:62-78`
+- Kategori: Düzgünlük
+- Açıklama: Trend, `time` ile çarpılarak tahmine taşınır. Fare aniden durunca pozitif trend hızı ~`1/0.75` olay daha yukarı tahmin eder → duruş sonrası 1-3 frame yüksek gain → "hayalet" mikro hareket.
+- Öneri: Trend'i olay başına değil zaman ölçekli sönümle; durma/reversal'da trend sıfıra yaklaştır.
+
+**SM-7 · ORTA · Dev half-life cursor'ı donduruyor** — **[KISMİ — üst sınır 1e9 → 1e6 ms (~17 dk); P107 set-param domain kontratı 1e6'nın sanitize'den değişmeden geçmesini zorunlu kıldığından 10 sn hedefine inilmedi]**
+- Konum: `include/rawaccel.hpp:19-20`, `src/config.cpp:509-520`
+- Kategori: Düzgünlük / DoS edge case
+- Açıklama: Sanitize `input_speed_smooth_halflife`'ı 1e9 ms'e (~11.6 gün) klamp'liyor; ama kod yorumu (`config.cpp:504`) hl ≥ ~1.4e16 üstünde `pow(0.5, 1/hl)`'in tam 1.0'a yuvarlandığını (twc=0 → kalıcı donma) zaten kaydediyor. Gerçekte 1e9-kapak dahi "neredeyse hiç hareket etmez" eşiğinin çok üstünde: `pow(0.5, 1e-9)≈0.9999999993` → `twc ≈ 6.9e-8`/1ms frame → speed/scale tahmini pratikte static → imleç ya donar ya ağır jitter yapar. (DoS edge case, clamp değerlerin çok üstünde.)
+- Öneri: Half-life üst sınırını gerçekçi bir değere (örn. 10 sn) indir.
+
+**SM-8 · ORTA · Gecikme toleransı / `DEFAULT_TIME_MIN` guard'ı coalesced frame'leri kapsamıyor** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1580` + `rawaccel-base.hpp:15`
+- Kategori: Düzgünlük
+- Açıklama: 0.0625 ms altı pozitif interval'ler (`(0, 0.0625]`) klamp'siz geçer → `ips_factor` patlar. 1 kHz poll'da frame arası gerçek aralık 1 ms iken; stall sonrası drained frame'ler 0.0005-0.01 ms aralıklar üretebilir.
+- Öneri: `time_ms = std::max(time_ms, DEFAULT_TIME_MIN)` (floor + clamp birlikte).
+
+---
+
+## C. ALGORİTMA / EĞRİ SÜREKSİZLİKLERİ (düzgünlüğü bozar)
+
+**CUR-1 · ORTA · `classic` GAIN — cap_y=0 fallback gerçek C0 adım üretir** — **[DÜZELTİLDİ]**
+- Konum: `include/accel-classic.hpp:134-142, 170-176`
+- Açıklama: `base_fn(cap_x)` kendi overflow guard'ına takılıp 0.0 dönünce `cap_y=0, constant=0` → cap_x altında `base_fn ≠ 0` iken cap_x'te çıktı **0'a atlar** (hard edge). Hız tam cap_x sınırında keskin gain sıçraması.
+- Öneri: cap_y=0 yerine asimptotik eğimi koruyan sürekli fallback.
+
+**CUR-2 · ORTA · `classic` — cap.y < 1 ise gain değeri negatif olabilir → eksen ters döner** — **[KASITLI — P105/P106/orakel kontratı; referans RawAccel davranışı]**
+- Konum: `include/accel-classic.hpp:69-70, 103-104` + operator() 50-51
+- Açıklama: `cap.y=0.5` (cap_mode=out) → `sign=-1` → `gain = 1 − min(base_fn, 0.5)`. `base_fn(x) > 1` olduğunda gain **negatif** → imleç ters yön. Yalnız eğri degenerasyonu korunuyor, polarite korunmuyor.
+- Öneri: sub-1 cap'lerde kullanıcı uyarısı veya gain alt sınırı 0.
+
+**CUR-3 · ORTA · `power` — Inf guard gain'i 1.0'a sertçe tıklatıyor** — **[DEĞİŞMEDİ — kapsam dışı]**
+- Konum: `include/accel-power.hpp:132` (+ 136-139)
+- Açıklama: `pow(scale·x, exponent)` taşarsa (scale=100, exp=5, hız~3e19) gain dev değerden doğrudan **1.0'a** atlar → imleç aniden 1:1. cap yoksa tüm eğri o noktadan sonra identity'e dönüşür.
+- Öneri: `minsd(out, cap)` sürekli tavan; sert 1.0 yerine.
+
+**CUR-4 · ORTA · `synchronous` GAIN — 512 ips üstünde gain → 0 (hızlı flick'te sürüklenme)** — **[DEĞİŞMEDİ — kapsam dışı]**
+- Konum: `include/accel-synchronous.hpp:151,158,170-172` + `accel-lookup.hpp:11-30`
+- Açıklama: `ilogb` 2^9'da kıstırılır; velocity modunda `gain = data[96]/x → 0` hız büyüdükçe. Çok hızlı flick imleci "sürükler"/yavaşlatır — etkili görünmez output-speed cap.
+- Öneri: LUT aralığını (point count) artır veya taper yerine sabit tail.
+
+**CUR-5 · DÜŞÜK · `power` — output_offset platosu hız=0'da gizli ramp/ilk kare vuruşu**
+- Konum: `include/accel-power.hpp:112-120,136-139`
+- Açıklama: `speed<=0 → 1.0`; `0 < speed ≤ offset.x` → `offset.y` platosu (output_offset 100'e kadar çıkabilir). Tam duruştan sonra ilk hareket frame'i gain≈output_offset (100×) kick — input smoothing yoksa sert.
+- Öneri: Platonun input smoothing ile kapatıldığını belge veya plato aralığını zaman-ölçekli yap.
+
+**CUR-6 · DÜŞÜK · `jump` LEGACY — step.crossing'de 1-count jitter tüm gain'i toggle ediyor**
+- Konum: `include/accel-jump.hpp:46-47`
+- Açıklama: `x<step.x → 1.0; aksi 1.0+step.y` — C0 süreksizlik; EMA input smoothing yoksa her 1-count jitter frame gain'i uçtan uca değiştirir.
+- Not: `smooth·step.x<1` eşiğinde (`accel-jump.hpp:26-27`) sigmoid sessizce kapanır → davranış süreksizliği.
+
+**CUR-7 · DÜŞÜK · NaN/Inf savunmaları her yerde sert 1.0/0.0 süreksizliği üretiyor**
+- Konum: `rawaccel.hpp:383-384` (final isfinite → sıfırlama = 1-kare imleç donması), `accel-classic.hpp:188-195`, `accel-power.hpp:132`, `accel-jump.hpp:80-81`
+- Açıklama: Her NaN girişi gain'i ya 1.0 ya 0.0 yapıyor — hareketli akışta sert kesinti. Korumalı ama "düzgün" değil.
+- Öneri: Son çare yerine komşu değere blend.
+
+**CUR-8 · BİLİNÇLİ · Düşük hızda tamsayı-count kuantizasyonu**
+- Konum: `daemon/daemon.cpp:1669-1686`
+- Açıklama: Frame başına ham delta tamsayı; düşük hızda dik eğrilere giren hız girişi frame-frame kaba kuantize — içsel gain jitter'ı. Yalnız input smoothing düzeltir. (Tasarım, tespit olarak logla.)
+
+---
+
+## D. TELEMETRİ / YARIŞ
+
+**TEL-1 · ORTA · accel→raw anahtarından sonra bayat `telem_ok=true` telemetri** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1980-2001` (seqlock okuma)
+- Kategori: Kontrat ihlali / GUI yanıltması
+- Açıklama: AGENTS.md "raw modda telem_ok=false" der; kod bunu yalnızca sayaç 0 iken üretiyor. Daha önce accel moddayken `samples` sayaç even ≠ 0'dır; raw inline yolu (`daemon.cpp:1731-1734`) asla increment etmediğinden devamcı çift sayaç "eşleşti" der → **bayat** `speed_ips/out_ips/gain` GUI'de "canlı" görünür. `apply_profile` (`daemon.cpp:886-911`) sayaç 0'lamıyor. (Gözlemlenen `G:1.0043` kalıntısı.)
+- Öneri: `apply_profile` içinde `telemetry->samples.store(0)` (veya raw geçişte) — `dump_latency_stats` bunu doğru yapıyor (BUG-21 `daemon.cpp:1741-1748`), yalnız seqlock yolu eksik.
+
+**RAC-1 · ORTA · Blocking uinput fd + EAGAIN "cihaz öldü" olarak yorumlanıyor** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1435-1438` (`uinput_write`), 1447-1469 (`uinput_write_rel`)
+- Kategori: Düzgünlük / kararlılık
+- Açıklama: `LIBEVDEV_UINPUT_OPEN_MANAGED` = O_RDWR blocking. Yavaş compositor uinput tüketicisini geri basınçlayınca hot-path `write()` **blocklayabilir** (tek loop thread saplanır → frame'ler birikir → SM-1) ya da EAGAIN dönerse koşulsuz cihaz ölümü sayılır → uinput destroy + grab bırakma + 5 sn yeniden açma churn (1374-1418). İkisi de pürüzsüzlüğü törpüler.
+- Öneri: write (EAGAIN) yolunda retry/backoff, yavaş tüketici tanısı ve uyarı.
+
+**RAC-2 · ORTA · Pre-epoll housekeeping her iterasyonda ms-mertebesinde gecikme ekleyebilir** — **[DEĞİŞMEDİ — belge; housekeeping bayrak-gated, SM-1 çözümü (ev.time) semptomu ortadan kaldırdı]**
+- Konum: `daemon/daemon.cpp:1272-1333`
+- Kategori: Zamanlama
+- Açıklama: `epoll_wait(10ms)` öncesi push_cfg apply, `apply_active_app()`, SIGHUP reload (dosya read+parse+tüm cihazlara re-apply), hotplug kontrol ve devices_mutex kontrolü çalışıyor. Hareketle aynı anda tetiklenirse ms-gap oluşur → frame'ler kuyruğa girer → SM-1'i besler.
+- Öneri: Housekeeping'i döngü ayrı yoluyla zamana yay; aktif cihaz varken gecikme kısmını minimal tut.
+
+**RAC-3 · ORTA · Gerçek zamanlı öncelik yok (scheduler preemption SM-1'in tetikleyicisi)** — **[KASITLI — systemd `RestrictRealtime` korundu; semptom SM-1 ev.time hesabıyla giderildi]**
+- Konum: `daemon/main.cpp:225-503` + `scripts/rawaccel.service` (`RestrictRealtime=true`)
+- Kategori: Zamanlama
+- Açıklama: Loop thread'i varsayılan CFS önceliğinde; systemd gerçek zamanlıyı yasaklıyor. Scheduler preemption tam olarak SM-1'i (coalesced frame) ve SM-4'ü (delay dip) doğurur. Ev.time düzeltmesi olmadan `Nice=-10` veya FIFO (`RestrictRealtime=false` + CAP_SYS_NICE) bile önemli iyileştirme sağlar.
+- Öneri: Evdev-time hesabı + gerekirse thread öncelik yükseltme (Nice).
+
+**RAC-4 · ORTA · SYN_DROPPED penceresi — yasal yarı-frame hareketi sessizce düşüyor** — **[KISMİ — SYN penceresini bitiren SYN'de interval tabanı re-anchor'landı; SYN_DROPPED öncesi birikmiş "yasal" hareketin korunması uygulanmadı (belirsiz penceredeki verinin güvenilirliği korundu)]**
+- Konum: `daemon/daemon.cpp:1692-1693, 1705-1710`
+- Kategori: Hareket kaybı
+- Açıklama: SYN_DROPPED geldiğinde `dx=dy=0; has_motion=false` — frame SYN'i hiç ulaşmamış ama *legally closed* olan hareket de kaybolur (gecikme değil KAYIP). Ayrıca `DEFAULT_TIME_MAX`/interval state ilerlediği için sonraki valid frame yanlış tabandan ölçer.
+- Öneri: SYN_DROPPED öncesi birikmiş, pürüzsüz bulunan hareketi koru (yalnız belirsiz penceredekileri düşür).
+
+**RAC-5 · DÜŞÜK · SYN_REPORT dışı SYN alt tipleri SYN_REPORT'a çökertiliyor** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1712-1715`
+- Açıklama: `SYN_MT_REPORT`/`SYN_CONFIG` herhangi bir EV_SYN → `SYN_REPORT` olarak yeniden yazılır; frame sınırlayıcıları bozulur. `is_physical_mouse` yalnız REL_X+REL_Y arar, hibrit pad/gesture cihazı geçerse birden çok MT frame'i tek dev frame'e birleşir → compositor büyük bileşik delta → imleç snap.
+- Öneri: Hangi SYN alt tiplerinin iletileceğini koru (SYN_REPORT olmayanları kopyalama), SYN_REPORT'u yalnız gerçek frame kapanışı için kullan.
+
+**LOW-1 · DÜŞÜK · Batch sonu sentetik SYN → çift SYN (REL, SYN, SYN)** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1764-1768`
+- Açıklama: BUG-CRIT-1 düzeltmesi (`wrote_unsynced_event`) kuyruktaki tail frame'in kendi SYN'i sonraki batch'te gelince boş ikinci frame üretir: `REL, SYN, SYN`. Protokolü bozmaz ama akışa bir fazla olay ekler; piksel pürüzsüzlüğü açısından minimal etki.
+
+**MED-4 · DÜŞÜK · Latency ölçümü cross-frame kontaminasyonlu** — **[DÜZELTİLDİ]**
+- Konum: `daemon/daemon.cpp:1614` vs 1624 (`batch_start_ns`)
+- Açıklama: `lat.record(t_now - batch_start_ns)` per flush çalışır; çok-frame'li batch'te sonraki frame'ler öncekilerin işlem süresini de sayar → p99/max şişkin, `rawaccel-cli latency` yorumu zorlaşır. (Ölçüm sorunu, smoothness değil.)
+
+---
+
+## E. ÖZET — RAW PASSTHROUGH & DÜZGÜNLÜK ÖNCELİK SIRASI
+
+**KAPANAN (bu turda düzeltildi):**
+1. SM-1 — `time_ms` kernel SYN_REPORT `ev.time` deltasından (duvar saati değil) (`daemon.cpp flush_motion`)
+2. SM-2 — Ara buton/tekerlek olayları buffer'a alınıp frame'in gerçek SYN'inde yazılıyor — frame bölünmüyor
+3. SM-8 — `(0, DEFAULT_TIME_MIN]` bandı floor'landı
+4. SM-5 — `reconfigure()`: EMA + remainder + zamanlama korunuyor (yalnız yeni smoother reset)
+5. TEL-1 — `apply_profile` telemetri sayaçlarını sıfırlıyor → `telem_ok=false` doğru
+6. SM-3 (trend clamp), SM-6 (stop ekstra sönüm), CUR-1 (C0 adım → sürekli kuyruk), RAC-1 (O_NONBLOCK + EAGAIN backoff), RAC-4 kısmi (interval re-anchor), RAC-5 (SYN alt tip korunumu), LOW-1 (sentetik SYN kaldırıldı), MED-4 (latency anchor), PAS-1/2/3 (ölü bayraklar + GUI grey-out)
+
+**Açık kalan (gelecek tur):**
+- SM-4 kısmi (idle-tetikleme çözümü yok), SM-7 kısmi (1e9→1e6, P107 kontratı), RAC-4 kısmi (SYN_DROPPED öncesi yasal hareket korunmuyor)
+- CUR-3/4/5/6/7 (power/synchronous/jump eğri düzeltmeleri — kapsam dışı), CUR-2 (referans davranış — kasıtlı), RAC-3 (systemd hardening — kasıtlı), PAS-4 (belgeleme)
+
+**Doğrulanan temiz noktalar (bulgu değil):**
+- Raw passthrough yolu 1:1; batch yok, has_motion kurulmuyor, zaman matematiği yok (`daemon.cpp:1722-1739`).
+- Sub-piksel accumulation sağlam (`motion_math.hpp:35-71`); NaN/inf remainder guard doğru.
+- `modify()` erken dönüşü (`rawaccel.hpp:251`) daemon'dan ulaşılmaz (clamp önce çalışır) — referans-parity, bug değil.
+- Raw vs accel uinput yazımı tek writer + aynı fd → interleave sıralaması güvenli.
+
+---
+
+# TUR 19 — Uinput E2E Harness Doğrulama Turu (2026-09-11)
+
+Analiz tarihi: 2026-09-11 (dördüncü tur)
+Kapsam: Sanal uinput fareyle daemon hot path'inin uçtan uca doğrulanması (`tests/e2e_harness.cpp`, `tests/run_e2e.sh`). Katmanlar: `daemon.cpp` batched read + `write_batch` + flush_motion; math: `motion_math`/rawaccel modifier.
+Yöntem: Harness root'ta `/dev/uinput` sanal fare üretir, `/tmp` e2e profiliyle daemon spawn edilir; accel + raw fazları beklenen çıktı frame'leriyle karşılaştırılır; sistem daemon'u SIGSTOP/SIGCONT trap ile izole edilir.
+DURUM: Tüm kapılar yeşil — E2E accel 5/5 + raw 2/2, birim 33789/33789, ASan 33789/33789, oracle 1071/68 OK, tr_coverage PASS.
+
+## CFG-1 · DÜŞÜK · `output_dpi: 0` clamp ≥1 ile accel çıktısını sessizce ~0'lıyor — **[DÜZELTİLDİ]**
+- Konum: `src/config.cpp:487` → artık `0` korunuyor; `rawaccel.hpp:438` guard'ı; CLI `set-param` domaini 0–32000 (`cli/main.cpp:918`); `cli/main.cpp:669` uyarı sınırı [0, 32000]
+- Kategori: Arayüz/behaviour (config foot-gun)
+- Açıklama: Programatik/JSON `output_dpi=0` ("scaling yok" sanılabilir) eskiden 1'e clamp edilir; `modify()` yolu `dpi_adjustment = (1/1000)·dpi_factor` → 800 dpi cihazda 0.00125 → "motion çıkış yok" gibi yanlış daemon hatası sanılan pratik donma (E2E'de iki tur debug). Oysa modifier'daki `args.output_dpi > 0` guard'ı 0'ı **"output-DPI normalizasyonu kapalı (1:1)"** olarak tasarlıyordu — sanitize o sentinel'i yutuyordu.
+- Düzeltme: Sanitize artık `output_dpi < 0 → 0`, `0 → 0` (sentinel korunur), `(0,1) → 1`, `> 32000 → 32000`. CLI `range_ok` ve `check` uyarı sınırı [0, 32000]'a genişletildi; help metni güncellendi. `modify()` guard'ına CFG-1 yorumu eklendi.
+- Doğrulama: birim 33789/33789, ASan 33789/33789, oracle 1071/68 OK, tr_coverage PASS, build 0 warning. Yeni testler: `sanitize` — `0→0`, `(0,1)→1`; O5 — `output_dpi=0` → çıktı değişmez (1:1).
+
+## CFG-2 · BİLGİ · Classic LINEAR profil hız-bağımsız sabit gain verir — E2E için deterministik, bug değil
+- Konum: `include/accel-classic.hpp` + `rawaccel-base.hpp` (linear: exponent_classic ≤ 1)
+- Açıklama: `exponent_classic=1.0` → gain = 1+acceleration (hızdan bağımsız sabit); modify ×3 E2E'de doğrulandı (20,10 → 60,30). Referans RawAccel parity; P105/P106 kontratı. Hız/zaman belirsizliğini ortadan kaldırdığından E2E'de tercih edildi.
+
+## Doğrulanan temiz noktalar (bulgu değil):
+- Harness kapsamı: T-A1 classic linear ×3 tek SYN; T-A2 buton+motion aynı frame; T-A3 buton-only frame; T-A4 LOW-1 deferral tam 2 frame; T-B1 raw 1:1 byte-identical — hepsi geçti.
+- `-v` daemon log'u (`/tmp/rawe2e-<pid>/`) tek write + tek SYN flush akışını kanıtladı; teardown'da "Device error (No such device)" beklenen kaynak destroy logu (harness hâlâ capture yaparken kaynak kapatılıyor).
+- Tek writer + tek loop thread kuralı, sistem daemon'u SIGSTOP izole edilirken iki daemon yan yana çalıştırıldığında da ihlal edilmedi.

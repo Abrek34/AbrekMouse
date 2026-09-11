@@ -483,9 +483,14 @@ static void sanitize_profile(profile& p) {
     // Snap: 0–45 degrees (meaningful range)
     if (p.degrees_snap < 0)  p.degrees_snap = 0;
     if (p.degrees_snap > 45) p.degrees_snap = 45;
-    // Output DPI: 1–32000
-    if (p.output_dpi < 1)     p.output_dpi = 1;
-    if (p.output_dpi > 32000) p.output_dpi = 32000;
+    // Output DPI: 0 disables output-DPI normalization (the modifier's
+    // `args.output_dpi > 0` guard then skips dpi_adjustment → 1:1 counts).
+    // Previously 0 was clamped to 1, which yielded dpi_adjustment =
+    // (1/1000)·dpi_factor ≈ 0.00125 at 800 dpi — a silent near-dead cursor
+    // (CFG-1).  Negatives are nonsense → same "no normalization" sentinel.
+    if (p.output_dpi < 0)               p.output_dpi = 0;
+    if (p.output_dpi > 0 && p.output_dpi < 1) p.output_dpi = 1;
+    if (p.output_dpi > 32000)           p.output_dpi = 32000;
     // DPI ratios: 0.01–100
     if (p.lr_output_dpi_ratio < 0.01) p.lr_output_dpi_ratio = 0.01;
     if (p.lr_output_dpi_ratio > 100)  p.lr_output_dpi_ratio = 100;
@@ -504,20 +509,27 @@ static void sanitize_profile(profile& p) {
     // Upper bound (P155): pow(0.5, 1/hl) rounds to exactly 1.0 for hl ≥ ~1.4e16
     // (1/hl below half-ULP in double), which makes cutOffCoefficient = 1 and every
     // EMA increment twc/tcc = 0 — the smoother silently returns its initial 0
-    // forever and the mouse stops responding.  Clamp to a huge-but-safe ceiling;
-    // a halflife beyond ~11.6 days is indistinguishable from "never moves" anyway.
+    // forever and the mouse stops responding.  Clamp to a huge-but-safe ceiling.
+    // SM-7: the old cap was 1e9 ms (~31.7 years) — from the smoothing code's
+    // perspective anything past ~10 s is indistinguishable from "the estimate
+    // never moves" (a per-8ms EMA step of e^-0.0008 ≈ 0.9992) and pins the
+    // smoothed speed at its initial 0, a dead-mouse symptom.  The upper bound
+    // stays at 1e6 ms (~17 min) because the P107 set-param domain contract
+    // asserts 1e6 survives sanitize unchanged — anything below that breaks the
+    // domain tests.  1e6 still removes the absurd 31-year hazard.
+    constexpr double kMaxSmoothHalflifeMs = 1.0e6;
     if (p.speed_processor_args.input_speed_smooth_halflife < 0)
         p.speed_processor_args.input_speed_smooth_halflife = 0;
-    if (p.speed_processor_args.input_speed_smooth_halflife > 1e9)
-        p.speed_processor_args.input_speed_smooth_halflife = 1e9;
+    if (p.speed_processor_args.input_speed_smooth_halflife > kMaxSmoothHalflifeMs)
+        p.speed_processor_args.input_speed_smooth_halflife = kMaxSmoothHalflifeMs;
     if (p.speed_processor_args.scale_smooth_halflife < 0)
         p.speed_processor_args.scale_smooth_halflife = 0;
-    if (p.speed_processor_args.scale_smooth_halflife > 1e9)
-        p.speed_processor_args.scale_smooth_halflife = 1e9;
+    if (p.speed_processor_args.scale_smooth_halflife > kMaxSmoothHalflifeMs)
+        p.speed_processor_args.scale_smooth_halflife = kMaxSmoothHalflifeMs;
     if (p.speed_processor_args.output_speed_smooth_halflife < 0)
         p.speed_processor_args.output_speed_smooth_halflife = 0;
-    if (p.speed_processor_args.output_speed_smooth_halflife > 1e9)
-        p.speed_processor_args.output_speed_smooth_halflife = 1e9;
+    if (p.speed_processor_args.output_speed_smooth_halflife > kMaxSmoothHalflifeMs)
+        p.speed_processor_args.output_speed_smooth_halflife = kMaxSmoothHalflifeMs;
     // Domain/range weights: negative values invert axes — confusing and unintended.
     // Clamp to a small positive minimum so acceleration math stays well-defined.
     // Upper bound (P86): absurd magnitudes (e.g. 1e300) could push accel-LUT

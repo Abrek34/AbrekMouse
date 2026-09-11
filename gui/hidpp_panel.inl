@@ -157,6 +157,10 @@ struct HwQueryTask {
     int device_index;          // snapshot taken on the main thread
     std::vector<std::pair<uint16_t, uint8_t>> features; // P169 battery source
     bool hidpp10 = false;      // P169: HID++ 1.0 register battery fallback
+    // R2-08: hidpp_devs generation captured at schedule time.  The idle
+    // callback drops the result when the vector was rebuilt in the meantime
+    // (same index may now name a different physical device).
+    int devs_version = 0;
 };
 
 struct HwApplyTask {
@@ -167,6 +171,7 @@ struct HwApplyTask {
     uint16_t dpi;
     uint32_t rate_hz;
     int lod; // hidpp_lift_off_distance value
+    int devs_version = 0;
 };
 
 struct HwNotificationTask {
@@ -179,6 +184,7 @@ struct HwNotificationTask {
     // callback must NOT re-read S->hidpp_devs at the old index — a completed
     // rescan may have replaced the vector, mapping idx to a different device.
     bool legacy_protocol = false;
+    int devs_version = 0;
 };
 
 // Fire-and-forget GLib thread.  We do not join; GLib frees the handle once the
@@ -196,8 +202,8 @@ static gpointer hw_scan_thread(gpointer data) {
 
     std::vector<hidpp_device> devs;
     for (const auto& path : discover_logitech_hidraw_devices()) {
-        if (auto dev = identify_logitech_device(path))
-            devs.push_back(std::move(*dev));
+        for (auto& dev : identify_logitech_devices(path))
+            devs.push_back(std::move(dev));
     }
 
     struct Result { AppState* S; std::vector<hidpp_device> devs; };
@@ -211,6 +217,9 @@ static gpointer hw_scan_thread(gpointer data) {
         if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_busy = false;
         S->hidpp_devs = std::move(r->devs);
+        // R2-08: invalidate any in-flight query/notification results — they
+        // were snapshotted against the previous vector generation.
+        ++S->hw_devs_version;
         if (S->hw_dev_combo) {
             GtkStringList* sl = gtk_string_list_new(nullptr);
             for (const auto& d : S->hidpp_devs) {
@@ -276,11 +285,12 @@ static gpointer hw_query_thread(gpointer data) {
         }
     }
 
-    struct Result { AppState* S; int idx; Current cur; };
+    struct Result { AppState* S; int idx; Current cur; int devs_version = 0; };
     auto* res = new Result();
     res->S = S;
     res->idx = task->idx;
     res->cur = cur;
+    res->devs_version = task->devs_version;
     delete task;
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
@@ -292,6 +302,13 @@ static gpointer hw_query_thread(gpointer data) {
             : -1;
         // P169 — capability summary is independent of the query result.
         hw_render_caps(S, selected);
+        // R2-08: the device list was rebuilt while this query was in flight —
+        // r->idx may now name a different physical device.  Drop the values.
+        if (r->devs_version != S->hw_devs_version) {
+            hw_update_ui_state(S);
+            delete r;
+            return G_SOURCE_REMOVE;
+        }
         hw_set_battery(S, r->idx, r->cur.battery, r->cur.bsrc);
         if (r->idx == selected) {
             hw_update_ui_state(S);
@@ -423,10 +440,11 @@ static gpointer hw_notification_thread(gpointer data) {
         // R2-08: device snapshot captured at schedule time.
         bool legacy_protocol = false;
         std::vector<std::pair<uint16_t, uint8_t>> features;
+        int devs_version = 0;
     };
     auto* result = new Result{task->S, task->idx, task->hidraw_path,
                               std::nullopt, 0, task->legacy_protocol,
-                              task->features};
+                              task->features, task->devs_version};
     HidppTransport transport(task->hidraw_path);
     if (transport.is_open()) {
         transport.set_device_index(task->device_index);
@@ -470,7 +488,10 @@ static gpointer hw_notification_thread(gpointer data) {
             ? (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo))
             : -1;
         if (selected == r->idx && r->battery &&
-            r->idx >= 0 && r->idx < (int)S->hidpp_devs.size()) {
+            r->idx >= 0 && r->idx < (int)S->hidpp_devs.size() &&
+            // R2-08: only paint when no rescan replaced the device list since
+            // this tick was scheduled (the index may point at new hardware).
+            r->devs_version == S->hw_devs_version) {
             const std::string level = r->battery->level == 255
                 ? tr("unknown") : std::to_string(r->battery->level) + "%";
             hw_set_status(S, trf("Notification: battery %s%s",
@@ -508,6 +529,7 @@ static gboolean hw_notification_tick(gpointer user_data) {
     task->device_index = S->hidpp_devs[idx].device_index;
     task->features = S->hidpp_devs[idx].features;
     task->legacy_protocol = S->hidpp_devs[idx].info.protocol_version < 2;
+    task->devs_version = S->hw_devs_version;
     hw_thread("rawaccel-hw-notify", hw_notification_thread, task);
     return G_SOURCE_CONTINUE;
 }
@@ -562,6 +584,7 @@ void hw_query_current(AppState* S) {
     task->device_index = S->hidpp_devs[idx].device_index; // main-thread snapshot
     task->features = S->hidpp_devs[idx].features;         // P169 battery source
     task->hidpp10 = S->hidpp_devs[idx].info.protocol_version < 2;
+    task->devs_version = S->hw_devs_version;
     hw_thread("rawaccel-hw-query", hw_query_thread, task);
 }
 
@@ -593,5 +616,6 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
         0, HW_NRATES - 1)];
     task->lod = std::clamp(
         (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo)), 0, 2);
+    task->devs_version = S->hw_devs_version;
     hw_thread("rawaccel-hw-apply", hw_apply_thread, task);
 }

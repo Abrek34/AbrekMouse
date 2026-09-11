@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(rawaccel-linux VERSION 0.6.7 LANGUAGES CXX)
+project(rawaccel-linux VERSION 0.6.6 LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)

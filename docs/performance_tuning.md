@@ -16,32 +16,31 @@ research notes in `docs/research/precision.md` (§8).
 
 ---
 
-## 1. The hot path: 3 syscalls per motion event
+## 1. The hot path: 4 syscalls per motion frame (2× clock + 1 read + 1 write)
 
-The canonical per-motion-event cost (see `AGENTS.md`, "Low-latency motion
-contract") is counted inside `flush_motion()`, where the actual *processing*
-happens:
+The canonical per-motion-frame cost (see `AGENTS.md`, "Low-latency motion
+contract") now includes the batched evdev read + the P93-BATCH single-output write:
 
-1. **`clock_gettime(CLOCK_MONOTONIC_RAW)` #1** — at `flush_motion()` entry:
+1. **1 batched `read()`** — one or several of a 32-`input_event` batch comes
+   off the evdev node; a typical 3-event frame (REL_X, REL_Y, SYN) costs one read.
+2. **`clock_gettime(CLOCK_MONOTONIC_RAW)` #1** — at `flush_motion()` entry:
    starts the interval and latency measurement (vDSO, no kernel round-trip).
-2. **Math + EMA** (a few ns — §2) producing the accelerated `out_x/out_y`.
-3. **1 batched `write()`** — the accelerated REL_X+REL_Y are packed into a
-   single `input_event[2]` buffer and written once (`uinput_write_rel()`,
-   P93). The kernel uinput driver injects every event found in the buffer,
-   so the stream is byte-identical to the old two single-axis writes.
-4. **`clock_gettime` #2** — at the end, to compute the measured µs.
+3. **Math + EMA** (a few ns — §2) producing the accelerated `out_x/out_y`.
+4. **1 batched `write()`** — the whole frame (motion REL, any queued buttons,
+   and the closing SYN_REPORT) is accumulated in a stack `write_batch`
+   (`daemon/daemon.cpp`) and submitted in **one** write at the real SYN_REPORT
+   (P93-BATCH). The kernel uinput driver injects every event found in the
+   buffer, so the stream is byte-identical — while collapsing (typically 3+)
+   syscalls into 1. A full 16-event buffer flushes in place (nothing dropped).
+5. **`clock_gettime` #2** — at the end, to compute the measured µs.
 
-That is the canonical **3 hot-path syscalls per motion event** (2× clock reads
-+ 1 batched write). Event *delivery* adds the kernel-side reads: the loop reads
-the batch from an **evdev node** once per input cycle (the `read` syscalls live
-outside `flush_motion` and are counted in §2's kernel-delivery figures).
-Plus a thin epoll cycle: the `epoll_wait` 10 ms timeout is **housekeeping
-only** (hot-plug, IPC, signals) — motion events are processed synchronously as
-they arrive, never delayed to the timeout. You also forward a motionless
-`SYN_REPORT` write per frame for the kernel's event framing — not counted in
-the per-motion number. There is no per-event allocation, `dpi_factor` is
-pre-computed once per profile, and both timers share the same
-`CLOCK_MONOTONIC_RAW` source.
+That is the canonical **4 hot-path syscalls per motion frame** (1 read + 1
+write + 2× clock reads). Everything outside the read/write is a thin epoll
+cycle whose 10 ms timeout is **housekeeping only** (hot-plug, IPC, signals) —
+motion events are processed synchronously as they arrive, never delayed to the
+timeout. All the syscalls are kernel-bound; the math is `uinput_write_rel()`-free
+and allocation-free, `dpi_factor` is pre-computed once per profile, and both
+timers share the same `CLOCK_MONOTONIC_RAW` source.
 
 ## 2. Where the microseconds actually go
 
@@ -293,7 +292,7 @@ init/object costs — another sign there is nothing left to squeeze in hot math.
 
 - `AGENTS.md` — "Low-latency motion contract" (canonical 3-syscall count),
   "P93 batched REL write", "P100 unified clock".
-- `daemon/daemon.cpp` — `flush_motion()`, `uinput_write_rel()`, `now_ns()`.
+- `daemon/daemon.cpp` — `flush_motion()`, `write_batch`, `now_ns()`.
 - `docs/research/precision.md` — §8.3 responsive-table (halflife×knee),
   FMA/`-ffp-contract` notes, interaction-aware defaults.
 - `docs/real_hardware_test.md` — §3.2 DPI ladder, §4 latency methodology +

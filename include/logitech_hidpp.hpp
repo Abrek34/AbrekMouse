@@ -550,4 +550,14 @@ std::vector<std::string> discover_logitech_hidraw_devices(const char* root = "/d
 /// Only an unopenable node yields std::nullopt.
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path);
 
+/// Discover every HID++ device reachable on a single hidraw node: the receiver
+/// shell on 0xFF, a directly connected peripheral on 0x00, and any paired
+/// wireless device the receiver answers for on indexes 1..6.  Probing only
+/// 0xFF/0x00 previously surfaced just a single-interface receiver (which
+/// carries no DPI/polling-rate features) and silently dropped every paired
+/// mouse behind it.  Same fallbacks as identify_logitech_device (HID++ 1.0,
+/// then protocol_version 0 display shell).  Empty only when the node cannot be
+/// opened at all.
+std::vector<hidpp_device> identify_logitech_devices(const std::string& hidraw_path);
+
 } // namespace rawaccel

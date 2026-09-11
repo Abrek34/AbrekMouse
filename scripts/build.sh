@@ -60,12 +60,15 @@ esac
 
 # If the environment already defines _FORTIFY_SOURCE (e.g. makepkg.conf
 # -D_FORTIFY_SOURCE=3, or the caller exported CFLAGS/CXXFLAGS with it), DON'T
-# re-define =2 — that trips a "redefined" warning.  L-3: the probe must run
-# through the caller's CFLAGS/CXXFLAGS, not just the compiler defaults, so the
-# check reflects the actual final command line.
+# re-define =2 — that trips a "redefined" warning.  L-3: the probe MUST run
+# with the exact final compile flags.  BASE_CXXFLAGS carries -O3/$MARCH, and
+# gcc's distro spec files only define _FORTIFY_SOURCE when optimization is on
+# (Fedora) — probing without them would wrongly suppress the define and build
+# a non-fortified binary.  The probe deliberately excludes HARDENING/FORTIFY
+# themselves so the -D we are about to add cannot self-report as "already set".
 FORTIFY="-D_FORTIFY_SOURCE=2"
-if printf 'int main(){return 0;}' | $CXX $CFLAGS $CXXFLAGS -dM -E -x c++ - 2>/dev/null \
-        | grep -q '^#define _FORTIFY_SOURCE'; then
+if printf 'int main(){return 0;}' | $CXX $BASE_CXXFLAGS $CFLAGS $CXXFLAGS \
+        -dM -E -x c++ - 2>/dev/null | grep -q '^#define _FORTIFY_SOURCE'; then
     FORTIFY=""
 fi
 

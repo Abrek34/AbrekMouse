@@ -2604,7 +2604,7 @@ static void test_sanitize_extremes() {
     dp.dev_cfg.polling_rate = 99999;
     dp.prof.degrees_rotation = -720.0;
     dp.prof.degrees_snap = 90.0;
-    dp.prof.output_dpi = 0;
+    dp.prof.output_dpi = 0;   // 0 = no output-DPI normalization (CFG-1)
     dp.prof.lr_output_dpi_ratio = 0.0001;
     dp.prof.ud_output_dpi_ratio = 999.0;
     dp.prof.speed_min = -5;
@@ -2618,7 +2618,7 @@ static void test_sanitize_extremes() {
     EXPECT(dp.prof.degrees_rotation >= 0.0);
     EXPECT(dp.prof.degrees_rotation < 360.0);
     EXPECT(dp.prof.degrees_snap <= 45.0);
-    EXPECT(dp.prof.output_dpi >= 1);
+    EXPECT(dp.prof.output_dpi == 0.0);   // 0 preserved: guard skips dpi_adjustment → 1:1
     EXPECT(dp.prof.lr_output_dpi_ratio >= 0.01);
     EXPECT(dp.prof.ud_output_dpi_ratio <= 100.0);
     EXPECT(dp.prof.speed_min >= 0);
@@ -4882,6 +4882,15 @@ static void test_output_dpi_applied() {
     mod.modify(in3, sp, settings, 0.5, 1.0);
     EXPECT_NEAR(in3.x, 10.0, 1e-9);
     EXPECT_NEAR(in3.y, -6.0, 1e-9);
+
+    // CFG-1: output_dpi = 0 disables output-DPI normalization → 1:1 counts
+    // (modifier guard `args.output_dpi > 0` skips dpi_adjustment entirely).
+    settings.prof.output_dpi = 0.0;
+    init_settings(settings);
+    vec2d in4 = {10.0, -6.0};
+    mod.modify(in4, sp, settings, 1.0, 1.0);
+    EXPECT_NEAR(in4.x, 10.0, 1e-9);
+    EXPECT_NEAR(in4.y, -6.0, 1e-9);
 }
 
 // ── R10: EMA smoother correctness ────────────────────────────────────────────
@@ -6482,11 +6491,17 @@ static void test_natural_legacy_mode() {
 static void test_config_output_dpi_sanitize() {
     SECTION("R12 — sanitize output_dpi boundary values");
 
-    // output_dpi < 1 → clamped to 1
+    // output_dpi < 0 → "no normalization" sentinel 0 (CFG-1)
     device_profile dp;
     dp.prof.output_dpi = -500;
     sanitize_device_profile(dp);
-    EXPECT(dp.prof.output_dpi >= 1.0);
+    EXPECT(dp.prof.output_dpi == 0.0);
+
+    // output_dpi in (0,1) → clamped to 1
+    device_profile dph;
+    dph.prof.output_dpi = 0.5;
+    sanitize_device_profile(dph);
+    EXPECT(dph.prof.output_dpi == 1.0);
 
     // output_dpi > 32000 → clamped to 32000
     device_profile dp2;

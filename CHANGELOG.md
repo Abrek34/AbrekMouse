@@ -6,53 +6,6 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
-## [0.6.7] — 2026-09-11
-
-Stability & hardening release: UB and data-race elimination, IPC/daemon
-hardening, HID++ battery/Bolt accuracy fixes, and installer/build corrections.
-
-### Fixed
-- **BUG-CRIT-2 (UB)**: the acceleration pipeline clamped against
-  `static_cast<double>(INT_MAX) == 2147483648.0`, so casting that exact value
-  back to `int` was undefined behaviour. Fixed at all 4 sites (motion_math
-  `INT_HI`, daemon raw passthrough, config clamp, CLI `finite_double_to_int`)
-  — inputs ≥ 2147483648.0 now clamp to `INT_MAX`.
-- **BUG-MED-1**: LUT build could store non-finite entries when `speed*gain`
-  overflowed to Inf, poisoning later smoother state with NaN — overflowed
-  entries are now dropped.
-- **TH-1 (data race)**: the IPC socket path string was mutated by
-  `stop_ipc_server()` while the IPC worker could still read it — access is
-  now guarded by a mutex.
-- **BUG-LOW-2**: `version_lt` parsed a negative component ("0.6.-1") as
-  `strtoul`→`ULONG_MAX`/INT_MAX and silently skipped a migration; negative
-  components are now rejected.
-- **SEC-9 (IPC DoS)**: config load caps the profile list at `MAX_PROFILES`
-  (256) so a hostile unix-socket client cannot grow a root daemon's memory
-  without bound.
-- **ERR-4**: GTK4 inotify buffer is now `alignas(struct inotify_event)`
-  (misaligned-read UB on ARM).
-- **HID++ battery**: status 0x02 (almost_full) is now reported as charging
-  (B5). Bolt slot occupancy reads the pairing-data kind/WPID bytes instead of
-  the echoed subregister byte, which is always non-zero (B1).
-- **presets**: classic GAIN-profile caps aligned with the declared limit so
-  preset curves actually reach 1.8x (C-5); the raw passthrough path is now
-  formally documented as deliberate (BUG-HIGH-2).
-- HID++ graphic-panel: refreshed battery/profile no longer re-reads the
-  device vector in the idle callback (R2-08).
-
-### Build / installer
-- `tests/run_fuzz.sh`: quoting fix — `FUZZ_FLAGS` is now a bash array (no
-  accidental word-split).
-- `scripts/build.sh`: `_FORTIFY_SOURCE` detection honours the caller's
-  `CFLAGS`/`CXXFLAGS` (L-3).
-- `setup.sh`: backups gain a PID suffix so same-second reinstalls can't
-  silently overwrite (L-7); the pacman-conflict prompt now warns loudly on a
-  closed stdin instead of proceeding silently (L-6).
-- `scripts/bug_watch.sh`: state moved out of `/tmp` into a per-user
-  mode-0700 directory (L-9).
-- `scripts/rawaccel.service`: removed the dead `PIDFile=` directive (only
-  honoured for `Type=forking`) (BS-11).
-
 ## [0.6.6] — 2026-09-11
 
 ### Added

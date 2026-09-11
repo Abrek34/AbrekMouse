@@ -21,6 +21,10 @@ static void update_raw_sensitivity(AppState* S, bool raw) {
     if (S->input_hl_spin)      gtk_widget_set_sensitive(S->input_hl_spin, !raw);
     if (S->scale_hl_spin)      gtk_widget_set_sensitive(S->scale_hl_spin, !raw);
     if (S->output_hl_spin)     gtk_widget_set_sensitive(S->output_hl_spin, !raw);
+    // PAS-3: DPI resolution is an acceleration-pipeline element (it feeds
+    // dpi_factor).  In raw passthrough it is not applied — the previously
+    // missed widget would keep telling the user a value is live that isn't.
+    if (S->output_dpi_spin)    gtk_widget_set_sensitive(S->output_dpi_spin, !raw);
 }
 
 // Which modes consume each curve parameter. Derived from the actual accel_args
