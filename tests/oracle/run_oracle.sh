@@ -16,9 +16,6 @@ CXX="${CXX:-g++}"
 STD="-std=c++20"
 
 TOL="${TOL:-1e-9}"   # relative tolerance on gain (identical math ⇒ ~1e-15)
-# Validate TOL is numeric
-[[ "$TOL" =~ ^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
-    || { echo "Hata: TOL geçerli bir sayı değil: '$TOL'" >&2; exit 2; }
 VERBOSE=0
 # P114 BUG-E: --tolerance <val> flag'i gerçekten parse ediliyor (TOL env korunur).
 while [ $# -gt 0 ]; do
@@ -35,6 +32,11 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# R4-L-1: TOL env'den veya --tolerance bayrağından GELDİĞİNDE parse öncesi
+# doğrulama atlanır (--tolerance abc, tanımsız env TOL, ...). Çözüm: değeri
+# parse SONRASI yeniden doğrula — geçersiz değer python traceback'e gitmez.
+[[ "$TOL" =~ ^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
+    || { echo "Hata: TOL geçerli bir sayı değil: '$TOL'" >&2; exit 2; }
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

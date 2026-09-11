@@ -29,15 +29,44 @@ using namespace rawaccel;
 
 // ── Daemon communication ──────────────────────────────────────────────────────
 
-/// Check whether a PID is alive by probing /proc/<pid>.
-/// Unlike kill(pid, 0), this works even when the daemon runs as root
-/// and the caller is an unprivileged user (kill -0 returns EPERM in that case).
-static bool pid_alive(pid_t pid) {
+/// True when the process at /proc/<pid> is genuinely the rawaccel daemon
+/// (R5-S-1). /proc/<pid>/comm can be spoofed with prctl(PR_SET_NAME); the
+/// kernel-maintained /proc/<pid>/exe link cannot.  The exe check is best-effort
+/// (falls back to comm alone when /proc is restricted — EACCES against a root
+/// daemon) so a permission restriction never breaks daemon detection.
+static bool pid_is_rawaccel_daemon(pid_t pid) {
     if (pid <= 0) return false;
-    // /proc/<pid> exists as long as the process is alive — readable by any user.
-    std::string proc_path = "/proc/" + std::to_string(pid);
-    struct stat st{};
-    return stat(proc_path.c_str(), &st) == 0;
+    char proc_root[64];
+    std::snprintf(proc_root, sizeof(proc_root), "/proc/%d", (int)pid);
+
+    // 1) Kernel-maintained binary link — strongest identity check.
+    {
+        char link[96];
+        std::snprintf(link, sizeof(link), "%s/exe", proc_root);
+        char exe[4096];
+        ssize_t n = readlink(link, exe, sizeof(exe) - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            const char* base = std::strrchr(exe, '/');
+            base = base ? base + 1 : exe;
+            if (std::strcmp(base, "rawaccel-daemon") != 0) return false;
+        } else if (errno == ENOENT || errno == ESRCH) {
+            return false; // process gone
+        }
+        // else EACCES/EPERM (restricted /proc): fall through to the comm check.
+    }
+
+    // 2) /proc/<pid>/comm must also name the daemon.
+    char comm_path[96];
+    std::snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_root);
+    FILE* cf = std::fopen(comm_path, "r");
+    if (!cf) return false;
+    char comm[64] = {};
+    (void)!std::fgets(comm, sizeof(comm), cf);
+    std::fclose(cf);
+    size_t len = std::strlen(comm);
+    if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+    return std::strcmp(comm, "rawaccel-daemon") == 0;
 }
 
 /// Result codes from a daemon-signal attempt — lets the caller distinguish
@@ -60,7 +89,9 @@ static signal_result send_signal_to_daemon(int sig) {
         if (!f.is_open()) continue;
         pid_t pid = 0;
         f >> pid;
-        if (!pid_alive(pid)) continue;
+        // R5-S-1: only signal a PID that is actually the rawaccel daemon —
+        // prevents signalling a recycled / spoofed process.
+        if (!pid_is_rawaccel_daemon(pid)) continue;
         if (kill(pid, sig) == 0) return signal_result::sent;
         if (errno == EPERM)      return signal_result::permission_denied;
         return signal_result::other;
@@ -1106,78 +1137,140 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                   << " is larger than 1MB\n";
         return 1;
     }
-    device_profile dp;
-    try {
-        dp = profile_from_json(content);
-    } catch (std::exception& e) {
-        std::cerr << "Invalid profile JSON: " << e.what() << "\n";
-        return 1;
-    }
 
-    // BUG-15-fix-followup: the LUT truncate warning was previously placed
-    // AFTER profile_from_json() which calls sanitize_profile() →
-    // sort_lut_data() — by then a.length is already clamped to
-    // LUT_POINTS_CAPACITY*2, so the warning was dead code.  Re-parse the raw
-    // JSON to count the original lut_data array size and warn at import time.
+    // R3-NEW-1: export with an empty <name> prints one profile object per line,
+    // so `export > all.json && import all.json` fed a multi-object stream to a
+    // single-object parser and failed.  Import now accepts any of:
+    //   1. a single profile object,
+    //   2. a {"profiles":[...]} wrapper,
+    //   3. a newline-delimited stream of profile objects (the export format),
+    //   4. a bare JSON array of profile objects.
+    std::vector<std::string> frags;
     try {
-        auto raw = nlohmann::json::parse(content);
-        // P120-FAZ2 (A5-04): an imported LUT larger than the engine capacity
-        // (> 514 raw elements, i.e. > 257 speed/gain points) is REJECTED with
-        // rc=1 + an explicit error.  Previously import warned and silently
-        // truncated the curve — that could swap a legit 257-point table for an
-        // unrelated prefix.  No silent truncation.
-        auto check_lut_raw = [&](const char* axis_key, const char* axis) -> bool {
-            // P115-A5-04: the raw LUT sits under "profile" (device_profile
-            // JSON), not at the top level — the previous check looked at
-            // raw["accel_x"] and never matched, silently dropping the
-            // truncation warning.
-            if (!raw.contains("profile")) return true;
-            auto& ax = raw["profile"];
-            if (!ax.contains(axis_key)) return true;
-            auto& a = ax[axis_key];
-            if (!a.contains("lut_data") || !a["lut_data"].is_array()) return true;
-            size_t n = a["lut_data"].size();
-            if (n / 2 > LUT_POINTS_CAPACITY) {
-                std::cerr << "ERROR: LUT (" << axis << " axis) in imported "
-                          << "profile has " << (n/2) << " points; maximum is "
-                          << LUT_POINTS_CAPACITY << " (" << LUT_RAW_DATA_CAPACITY
-                          << " raw elements). Import rejected — fix the file.\n";
-                return false;
-            }
-            return true;
-        };
-        if (!check_lut_raw("accel_x", "X")) return 1;
-        if (!check_lut_raw("accel_y", "Y")) return 1;
-    } catch (const std::exception& e) {
-        std::cerr << "Warning: could not inspect raw LUT size: " << e.what() << "\n";
-    }
-
-    // BUG-20: previously cmd_import did NOT validate the profile name.  An
-    // empty name or a duplicate of an existing profile would be silently
-    // appended, leaving the user with multiple ambiguous profiles that
-    // commands like delete/show/set-param target by first match.
-    if (dp.name.empty()) {
-        std::cerr << "Imported profile has no 'name' — refusing to import "
-                     "(would leave the config ambiguous).\n";
-        return 1;
-    }
-    // C-2: enforce the same MAX_NAME_LEN cap that every other
-    // profile-create/rename path enforces (P82-MED-1 symmetric cap).
-    if (dp.name.size() > MAX_NAME_LEN) {
-        std::cerr << "Imported profile name is " << dp.name.size()
-                  << " chars (max " << MAX_NAME_LEN << ").\n";
-        return 1;
-    }
-    for (auto& existing : cfg.profiles) {
-        if (existing.name == dp.name) {
-            std::cerr << "Profile '" << dp.name << "' already exists. "
-                         "Delete it first or rename the JSON before importing.\n";
+        auto all = nlohmann::json::parse(content);
+        if (all.is_object() && all.contains("profiles") && all["profiles"].is_array()) {
+            for (auto& jp : all["profiles"]) frags.push_back(jp.dump());
+        } else if (all.is_object()) {
+            frags.push_back(content); // single profile object
+        } else if (all.is_array() && !all.empty() && all[0].is_object()) {
+            for (auto& jp : all) frags.push_back(jp.dump());
+        } else {
+            std::cerr << "Invalid profile JSON: expected a profile object, a "
+                         "{\"profiles\":[...]} array, or a line stream.\n";
             return 1;
         }
+    } catch (const std::exception&) {
+        // Not one JSON document → treat as the export line-stream format.
+        std::istringstream is(content);
+        std::string line;
+        while (std::getline(is, line)) {
+            size_t a = line.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) continue;
+            size_t b = line.find_last_not_of(" \t\r\n");
+            std::string t = line.substr(a, b - a + 1);
+            if (t.empty()) continue;
+            try {
+                const auto jl = nlohmann::json::parse(t);
+                if (!jl.is_object()) throw std::runtime_error("not a JSON object");
+            }
+            catch (...) {
+                std::cerr << "Invalid profile JSON line in stream: " << t << "\n";
+                return 1;
+            }
+            frags.push_back(t);
+        }
     }
-    cfg.profiles.push_back(dp);
+    if (frags.empty()) {
+        std::cerr << "No profiles found in: " << json_file << "\n";
+        return 1;
+    }
+
+    std::vector<device_profile> batch;
+    for (auto& fr : frags) {
+        device_profile dp;
+        try {
+            dp = profile_from_json(fr);
+        } catch (std::exception& e) {
+            std::cerr << "Invalid profile JSON: " << e.what() << "\n";
+            return 1;
+        }
+
+        // BUG-15-fix-followup: the LUT truncate warning was previously placed
+        // AFTER profile_from_json() which calls sanitize_profile() →
+        // sort_lut_data() — by then a.length is already clamped to
+        // LUT_POINTS_CAPACITY*2, so the warning was dead code.  Re-parse the raw
+        // JSON to count the original lut_data array size and warn at import time.
+        try {
+            auto raw = nlohmann::json::parse(fr);
+            // P120-FAZ2 (A5-04): an imported LUT larger than the engine capacity
+            // (> 514 raw elements, i.e. > 257 speed/gain points) is REJECTED with
+            // rc=1 + an explicit error.  Previously import warned and silently
+            // truncated the curve — that could swap a legit 257-point table for an
+            // unrelated prefix.  No silent truncation.
+            auto check_lut_raw = [&](const char* axis_key, const char* axis) -> bool {
+                // P115-A5-04: the raw LUT sits under "profile" (device_profile
+                // JSON), not at the top level — the previous check looked at
+                // raw["accel_x"] and never matched, silently dropping the
+                // truncation warning.
+                if (!raw.contains("profile")) return true;
+                auto& ax = raw["profile"];
+                if (!ax.contains(axis_key)) return true;
+                auto& a = ax[axis_key];
+                if (!a.contains("lut_data") || !a["lut_data"].is_array()) return true;
+                size_t n = a["lut_data"].size();
+                if (n / 2 > LUT_POINTS_CAPACITY) {
+                    std::cerr << "ERROR: LUT (" << axis << " axis) in imported "
+                              << "profile has " << (n/2) << " points; maximum is "
+                              << LUT_POINTS_CAPACITY << " (" << LUT_RAW_DATA_CAPACITY
+                              << " raw elements). Import rejected — fix the file.\n";
+                    return false;
+                }
+                return true;
+            };
+            if (!check_lut_raw("accel_x", "X")) return 1;
+            if (!check_lut_raw("accel_y", "Y")) return 1;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: could not inspect raw LUT size: " << e.what() << "\n";
+        }
+
+        // BUG-20: previously cmd_import did NOT validate the profile name.  An
+        // empty name or a duplicate of an existing profile would be silently
+        // appended, leaving the user with multiple ambiguous profiles that
+        // commands like delete/show/set-param target by first match.
+        if (dp.name.empty()) {
+            std::cerr << "Imported profile has no 'name' — refusing to import "
+                         "(would leave the config ambiguous).\n";
+            return 1;
+        }
+        // C-2: enforce the same MAX_NAME_LEN cap that every other
+        // profile-create/rename path enforces (P82-MED-1 symmetric cap).
+        if (dp.name.size() > MAX_NAME_LEN) {
+            std::cerr << "Imported profile name is " << dp.name.size()
+                      << " chars (max " << MAX_NAME_LEN << ").\n";
+            return 1;
+        }
+        for (auto& existing : cfg.profiles) {
+            if (existing.name == dp.name) {
+                std::cerr << "Profile '" << dp.name << "' already exists. "
+                             "Delete it first or rename the JSON before importing.\n";
+                return 1;
+            }
+        }
+        // Duplicate within the import batch itself.
+        for (auto& pd : batch)
+            if (pd.name == dp.name) {
+                std::cerr << "Duplicate profile '" << dp.name
+                          << "' in import file — refusing to import.\n";
+                return 1;
+            }
+        batch.push_back(dp);
+    }
+
+    for (auto& dp : batch) {
+        cfg.profiles.push_back(dp);
+        std::cout << "Imported profile: " << dp.name << "\n";
+    }
     if (!safe_save(cfg, config_path)) return 1;
-    std::cout << "Imported profile: " << dp.name << "\n";
     return daemon_apply_if_enabled(cfg);
 }
 
@@ -1255,7 +1348,8 @@ static bool daemon_running() {
         if (!f.is_open()) continue;
         pid_t pid = 0;
         f >> pid;
-        if (pid_alive(pid)) return true;
+        // R5-S-1: a recycled/spoofed PID must not be reported as the daemon.
+        if (pid_is_rawaccel_daemon(pid)) return true;
     }
     return false;
 }

@@ -782,7 +782,11 @@ void save_config(const app_config& cfg, const std::string& path) {
 }
 
 std::string profile_to_json(const device_profile& p) {
-    return device_profile_to_json(p).dump(4);
+    // Compact (single-line) dump: the CLI export format writes one JSON object
+    // per line so that the line-stream import fallback can split on newlines.
+    // Pretty-printed (.dump(4)) multi-line output broke round-trip for
+    // multi-profile configs (R3-NEW-1 follow-up, verified by the agent audit).
+    return device_profile_to_json(p).dump();
 }
 
 device_profile profile_from_json(const std::string& json_str) {

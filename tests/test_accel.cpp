@@ -5313,6 +5313,7 @@ enum : unsigned short {
 };
 enum : unsigned short {
     syn_report = 0x00,
+    syn_mt_report = 0x01,
     syn_dropped = 0x03,
 };
 enum : unsigned short {
@@ -5345,8 +5346,12 @@ struct sim {
                 dropped = true;
                 return;
             }
-            if (dropped) {           // clearing SYN_REPORT: silent boundary
-                dropped = false;
+            if (dropped) {
+                // R1-06: only a genuine SYN_REPORT ends the dropped window.
+                // Other EV_SYN subtypes (SYN_MT_REPORT/SYN_CONFIG) that arrive
+                // inside the window are unreliable too — they stay dropped AND
+                // are themselves discarded.
+                if (code == syn_report) dropped = false;
                 return;
             }
             has_syn = true;
@@ -5466,6 +5471,21 @@ static void test_syn_dropped_event_stream() {
         s.handle(ev_syn, syn_report, 0);
         EXPECT(has_rel(s.out, 3, 1));
         EXPECT(s.out.size() == 3);
+        EXPECT(!s.dropped);
+    }
+
+    SECTION("T24 — SYN_MT_REPORT inside the dropped window does NOT end it (R1-06)");
+    {
+        // Only a genuine SYN_REPORT ends the [SYN_DROPPED, SYN_REPORT] window.
+        // A non-SYN_REPORT EV_SYN subtype arriving inside it is itself
+        // unreliable — the flag must stay set and later motion discarded.
+        sim s;
+        s.handle(ev_rel, rel_x, 5);
+        s.handle(ev_syn, syn_dropped, 0);
+        s.handle(ev_syn, syn_mt_report, 0);  // must NOT clear dropped
+        s.handle(ev_rel, rel_y, 20);         // still unreliable: discarded
+        s.handle(ev_syn, syn_report, 0);     // genuine SYN_REPORT: ends window
+        EXPECT(s.out.empty());
         EXPECT(!s.dropped);
     }
 

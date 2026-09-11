@@ -153,6 +153,40 @@ static std::vector<InputDeviceInfo> list_mice() {
 
 // ── Mice combo refresh (shared by manual button + inotify auto-refresh) ───────
 
+/// R2-03: Select the combo entry matching `device_id` in the current model.
+/// Returns the connected mouse index (1-based) on match, 0 for "All devices".
+/// If the profile is bound to a device that is NOT currently connected, append
+/// a single "(unplugged)" placeholder entry (idempotent — a stale placeholder
+/// from a previous device is swapped in place) and return its index.  This
+/// keeps the persistent binding visible instead of silently showing the
+/// "All devices (default)" fallback while the device is unplugged.
+static int device_combo_select(AppState* S, const std::string& device_id) {
+    if (!S->device_id_combo) return 0;
+    for (int i = 0; i < (int)S->mice_list.size(); i++) {
+        auto& m = S->mice_list[i];
+        if ((!m.stable_id.empty() && m.stable_id == device_id) ||
+            m.event_node == device_id)
+            return i + 1;
+    }
+    if (device_id.empty()) return 0;
+    GListModel* mdl = gtk_drop_down_get_model(GTK_DROP_DOWN(S->device_id_combo));
+    if (mdl && G_IS_LIST_MODEL(mdl)) {
+        GtkStringList* sl = GTK_STRING_LIST(mdl);
+        gsize n = g_list_model_get_n_items(mdl);
+        const std::string want = device_id + "  [" + tr("(unplugged)") + "]";
+        if (n > 0) {
+            const char* s = gtk_string_list_get_string(sl, (guint)(n - 1));
+            if (s && std::string(s).find(tr("(unplugged)")) != std::string::npos) {
+                gtk_string_list_remove(sl, (guint)(n - 1)); // swap stale placeholder
+                n = g_list_model_get_n_items(mdl);
+            }
+        }
+        gtk_string_list_append(sl, want.c_str());
+        return (int)g_list_model_get_n_items(mdl) - 1;
+    }
+    return 0;
+}
+
 /// Rescans the mouse list and updates the device_id_combo model.
 /// If is_auto==true (inotify-triggered), only rebuilds the model when the device
 /// list actually changed — avoids the flicker from destroying/recreating the widget
@@ -184,18 +218,9 @@ void refresh_mice_combo(AppState* S, bool is_auto, bool quiet) {
     }
 
     // O8: guard against UB in cur_prof() when the profile list is empty
-    if (!S->config.profiles.empty()) {
-        const std::string& did = cur_prof(S).device_id;
-        int sel = 0;
-        for (int i = 0; i < (int)S->mice_list.size(); i++) {
-            auto& m = S->mice_list[i];
-            if ((!m.stable_id.empty() && m.stable_id == did) ||
-                m.event_node == did) {
-                sel = i + 1; break;
-            }
-        }
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo), (guint)sel);
-    }
+    if (!S->config.profiles.empty())
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo),
+                                   (guint)device_combo_select(S, cur_prof(S).device_id));
 
     S->updating = prev_updating;
 

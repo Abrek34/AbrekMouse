@@ -12,11 +12,18 @@ BENCH_BIN="$BUILD_DIR/bench_hotpath"
 ITERATIONS="${1:-1000000}"
 PERF_RUNS="${2:-3}"
 OUTPUT_FILE="${3:-$PROJECT_ROOT/bench_hotpath_results.txt}"
+CXX="${CXX:-g++}"
 
 if [[ ! -f "$BENCH_BIN" ]]; then
     echo "Building benchmark..."
     cd "$PROJECT_ROOT"
-    g++ -O3 -march=native -std=c++20 \
+    # R4-L-4: $CXX onurlandır; RAWACCEL_PORTABLE=1 portable üretir (mirror build.sh).
+    if [[ "${RAWACCEL_PORTABLE:-0}" = "1" ]]; then
+        MARCH=""
+    else
+        MARCH="-march=native"
+    fi
+    "$CXX" -O3 $MARCH -std=c++20 \
         -I"$PROJECT_ROOT/include" \
         -I"$PROJECT_ROOT/include/nlohmann" \
         "$PROJECT_ROOT/tests/bench_hotpath.cpp" \
@@ -37,7 +44,7 @@ fi
     echo "Iterations per run: $ITERATIONS"
     echo "Perf runs per config: $PERF_RUNS"
     echo "Binary: $BENCH_BIN"
-    echo "Compiler: $(g++ --version | head -1)"
+    echo "Compiler: $($CXX --version | head -1)"
     echo ""
     
     # Run benchmark without perf (timing only)

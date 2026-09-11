@@ -1,6 +1,7 @@
 #!/bin/bash
 # RawAccel Linux Uninstaller
 set -e
+set -o pipefail
 
 echo "=== RawAccel Linux Uninstaller ==="
 echo ""
@@ -22,15 +23,23 @@ fi
 # Kill any rawaccel-daemon started outside systemd (e.g. directly via pkexec).
 # Without this, removing the binary leaves the running process holding /dev/uinput.
 pkill -TERM -x rawaccel-daemon 2>/dev/null || true
+# R4-L-8: also stop a running rawaccel-gui — remove the binary beneath a live
+# GUI leaves the process + its daemon-watch alive (the user's mouse keeps
+# working from a process tree that no longer exists on disk).
+pkill -TERM -x rawaccel-gui 2>/dev/null || true
 sleep 0.3
 pkill -KILL -x rawaccel-daemon 2>/dev/null || true
+pkill -KILL -x rawaccel-gui 2>/dev/null || true
 # Clean up PID/socket artefacts
 rm -f /run/rawaccel.pid /run/rawaccel.sock /tmp/rawaccel.pid /tmp/rawaccel.sock 2>/dev/null || true
 # P121/BUG-09: the R49 daemon writes the pid+sock under $XDG_RUNTIME_DIR
 # (=/run/user/$UID) — the /run /tmp paths alone left these behind.
+# nullglob: skip silently when /run/user is empty (no literal /run/user/*).
+shopt -s nullglob
 for d in /run/user/*; do
     rm -f "$d/rawaccel.pid" "$d/rawaccel.sock" 2>/dev/null || true
 done
+shopt -u nullglob
 
 # Remove service file (R44: setup.sh installs to /usr/lib; /etc + /etc/user
 # are legacy shadow locations cleaned for completeness)
@@ -96,9 +105,15 @@ if [[ -x "$KDE_FIX" ]]; then
             echo "      Removing kwinrc traces for user '$user'..."
             # H-3: sudo resets session env by default; preserve the KDE
             # detection variables or --remove silently no-ops.
-            sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
-                bash "$KDE_FIX" --remove >/dev/null 2>&1 || \
-                echo "      (kwinrc trace cleanup skipped for '$user')"
+            if out="$(sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+                bash "$KDE_FIX" --remove 2>&1)"; then
+                # R4-L-8: success path may still print diagnostics — surface
+                # genuine error/failure lines instead of hiding the stream.
+                grep -i -E "error|fail|hata|bulunamad" <<<"$out" \
+                    && echo "      (see above for '$user' kwinrc cleanup note)" || true
+            else
+                echo "      (kwinrc trace cleanup failed for '$user': $(head -1 <<<"$out"))"
+            fi
         done
     fi
 fi

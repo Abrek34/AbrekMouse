@@ -18,6 +18,11 @@
 #     (identity); the reference blindly runs the formula, yielding artifacts
 #     (power → 0, synchronous → ≈0.667). Speed 0 is non-physical for a mouse
 #     (output = input × gain = 0 anyway). AGENTS.md test: "synchronous power<1".
+#  3. power exponent_power ∈ [1e-4, 1e-3) → the port floors the shared exponent
+#     at 1e-3 (BUG-02 root-cause: scale derivation and curve evaluation must use
+#     the SAME n), the reference evaluates the raw ep. Every speed in the band is
+#     a documented deviation; `power_tinyexp_floor` pins it (raw*_pX cases use
+#     exponents ≥ 0.3 so they never exercise the band).
 classic_gain_exp_le1	0.001
 classic_gain_exp_le1	0.005
 classic_gain_exp_le1	0.01
@@ -43,6 +48,31 @@ classic_gain_exp_le1	10000
 classic_gain_exp_le1	100000
 power_gain_p1	0
 power_legacy_p1	0
+power_tinyexp_floor	0
+power_tinyexp_floor	0.001
+power_tinyexp_floor	0.005
+power_tinyexp_floor	0.01
+power_tinyexp_floor	0.1
+power_tinyexp_floor	0.5
+# spd=1 is NOT a deviation: both sides reduce to 1^n with scale=1 (cap out)
+# and agree exactly; keep it unlisted so it is force-checked every run.
+power_tinyexp_floor	3
+power_tinyexp_floor	5
+power_tinyexp_floor	7.5
+power_tinyexp_floor	10
+power_tinyexp_floor	15
+power_tinyexp_floor	30
+power_tinyexp_floor	50
+power_tinyexp_floor	100
+power_tinyexp_floor	250
+power_tinyexp_floor	500
+power_tinyexp_floor	1000
+power_tinyexp_floor	2000
+power_tinyexp_floor	3000
+power_tinyexp_floor	4000
+power_tinyexp_floor	5000
+power_tinyexp_floor	10000
+power_tinyexp_floor	100000
 sync_gain_p2	0
 sync_gain_p1	0
 sync_gain_p07	0

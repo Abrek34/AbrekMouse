@@ -157,6 +157,12 @@ inline std::vector<Case> cases() {
     };
     c.push_back(mkpow("power_gain_p1",  true,  1.0, 1.0));
     c.push_back(mkpow("power_legacy_p1",false, 1.0, 1.0));
+    // R3-NEW-2: exponent_power inside [1e-4, 1e-3).  The local port floors the
+    // shared exponent at 1e-3 (BUG-02 — scale derivation and curve evaluation
+    // use the SAME n), the vendored reference evaluates the raw exp.  Every
+    // speed row deviates and is listed in known_deviations.txt; this case pins
+    // the band so a future change to the floor can't go unnoticed.
+    c.push_back(mkpow("power_tinyexp_floor", true,  1.0, 5e-4));
 
     // ── Regression sweep (P98): >100x gain-magnitude swing ──────────────────
     // Stress the relative-tolerance comparator across many orders of magnitude.

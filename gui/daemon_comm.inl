@@ -213,12 +213,41 @@ bool daemon_ipc_push_config(const std::string& json) {
         .find("\"ok\":true") != std::string::npos;
 }
 
-/// True when /proc/<pid>/comm names a rawaccel-daemon process.  Guards against
-/// stale PID files whose PID was recycled by an unrelated process (BUG-07):
-/// kill(pid,0) alone cannot tell us *which* process the PID now belongs to.
+/// True when the process at /proc/<pid> is genuinely the rawaccel daemon.
+/// Guards against stale PID files whose PID was recycled by an unrelated
+/// process (BUG-07) AND against the R5-S-1 comm-spoofing vector: /proc/<pid>/comm
+/// can be faked by any process with prctl(PR_SET_NAME), but /proc/<pid>/exe is a
+/// kernel-maintained symlink to the actual executable — it cannot be redirected.
+///
+/// The /proc/<pid>/exe readlink check is best-effort: on a per-user daemon (or
+/// hidepid=0 setups) it reads fine; against a root daemon on a restricted /proc
+/// it can return EACCES.  In that case we fall back to the comm check alone so a
+/// permission restriction never silently kills daemon detection — the attack
+/// surface is still reduced wherever the kernel lets us verify the real binary.
 static bool pid_is_rawaccel_daemon(pid_t pid) {
-    char comm_path[64];
-    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)pid);
+    char proc_root[64];
+    snprintf(proc_root, sizeof(proc_root), "/proc/%d", (int)pid);
+
+    // 1) Kernel-maintained binary link — strongest identity check.
+    {
+        char link[96];
+        snprintf(link, sizeof(link), "%s/exe", proc_root);
+        char exe[4096];
+        ssize_t n = readlink(link, exe, sizeof(exe) - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            const char* base = strrchr(exe, '/');
+            base = base ? base + 1 : exe;
+            if (strcmp(base, "rawaccel-daemon") != 0) return false;
+        } else if (errno == ENOENT || errno == ESRCH) {
+            return false; // process gone
+        }
+        // else EACCES/EPERM (restricted /proc): fall through to the comm check.
+    }
+
+    // 2) /proc/<pid>/comm must also name the daemon.
+    char comm_path[96];
+    snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_root);
     FILE* cf = fopen(comm_path, "r");
     if (!cf) return false; // no such process (or no permission)
     char comm[64] = {};
@@ -273,28 +302,17 @@ pid_t read_daemon_pid() {
                 if (*p < '0' || *p > '9') { is_num = false; break; }
             if (!is_num) continue;
 
-            std::string comm_path = std::string("/proc/") + ent->d_name + "/comm";
-            FILE* cf = fopen(comm_path.c_str(), "r");
-            if (!cf) continue;
-            char comm[64] = {};
-            // Zero-init guarantees a NUL terminator even if fgets yields nothing.
-            (void)!fgets(comm, sizeof(comm), cf);
-            fclose(cf);
-            // strip newline
-            size_t len = strlen(comm);
-            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
-
-            if (strcmp(comm, "rawaccel-daemon") == 0) {
-                // BUG-6: atoi(d_name) is UB if the directory name doesn't
-                // fit in `int`.  /proc only exposes numeric PIDs (pid_t,
-                // typically 4194304 max) but be defensive — strtol +
-                // range check before the pid_t cast.
-                errno = 0;
-                char* end = nullptr;
-                long v = strtol(ent->d_name, &end, 10);
-                if (end != ent->d_name && errno == 0 && v > 0 &&
-                    v <= INT_MAX) {
-                    pid_t pid = static_cast<pid_t>(v);
+            // BUG-6: atoi(d_name) is UB if the directory name doesn't fit in
+            // `int`.  /proc only exposes numeric PIDs (pid_t, typically
+            // 4194304 max) but be defensive — strtol + range check first, then
+            // delegate to pid_is_rawaccel_daemon() (identical identity logic to
+            // the PID-file path, including the /proc/<pid>/exe anti-spoof check).
+            errno = 0;
+            char* end = nullptr;
+            long v = strtol(ent->d_name, &end, 10);
+            if (end != ent->d_name && errno == 0 && v > 0 && v <= INT_MAX) {
+                pid_t pid = static_cast<pid_t>(v);
+                if (pid_is_rawaccel_daemon(pid)) {
                     closedir(proc);
                     return pid;
                 }

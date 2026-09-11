@@ -17,5 +17,11 @@ SRC=(
   gui/mouse_test.inl
 )
 CXX="${CXX:-g++}"
-"$CXX" -std=c++20 -Wall -Wextra -O1 -o /tmp/tr_coverage tests/tr_coverage.cpp
-/tmp/tr_coverage "${SRC[@]}"
+# Compile to a unique temp path (mktemp) instead of a predictable
+# /tmp/tr_coverage — a pre-created symlink there would let a local attacker
+# redirect the compiler output / swapped binary (TOCTOU).
+TMPDIR_bin="${TMPDIR:-/tmp}"
+BIN="$(mktemp "$TMPDIR_bin/tr_coverage.XXXXXX")"
+trap 'rm -f "$BIN"' EXIT
+"$CXX" -std=c++20 -Wall -Wextra -O1 -o "$BIN" tests/tr_coverage.cpp
+"$BIN" "${SRC[@]}"

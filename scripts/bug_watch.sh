@@ -23,6 +23,9 @@ MARK="$STATE_DIR/seen.md5"
 LOCK="$STATE_DIR/lock"
 LOGFILE="$STATE_DIR/bug_watch.log"
 MODE="${1:-watch}"
+# M-5b: bir rapor için en fazla opencode denemesi.  Aşılırsa MARK ilerletilir
+# (rapor bir daha otomatik tetiklenmez); elle müdahale için log tutulur.
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 
 mkdir -p "$STATE_DIR"
 
@@ -61,16 +64,41 @@ lock() {
 unlock() { rm -rf "$LOCK"; }
 
 handle_change() {
+  local report_md5
+  report_md5="$(md5sum "$REPORT_FILE" | cut -d' ' -f1)"
+
+  local retry_cnt_file="$STATE_DIR/attempts.${report_md5}.cnt"
+  local report_txt_file="$STATE_DIR/report.${report_md5}.txt"
+
+  # ── M-5b: bounded retry bookkeeping ─────────────────────────────────────────
+  # A failed opencode run must NOT advance the MARK (previously it did, so the
+  # watch loop never retried a still-failing report).  Instead we allow up to
+  # MAX_ATTEMPTS retriggers of the SAME report, tracking the attempt count in a
+  # per-report-hash file.  Only after the cap is writing the MARK ("give up").
+  local retries=0
+  [[ -f "$retry_cnt_file" ]] && retries="$(cat "$retry_cnt_file" 2>/dev/null || echo 0)"
+  retries=$(( retries + 1 ))
+  log "Rapor hash=$report_md5 deneme $retries/$MAX_ATTEMPTS"
+
+  # ── Extract the new text ────────────────────────────────────────────────────
+  # First attempt: diff from the last-seen baseline.  Retries reuse the stored
+  # report text so the prompt is identical every time (the diff baseline has
+  # advanced by then and would otherwise yield nothing).
   local new_text=""
-  if [[ -f "$PREV_FILE" ]]; then
-    new_text="$(diff -u "$PREV_FILE" "$REPORT_FILE" 2>/dev/null \
-      | grep '^+' | grep -v '^+++' | sed 's/^+//' || true)"
-  fi
-  if [[ -z "$new_text" ]]; then
-    new_text="$(cd "$PROJECT_DIR" && sed -n '/ZU DÜZELTİLECEK RAPOR/,/^$/p' "$REPORT_FILE" 2>/dev/null || true)"
-  fi
-  if [[ -z "$new_text" ]]; then
-    new_text="$(cat "$REPORT_FILE")"
+  if [[ -f "$report_txt_file" ]]; then
+    new_text="$(cat "$report_txt_file")"
+  else
+    if [[ -f "$PREV_FILE" ]]; then
+      new_text="$(diff -u "$PREV_FILE" "$REPORT_FILE" 2>/dev/null \
+        | grep '^+' | grep -v '^+++' | sed 's/^+//' || true)"
+    fi
+    if [[ -z "$new_text" ]]; then
+      new_text="$(cd "$PROJECT_DIR" && sed -n '/ZU DÜZELTİLECEK RAPOR/,/^$/p' "$REPORT_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -z "$new_text" ]]; then
+      new_text="$(cat "$REPORT_FILE")"
+    fi
+    printf '%s\n' "$new_text" > "$report_txt_file"
   fi
 
   cp "$REPORT_FILE" "$PREV_FILE"
@@ -86,8 +114,6 @@ handle_change() {
     printf '%s\n' "$new_text"
     printf '--- END RAPOR ---\n'
   } | { tee /dev/stderr; } >> "$LOGFILE"
-
-  md5sum "$REPORT_FILE" | cut -d' ' -f1 > "$MARK"
 
   log "opencode tetikleniyor (başlangıç: $(date '+%T'))"
 
@@ -123,18 +149,31 @@ EOF
   ( cd "$PROJECT_DIR" && opencode run "$(cat "$tmp_prompt")" ) || code=$?
   rm -f "$tmp_prompt"
 
-  # Ajan sonuçtan sonra dosyayı değiştirebileceği için (raporu silme vb.)
-  # yeni durumu işaretle — aynı içerik bir daha rapor olarak tetiklenmesin.
-  if [[ -f "$REPORT_FILE" ]]; then
-    cp "$REPORT_FILE" "$PREV_FILE"
-    md5sum "$REPORT_FILE" | cut -d' ' -f1 > "$MARK"
-  fi
-
   if [[ "$code" -eq 0 ]]; then
+    # Başarı: agent raporu silmiş olabilir.  MARK'ı son içeriğe ilerlet, sayaçları temizle.
+    if [[ -f "$REPORT_FILE" ]]; then
+      cp "$REPORT_FILE" "$PREV_FILE"
+      md5sum "$REPORT_FILE" | cut -d' ' -f1 > "$MARK"
+    fi
+    rm -f "$retry_cnt_file" "$report_txt_file"
     log "opencode tamamlandı (çıkış 0). Rapor düzeltilmişse dosyadan silindi."
   else
-    log "opencode çıktı kodu $code ile bitti (bkz. $STATE_DIR/last_change.txt; log: $LOGFILE)"
-    log "Rapor dosyada bırakıldı — izleyici aynı raporu tekrar tetiklememek için blokluyor."
+    if [[ "$retries" -lt "$MAX_ATTEMPTS" ]]; then
+      # M-5b: MARK ilerletme, sayaç bırak — sonraki poll aynı raporu yeniden dener.
+      printf '%s\n' "$retries" > "$retry_cnt_file"
+      log "opencode çıktı kodu $code ile bitti (deneme $retries/$MAX_ATTEMPTS)."
+      log "MARK ilerletilmedi — sonraki kontrol aynı raporu yeniden deneyecek."
+      log "Düzeltme hala varsa: $STATE_DIR/last_change.txt | log: $LOGFILE"
+    else
+      # Üst sınır aşıldı: MARK'ı ilerlet (vazgeç), artık yeniden denenmez.
+      if [[ -f "$REPORT_FILE" ]]; then
+        cp "$REPORT_FILE" "$PREV_FILE"
+        md5sum "$REPORT_FILE" | cut -d' ' -f1 > "$MARK"
+      fi
+      rm -f "$retry_cnt_file"
+      log "opencode art arda $MAX_ATTEMPTS kez başarısız oldu — bu rapor bir daha denenmeyecek."
+      log "Elle inceleyin: $STATE_DIR/last_change.txt | rapor: $REPORT_FILE"
+    fi
   fi
   log "=========================================================================="
 }

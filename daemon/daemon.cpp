@@ -823,6 +823,16 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     // Reset subpixel remainders on profile change
     dev.remainder_x = 0.0;
     dev.remainder_y = 0.0;
+    // R3-NEW-3: re-anchor the speed interval.  last_time_ms starts at 0 and —
+    // critically — is NOT updated while the previous profile was in raw
+    // passthrough (flush_motion() never runs there).  Without this refresh, the
+    // first accelerated event after a raw→accel switch computed
+    // time_ms = now − 0 → clamped to DEFAULT_TIME_MAX → speed ≈ 0 → gain ≈ 1:
+    // a single suppressed frame.  Tying it to "now" on every profile apply makes
+    // the first accelerated event measure a real interval (and also covers the
+    // hot reload / device-connect cases the DEFAULT_TIME_MAX clamp was bare
+    // mitigation for).
+    dev.last_time_ms = now_ms();
 }
 
 // ── Shared config apply path (SIGHUP reload + IPC config push) ────────────────
@@ -1546,12 +1556,19 @@ void AccelDaemon::process_device(mouse_device& dev) {
                 syn_dropped = true;
                 continue;
             }
-            // SYN_REPORT: if we were in syn_dropped state, this marks the
-            // boundary — clear the flag and resume normal processing.
-            // Do NOT flush any motion or forward this SYN (the dropped window
-            // ends here; fresh data starts from the next event batch).
+            // R1-06: the dropped window is [SYN_DROPPED, SYN_REPORT].  Only a
+            // genuine SYN_REPORT marks its end.  A previous version cleared the
+            // flag on ANY EV_SYN event — so a SYN_MT_REPORT or SYN_CONFIG that
+            // happened to arrive inside the window would silently end the drop,
+            // and the remaining unreliable motion events between it and the real
+            // SYN_REPORT got forwarded as if they were fresh.  Other EV_SYN
+            // subtypes inside the window stay in the dropped state (and are
+            // themselves discarded).
             if (syn_dropped) {
-                syn_dropped = false;
+                if (ev.code == SYN_REPORT)
+                    syn_dropped = false;
+                // Do NOT flush any motion or forward this SYN (the dropped
+                // window ends here; fresh data starts from the next event batch).
                 continue;
             }
             has_syn = true;

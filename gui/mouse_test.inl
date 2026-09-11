@@ -248,6 +248,11 @@ static gboolean mouse_test_poll(gpointer user_data) {
     double gain = daemon_device_field(resp, S, "telem_gain");
     if (in < 0) {
         // Daemon answered but has not seen a motion sample yet.
+        // R2-07: zero out the readouts too — otherwise the in/out/gain labels
+        // keep showing the LAST sample (stale) while the status says "awaiting".
+        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
+        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
+        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
         mouse_test_set_status(S, 1); // awaiting motion
         return G_SOURCE_CONTINUE;
     }

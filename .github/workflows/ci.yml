@@ -30,10 +30,15 @@ jobs:
       - name: Build (warning-as-failure gate)
         run: |
           set -o pipefail
-          # Capture full output, then fail if any warning/error line appears.
+          # Capture full output, then fail if any compiler diagnostic appears.
           bash scripts/build.sh 2>&1 | tee build.log
-          if grep -E "warning:|error:" build.log; then
-            echo "::error::Build produced warnings or errors (see above)."
+          # R4-L-10: the old `grep -E "warning:|error:"` matched ANY line
+          # containing those strings — innocent output (e.g. a filename with
+          # "error" in it, scripts echoing the words) false-failed the gate.
+          # Match only compiler/linker diagnostic shapes: FILE:LINE[:COL]:
+          # (warning|fatal error|error):, plus ld:/collect2 errors.
+          if grep -E ":[0-9]+(:[0-9]+)?: (warning|fatal error|error):| (ld|collect2): (error|warning):" build.log; then
+            echo "::error::Build produced compiler warnings or errors (see above)."
             exit 1
           fi
 

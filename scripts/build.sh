@@ -94,7 +94,7 @@ else
 echo "[1/3] Building rawaccel-daemon..."
     # EVDEV_CFLAGS (-I/usr/include/libevdev-1.0) is required for
     # "libevdev/libevdev-uinput.h" — EVDEV_LIBS alone only covers linking.
-    $CXX $BASE_CXXFLAGS $HARDENING $EVDEV_CFLAGS -I$ROOT/include \
+    $CXX $BASE_CXXFLAGS $HARDENING $EVDEV_CFLAGS -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
@@ -104,7 +104,7 @@ echo "[1/3] Building rawaccel-daemon..."
         -o "$BUILD/rawaccel-daemon"
 
     echo "[2/3] Building rawaccel-cli..."
-    $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $HARDENING -I$ROOT/include \
+    $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $HARDENING -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
@@ -114,7 +114,7 @@ echo "[1/3] Building rawaccel-daemon..."
 
     if [ "$HAVE_GTK4" = "1" ]; then
         echo "[3/3] Building rawaccel-gui..."
-        $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS -I$ROOT/include \
+        $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \

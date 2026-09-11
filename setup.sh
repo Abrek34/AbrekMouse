@@ -114,11 +114,22 @@ install_deps() {
         ok "Debian/Ubuntu tespit edildi → apt"
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        # qt6-tools-dev-tools sağlar: qdbus6
+        # M-6: qt6-tools-dev-tools (qdbus6) yalnızca Ubuntu ≥ 24.04 /
+        # Debian ≥ 13'tedir; 20.04/22.04'te "Unable to locate package" verir ve
+        # set -e altında kurulumu tamamen öldürürdü.  Çekirdek bağımlılıklar ÖNCE
+        # (qt6 hariç) ayrı kurulur, qt6 paketi ayrı bir turda kapılanır: önce
+        # qt6-tools-dev-tools, bulunamazsa qt6-tools, o da yoksa yalnızca uyarı
+        # (KDE canlı reconfigure devre dışı kalır, kurulum yine de sürer).
         apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config libevdev-dev libgtk-4-dev \
-            libpolkit-gobject-1-dev systemd udev policykit-1 python3 \
-            qt6-tools-dev-tools
+            libpolkit-gobject-1-dev systemd udev policykit-1 python3
+        if ! apt-get install -y --no-install-recommends qt6-tools-dev-tools; then
+            warn "qt6-tools-dev-tools yok (Ubuntu < 24.04 / Debian < 13) — qt6-tools deneniyor."
+            if ! apt-get install -y --no-install-recommends qt6-tools; then
+                warn "qt6-tools da kurulamadı — KDE canlı reload (qdbus6) eksik kalacak."
+                warn "GUI'deki 'Fix Now' düğmesi yine çalışır, sadece anlık KWin yeniden yükleme atlanır."
+            fi
+        fi
     elif is_fedora_like; then
         ok "Fedora/RHEL tespit edildi → dnf"
         # qt6-qttools sağlar: qdbus-qt6
@@ -151,6 +162,15 @@ install_deps() {
         || die "libevdev devel paketi eksik. Kurun: libevdev (Arch) / libevdev-dev (Debian) / libevdev-devel (Fedora)"
     pkg-config --exists gtk4 \
         || die "gtk4 devel paketi eksik — GUI DERLENEMEZ. Kurun: gtk4 (Arch) / libgtk-4-dev (Debian) / gtk4-devel (Fedora)"
+    # M-6: KDE canlı reconfigure aracı — Plasma 6'da qdbus6, Plasma 5'te qdbus.
+    # İkisi de eksikse canlı reload çalışmaz; kurulumu durdurmaz (yalnız uyarı).
+    if command -v qdbus6 >/dev/null 2>&1 || command -v qdbus >/dev/null 2>&1; then
+        ok "qdbus doğrulandı (KDE canlı reconfigure)."
+    else
+        warn "qdbus6/qdbus bulunamadı — KDE canlı reconfigure devre dışı."
+        warn "Kur: Arch 'qt6-tools', Ubuntu ≥ 24.04 'qt6-tools-dev-tools', Fedora 'qt6-qttools'."
+        warn "Kuruluma devam ediliyor (yalnız KDE anlık yeniden yükleme eksik)."
+    fi
     ok "Tüm bağımlılıklar mevcut."
 }
 
@@ -209,12 +229,15 @@ clean_old_install() {
               "$REAL_HOME/.local/bin/rawaccel-gui" 2>/dev/null || true
     fi
     # M-1: also every homedir (in case of multi-user boxes).
+    # nullglob: a literal /home/* must not be iterated when /home is empty/missing.
+    shopt -s nullglob
     for home in /home/*; do
         [[ "$home" == "$REAL_HOME" ]] && continue
         rm -f "$home/.local/bin/rawaccel-daemon" \
               "$home/.local/bin/rawaccel-cli" \
               "$home/.local/bin/rawaccel-gui" 2>/dev/null || true
     done
+    shopt -u nullglob
     for f in "${files[@]}"; do
         [[ -e "$f" ]] && rm -f "$f" && ok "Silindi: $f"
     done
@@ -472,9 +495,11 @@ do_uninstall() {
     # "Tamamen silmek için: rm -rf /etc/rawaccel" notu yazılır.
     # XDG_RUNTIME_DIR socket/pid izleri (PID önceliği: $XDG_RUNTIME_DIR →
     # /run → /tmp; /run/user/$UID altında kalıyordu).
+    shopt -s nullglob
     for d in /run/user/*; do
         rm -f "$d/rawaccel.pid" "$d/rawaccel.sock" 2>/dev/null || true
     done
+    shopt -u nullglob
     # KDE kwinrc izleri: per-device (RawAccel) override bölümlerini kaldır ve
     # global [Libinput]'i adaptive'e döndür (kde-fix-accel.sh --remove).
     if [[ -n "$REAL_USER" ]] && [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then

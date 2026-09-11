@@ -88,7 +88,11 @@ gain row. Rows that intentionally deviate (classic exponent<=1 "linear path"
 constant gain, `power`/`synchronous` identity at speed 0, and the power
 `io` cap.y=0 identity guard — ref yields NaN/0 for that degenerate input,
 P155) are listed in `tests/oracle/known_deviations.txt` and do not fail the
-run. Current grid: **1047 rows compared, 45 documented deviations** (P158).
+run. Current grid: **1071 rows compared, 68 documented deviations** (R3-NEW-2
+added `power_tinyexp_floor` with exponent_power=5e-4 inside the BUG-02 floor
+band — the local port evaluates a shared exponent floored at 1e-3, the
+reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
+because both sides reduce to 1^n with scale=1 exactly).
 The `io`-gain cap.y=0 rows are intentionally NOT listed: the reference emits
 NaN there and `NaN > tol` is never true, so they can never appear as a
 deviation — listing them would raise a stale-row error. Run this after

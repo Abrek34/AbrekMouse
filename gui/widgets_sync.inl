@@ -336,18 +336,12 @@ void profile_to_widgets(AppState* S) {
         if (S->lp_norm_spin)  gtk_widget_set_visible(S->lp_norm_spin,  show_lp2);
     }
 
-    // device_id dropdown: empty = index 0, match on stable_id or event_node
-    if (S->device_id_combo) {
-        int sel = 0; // "All devices"
-        for (int i = 0; i < (int)S->mice_list.size(); i++) {
-            auto& m = S->mice_list[i];
-            if ((!m.stable_id.empty() && m.stable_id == dp.device_id) ||
-                m.event_node == dp.device_id) {
-                sel = i + 1; break;
-            }
-        }
-        gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo), (guint)sel);
-    }
+    // device_id dropdown: match on stable_id or event_node; R2-03 handles a
+    // bound-but-unplugged device (trailing "(unplugged)" entry) instead of the
+    // "All devices" fallback.
+    if (S->device_id_combo)
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo),
+                                   (guint)device_combo_select(S, dp.device_id));
 
 #undef SET_SPIN
 #undef SET_DD
@@ -385,22 +379,68 @@ static bool has_systemd_rawaccel_unit() {
            fs::exists("/usr/lib/systemd/system/rawaccel.service");
 }
 
-static bool pkexec_systemctl_async(const char* action, std::string* err_out = nullptr) {
+// R2-06 / R4-L-11: pkexec could previously fail silently — a missing pkexec
+// (exec → _exit(127)), a polkit auth cancel/refusal or an exec-permission
+// error (126) was reported to the user as "Starting.../Stopping..." success.
+// The child is reaped event-driven (no polling), and a non-zero wait status is
+// surfaced in the status bar with the pkexec-specific meaning.
+struct pkexec_watch_ctx {
+    AppState* S;
+    std::string what; // human action, e.g. "systemctl start rawaccel"
+};
+
+static void pkexec_child_report(GPid p, gint status, gpointer d) {
+    auto* ctx = static_cast<pkexec_watch_ctx*>(d);
+    if (ctx && ctx->S) {
+        std::string detail;
+        if (WIFEXITED(status)) {
+            int code = WEXITSTATUS(status);
+            if (code != 0) {
+                detail = (code == 126)
+                    ? tr("pkexec could not execute the command (126).")
+                    : (code == 127)
+                    ? tr("pkexec refused or the command was not found (127).")
+                    : trf("pkexec exited with code %d.", code);
+            }
+        } else if (WIFSIGNALED(status)) {
+            detail = trf("pkexec was terminated by signal %d.", WTERMSIG(status));
+        }
+        if (!detail.empty())
+            set_status(ctx->S, ctx->what + " — " + detail);
+    }
+    delete ctx;
+    g_spawn_close_pid(p);
+}
+
+/// fork+exec hijacking pkexec; child is watchdogged via the GLib SIGCHLD
+/// mechanism.  Returns the child pid (>0) on success, -1 on fork failure.
+static pid_t pkexec_spawn(char* const argv[], AppState* S, std::string what) {
     pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setsid();
+        execvp(argv[0], argv);
+        _exit(127); // execvp failed (e.g. pkexec not installed)
+    }
+    auto* ctx = new pkexec_watch_ctx{S, std::move(what)};
+    g_child_watch_add(pid, pkexec_child_report, ctx);
+    return pid;
+}
+
+static bool pkexec_systemctl_async(const char* action, AppState* S, std::string* err_out = nullptr) {
+    char* args[] = {
+        const_cast<char*>("pkexec"),
+        const_cast<char*>("systemctl"),
+        const_cast<char*>(action),
+        const_cast<char*>("rawaccel"),
+        nullptr
+    };
+    std::string what = std::string("systemctl ") + action + " rawaccel";
+    pid_t pid = pkexec_spawn(args, S, what);
     if (pid < 0) {
         if (err_out) *err_out = "fork() failed.";
         return false;
     }
-    if (pid == 0) {
-        setsid();
-        execlp("pkexec", "pkexec", "systemctl", action, "rawaccel", (char*)nullptr);
-        _exit(127);
-    }
-    // Event-driven child watcher: uses GLib's internal SIGCHLD mechanism to
-    // reap the process once it exits without periodic timer polling or leaks.
-    g_child_watch_add(pid, [](GPid p, gint /*status*/, gpointer) {
-        g_spawn_close_pid(p);
-    }, nullptr);
     if (err_out) err_out->clear();
     return pid > 0;
 }
@@ -454,27 +494,84 @@ void on_xy_link_toggled(GtkCheckButton* btn, gpointer user_data) {
 // Shared "Save As" flow: asks for a name, upserts the profile, persists it.
 // save_config_now() auto-sends SIGHUP when the daemon is running, so both
 // handlers end with the same persist call.
+//
+// R2-05: saving under a name that belongs to a DIFFERENT profile would
+// silently overwrite that profile's on-disk settings (through Apply too, since
+// it shares this dialog).  Overwrite now requires an explicit confirmation; a
+// plain "save under my own current name" stays confirmation-free.
 static void save_profile_as_dialog(AppState* S) {
     std::string cur_name = S->config.profiles.empty() ? "" : cur_prof(S).name;
     show_input_dialog(S, tr("Save Profile As"), tr("Profile name"), cur_name.c_str(),
         [S](const std::string& name) {
             if (name.empty()) return;
-            // If a profile with this name already exists, overwrite it;
-            // otherwise create a new one (copy of current settings).
             widgets_to_profile(S);
             device_profile dp = cur_prof(S);
             dp.name = name;
 
-            bool found = false;
+            int existing = -1;
             for (int i = 0; i < (int)S->config.profiles.size(); ++i) {
-                if (S->config.profiles[i].name == name) {
-                    S->config.profiles[i] = dp;
-                    S->current_profile_idx = i;
-                    found = true;
-                    break;
-                }
+                if (S->config.profiles[i].name == name) { existing = i; break; }
             }
-            if (!found) {
+
+            // Name already taken by a DIFFERENT profile → ask before overwriting.
+            if (existing >= 0 && existing != S->current_profile_idx) {
+                GtkWidget* dlg = gtk_window_new();
+                gtk_window_set_title(GTK_WINDOW(dlg), tr("Overwrite Profile"));
+                gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(S->window));
+                gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+                gtk_window_set_default_size(GTK_WINDOW(dlg), 340, -1);
+
+                GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+                gtk_widget_set_margin_start(vbox, 16); gtk_widget_set_margin_end(vbox, 16);
+                gtk_widget_set_margin_top(vbox, 16);   gtk_widget_set_margin_bottom(vbox, 16);
+                gtk_window_set_child(GTK_WINDOW(dlg), vbox);
+
+                std::string msg = trf(
+                    "Profile \"%s\" already exists.\nIts settings will be "
+                    "permanently replaced with the current settings.\nContinue?",
+                    name.c_str());
+                GtkWidget* lbl = gtk_label_new(msg.c_str());
+                gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+                gtk_label_set_justify(GTK_LABEL(lbl), GTK_JUSTIFY_CENTER);
+                gtk_box_append(GTK_BOX(vbox), lbl);
+
+                GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+                gtk_widget_set_halign(hbox, GTK_ALIGN_END);
+                gtk_box_append(GTK_BOX(vbox), hbox);
+
+                GtkWidget* cancel_btn = gtk_button_new_with_label(tr("Cancel"));
+                GtkWidget* ov_btn     = gtk_button_new_with_label(tr("Overwrite"));
+                gtk_widget_add_css_class(ov_btn, "destructive-action");
+                gtk_box_append(GTK_BOX(hbox), cancel_btn);
+                gtk_box_append(GTK_BOX(hbox), ov_btn);
+
+                g_signal_connect(cancel_btn, "clicked",
+                    G_CALLBACK(+[](GtkWidget*, gpointer d){ gtk_window_destroy(GTK_WINDOW(d)); }), dlg);
+
+                struct overwrite_ctx { AppState* S; device_profile dp; int existing; };
+                auto* ctx = new overwrite_ctx{ S, dp, existing };
+                g_object_set_data_full(G_OBJECT(dlg), "ctx", ctx,
+                    [](gpointer p) { delete (overwrite_ctx*)p; });
+                g_signal_connect(ov_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
+                    auto* dlg_w  = GTK_WIDGET(d);
+                    auto* c      = static_cast<overwrite_ctx*>(g_object_get_data(G_OBJECT(dlg_w), "ctx"));
+                    c->S->config.profiles[c->existing] = c->dp;
+                    c->S->current_profile_idx = c->existing;
+                    c->S->config.active_profile = c->dp.name;
+                    rebuild_profile_combo(c->S);
+                    save_config_now(c->S);
+                    gtk_window_destroy(GTK_WINDOW(d));
+                }), dlg);
+
+                gtk_window_present(GTK_WINDOW(dlg));
+                return;
+            }
+
+            // No conflict: overwrite self under the same name, or create new.
+            if (existing >= 0) {
+                S->config.profiles[existing] = dp;
+                S->current_profile_idx = existing;
+            } else {
                 S->config.profiles.push_back(dp);
                 S->current_profile_idx = (int)S->config.profiles.size() - 1;
             }
@@ -498,7 +595,7 @@ void on_daemon_start(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (has_systemd_rawaccel_unit()) {
         std::string err;
-        if (pkexec_systemctl_async("start", &err)) {
+        if (pkexec_systemctl_async("start", S, &err)) {
             g_timeout_add(1000, [](gpointer p) -> gboolean {
                 update_daemon_status(static_cast<AppState*>(p));
                 return G_SOURCE_REMOVE;
@@ -538,30 +635,24 @@ void on_daemon_start(GtkButton*, gpointer user_data) {
         return;
     }
 
-    // Use fork+execv to avoid shell injection — never pass paths through sh -c
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child: exec pkexec rawaccel-daemon -v -c <config>
-        // setsid so child doesn't die with GUI
-        setsid();
-        const char* args[] = {
-            "pkexec",
-            daemon_path.c_str(),
-            "-v",
-            "-c", S->config_path.c_str(),
+    // Use fork+exec to avoid shell injection — never pass paths through sh -c.
+    // R2-06: route through the shared prijit reporter so a cancelled/refused
+    // pkexec or a missing executable surfaces as a failure, not a lie.
+    {
+        char* args[] = {
+            const_cast<char*>("pkexec"),
+            const_cast<char*>(daemon_path.c_str()),
+            const_cast<char*>("-v"),
+            const_cast<char*>("-c"),
+            const_cast<char*>(S->config_path.c_str()),
             nullptr
         };
-        execvp("pkexec", const_cast<char* const*>(args));
-        _exit(127); // execvp failed
-    } else if (pid > 0) {
-        // Parent: don't wait — daemon runs in background.
-        // Event-driven watcher reaps the child when it terminates without polling timers.
-        g_child_watch_add(pid, [](GPid p, gint /*status*/, gpointer) {
-            g_spawn_close_pid(p);
-        }, nullptr);
-    } else {
-        set_status(S, tr("fork() failed."));
-        return;
+        pid_t pid = pkexec_spawn(args, S,
+            trf("pkexec rawaccel-daemon %s", S->config_path.c_str()));
+        if (pid < 0) {
+            set_status(S, tr("fork() failed."));
+            return;
+        }
     }
     // Update daemon status after a short delay (daemon needs time to start)
     g_timeout_add(1500, [](gpointer p) -> gboolean {
@@ -575,7 +666,7 @@ void on_daemon_stop(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (has_systemd_rawaccel_unit()) {
         std::string err;
-        if (pkexec_systemctl_async("stop", &err)) {
+        if (pkexec_systemctl_async("stop", S, &err)) {
             g_timeout_add(800, [](gpointer p) -> gboolean {
                 update_daemon_status(static_cast<AppState*>(p));
                 return G_SOURCE_REMOVE;
@@ -609,7 +700,7 @@ void on_daemon_reload(GtkButton*, gpointer user_data) {
     if (!daemon_send_signal(SIGHUP, &err)) {
         if (has_systemd_rawaccel_unit()) {
             std::string serr;
-            if (pkexec_systemctl_async("reload", &serr)) {
+            if (pkexec_systemctl_async("reload", S, &serr)) {
                 set_status(S, tr("Daemon reloaded (systemd)."));
                 update_daemon_status(S);
                 return;

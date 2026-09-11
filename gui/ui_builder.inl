@@ -1357,6 +1357,56 @@ static bool kde_write_flat_accel() {
     return kde_write_kwinrc_accel("1", "0");
 }
 
+// ── R2-02: one-shot auto-fix marker ───────────────────────────────────────────
+// on_activate() used to run kde_write_flat_accel() unconditionally on every GUI
+// startup — even when nothing changed, it rewrote kwinrc+kcminputrc and spawned
+// qdbus6/kcminit processes.  Now a marker file in the rawaccel config dir lists
+// the kwinrc section headers the fix has already written.  The full "toggle
+// dance" only runs when there is actually something new: no marker yet, or a
+// hot-plugged "(RawAccel)" device whose section header is missing.  The KDE
+// warning bar ("Fix Now") still covers the case where a user re-enabled
+// acceleration manually — update_kde_warn_bar() detects that and re-offers the
+// one-click fix.
+
+/// Marker path: <config_dir>/kde_fix_applied (same dir as settings.json).
+static std::string kde_fix_marker_path(AppState* S) {
+    return (fs::path(S->config_path).parent_path() / "kde_fix_applied").string();
+}
+
+/// Section headers currently recorded in the marker.
+static std::vector<std::string> kde_fix_marker_read(AppState* S) {
+    std::vector<std::string> out;
+    for (auto& l : kde_read_lines(kde_fix_marker_path(S)))
+        if (!l.empty() && l[0] == '[') out.push_back(l);
+    return out;
+}
+
+/// Persist the freshly-fixed state (global section + every current device).
+static void kde_fix_marker_write(AppState* S, const std::vector<rawaccel_dev_t>& devs) {
+    std::vector<std::string> lines;
+    lines.push_back("[Libinput]");
+    for (auto& d : devs)
+        lines.push_back("[Libinput][" + std::to_string(d.bus) + "][" +
+                        std::to_string(d.vendor) + "][" +
+                        std::to_string(d.product) + "][" + d.name + "]");
+    kde_atomic_write(kde_fix_marker_path(S), lines);
+}
+
+/// True when every current RawAccel device already has a recorded flat
+/// override — i.e. the marker covers the present device set, nothing to fix.
+static bool kde_fix_already_done(AppState* S, const std::vector<rawaccel_dev_t>& devs) {
+    std::vector<std::string> known = kde_fix_marker_read(S);
+    if (known.empty()) return false;
+    for (auto& d : devs) {
+        std::string header = "[Libinput][" + std::to_string(d.bus) + "][" +
+                             std::to_string(d.vendor) + "][" +
+                             std::to_string(d.product) + "][" + d.name + "]";
+        if (std::find(known.begin(), known.end(), header) == known.end())
+            return false; // a device without a recorded override → re-fix
+    }
+    return true;
+}
+
 /// Run a single command via fork+exec, waiting for completion. Returns true
 /// if the child exited with status 0.
 static bool kde_run_cmd(const char* const* argv) {
@@ -1409,6 +1459,9 @@ static void on_kde_fix_clicked(GtkButton*, gpointer user_data) {
     bool ok = kde_write_flat_accel();
     if (ok) {
         // kde_write_flat_accel() already calls kde_reload_input_settings()
+        // R2-02: record the fixed state so on_activate() won't redo the
+        // toggle dance on the next startup for the same device set.
+        kde_fix_marker_write(S, kde_enumerate_rawaccel_devices());
         S->kde_accel_ok = true;
         // Hide the warning bar
         if (S->kde_warn_bar) gtk_widget_set_visible(S->kde_warn_bar, FALSE);
@@ -1465,15 +1518,19 @@ void on_activate(GtkApplication* gapp, gpointer user_data) {
     register_shortcuts(S, gapp);
     build_ui(S, gapp);
 
-    // Auto-fix KDE acceleration on every GUI startup (idempotent).
-    // This catches newly hot-plugged mice — daemon creates a "(RawAccel)"
-    // virtual device for each, and kde_write_flat_accel() reads
-    // /proc/bus/input/devices to write per-device kwinrc overrides.
-    // Generic across hosts and mice (vendor/product/name auto-detected).
+    // Auto-fix KDE acceleration — but ONLY when there is something new to fix
+    // (R2-02): the first run, or a hot-plugged "(RawAccel)" mouse whose kwinrc
+    // override the marker doesn't list yet.  This stops the silent kwinrc write
+    // + qdbus6/kcminit subprocess spawn on every GUI startup while keeping the
+    // freshly-hot-plugged-mouse safety net.
     if (S->is_kde) {
-        if (kde_write_flat_accel()) {
-            kde_reload_input_settings();
-            S->kde_accel_ok = true;
+        std::vector<rawaccel_dev_t> kde_devs = kde_enumerate_rawaccel_devices();
+        if (!kde_fix_already_done(S, kde_devs)) {
+            if (kde_write_flat_accel()) {
+                kde_reload_input_settings();
+                kde_fix_marker_write(S, kde_devs);
+                S->kde_accel_ok = true;
+            }
         }
     }
 
