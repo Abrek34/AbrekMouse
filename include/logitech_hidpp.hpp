@@ -143,6 +143,10 @@ struct hidpp_firmware_record {
 };
 
 struct hidpp_device_info {
+    // 2 = HID++ 2.0 feature set discovered, 1 = HID++ 1.0 register protocol
+    // (no feature index), 0 = Logitech hidraw node that implements neither
+    // (e.g. the 046d:c542 Nano receiver).  protocol_version 0 devices are
+    // listed for display only; HID++ hardware controls never apply.
     uint8_t protocol_version = 0;
     uint8_t target           = 0;
     uint16_t pid             = 0;
@@ -312,6 +316,13 @@ public:
         size_t param_len = 0,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(500),
         uint8_t target_device_index = 0xFF);
+
+    /// Probe the HID++ 1.0 protocol with a short PING (read of register
+    /// 0x0000).  A valid reply — success echo (0x81RR) OR register error
+    /// (0x8FRR) — proves the endpoint speaks the legacy protocol even when
+    /// HID++ 2.0 feature discovery came up empty.  Devices that implement no
+    /// HID++ at all never answer, so this returns false.
+    bool probe_hidpp10(uint8_t target_device_index = 0xFF);
 
     /// Issue a capability-gated HID++ 2.0 feature request and return its
     /// payload without report headers. Unknown features are rejected locally.
@@ -490,6 +501,13 @@ std::optional<hidpp_pairing_slot> hidpp_parse_receiver_pairing(
 std::vector<std::string> discover_logitech_hidraw_devices(const char* root = "/dev");
 
 /// Try to open and identify a Logitech HID++ device.
+///
+/// Returns an identified HID++ 2.0 device (full feature set) or a HID++ 1.0
+/// device (protocol_version 1, no feature index).  Logitech hidraw nodes that
+/// implement neither protocol are still returned with protocol_version 0 and
+/// connected=false so UI layers can explain the limitation instead of showing
+/// an empty list; daemon callers must skip protocol_version 0 devices.
+/// Only an unopenable node yields std::nullopt.
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path);
 
 } // namespace rawaccel

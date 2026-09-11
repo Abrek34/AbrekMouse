@@ -1590,7 +1590,16 @@ static int cmd_hidpp() {
             nlohmann::json entry;
             entry["hidraw_path"] = path;
             if (auto dev = identify_logitech_device(path)) {
-                entry["connected"] = true;
+                entry["connected"] = dev->connected;
+                entry["protocol_version"] = dev->info.protocol_version;
+                if (dev->info.protocol_version == 0) {
+                    // No HID++ at all (e.g. 046d:c542 Nano receiver): display
+                    // shell only — battery/DPI/rate queries cannot apply.
+                    entry["name"] = dev->info.name;
+                    entry["hidpp_not_implemented"] = true;
+                    out.push_back(entry);
+                    continue;
+                }
                 entry["vendor_id"] = dev->vendor_id;
                 entry["product_id"] = dev->product_id;
                 entry["device_index"] = dev->device_index;
@@ -1606,7 +1615,6 @@ static int cmd_hidpp() {
                 entry["model_id"] = dev->info.model_id;
                 entry["transport_flags"] = dev->info.transport_flags;
                 entry["device_kind"] = dev->info.device_kind;
-                entry["protocol_version"] = dev->info.protocol_version;
                 entry["bluetooth_id"] = dev->info.bluetooth_id;
                 entry["bluetooth_le_id"] = dev->info.bluetooth_le_id;
                 entry["wireless_pid"] = dev->info.wireless_pid;
@@ -1734,6 +1742,14 @@ static int cmd_hidpp() {
     for (const auto& path : hidraw_devices) {
         std::cout << "Device: " << path << "\n";
         if (auto dev = identify_logitech_device(path)) {
+            if (dev->info.protocol_version == 0) {
+                std::cout << "  Name: " << dev->info.name << "\n"
+                          << "  (Logitech hidraw node without HID++ — neither\n"
+                          << "   HID++ 2.0 nor HID++ 1.0 is implemented by this\n"
+                          << "   hardware, so onboard DPI/rate/LOD are unavailable)\n";
+                std::cout << "\n";
+                continue;
+            }
             std::cout << "  Name: " << dev->info.name << "\n"
                       << "  Friendly name: " << dev->info.friendly_name << "\n"
                       << "  Serial: " << dev->info.serial << "\n"

@@ -92,6 +92,18 @@ void hw_render_caps(AppState* S, int idx) {
     const logitech_controls c = logitech_controls_for(dev.features);
     std::string m;
 
+    // A Logitech hidraw node that implements neither HID++ 2.0 nor HID++ 1.0
+    // (e.g. the 046d:c542 Nano receiver) is listed so the panel is never
+    // silently empty, but no onboard control can apply to it.
+    if (dev.info.protocol_version == 0) {
+        m += tr("HID++ protocol: not implemented by this device");
+        m += "\n";
+        m += tr("Onboard DPI / report rate / LOD are not available on this hardware.");
+        m += "\n";
+        gtk_label_set_text(GTK_LABEL(S->hw_caps_lbl), m.c_str());
+        return;
+    }
+
     if (!c.dpi) m += tr("DPI: not advertised");
     else if (c.dpi_xy) m += tr("DPI: adjustable + X/Y (extended)");
     else m += tr("DPI: adjustable");

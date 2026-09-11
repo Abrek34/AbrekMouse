@@ -942,6 +942,37 @@ std::optional<std::vector<uint8_t>> HidppTransport::read_register(
     return std::nullopt;
 }
 
+bool HidppTransport::probe_hidpp10(uint8_t target_device_index) {
+    // HID++ 1.0 PING: read of register 0x0000.  A success echo (0x81RR) or a
+    // register error (0x8FRR) can only be produced by a device that decodes
+    // the HID++ register-access sub-ID range; a node that implements no HID++
+    // at all never answers, which is how the 046d:c542 Nano receiver behaves.
+    std::lock_guard lock(request_mutex_);
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index : device_index_.load(std::memory_order_relaxed);
+    std::array<uint8_t, 7> request{};
+    request[0] = 0x10;
+    request[1] = target;
+    request[2] = 0x81;
+    request[3] = 0x00;
+    if (!write_packet(request.data(), request.size())) return false;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(600);
+    uint8_t buf[64];
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) break;
+        size_t len = 0;
+        if (!read_packet(buf, sizeof(buf), len, remaining)) continue;
+        if ((len != 7 && len != 20) || buf[1] != target) continue;
+        if (buf[2] == 0x81 && buf[3] == 0x00) return true; // success echo
+        if (buf[2] == 0x8F && buf[3] == 0x00) return true; // register error
+    }
+    return false;
+}
+
 std::optional<std::vector<uint8_t>> HidppTransport::feature_request(
     uint16_t feature_id, uint8_t function_id, const uint8_t* params,
     size_t param_len, std::chrono::milliseconds timeout,
@@ -1847,6 +1878,16 @@ std::vector<std::string> discover_logitech_hidraw_devices(const char* root) {
     return result;
 }
 
+static std::string hidraw_export_name(const std::string& path) {
+    char buf[256] = {};
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return std::string();
+    if (ioctl(fd, HIDIOCGRAWNAME(sizeof(buf) - 1), buf) < 0)
+        buf[0] = '\0';
+    close(fd);
+    return std::string(buf);
+}
+
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path) {
     HidppTransport transport(hidraw_path);
     if (!transport.is_open()) return std::nullopt;
@@ -1860,21 +1901,52 @@ std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_p
         features = transport.get_feature_set();
         target = 0x00;
     }
-    if (features.empty()) return std::nullopt;
-
-    auto info = transport.get_device_info(target);
-    if (!info) return std::nullopt;
 
     hidpp_device device;
     device.hidraw_path = hidraw_path;
     device.vendor_id = transport.vendor_id();
     device.product_id = transport.product_id();
     device.device_index = target;
-    device.info = *info;
-    device.features = std::move(features);
-    device.feature_metadata = transport.get_feature_metadata();
-    device.connected = true;
 
+    if (!features.empty()) {
+        auto info = transport.get_device_info(target);
+        if (!info) return std::nullopt;
+        device.info = *info;
+        device.features = std::move(features);
+        device.feature_metadata = transport.get_feature_metadata();
+        device.connected = true;
+        return device;
+    }
+
+    // No HID++ 2.0 feature index.  Try the legacy HID++ 1.0 protocol before
+    // giving up: older wired mice (G700/G7-era, M-series) answer register
+    // reads but never expose a feature set.  The receiver always answers on
+    // 0xFF; a direct 1.0 peripheral answers on 0x00.
+    uint8_t v10_target = 0xFF;
+    bool v10 = transport.probe_hidpp10(0xFF);
+    if (!v10 && transport.probe_hidpp10(0x00)) {
+        v10 = true;
+        v10_target = 0x00;
+    }
+    if (v10) {
+        device.device_index = v10_target;
+        device.info.protocol_version = 1;
+        device.info.target = v10_target;
+        // Kernel-exposed HID name; 1.0 register 0x0005 is not a reliable name
+        // source across devices.
+        device.info.name = hidraw_export_name(hidraw_path);
+        device.connected = true;
+        return device;
+    }
+
+    // A Logitech hidraw node with neither protocol (e.g. the 046d:c542 Nano
+    // receiver, which implements no HID++ at all).  Surface it with
+    // protocol_version 0 so the GUI/CLI can explain the limitation instead of
+    // showing an empty panel.  Daemon callers filter these out.
+    device.info.protocol_version = 0;
+    device.info.target = target;
+    device.info.name = hidraw_export_name(hidraw_path);
+    device.connected = false;
     return device;
 }
 

@@ -468,6 +468,16 @@ static void test_logitech_hidraw_discovery() {
     // hardware with no Logitech hidraw node it returns an empty vector.
     auto devices = discover_logitech_hidraw_devices();
     (void)devices; // count depends on hardware — just exercise the default root
+
+    // Identification of an unopenable node yields nullopt (never a protocol-0
+    // display shell — that is only produced once the node is actually readable).
+    EXPECT(!identify_logitech_device("/nonexistent/rawaccel/hidraw99").has_value());
+
+    // A failed transport can neither confirm nor deny HID++ 1.0.
+    HidppTransport closed("/nonexistent/rawaccel/hidraw99");
+    EXPECT(!closed.is_open());
+    EXPECT(!closed.probe_hidpp10());
+    EXPECT(!closed.probe_hidpp10(0x00));
 }
 
 static void test_logitech_hidpp_hardware_controls() {

@@ -1107,6 +1107,11 @@ void AccelDaemon::poll_hidpp_notifications() {
                 [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
             if (known) continue; // already identified; drain only
             if (auto dev = identify_logitech_device(path)) {
+                // protocol_version 0 = Logitech hidraw node with no HID++
+                // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
+                // UI/CLI display entry only and has no battery or notification
+                // stream to subscribe to.
+                if (dev->info.protocol_version == 0) continue;
                 log("HID++ device detected: " + path, true);
                 hidpp_devs_.push_back(std::move(*dev));
             }
