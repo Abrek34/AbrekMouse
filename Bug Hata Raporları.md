@@ -453,3 +453,340 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 13. **TS-1**: Thread safety doğrulandı
 14. **TS-4**: IPC TOCTOU ele alınmış
 15. **PERF-4**: find_mice() maliyeti kabul edilebilir
+
+---
+
+# TUR 7 — Güvenlik Analizi
+
+### SEC-1 · MEDIUM · IPC Socketcredential check yok
+- Konum: `daemon/daemon.cpp:2068-2181`
+- **Açıklama:** IPC Unix socket `chmod 0660 root:input`. `input` grubundaki herhangi bir process bağlanıp `set_config` ile rastgele JSON config gönderebilir. Per-connection credential check (SO_PEERCRED) yok.
+- **Öneri:** SO_PEERCRED + getgrouplist ile bağlanan process'in input grubunda olduğunu doğrula.
+
+### SEC-2 · LOW · CLI --config path validasyonu yok
+- Konum: `cli/main.cpp:2103-2117`
+- **Açıklama:** Daemon `validate_config_path()` kullanıyor ama CLI hiçbir path validasyonu yapmıyor.
+
+### SEC-3 · LOW · PID dosyası world-readable (0644)
+- Konum: `daemon/main.cpp:38`
+
+### SEC-4 · MEDIUM · setup.sh user config ownership doğrulanmamış
+- Konum: `setup.sh:286-301`
+
+### SEC-8 · MEDIUM · Daemon capability drop yapmıyor
+- Konum: `daemon/main.cpp:225-503`
+- **Açıklama:** Tam root yetkileri lifecycle boyunca korunuyor. Minimal capability'e düşürülmeli.
+
+### SEC-9 · LOW · Max profil sayısı sınırı yok (IPC ile bellek tüketimi)
+- Konum: `src/config.cpp:604-609`
+
+---
+
+# TUR 8 — Hata Yönetimi Analizi
+
+### ERR-1 · HIGH · IPC thread kendi kendine join → std::terminate
+- Konum: `daemon/daemon.cpp:2006-2016`
+- **Açıklama:** IPC thread exception handler'ı `stop_ipc_server()` → `ipc_thread_.join()` → thread kendi kendine join → UB → std::terminate. Loop ve HID++ thread doğru davranıyor (yalnızca request_stop()).
+
+### ERR-2 · MEDIUM · dump_latency_stats mutex altında stdout I/O
+- Konum: `daemon/daemon.cpp:1629-1676`
+- **Açıklama:** devices_mutex_ tüm stdout yazımı sırasında tutuluyor. Loop thread starved.
+
+### ERR-3 · MEDIUM · Client FD leak on exception
+- Konum: `daemon/daemon.cpp:2061-2064`
+- **Açıklama:** handle_ipc_client exception fırlatırsa close() atlanıyor → FD leak.
+
+### ERR-4 · LOW · devices.inl inotify buffer alignas eksik
+- Konum: `gui/devices.inl:236`
+
+### ERR-7 · LOW · daemon_ipc_push_config substring match kırılgan
+- Konum: `gui/daemon_comm.inl:210-213`
+
+---
+
+# TUR 9 — IPC Protokol Doğruluğu
+
+### IPC-1 · MEDIUM · Serial IPC push_config disk I/O sırasında blokluyor
+- Konum: `daemon/daemon.cpp:2039-2065`
+
+### IPC-2 · MEDIUM · GUI reader \n contract kırılgan
+- Konum: `gui/daemon_comm.inl:189`
+
+### IPC-3 · MEDIUM · Versiyon müzakeresi yok
+- Konum: daemon/CLI/GUI
+
+---
+
+# TUR 10 — Satır Satır Derin Kod İncelemesi (KRİTİK BUG'LAR)
+
+### BUG-CRIT-1 · KRİTİK · Motion kaybı — mid-batch SYN_REPORT sonrası tail flush
+- Konum: `daemon/daemon.cpp:1619-1624`
+- **Hata:** Guard `!has_syn` ama doğru olan `has_motion || wrote_unsynced_event`. SYN_REPORT geldikten sonraREL_X/+3 biriktiyse bu blok atlanıyor, motion kalıcı kaybolur.
+- **Düzeltme:** `!has_syn` → `has_motion || wrote_unsynced_event`
+
+### BUG-CRIT-2 · KRİTİK · INT_MAX UB — (double)INT_MAX == 2147483648.0 (3 yer)
+- Konum: `daemon/daemon.cpp:1403`, `daemon/motion_math.hpp:44`, `src/config.cpp:545`
+- **Hata:** `(double)INT_MAX == 2147483648.0`. std::clamp eşitliği geçiş saymaz → static_cast<int>(2147483648.0) = UB.
+- **Düzeltme:** `INT_HI = 2147483647.5`
+
+### BUG-HIGH-1 · YÜKSEK · NaN percentile UB
+- Konum: `daemon/lat_stats.hpp:103-105, 131-133`
+- **Hata:** pct=NaN her iki guard'ı da geçer → ceil(count*NaN/100)=NaN → static_cast<uint64_t>(NaN) = UB.
+
+### BUG-HIGH-2 · YÜKSEK · Raw motion sızıntısı — modifier early return
+- Konum: `include/rawaccel.hpp:242`
+- **Hata:** `if (!std::isfinite(time) || time <= 0) return;` → in.x/in.y sıfırlanmıyor → raw delta 1:1 iletilir.
+
+### BUG-MED-1 · ORTA · migrate_lookup_gain Inf LUT zehirlenmesi
+- Konum: `src/config.cpp:831-849`
+- **Hata:** Migration sanitize sonrası çalışıyor. y*x overflow → Inf LUT'a yazılıyor.
+
+### BUG-MED-2 · ORTA · Post-reload interval spike
+- Konum: `daemon/daemon.cpp:835`
+- **Hata:** `last_time_ms = now_ms()` → ilk event'te time≈0 → ips_factor absürt → tek kare jump.
+
+### BUG-LOW-1 · DÜŞÜK · Dead branch — setup_devices() her zaman true
+- Konum: `daemon/daemon.cpp:469, 881`
+
+### BUG-LOW-2 · DÜŞÜK · version_lt negative component (strtoul("-1") → ULONG_MAX)
+- Konum: `src/config.cpp:863-871`
+
+---
+
+# TUR 11 — Kod Kalitesi
+
+### Dead Code
+| # | Konum | Açıklama |
+|---|-------|----------|
+| DC1 | `accel-synchronous.hpp:37-40` | Gain mode 8 dead member |
+| DC2 | `accel-synchronous.hpp:101-132` | velocity her zaman true — dead branch |
+
+### Kod Tekrarı
+| # | Konum | Açıklama |
+|---|-------|----------|
+| DD1 | `accel-classic.hpp:82-176` | pow+guard 4× tekrar |
+| DD4 | `rawaccel.hpp:20,50` | cutoffCoefficient duplicate |
+
+### Magic Numbers
+| # | Konum | Açıklama |
+|---|-------|----------|
+| MN1 | `rawaccel.hpp:124,192-198` | 1e-9 8× farklı amaç |
+
+### Include Hijyeni
+| # | Konum | Açıklama |
+|---|-------|----------|
+| IH1 | `accel-classic.hpp:33` | std::max ama <algorithm> yok |
+
+---
+
+# TUR 12 — Edge Case / Stress / Test Kapsamı Boşlukları
+
+### Test Kapsamı Boşlukları
+| # | Alan | Eksik |
+|---|------|-------|
+| TC-1 | Logitech quirks | logitech_quirks.hpp hiç test edilmemiş |
+| TC-2 | Migration | migrate_config() actual migration test edilmemiş |
+| TC-3 | IPC wire protocol | handle_ipc_client test edilmemiş |
+| TC-4 | Fuzz盲点 | fuzz_accel non-finite time test etmiyor |
+
+---
+
+# TUR 13 — GUI Derinlemesine İnceleme
+
+### G-1 · ORTA · KDE fix GTK ana thread'i donduruyor
+- Konum: `gui/ui_builder.inl`
+- **Açıklama:** kde_write_flat_accel() 250ms sleep ve 3 subprocess waitpid yapıyor, GTK main thread'de çalışıyor. Startup'ta ve "Fix Now" butonunda çalışıyor.
+- **Düzeltme:** Detached worker thread'e taşı (uygulandı ✓)
+
+### G-2 · ORTA · Dil combo'su build zamanında çevriliyor
+- Konum: `gui/ui_builder.inl:130`
+- **Açıklama:** tr() "Auto (locale)" → "Otomatik (sistem)" çeviriyor ama model yeniden oluşturulmuyor.
+- **Düzeltme:** Ham string ekle (uygulandı ✓)
+
+### G-3 · LOW · mode_uses her çağrıda heap alloc
+- Konum: `gui/widgets_sync.inl:38`
+- **Düzeltme:** initializer_list ile değiştirildi (uygulandı ✓)
+
+### G-4 · ORTA · Graph pan zoom race
+- Konum: `gui/graph.inl:282`
+- **Düzeltme:** drag_zoom_start eklendi (uygulandı ✓)
+
+### G-5 · LOW · Whitespace-only profile name kabul ediliyor
+- Konum: `gui/profile_mgr.inl`
+- **Düzeltme:** trim_profile_name() eklendi (uygulandı ✓)
+
+### G-6 · LOW · Premature "Daemon reloaded" mesajı
+- Konum: `gui/widgets_sync.inl:700`
+- **Düzeltme:** "Requesting..." + delayed refresh (uygulandı ✓)
+
+---
+
+# TUR 14 — Logitech HID++ / Receiver Analizi
+
+### B1 · ORTA · Bolt pairing slotu "occupied" her zaman true
+- Konum: `src/logitech_hidpp.cpp:390`
+- **Açıklama:** payload[0] echo byte'ı (subregister byte) — hiçbir zaman sıfır olamaz. Gerçek "dolu/bos" payload[1..3]'te (kind nibble veya WPID).
+
+### B2 · ORTA · HID++ 1.0 bildirimleri 2.0'a sahte sınıflandırma
+- Konum: `src/logitech_hidpp.cpp:502-520`
+- **Açıklama:** sub_id ∈ {0x40..0x4B} + address & 0x0F == 0 ise hidpp20 olarak sınıflandırılıyor (yanlış). 1.0 cihazlarda CONNECT_DISCONNECT olayı sessizce düşer.
+- **Düzeltme:** `const bool hidpp20 = sub_id < 0x40 && (address & 0x0F) == 0;`
+
+### B3 · LOW · Genişletilmiş rapor hızı fallback eksik
+- Konum: `src/logitech_hidpp.cpp:1760-1768`
+- **Açıklama:** 0x8061 nullopt döndürdüğünde 0x8060 legacy dilimine inmiyor.
+
+### B4 · LOW · Model ID parçaları yanlış genişlik (2 hex vs 4 hex)
+- Konum: `src/logitech_hidpp.cpp:1299-1311`
+
+### B5 · LOW · almost_full (0x02) şarj ediliyor sayılmıyor
+- Konum: `src/logitech_hidpp.cpp:190,204`
+- **Düzeltme:** `status == 0x01 || status == 0x02 || status == 0x04`
+
+### B6 · LOW · BATTERY_CHARGE default dal cihazı çevrimdışı yapıyor
+- Konum: `src/logitech_hidpp.cpp:216-220`
+
+### B7 · LOW · from_bytes() legacy_battery data[6]==0 şartı
+- Konum: `src/logitech_hidpp.cpp:499-500`
+
+### B8 · LOW · Bolt cihaz adı hiç okunmuyor
+- Konum: `src/logitech_hidpp.cpp:1476-1496`
+
+---
+
+# TUR 15 — CLI Derinlemesine İnceleme
+
+### C-1 · ORTA · -c/--config sonraki token'ı yutuyor
+- Konum: `cli/main.cpp:2119-2127`
+- **Açıklama:** `rawaccel-cli -c --json list` config path'i literal "--json" olarak ayarlıyor → dosya oluşturuyor.
+
+### C-2 · ORTA · speed_max < speed_min kabul ediliyor
+- Konum: `cli/main.cpp:948-953` + `src/config.cpp:497-498`
+- **Açıklama:** Sessizce clamp ediliyor ama rc=0 dönüyor.
+
+### C-3 · ORTA · mode=lookup uyarısı lut-data'yı gösteriyor — CLI'da yok
+- Konum: `cli/main.cpp:968-972`
+- **Açıklama:** LUT verileri yalnızca GUI ve import ile değiştirilebilir.
+
+### C-4 · ORTA · Import edilen isim > 256 sessizce truncate ediliyor
+- Konum: `cli/main.cpp:1247-1251` + `src/config.cpp:571`
+
+### C-5 · YÜKSEK · gaming preset'in limit=1.8'i cap_mode=out 1.5 ile ulaşılamaz
+- Konum: `include/presets.hpp:26-40`
+- **Açıklama:** Classic GAIN modunda cap.y=1.5 (default) → gain asimptotu 1.5. limit=1.8 hiçbir zaman çalışmaz.
+- **Düzeltme:** cap = {0, 1.5} veya limit ile eşleşecek cap ayarla.
+
+### C-6 · YÜKSEK · --no-daemon + reload hiç uygulanmaz
+- Konum: `cli/main.cpp:239,247` + `src/config.cpp:803-821`
+- **Açıklama:** --no-daemon user home'a kaydediyor, reload daemon'un /etc/ dosyasını okuyor. İkisi farklı dosya → düzenleme sessizce kaybolur.
+
+### C-7 · DÜŞÜK · Stop zaten durmuş daemon'da rc=1 dönüyor
+- Konum: `cli/main.cpp:1330-1338`
+
+### C-8 · DÜŞÜK · Unknown command stdout'a help dump yapıyor (stderr olmalı)
+- Konum: `cli/main.cpp:2256-2259`
+
+---
+
+# TUR 16 — Build System / Setup Analizi
+
+### BS-1 · YÜKSEK · setup.sh clean_old_install modprobe.conf'u temizlemiyor
+- Konum: `setup.sh:213-214`
+
+### BS-2 · YÜKSEK · setup.sh build → clean order: stale .o ABI mismatch riski
+- Konum: `setup.sh:537-541`
+- **Açıklama:** Build, clean'den önce çalışıyor. Eski GCC version)object files varsa ABI mismatch.
+
+### BS-3 · YÜKSEK · ASan build logitech dosyalarını kapsamıyor
+- Konum: `tests/run_tests_asan.sh:23-28`
+- **Açıklama:** logitech_receiver.cpp ve logitech_hidpp.cpp Sanity test altında compile edilmiyor.
+
+### BS-4 · YÜKSEK · setup.sh GTK4 yoksa verify_install "EKSİK" raporluyor
+- Konum: `setup.sh:538`
+
+### BS-5 · ORTA · run_fuzz.sh unquoted $FUZZ_FLAGS + eksik logitech kaynakları
+- Konum: `tests/run_fuzz.sh:25,28,37`
+
+### BS-6 · ORTA · setup.sh backup timestamp collision (aynı saniye)
+- Konum: `setup.sh:296-300`
+
+### BS-7 · ORTA · udevadm control --reload-rules container'da fail oluyor
+- Konum: `setup.sh:312`
+
+### BS-8 · ORTA · build.sh unquoted compiler vars
+- Konum: `scripts/build.sh:97,107,117`
+
+### BS-9 · ORTA · bench_hotpath.sh hardening flags eksik
+- Konum: `scripts/bench_hotpath.sh:17-31`
+
+### BS-10 · ORTA · perf-gate CI job eksik dependency
+- Konum: `.github/workflows/ci.yml:136-153`
+
+### BS-11 · ORTA · PIDFile dead config (Type=simple)
+- Konum: `scripts/rawaccel.service:24`
+
+### BS-12 · DÜŞÜK · CMakeLists hardcoded DESTINATION
+- Konum: `CMakeLists.txt:144-145`
+
+---
+
+# TUR 17 — Threading / Timing Derinlemesine İnceleme
+
+### TH-1 · ORTA · stop_ipc_server concurrent double-entry — data race
+- Konum: `daemon/daemon.cpp:2031-2054`
+- **Açıklama:** IPC thread catch → stop_ipc_server() ve main thread → stop_ipc_server() eş zamanlı → ipc_sock_path_ data race (plain std::string, no lock).
+
+### TH-2 · ORTA · push_cfg_mu_ wait boundsuz — IPC DoS
+- Konum: `daemon/daemon.cpp:553`
+- **Açıklama:** set_config push_config mutex'i beklerken hotplug setup_devices() çok uzun sürebilir → serial accept loop bloklanır → status/reload/ping timeout.
+
+### TH-3 · ORTA · dump_latency_stats mutex altında cout I/O
+- Konum: `daemon/daemon.cpp:1646-1685`
+- **Açıklama:** stdout block olursa devices_mutex_ tutuluyor → hotplug/reload starved.
+
+### TH-4 · ORTA · Telemetry seqlock spin devices_mutex_ altında
+- Konum: `daemon/daemon.cpp:1824-1845`
+- **Açıklama:** 64-spin seqlock devices_mutex_ altında → yüksek hızda yazıcı varken mutex starved. Hiclik, per-device alanların zaten atomic olması.
+
+### TH-5 · LOW · config_path_ unsynchronized access (bugün güvenli invariant nedeniyle)
+- Konum: `daemon/daemon.cpp:534,551,2178`
+
+### TH-6 · LOW · Per-device hot-path state loop thread convention'a bağlı
+- Konum: `daemon/daemon.cpp:1485-1635,811-836`
+
+### TH-7 · LOW · Signal handler std::atomic lock-free guarantee yok
+- Konum: `daemon/main.cpp:83-99`
+
+### Doğrulanan Temiz Noktalar (tur 17):
+- Lock order acyclic (push_cfg_mu_ → devices_mutex_ → lat.mtx → log_mu_)
+- CLOCK_MONOTONIC_RAW unified
+- Seqlock protocol doğru
+- Deadlock yok
+- Condition variable yok (hepsi sticky atomic flag)
+- EINTR her yerde ele alınıyor
+
+---
+
+## GÜNCEL TOPLAM — TÜM 17 TUR
+
+### KRİTİK:
+1. BUG-CRIT-1 — Motion kaybı (mid-batch tail flush)
+2. BUG-CRIT-2 — INT_MAX UB (3 yerde)
+
+### YÜKSEK:
+3. ERR-1 — IPC thread self-join → std::terminate
+4. BUG-HIGH-1 — NaN percentile UB
+5. BUG-HIGH-2 — Raw motion sızıntısı
+6. POLL-1 — 2000/4000/8000 Hz algılama hatası
+7. C-5 — gaming preset limit cap çelişkisi
+8. C-6 — --no-daemon + reload uygulanmıyor
+9. BS-1 — setup.sh modprobe.conf temizlenmiyor
+10. BS-2 — stale .o ABI mismatch riski
+11. BS-3 — ASan build logitech kapsamıyor
+12. BS-4 — GTK4 yoksa false "EKSİK"
+
+### ORTA:
+13-30: BUG-MED-1/2, ERR-2/3, SEC-1/4/8, IPC-1/2/3, G-1/2/4, B1/2, C-1/2/3/4, BS-5..11, TH-1/2/3/4
+
+### DÜŞÜK:
+31+: BUG-LOW-1/2, ERR-4..7, SEC-2/3/9, G-3/5/6, B3-B8, C-7/8, BS-12, TH-5/6/7

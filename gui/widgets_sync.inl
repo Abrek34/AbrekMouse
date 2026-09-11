@@ -35,7 +35,7 @@ static void update_raw_sensitivity(AppState* S, bool raw) {
 // gain (LEGACY/GAIN switch) is meaningful for unchanged modes: classic
 // (classic<GAIN>) and jump/synchronous (activation_framework<GAIN>); lookup
 // gain toggles the velocity (y/x) interpretation.
-static bool mode_uses(accel_mode m, std::vector<accel_mode> modes) {
+static bool mode_uses(accel_mode m, std::initializer_list<accel_mode> modes) {
     for (accel_mode x : modes) if (m == x) return true;
     return false;
 }
@@ -250,6 +250,19 @@ void widgets_to_profile(AppState* S) {
         }
     }
 
+// P-APP: app match entry → match_app (trimmed, lowercased by the daemon's
+    // ascii_icontains; keep it store-friendly and cap at the JSON limit).
+    if (S->match_app_entry) {
+        const gchar* txt = gtk_editable_get_text(GTK_EDITABLE(S->match_app_entry));
+        std::string app = txt ? txt : "";
+        // trim leading/trailing whitespace
+        while (!app.empty() && std::isspace((unsigned char)app.back())) app.pop_back();
+        size_t b = 0; while (b < app.size() && std::isspace((unsigned char)app[b])) ++b;
+        app = app.substr(b);
+        if (app.size() > 128) app.resize(128);
+        dp.match_app = app;
+    }
+
 #undef SPIN
 #undef CHECK
 #undef DD
@@ -342,6 +355,11 @@ void profile_to_widgets(AppState* S) {
     if (S->device_id_combo)
         gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo),
                                    (guint)device_combo_select(S, dp.device_id));
+
+    // P-APP: match_app entry (only when not mid-update to avoid clearing user input)
+    if (S->match_app_entry)
+        gtk_editable_set_text(GTK_EDITABLE(S->match_app_entry),
+                              dp.match_app.c_str());
 
 #undef SET_SPIN
 #undef SET_DD
@@ -701,8 +719,15 @@ void on_daemon_reload(GtkButton*, gpointer user_data) {
         if (has_systemd_rawaccel_unit()) {
             std::string serr;
             if (pkexec_systemctl_async("reload", S, &serr)) {
-                set_status(S, tr("Daemon reloaded (systemd)."));
-                update_daemon_status(S);
+                // pkexec runs asynchronously — the polkit prompt may still be
+                // open, so never claim success here.  The pkexec watchdog
+                // (pkexec_child_report) surfaces any failure in the status bar;
+                // refresh the daemon state only after the subprocess settles.
+                set_status(S, tr("Requesting daemon reload via systemd..."));
+                g_timeout_add(1800, [](gpointer p) -> gboolean {
+                    update_daemon_status(static_cast<AppState*>(p));
+                    return G_SOURCE_REMOVE;
+                }, S);
                 return;
             }
             set_status(S, std::string(tr(err.c_str())) + " | " + tr(serr.c_str()));

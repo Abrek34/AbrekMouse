@@ -5,6 +5,16 @@
 #include <fstream>
 #include <cerrno>
 
+/// Strip surrounding whitespace from a typed-in profile name before the
+/// "not empty" gate — a name of only spaces used to pass gtk_editable_get_text
+/// and produce a blank/ambiguous profile row.
+static std::string trim_profile_name(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
 /// Write a text file at `path`, atomically via a temp file + rename (same
 /// discipline as save_config). Returns true on success, false on I/O failure.
 ///
@@ -193,7 +203,7 @@ void show_new_profile_dialog(AppState* S) {
     auto do_ok = +[](GtkWidget*, gpointer dlg_ptr) {
         GtkWidget* d = GTK_WIDGET(dlg_ptr);
         auto* ctx = static_cast<NewProfileCtx*>(g_object_get_data(G_OBJECT(d), "ctx"));
-        std::string name = gtk_editable_get_text(GTK_EDITABLE(ctx->entry));
+        std::string name = trim_profile_name(gtk_editable_get_text(GTK_EDITABLE(ctx->entry)));
         int idx = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctx->combo));
         std::string preset =
             (idx > 0 && idx <= rawaccel::PRESET_COUNT) ? rawaccel::PRESET_NAMES[idx - 1] : "";
@@ -284,7 +294,7 @@ void show_input_dialog(AppState* S,
         GtkWidget* e = GTK_WIDGET(g_object_get_data(G_OBJECT(dlg_ptr), "entry"));
         auto* cb_p   = (std::function<void(const std::string&)>*)
                         g_object_get_data(G_OBJECT(dlg_ptr), "cb");
-        std::string val = gtk_editable_get_text(GTK_EDITABLE(e));
+        std::string val = trim_profile_name(gtk_editable_get_text(GTK_EDITABLE(e)));
         if (!val.empty() && cb_p) (*cb_p)(val);
         gtk_window_destroy(GTK_WINDOW(dlg_ptr));
     };

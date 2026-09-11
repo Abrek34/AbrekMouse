@@ -166,7 +166,14 @@ private:
     /// grab, and falls back to a full setup when no devices are open yet.
     void apply_new_config(const app_config& new_cfg);
     /// Searches by device_id match first, then active_profile, then the first profile.
+    /// P-APP: when current_app_ is non-empty, a profile whose match_app CLASSNOT
+    /// matches the focused application is preferred over the global fallback.
     const device_profile* find_profile(const std::string& dev_id) const;
+    /// P-APP: applies the profile that matches the currently focused application.
+    /// Called from the loop thread when the GUI reports a focus change via
+    /// "set_active_app" IPC; live-reapplies per-device settings without dropping
+    /// grabs (same contract as apply_new_config).
+    void apply_active_app();
     void handle_hotplug();
     void do_hotplug_scan();
     /// P168: non-blocking HID++ notification drain hook.  Runs on the loop
@@ -245,6 +252,17 @@ private:
     std::mutex   push_cfg_mu_;
     app_config   push_cfg_;
     bool         push_cfg_pending_ = false;
+
+    // ── P-APP: per-application profile switching ──────────────────────────
+    // Focused application (WM_CLASS class / cmdline basename, lowercased) as
+    // reported by the GUI over IPC ("set_active_app <app>").  Only ever mutated
+    // on the loop thread; the IPC thread stashes a pending value in the slot
+    // below and the loop consumes it at a safe point (same pattern as the
+    // config push).  Empty = "no focused app reported / desktop matching off".
+    std::mutex   active_app_mu_;
+    std::string  pending_app_;
+    bool         active_app_dirty_ = false;
+    std::string  current_app_;
 
     // IPC server state
     std::thread         ipc_thread_;

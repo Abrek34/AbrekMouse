@@ -112,6 +112,7 @@ std::string check_duplicate_device_ids(const app_config& cfg) {
 #include "mouse_test.inl"
 #include "profile_mgr.inl"
 #include "hidpp_panel.inl"
+#include "kwin_focus.inl"
 #include "ui_builder.inl"
 
 // ── main ─────────────────────────────────────────────────────────────────────

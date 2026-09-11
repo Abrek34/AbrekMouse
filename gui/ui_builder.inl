@@ -127,7 +127,11 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     {
         static const char* LANG_KEYS[] = {"Auto (locale)", "English", "Türkçe", nullptr};
         GtkStringList* lsl = gtk_string_list_new(nullptr);
-        for (int i = 0; LANG_KEYS[i]; i++) gtk_string_list_append(lsl, tr(LANG_KEYS[i]));
+        // Deliberately NOT tr(): the model is built once at startup and never
+        // rebuilt on language switch, so translating here would make the entry
+        // language-dependent (and stale after switching) — the control must
+        // always read "Auto (locale) / English / Türkçe".
+        for (int i = 0; LANG_KEYS[i]; i++) gtk_string_list_append(lsl, LANG_KEYS[i]);
         S->lang_combo = gtk_drop_down_new(G_LIST_MODEL(lsl), nullptr);
         g_object_unref(lsl);
         gtk_drop_down_set_selected(GTK_DROP_DOWN(S->lang_combo), (guint)(S->lang_override + 1));
@@ -643,6 +647,19 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         GtkWidget* da_grid = append_grid();
         grid_row(da_grid, 0, "Mouse:", S->device_id_combo);
 
+        // P-APP: per-application profile binding.  Empty = apply always;
+        // non-empty = only while the focused app's WM_CLASS matches.  Works
+        // automatically on KDE Wayland (KWin focus relay) and X11; on other
+        // desktops the daemon uses the last value pushed via IPC.
+        S->match_app_entry = gtk_entry_new();
+        gtk_entry_set_placeholder_text(GTK_ENTRY(S->match_app_entry),
+                                       tr("App class (e.g. firefox) — optional"));
+        gtk_entry_set_max_length(GTK_ENTRY(S->match_app_entry), 128);
+        gtk_widget_set_hexpand(S->match_app_entry, TRUE);
+        g_signal_connect(S->match_app_entry, "changed",
+                         G_CALLBACK(on_notify_param_changed), S);
+        grid_row(da_grid, 1, "App:", S->match_app_entry);
+
         // Yenile butonu — fare listesini yeniden tara
         GtkWidget* refresh_btn = gtk_button_new_from_icon_name("view-refresh-symbolic");
         trtip(refresh_btn, "Rescan connected mice");
@@ -975,6 +992,8 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             }
             // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
             S2->hw_cancel = true;
+            // P-APP: unload the KWin focus script, release the GDBus name
+            kwin_focus_uninstall(S2);
         }), S);
 
     gtk_window_present(GTK_WINDOW(S->window));
@@ -1440,6 +1459,55 @@ static void kde_reload_input_settings() {
     }
 }
 
+// ── Async KDE fix ─────────────────────────────────────────────────────────────
+// kde_run_cmd() forks and waitpid()s up to three subprocesses and
+// kde_write_flat_accel() sleeps 250 ms mid-dance, so the whole fix sequence
+// takes well over 300 ms.  Running it on the GTK main thread froze the window
+// on every startup (on_activate) and on every "Fix Now" click.  The sequence
+// touches only files and child processes — no widgets — so it runs on a worker
+// thread; the finish idle marshals the result back to the main thread.
+struct kde_fix_task {
+    AppState* S = nullptr;
+    bool ok = false;
+};
+
+static gboolean kde_fix_finish(gpointer p) {
+    auto* t = static_cast<kde_fix_task*>(p);
+    AppState* S = t->S;
+    if (t->ok) {
+        kde_fix_marker_write(S, kde_enumerate_rawaccel_devices());
+        S->kde_accel_ok = true;
+        if (S->kde_warn_bar) gtk_widget_set_visible(S->kde_warn_bar, FALSE);
+        set_status(S, tr("KDE: libinput acceleration disabled. Changes applied immediately."));
+    } else {
+        set_status(S, tr("KDE: Could not write to kwinrc. Edit manually: System Settings → Input Devices → Mouse → Pointer Acceleration = Flat."));
+    }
+    S->kde_fix_running = false;
+    delete t;
+    return G_SOURCE_REMOVE;
+}
+
+static gpointer kde_fix_worker(gpointer p) {
+    auto* t = static_cast<kde_fix_task*>(p);
+    t->ok = kde_write_flat_accel();
+    // Apply the final Flat state: kde_write_flat_accel() reloads KWin after
+    // the temporary Adaptive step only; this second reload pushes the kept
+    // Flat profile to the running compositor/the KCM (applies to "Fix Now").
+    if (t->ok) kde_reload_input_settings();
+    g_idle_add(kde_fix_finish, t);
+    return nullptr;
+}
+
+/// Start the async KDE fix if one is not already running.  No-op otherwise.
+static void kde_fix_start(AppState* S) {
+    if (S->kde_fix_running) return;
+    S->kde_fix_running = true;
+    auto* t = new kde_fix_task;
+    t->S = S;
+    GThread* th = g_thread_new("kde-fix", kde_fix_worker, t);
+    g_thread_unref(th); // worker is detached; it keeps itself alive via idle
+}
+
 /// Callback: "Manual" button — opens KDE System Settings mouse page.
 static void on_kde_open_settings(GtkWidget*, gpointer) {
     GError* err = nullptr;
@@ -1456,19 +1524,7 @@ static void on_kde_open_settings(GtkWidget*, gpointer) {
 /// Callback: "Fix Now" button in the KDE warning bar.
 static void on_kde_fix_clicked(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
-    bool ok = kde_write_flat_accel();
-    if (ok) {
-        // kde_write_flat_accel() already calls kde_reload_input_settings()
-        // R2-02: record the fixed state so on_activate() won't redo the
-        // toggle dance on the next startup for the same device set.
-        kde_fix_marker_write(S, kde_enumerate_rawaccel_devices());
-        S->kde_accel_ok = true;
-        // Hide the warning bar
-        if (S->kde_warn_bar) gtk_widget_set_visible(S->kde_warn_bar, FALSE);
-        set_status(S, tr("KDE: libinput acceleration disabled. Changes applied immediately."));
-    } else {
-        set_status(S, tr("KDE: Could not write to kwinrc. Edit manually: System Settings → Input Devices → Mouse → Pointer Acceleration = Flat."));
-    }
+    kde_fix_start(S); // async — result/status handled in kde_fix_finish
 }
 
 /// Check KDE state and show/hide the warning bar.
@@ -1525,14 +1581,15 @@ void on_activate(GtkApplication* gapp, gpointer user_data) {
     // freshly-hot-plugged-mouse safety net.
     if (S->is_kde) {
         std::vector<rawaccel_dev_t> kde_devs = kde_enumerate_rawaccel_devices();
-        if (!kde_fix_already_done(S, kde_devs)) {
-            if (kde_write_flat_accel()) {
-                kde_reload_input_settings();
-                kde_fix_marker_write(S, kde_devs);
-                S->kde_accel_ok = true;
-            }
-        }
+        if (!kde_fix_already_done(S, kde_devs))
+            kde_fix_start(S); // async: worker + idle (no main-thread freeze)
     }
+
+    // P-APP: KDE Wayland active-window focus relay (best-effort; no-op when
+    // KWin / session bus unavailable).  Per-app profiles (`match_app`) become
+    // live even for native Wayland windows via the embedded KWin script.
+    if (S->is_kde && S->is_wayland)
+        kwin_focus_install(S);
 
     // Warn on startup if multiple profiles share the same device_id
     std::string dup_warn = check_duplicate_device_ids(S->config);

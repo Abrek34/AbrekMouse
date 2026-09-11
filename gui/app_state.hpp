@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <functional>
 #include <pwd.h>
+#include <initializer_list>
 
 #include "../include/rawaccel.hpp"
 #include "../include/config.hpp"
@@ -93,6 +94,7 @@ struct AppState {
     double graph_pan_x    = 0.0;
     bool   graph_drag     = false;
     double drag_pan_start = 0.0;
+    double drag_zoom_start = 1.0; // zoom at drag start — pan must not re-read live zoom
     // Cached Y-axis max gain from the last draw — on_graph_motion reuses it
     // instead of re-running the full 200-sample compute_max_gain() on every
     // mouse move (L-BUG-17).  Any graph-visible state change triggers a
@@ -103,6 +105,7 @@ struct AppState {
     bool   is_kde          = false;   // true if running under KDE Plasma
     bool   is_wayland      = false;   // true if Wayland session
     bool   kde_accel_ok    = true;    // false = libinput accel NOT disabled → double-accel!
+    bool   kde_fix_running = false;   // an async KDE fix worker is in flight
     GtkWidget* kde_warn_bar = nullptr; // infobar shown when kde_accel_ok == false
 
     // Auto-detected device properties (from daemon status_json)
@@ -241,7 +244,10 @@ struct AppState {
 
     // Device assignment
     GtkWidget* device_id_combo = nullptr;
+    GtkWidget* match_app_entry = nullptr;  // P-APP: optional focused-app class
     std::vector<InputDeviceInfo> mice_list;
+    // P-APP: KWin focus relay internal context (kwin_focus.inl)
+    void* kwin_focus_ctx = nullptr;
 };
 
 // ── Global app state pointer (defined in main.cpp) ───────────────────────────

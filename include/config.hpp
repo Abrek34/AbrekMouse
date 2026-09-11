@@ -32,6 +32,13 @@ struct device_profile {
     std::string  name;
     device_config dev_cfg;
     profile      prof;
+    // P-APP profile: non-empty → this profile only applies while an
+    // application whose WM_CLASS (or cmdline basename) contains this
+    // case-insensitive substring is focused.  Empty = applies always
+    // (fallback).  When both device_id and match_app are set, BOTH must
+    // match for the profile to be used; "All devices" with an app match
+    // is the common configuration.
+    std::string  match_app;
 };
 
 struct app_config {

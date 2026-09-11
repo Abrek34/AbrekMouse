@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cmath>
 #include <iostream>
 #include <iomanip>
@@ -40,6 +41,34 @@ static double now_ms() {
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return static_cast<double>(ts.tv_sec) * 1000.0 +
            static_cast<double>(ts.tv_nsec) / 1'000'000.0;
+}
+
+// ── P-APP: per-application profile matching ──────────────────────────────────
+// A profile's match_app is matched case-insensitively as a SUBSTRING of the
+// focused application class (WM_CLASS class, e.g. "firefox", "org.kde.krita").
+// Substring semantics keep per-app configs tolerant of versioned WM_CLASSes
+// (e.g. "Code" vs "code-server") while still letting "chromium" match anything
+// Chromium-based that keeps the base class.
+static bool ascii_icontains(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (haystack.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (size_t k = 0; k < needle.size(); ++k) {
+            const char a = haystack[i + k], b = needle[k];
+            if (std::tolower(static_cast<unsigned char>(a)) !=
+                std::tolower(static_cast<unsigned char>(b))) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+/// Empty match_app matches everything (no app constraint).  Only meaningful
+/// when the daemon has a focused-app report at all.
+static bool profile_matches_app(const device_profile& p, const std::string& app) {
+    if (p.match_app.empty()) return true;
+    return ascii_icontains(app, p.match_app);
 }
 
 // ── sysfs device property helpers ────────────────────────────────────────────
@@ -790,6 +819,24 @@ void AccelDaemon::teardown_devices() {
 }
 
 const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const {
+    // P-APP: a profile with a non-empty match_app applies ONLY while the
+    // focused application matches.  current_app_ is set from the GUI's
+    // "set_active_app" IPC (WM_CLASS class, lowercased).  We check the app
+    // constraint FIRST, per device preference order:
+    //   1. device_id + app match       (highest priority)
+    //   2. "all devices" + app match
+    //   3. device_id (no app constraint, i.e. generic binding)
+    //   4. "all devices" (generic fallback)
+    //   5. active_profile / first profile (historic fallbacks)
+    const bool have_app = !current_app_.empty();
+    if (have_app) {
+        for (auto& p : config_.profiles)
+            if (!p.device_id.empty() && p.device_id == dev_id &&
+                profile_matches_app(p, current_app_)) return &p;
+        for (auto& p : config_.profiles)
+            if (p.device_id.empty() &&
+                profile_matches_app(p, current_app_)) return &p;
+    }
     // 1. Device-specific assignment takes priority
     for (auto& p : config_.profiles)
         if (!p.device_id.empty() && p.device_id == dev_id) return &p;
@@ -806,6 +853,33 @@ const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const
     // 4. First profile (last resort fallback)
     if (!config_.profiles.empty()) return &config_.profiles[0];
     return nullptr;
+}
+
+void AccelDaemon::apply_active_app() {
+    // Consume the GUI's latest focus report (loop thread only).  IPC thread
+    // wrote pending_app_ under active_app_mu_; we copy it into current_app_
+    // and re-apply profiles only when the focused app actually changed.
+    std::string next;
+    {
+        std::lock_guard<std::mutex> lk(active_app_mu_);
+        if (!active_app_dirty_) return;
+        active_app_dirty_ = false;
+        next = pending_app_;
+    }
+    if (next == current_app_) return;
+
+    if (next.empty())
+        log("Focus: no application focused — app-specific profiles inactive.");
+    else
+        log("Focus: application \"" + next + "\" — re-applying profiles.");
+    current_app_ = next;
+
+    // Recompute the active profile for every open device, live (no grab drop).
+    std::lock_guard<std::mutex> lk(devices_mutex_);
+    for (auto& dev : devices_) {
+        const device_profile* prof = find_profile(dev.device_id);
+        if (prof) apply_profile(dev, *prof);
+    }
 }
 
 void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
@@ -1202,6 +1276,10 @@ void AccelDaemon::run_loop() {
                 log("Applied config pushed over IPC.", true);
             }
         }
+
+        // P-APP: consume a focused-application report from the GUI (cheap
+        // no-op when nothing changed — one mutex lock per loop iteration).
+        apply_active_app();
 
         // Handle config reload request (SIGHUP or IPC "reload")
         if (reload_flag_.exchange(false)) {
@@ -2136,6 +2214,18 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     } else if (line == "reload") {
         reload_flag_.store(true);
         response = "{\"ok\":true,\"message\":\"config reload scheduled\"}\n";
+    } else if (line.rfind("set_active_app ", 0) == 0) {
+        // P-APP: GUI reports the focused application's WM_CLASS (lowercased).
+        // Empty payload clears the report ("none" / unescaped "{}").  We stash
+        // the value under active_app_mu_; the loop thread consumes it and
+        // re-applies app-scoped profiles without dropping any grab.
+        std::string app = line.substr(std::strlen("set_active_app "));
+        if (app == "none") app.clear();
+        if (app.size() > 128) app.resize(128);
+        std::lock_guard<std::mutex> lk(active_app_mu_);
+        pending_app_ = app;
+        active_app_dirty_ = true;
+        response = "{\"ok\":true,\"message\":\"active app updated\"}\n";
     } else if (line == "latency") {
         // Same effect as SIGUSR1, but accessible to any input-group user
         // even when the daemon runs as root via systemd (kill() returns

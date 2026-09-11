@@ -310,6 +310,8 @@ static json device_profile_to_json(const device_profile& dp) {
     json j;
     j["name"]       = dp.name;
     j["device_id"]  = dp.device_id;
+    if (!dp.match_app.empty())
+        j["match_app"] = dp.match_app;
     j["dpi"]        = dp.dev_cfg.dpi;
     j["polling_rate"] = dp.dev_cfg.polling_rate;
     j["disable"]    = dp.dev_cfg.disable;
@@ -570,6 +572,7 @@ static device_profile device_profile_from_json(const json& j) {
     constexpr size_t MAX_DP_DEVICE_ID = 256;
     if (j.contains("name"))       dp.name      = json_get_string_limited(j["name"], "", MAX_DP_NAME);
     if (j.contains("device_id"))  dp.device_id = json_get_string_limited(j["device_id"], "", MAX_DP_DEVICE_ID);
+    if (j.contains("match_app"))  dp.match_app = json_get_string_limited(j["match_app"], "", 128);
     if (j.contains("dpi"))          dp.dev_cfg.dpi   = json_get_int_safe(j["dpi"], 800);
     if (j.contains("polling_rate")) dp.dev_cfg.polling_rate = json_get_int_safe(j["polling_rate"], 1000);
     if (j.contains("disable"))      dp.dev_cfg.disable = j["disable"].is_boolean()

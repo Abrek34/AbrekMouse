@@ -276,6 +276,7 @@ void on_graph_drag_begin(GtkGestureDrag* drag, double x, double /*y*/, gpointer 
     }
     S->graph_drag      = true;
     S->drag_pan_start  = S->graph_pan_x;
+    S->drag_zoom_start = S->graph_zoom;
     (void)x; // drag_start_x is no longer used (fixed in K3)
 }
 
@@ -286,9 +287,11 @@ void on_graph_drag_update(GtkGestureDrag*, double dx, double /*dy*/, gpointer us
     double PW = w - GRAPH_ML - GRAPH_MR;
     if (PW <= 0) return;
 
-    // max_speed must remain fixed at the pan value recorded at drag start —
+    // max_speed must remain fixed at the values recorded at drag start —
     // otherwise the pixel↔ips ratio drifts during the drag (non-linear pan).
-    double max_speed_at_start = 50.0 / S->graph_zoom + S->drag_pan_start;
+    // Wheel-zooming mid-drag changes graph_zoom, so pan uses the frozen
+    // drag_zoom_start instead of re-reading the live zoom.
+    double max_speed_at_start = 50.0 / S->drag_zoom_start + S->drag_pan_start;
     max_speed_at_start = std::max(max_speed_at_start, 5.0);
 
     // On-screen pixel movement → pan delta in ips

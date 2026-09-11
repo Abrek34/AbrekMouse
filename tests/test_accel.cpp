@@ -1130,6 +1130,7 @@ static void test_json_roundtrip() {
     device_profile dp;
     dp.name      = "test-profile";
     dp.device_id = "/dev/input/event3";
+    dp.match_app = "firefox";
     dp.dev_cfg.dpi          = 1600;
     dp.dev_cfg.polling_rate = 500;
     dp.prof.degrees_rotation = 15.0;
@@ -1156,6 +1157,7 @@ static void test_json_roundtrip() {
 
     EXPECT(dp2.name       == dp.name);
     EXPECT(dp2.device_id  == dp.device_id);
+    EXPECT(dp2.match_app  == dp.match_app);
     EXPECT(dp2.dev_cfg.dpi          == dp.dev_cfg.dpi);
     EXPECT(dp2.dev_cfg.polling_rate == dp.dev_cfg.polling_rate);
     EXPECT_NEAR(dp2.prof.degrees_rotation, dp.prof.degrees_rotation, 1e-9);
@@ -8324,6 +8326,31 @@ static void test_p106_extremes_table() {
         device_profile dp = profile_from_json(j.dump());
         EXPECT(dp.device_id.size() == 256);
         EXPECT(dp.name == "cap");
+    }
+
+    // P-APP: match_app — boş/dolu round-trip korur, JSON yolunda 128'e kesilir,
+    // case-mismatch substring eşleştirme (daemon find_profile boyutu)
+    {
+        device_profile dp;
+        dp.match_app = "";
+        sanitize_device_profile(dp);
+        EXPECT(dp.match_app.empty());
+        dp.match_app = "FireFox";
+        EXPECT(profile_from_json(profile_to_json(dp)).match_app == "FireFox");
+
+        std::string long_app(300, 'x');
+        nlohmann::json j = nlohmann::json::object();
+        j["name"] = "cap"; j["device_id"] = "";
+        j["match_app"] = long_app;
+        j["dpi"] = 16000; j["polling_rate"] = 1000;
+        j["profile"] = nlohmann::json::object();
+        EXPECT(profile_from_json(j.dump()).match_app.size() == 128);
+        // JSON'da olmayan match_app → boş (eski config'ler geriye dönük uyumlu)
+        nlohmann::json j2 = nlohmann::json::object();
+        j2["name"] = "legacy"; j2["device_id"] = "";
+        j2["dpi"] = 800; j2["polling_rate"] = 1000;
+        j2["profile"] = nlohmann::json::object();
+        EXPECT(profile_from_json(j2.dump()).match_app.empty());
     }
 
     // boş device_id hiçbir zaman duplicate sayılmaz (iki boş profil çakışmasız)

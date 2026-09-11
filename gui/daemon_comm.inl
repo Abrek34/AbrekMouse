@@ -200,6 +200,27 @@ static std::string daemon_ipc_query(const std::string& cmd, int timeout_ms = 150
     return daemon_ipc_send_raw(cmd + "\n", timeout_ms);
 }
 
+/// P-APP: report the currently focused application's WM_CLASS (lowercased) to
+/// the daemon so app-scoped profiles (`match_app`) can be live-applied.  The
+/// daemon stashes the value on the loop thread and re-applies profiles only
+/// when the app actually changed.  Empty string = "no app focused".
+static void daemon_ipc_set_active_app(const std::string& wm_class) {
+    std::string norm;
+    norm.reserve(wm_class.size());
+    for (char c : wm_class) {
+        // Keep it to safe ASCII: WM_CLASS class is lowercase ASCII already, but
+        // guard against hostile/spread values from the compositor.
+        if (c >= 'a' && c <= 'z') norm.push_back(c);
+        else if (c >= 'A' && c <= 'Z') norm.push_back(static_cast<char>(c + ('a' - 'A')));
+        else if (c == '.' || c == '_' || c == '-' || c == '/' || c == '@')
+            norm.push_back(c);
+        // anything else dropped — substring matching in the daemon only ever
+        // sees a trimmed, URL-safe-ish class token.
+    }
+    daemon_ipc_query("set_active_app " + (norm.empty() ? std::string("none") : norm),
+                     /*timeout_ms=*/150);
+}
+
 /// Push the full config to the daemon over IPC (the daemon's "set_config" RPC).
 /// The daemon persists it to ITS OWN config path — a root systemd daemon writes
 /// /etc/rawaccel/settings.json even though the GUI's working copy lives in the

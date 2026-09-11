@@ -70,6 +70,14 @@ enum class hidpp_feature_index : uint16_t {
     // request) or data[2] == 1 (powered on); the handler treats any
     // WIRELESS_DEVICE_STATUS notification as a signed-on device.
     wireless_device_status = 0x1D4B,
+    // ── Aşama 1: Easy-Switch / LED / Button / Superstrike ─────────────────
+    change_host              = 0x1814, // multi-host switching (1=host, fn=write)
+    reprog_controls_v4       = 0x1B04, // reprogrammable keys + divert
+    superstrike_tuning       = 0x1B0C, // hall-effect trigger tuning
+    persistent_remappable_action = 0x1C00, // persistent per-key remap
+    brightness_control       = 0x8040, // simple brightness control
+    rgb_effects              = 0x8071, // RGB zone effects
+    // Aşama 2: DPI sliding — DPISliding is a sub-function of adjustable_dpi
 };
 
 struct hidpp_short_packet {
@@ -374,6 +382,38 @@ public:
     get_lift_off_distance(uint8_t target_device_index = 0xFF);
     bool set_lift_off_distance(hidpp_lift_off_distance distance,
                                uint8_t target_device_index = 0xFF);
+
+    // ── Aşama 1: multi-host (Easy-Switch), LED, onboard write, buttons ─────
+
+    struct hidpp_host_info {
+        uint8_t current_host = 0xFF;
+        uint8_t host_count   = 0;
+        uint8_t flags        = 0;
+    };
+    /// 0x1814 CHANGE_HOST fn=0x00 — current host index + number of hosts.
+    std::optional<hidpp_host_info> get_change_host_info(uint8_t target_device_index = 0xFF);
+    /// 0x1814 CHANGE_HOST fn=0x10 — switch to host idx (0-based).
+    bool set_change_host(uint8_t host_index, uint8_t target_device_index = 0xFF);
+
+    /// Highest-advertised LED feature brightness range (0..100).
+    /// Prefers brightness_control (0x8040), then backlight2 (0x1982), then
+    /// backlight (0x1981); returns {ok, supported, value}.
+    std::optional<std::pair<bool, uint8_t>> get_led_brightness(uint8_t target_device_index = 0xFF);
+    /// 0x8040 fn=0x10 / 0x1982 fn=0x10 / 0x1981 fn=0x10 — set brightness 0..100.
+    bool set_led_brightness(uint8_t brightness, uint8_t target_device_index = 0xFF);
+    /// Which LED feature this device advertises (0x1981/0x1982/0x8040 or 0 if none).
+    uint16_t led_feature_id(uint8_t target_device_index = 0xFF);
+
+    /// 0x1B04 REPROG_CONTROLS_V4 fn=0x00 — read the remappable control list
+    /// (control index → HID usage).  Returns pairs (control_id, hid_usage).
+    std::vector<std::pair<uint8_t, uint16_t>>
+    get_reprog_controls(uint8_t target_device_index = 0xFF);
+
+    /// Write an onboard-profile flash sector.  `data` must be sector_bytes long.
+    /// 0x8100 fn=0x50 set_long_parameter benchmark, fn=0x48 write_sector.
+    bool write_onboard_profile_sector(uint16_t sector,
+                                      const std::vector<uint8_t>& data,
+                                      uint8_t target_device_index = 0xFF);
 
     // Root feature: get feature set
     std::vector<std::pair<uint16_t, uint8_t>> get_feature_set();

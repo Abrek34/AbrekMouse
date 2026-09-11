@@ -164,6 +164,11 @@ struct logitech_controls {
     bool report_rate         = false; // 0x8060 (legacy 1..8 ms periods)
     bool report_rate_extended = false; // 0x8061 (extended, down to 125 us)
     bool onboard_profiles    = false; // 0x8100 (read-only query supported)
+    // ── Aşama 1 ─────────────────────────────────────────────────────
+    bool change_host         = false; // 0x1814 Easy-Switch
+    bool led_brightness      = false; // 0x8040 / 0x1982 / 0x1981
+    bool reprog_controls     = false; // 0x1B04 button list / diversion
+    bool super_strike        = false; // 0x1B0C hall-effect trigger
 };
 
 inline logitech_controls logitech_controls_for(
@@ -182,6 +187,18 @@ inline logitech_controls logitech_controls_for(
         static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate));
     c.onboard_profiles = logitech_has_feature(features,
         static_cast<uint16_t>(hidpp_feature_index::onboard_profiles));
+    c.change_host = logitech_has_feature(features,
+        static_cast<uint16_t>(hidpp_feature_index::change_host));
+    c.led_brightness = logitech_has_feature(features,
+            static_cast<uint16_t>(hidpp_feature_index::brightness_control)) ||
+        logitech_has_feature(features,
+            static_cast<uint16_t>(hidpp_feature_index::backlight2)) ||
+        logitech_has_feature(features,
+            static_cast<uint16_t>(hidpp_feature_index::backlight));
+    c.reprog_controls = logitech_has_feature(features,
+        static_cast<uint16_t>(hidpp_feature_index::reprog_controls_v4));
+    c.super_strike = logitech_has_feature(features,
+        static_cast<uint16_t>(hidpp_feature_index::superstrike_tuning));
     return c;
 }
 

@@ -1849,6 +1849,146 @@ bool HidppTransport::set_lift_off_distance(hidpp_lift_off_distance distance,
                                 target_device_index).has_value();
 }
 
+// ── Aşama 1: multi-host (Easy-Switch), LED, onboard write, buttons ─────────
+
+std::optional<HidppTransport::hidpp_host_info>
+HidppTransport::get_change_host_info(uint8_t target_device_index) {
+    auto index = resolve_feature_index(hidpp_feature_index::change_host,
+                                       target_device_index);
+    if (!index) return std::nullopt;
+    if (auto reply = send_feature_request(*index, 0x00, nullptr, 0,
+                                          std::chrono::milliseconds(500),
+                                          target_device_index);
+        reply && reply->size() >= 2) {
+        hidpp_host_info info;
+        info.current_host = (*reply)[0];
+        info.host_count   = (*reply)[1];
+        info.flags        = reply->size() > 2 ? (*reply)[2] : 0;
+        return info;
+    }
+    return std::nullopt;
+}
+
+bool HidppTransport::set_change_host(uint8_t host_index,
+                                     uint8_t target_device_index) {
+    auto index = resolve_feature_index(hidpp_feature_index::change_host,
+                                       target_device_index);
+    if (!index) return false;
+    // 0x10 set_current_host.  Solaar reserves one byte for the host parameter.
+    const uint8_t params[1] = { host_index };
+    return send_feature_request(*index, 0x10, params, sizeof(params),
+                                std::chrono::milliseconds(700),
+                                target_device_index).has_value();
+}
+
+uint16_t HidppTransport::led_feature_id(uint8_t target_device_index) {
+    // Priority mirrors Solaar: brightness_control (0x8040) is the simple
+    // modern path, then backlight2 (0x1982), then legacy backlight (0x1981).
+    static const hidpp_feature_index prio[] = {
+        hidpp_feature_index::brightness_control,
+        hidpp_feature_index::backlight2,
+        hidpp_feature_index::backlight,
+    };
+    for (auto f : prio) {
+        if (resolve_feature_index(f, target_device_index))
+            return static_cast<uint16_t>(f);
+    }
+    return 0;
+}
+
+std::optional<std::pair<bool, uint8_t>>
+HidppTransport::get_led_brightness(uint8_t target_device_index) {
+    const uint16_t fid = led_feature_id(target_device_index);
+    if (fid == 0) return std::nullopt;
+    // 0x30 get_led_info (brightness_control) / 0x00 get_config / 0x00 get_info.
+    // Solaar: every LED feature exposes the current level via fn 0x00.
+    const auto index = resolve_feature_index(
+        static_cast<hidpp_feature_index>(fid), target_device_index);
+    if (!index) return std::nullopt;
+    if (auto reply = send_feature_request(*index, 0x00, nullptr, 0,
+                                          std::chrono::milliseconds(500),
+                                          target_device_index);
+        reply && !reply->empty()) {
+        // Byte layout varies: 0x8040 → [0]=1 supported,[1]=current,[2]=…;
+        // 0x1982 → [0]=1, [1]=current state bit and [3]=brightness.
+        const bool supported = ((*reply)[0] & 0x01) != 0;
+        uint8_t value = 0;
+        if (fid == static_cast<uint16_t>(hidpp_feature_index::brightness_control))
+            value = reply->size() > 1 ? (*reply)[1] : 0;
+        else if (fid == static_cast<uint16_t>(hidpp_feature_index::backlight2))
+            value = reply->size() > 3 ? (*reply)[3] : 0;
+        else
+            value = reply->size() > 1 ? (*reply)[1] : 0;
+        return std::make_pair(supported, value);
+    }
+    return std::nullopt;
+}
+
+bool HidppTransport::set_led_brightness(uint8_t brightness,
+                                        uint8_t target_device_index) {
+    const uint16_t fid = led_feature_id(target_device_index);
+    if (fid == 0 || brightness > 100) return false;
+    const auto index = resolve_feature_index(
+        static_cast<hidpp_feature_index>(fid), target_device_index);
+    if (!index) return false;
+    // 0x8040: fn 0x10 set_led_power.  0x1982: fn 0x10 set_brightness.
+    // 0x1981: fn 0x10 set_brightness.  Payload = single brightness byte.
+    const uint8_t params[1] = { brightness };
+    return send_feature_request(*index, 0x10, params, sizeof(params),
+                                std::chrono::milliseconds(700),
+                                target_device_index).has_value();
+}
+
+std::vector<std::pair<uint8_t, uint16_t>>
+HidppTransport::get_reprog_controls(uint8_t target_device_index) {
+    std::vector<std::pair<uint8_t, uint16_t>> out;
+    auto index = resolve_feature_index(hidpp_feature_index::reprog_controls_v4,
+                                       target_device_index);
+    if (!index) return out;
+    // 0x1B04 fn=0x00 get_capabilities returns controlCount in byte 1.
+    auto caps = send_feature_request(*index, 0x00, nullptr, 0,
+                                     std::chrono::milliseconds(500),
+                                     target_device_index);
+    if (!caps || caps->size() < 2) return out;
+    const uint8_t count = std::min<uint8_t>((*caps)[1], 32);
+    for (uint8_t ctrl = 0; ctrl < count; ++ctrl) {
+        // fn=0x10 get_control_info → control_id in byte 0, HID usage in 1..2.
+        auto info = send_feature_request(*index, 0x10, &ctrl, 1,
+                                         std::chrono::milliseconds(500),
+                                         target_device_index);
+        if (info && info->size() >= 3) {
+            const uint16_t usage = (static_cast<uint16_t>((*info)[1]) << 8) |
+                                   (*info)[2];
+            out.emplace_back((*info)[0], usage);
+        }
+    }
+    return out;
+}
+
+bool HidppTransport::write_onboard_profile_sector(
+    uint16_t sector, const std::vector<uint8_t>& data,
+    uint8_t target_device_index) {
+    // 0x8100 OnboardProfiles — write a single flash sector.
+    // fn=0x48 write_sector: params = sector (u16 BE) + up to 16 bytes.
+    auto index = resolve_feature_index(hidpp_feature_index::onboard_profiles,
+                                       target_device_index);
+    if (!index) return false;
+    const size_t chunk = 16;
+    for (size_t off = 0; off < data.size(); off += chunk) {
+        std::vector<uint8_t> params(2 + chunk, 0);
+        params[0] = static_cast<uint8_t>(sector >> 8);
+        params[1] = static_cast<uint8_t>(sector);
+        const size_t n = std::min(chunk, data.size() - off);
+        std::copy(data.begin() + off, data.begin() + off + n, params.begin() + 2);
+        if (!send_feature_request(*index, 0x48, params.data(),
+                                  static_cast<uint8_t>(params.size()),
+                                  std::chrono::milliseconds(500),
+                                  target_device_index))
+            return false;
+    }
+    return true;
+}
+
 // ── Discovery & identification ──────────────────────────────────────
 std::vector<std::string> discover_logitech_hidraw_devices(const char* root) {
     std::vector<std::string> result;
