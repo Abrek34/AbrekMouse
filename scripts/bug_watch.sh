@@ -17,7 +17,15 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPORT_FILE="${REPORT_FILE:-$PROJECT_DIR/Bug Hata Raporları.md}"
-STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/rawaccel-bug-watch"
+# L-9: /tmp/rawaccel-bug-watch is world-writable on most systems — any user can
+# pre-create it, then symlink state/log files for the watcher to follow (log
+# forgery, lock bypass).  Use a per-user run dir (XDG_RUNTIME_DIR is 0700) or a
+# private hidden dir under $HOME when it is not set.
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    STATE_DIR="$XDG_RUNTIME_DIR/rawaccel-bug-watch"
+else
+    STATE_DIR="$HOME/.cache/rawaccel-bug-watch"
+fi
 PREV_FILE="$STATE_DIR/prev.md"
 MARK="$STATE_DIR/seen.md5"
 LOCK="$STATE_DIR/lock"
@@ -27,7 +35,9 @@ MODE="${1:-watch}"
 # (rapor bir daha otomatik tetiklenmez); elle müdahale için log tutulur.
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 
-mkdir -p "$STATE_DIR"
+# L-9: 0700 so nobody else can read/write watcher state even when the run dir
+# is unusual.  install -d (coreutils) is safe against symlink-following.
+install -d -m 700 "$STATE_DIR"
 
 log() {
   local line="$(printf '[%s] %s' "$(date '+%F %T')" "$*")"

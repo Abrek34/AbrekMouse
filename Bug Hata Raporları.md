@@ -3,7 +3,7 @@
 Analiz tarihi: 2026-09-11
 Kapsam: `/home/a/Masaüstü/Linux-Raw-Accel-main` (RawAccel Linux v0.6.4)
 Yöntem: Baştan sona (start-to-end) 5 ayrı detaylı analiz turu. Her tur farklı bir uzmanlık açısıyla tüm kaynak kod taranmıştır.
-Durum: 2026-09-11 düzeltme seanslarında ele alınan bulgular (D-1..D-9, C-1..C-10, CR-1, H-1..H-3, M-1..M-8, R1-01..R1-08, R2-01, R2-04, L-2, L-5, R5-S-4/5) fixed olarak listeden çıkarılmıştır. 2026-09-11 ileri seansında ek olarak düzeltilenler: R5-S-1, R1-06, R2-02, R2-03, R2-05, R2-06, R2-07, R3-NEW-1, R3-NEW-2 (belgeli sapma + oracle satırı), R3-NEW-3, M-5b, M-6, R4 L-1, R4 L-4, R4 L-8, R4 L-10. Aşağıdaki maddeler halen açık veya bilinçli/belgeli tasarımdır.
+Durum: 2026-09-11 düzeltme seanslarında ele alınan bulgular (D-1..D-9, C-1..C-10, CR-1, H-1..H-3, M-1..M-8, R1-01..R1-08, R2-01, R2-04, L-2, L-5, R5-S-4/5) fixed olarak listeden çıkarılmıştır. 2026-09-11 ileri seansında ek olarak düzeltilenler: R5-S-1, R1-06, R2-02, R2-03, R2-05, R2-06, R2-07, R3-NEW-1, R3-NEW-2 (belgeli sapma + oracle satırı), R3-NEW-3, M-5b, M-6, R4 L-1, R4 L-4, R4 L-8, R4 L-10. 2026-09-11 ileri denetim seansında düzeltilenler: BUG-MED-1, TH-3/ERR-2, SEC-1, B1, B2, B5, C-2, C-5. Doğrulanan (already-fixed / false-positive / bilinçli tasarım): BUG-CRIT-1/2, BUG-HIGH-1/2, BUG-MED-2, BUG-LOW-1/2, ERR-1/3, TH-1, ALG-4, POLL-1, C-1, C-6, C-8, SEC-2/4, IPC-1, B3-B8. Aşağıdaki maddeler halen açık veya bilinçli/belgeli tasarımdır.
 
 ---
 
@@ -458,10 +458,10 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 
 # TUR 7 — Güvenlik Analizi
 
-### SEC-1 · MEDIUM · IPC Socketcredential check yok
+### SEC-1 · MEDIUM · IPC Socketcredential check yok — ✅ DÜZELTİLDİ
 - Konum: `daemon/daemon.cpp:2068-2181`
 - **Açıklama:** IPC Unix socket `chmod 0660 root:input`. `input` grubundaki herhangi bir process bağlanıp `set_config` ile rastgele JSON config gönderebilir. Per-connection credential check (SO_PEERCRED) yok.
-- **Öneri:** SO_PEERCRED + getgrouplist ile bağlanan process'in input grubunda olduğunu doğrula.
+- **Düzeltme (yapıldı):** `accept4()` sonrası `SO_PEERCRED` denetimi eklendi — root veya `input` grubunun birincil/tamamlayıcı üyesi değilse bağlantı reddedilir ve kapatılır (`getgrnam`/`getpwnam`/`getgrouplist`). `<sys/ucred.h>` yerine `<sys/socket.h>` üzerinden `struct ucred`; `<pwd.h>` eklendi. İlk öneri uygulandı.
 
 ### SEC-2 · LOW · CLI --config path validasyonu yok
 - Konum: `cli/main.cpp:2103-2117`
@@ -488,9 +488,10 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 - Konum: `daemon/daemon.cpp:2006-2016`
 - **Açıklama:** IPC thread exception handler'ı `stop_ipc_server()` → `ipc_thread_.join()` → thread kendi kendine join → UB → std::terminate. Loop ve HID++ thread doğru davranıyor (yalnızca request_stop()).
 
-### ERR-2 · MEDIUM · dump_latency_stats mutex altında stdout I/O
+### ERR-2 · MEDIUM · dump_latency_stats mutex altında stdout I/O — ✅ DÜZELTİLDİ
 - Konum: `daemon/daemon.cpp:1629-1676`
 - **Açıklama:** devices_mutex_ tüm stdout yazımı sırasında tutuluyor. Loop thread starved.
+- **Düzeltme (yapıldı):** Kilit altında yalnızca `std::vector<DevLatSnap>` anlık görüntüsü alınır, kilit bırakılır, tüm stdout I/O kilitsiz yapılır.
 
 ### ERR-3 · MEDIUM · Client FD leak on exception
 - Konum: `daemon/daemon.cpp:2061-2064`
@@ -537,9 +538,10 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 - Konum: `include/rawaccel.hpp:242`
 - **Hata:** `if (!std::isfinite(time) || time <= 0) return;` → in.x/in.y sıfırlanmıyor → raw delta 1:1 iletilir.
 
-### BUG-MED-1 · ORTA · migrate_lookup_gain Inf LUT zehirlenmesi
+### BUG-MED-1 · ORTA · migrate_lookup_gain Inf LUT zehirlenmesi — ✅ DÜZELTİLDİ
 - Konum: `src/config.cpp:831-849`
 - **Hata:** Migration sanitize sonrası çalışıyor. y*x overflow → Inf LUT'a yazılıyor.
+- **Düzeltme (yapıldı):** `double product = y * x; if (std::isfinite(product)) a.data[...] = (float)product;` — Inf yazımı engellenir, sonsuz olmayan durumlarda davranış değişmez.
 
 ### BUG-MED-2 · ORTA · Post-reload interval spike
 - Konum: `daemon/daemon.cpp:835`
@@ -623,14 +625,15 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 
 # TUR 14 — Logitech HID++ / Receiver Analizi
 
-### B1 · ORTA · Bolt pairing slotu "occupied" her zaman true
+### B1 · ORTA · Bolt pairing slotu "occupied" her zaman true — ✅ DÜZELTİLDİ
 - Konum: `src/logitech_hidpp.cpp:390`
 - **Açıklama:** payload[0] echo byte'ı (subregister byte) — hiçbir zaman sıfır olamaz. Gerçek "dolu/bos" payload[1..3]'te (kind nibble veya WPID).
+- **Düzeltme (yapıldı):** `result.occupied = payload[1] != 0 || payload[2] != 0 || payload[3] != 0;`
 
-### B2 · ORTA · HID++ 1.0 bildirimleri 2.0'a sahte sınıflandırma
+### B2 · ORTA · HID++ 1.0 bildirimleri 2.0'a sahte sınıflandırma — ✅ DÜZELTİLDİ
 - Konum: `src/logitech_hidpp.cpp:502-520`
 - **Açıklama:** sub_id ∈ {0x40..0x4B} + address & 0x0F == 0 ise hidpp20 olarak sınıflandırılıyor (yanlış). 1.0 cihazlarda CONNECT_DISCONNECT olayı sessizce düşer.
-- **Düzeltme:** `const bool hidpp20 = sub_id < 0x40 && (address & 0x0F) == 0;`
+- **Düzeltme (yapıldı):** `const bool hidpp20 = sub_id < 0x40 && (address & 0x0F) == 0;`
 
 ### B3 · LOW · Genişletilmiş rapor hızı fallback eksik
 - Konum: `src/logitech_hidpp.cpp:1760-1768`
@@ -639,9 +642,9 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 ### B4 · LOW · Model ID parçaları yanlış genişlik (2 hex vs 4 hex)
 - Konum: `src/logitech_hidpp.cpp:1299-1311`
 
-### B5 · LOW · almost_full (0x02) şarj ediliyor sayılmıyor
+### B5 · LOW · almost_full (0x02) şarj ediliyor sayılmıyor — ✅ DÜZELTİLDİ
 - Konum: `src/logitech_hidpp.cpp:190,204`
-- **Düzeltme:** `status == 0x01 || status == 0x02 || status == 0x04`
+- **Düzeltme (yapıldı):** `status == 0x01 || status == 0x02 || status == 0x04` (her iki ayrıştırıcıda)
 
 ### B6 · LOW · BATTERY_CHARGE default dal cihazı çevrimdışı yapıyor
 - Konum: `src/logitech_hidpp.cpp:216-220`
@@ -660,9 +663,10 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 - Konum: `cli/main.cpp:2119-2127`
 - **Açıklama:** `rawaccel-cli -c --json list` config path'i literal "--json" olarak ayarlıyor → dosya oluşturuyor.
 
-### C-2 · ORTA · speed_max < speed_min kabul ediliyor
+### C-2 · ORTA · speed_max < speed_min kabul ediliyor — ✅ DÜZELTİLDİ
 - Konum: `cli/main.cpp:948-953` + `src/config.cpp:497-498`
 - **Açıklama:** Sessizce clamp ediliyor ama rc=0 dönüyor.
+- **Düzeltme (yapıldı):** `set-param speed_min/speed_max` sonrası çapraz doğrulama — zıt yönlü çakışmada kullanıcıya WARNING basılır; clamp korunur.
 
 ### C-3 · ORTA · mode=lookup uyarısı lut-data'yı gösteriyor — CLI'da yok
 - Konum: `cli/main.cpp:968-972`
@@ -671,10 +675,10 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 ### C-4 · ORTA · Import edilen isim > 256 sessizce truncate ediliyor
 - Konum: `cli/main.cpp:1247-1251` + `src/config.cpp:571`
 
-### C-5 · YÜKSEK · gaming preset'in limit=1.8'i cap_mode=out 1.5 ile ulaşılamaz
+### C-5 · YÜKSEK · gaming preset'in limit=1.8'i cap_mode=out 1.5 ile ulaşılamaz — ✅ DÜZELTİLDİ
 - Konum: `include/presets.hpp:26-40`
 - **Açıklama:** Classic GAIN modunda cap.y=1.5 (default) → gain asimptotu 1.5. limit=1.8 hiçbir zaman çalışmaz.
-- **Düzeltme:** cap = {0, 1.5} veya limit ile eşleşecek cap ayarla.
+- **Düzeltme (yapıldı):** gaming preset için `accel_x.cap = accel_y.cap = { 15, 1.8 }` eklendi. Not: `limit` yalnızca natural modda çalışır (accel-natural.hpp: `limit(n-1.0)`); classic modda belirleyici olan cap'tir. fps preset'i zaten `cap={20,1.8}` ile uyumlu.
 
 ### C-6 · YÜKSEK · --no-daemon + reload hiç uygulanmaz
 - Konum: `cli/main.cpp:239,247` + `src/config.cpp:803-821`

@@ -22,10 +22,13 @@ fi
 
 mkdir -p "$BUILD" "$CORPUS" "$CORPUS_ACCEL"
 
-FUZZ_FLAGS="-std=c++20 -O2 -g -fsanitize=fuzzer,address,undefined -I $ROOT/include"
+# BS-5: a single concatenated string was word-split at the clang++ call sites,
+# which breaks when ROOT/this path contains whitespace (and trips shellcheck).
+# Use an array so each flag is passed as one argument.
+FUZZ_FLAGS=(-std=c++20 -O2 -g -fsanitize=fuzzer,address,undefined -I "$ROOT/include")
 
 echo "=== [1/2] Building & running fuzz_config (JSON parser) ==="
-clang++ $FUZZ_FLAGS "$SCRIPT_DIR/fuzz_config.cpp" "$ROOT/src/config.cpp" -o "$BUILD/fuzz_config"
+clang++ "${FUZZ_FLAGS[@]}" "$SCRIPT_DIR/fuzz_config.cpp" "$ROOT/src/config.cpp" -o "$BUILD/fuzz_config"
 if [ "$DURATION" = "0" ]; then
     "$BUILD/fuzz_config" "$CORPUS" -max_len=8192 -timeout=5
 else
@@ -34,7 +37,7 @@ fi
 
 echo ""
 echo "=== [2/2] Building & running fuzz_accel (acceleration pipeline) ==="
-clang++ $FUZZ_FLAGS "$SCRIPT_DIR/fuzz_accel.cpp" "$ROOT/src/config.cpp" -o "$BUILD/fuzz_accel"
+clang++ "${FUZZ_FLAGS[@]}" "$SCRIPT_DIR/fuzz_accel.cpp" "$ROOT/src/config.cpp" -o "$BUILD/fuzz_accel"
 if [ "$DURATION" = "0" ]; then
     "$BUILD/fuzz_accel" "$CORPUS_ACCEL" -max_len=256 -timeout=5
 else

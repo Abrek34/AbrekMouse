@@ -59,10 +59,12 @@ case "$(uname -m)" in
 esac
 
 # If the environment already defines _FORTIFY_SOURCE (e.g. makepkg.conf
-# -D_FORTIFY_SOURCE=3), DON'T re-define =2 — that trips a "redefined"
-# warning. Mirrors the CMakeLists.txt check.
+# -D_FORTIFY_SOURCE=3, or the caller exported CFLAGS/CXXFLAGS with it), DON'T
+# re-define =2 — that trips a "redefined" warning.  L-3: the probe must run
+# through the caller's CFLAGS/CXXFLAGS, not just the compiler defaults, so the
+# check reflects the actual final command line.
 FORTIFY="-D_FORTIFY_SOURCE=2"
-if echo 'int main(){return 0;}' | $CXX -dM -E -x c++ - 2>/dev/null \
+if printf 'int main(){return 0;}' | $CXX $CFLAGS $CXXFLAGS -dM -E -x c++ - 2>/dev/null \
         | grep -q '^#define _FORTIFY_SOURCE'; then
     FORTIFY=""
 fi

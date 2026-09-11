@@ -233,7 +233,10 @@ void refresh_mice_combo(AppState* S, bool is_auto, bool quiet) {
 /// GLib IO callback: reads /dev/input inotify events and refreshes the combo.
 gboolean on_inotify_event(GIOChannel* chan, GIOCondition /*cond*/, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
-    char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
+    // ERR-4: the buffer is reinterpret_cast to struct inotify_event* — without
+    // alignas() that pointer is misaligned on strict-alignment targets (ARM),
+    // which is UB.  Force the array to the type's alignment.
+    alignas(struct inotify_event) char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
     gsize bytes_read = 0;
     // Non-blocking read — drain all pending events
     while (true) {

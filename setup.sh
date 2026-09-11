@@ -60,8 +60,15 @@ if command -v pacman &>/dev/null && pacman -Qi rawaccel-linux &>/dev/null 2>&1; 
     warn "setup.sh ile üstüne kurmak /etc/rawaccel/settings.json ve .desktop dosyalarında"
     warn "çakışmaya neden olur ve paket kurulumunu bozar."
     warn "Tavsiye ya da: sudo pacman -Rns rawaccel-linux ile kaldırın, ya da sadece paketi kullanın."
-    echo "Devam etmek için Enter'a basın (iptal için Ctrl+C)..."
-    read -r _ || true
+    if [[ -t 0 ]]; then
+        echo "Devam etmek için Enter'a basın (iptal için Ctrl+C)..."
+        read -r _ || true
+    else
+        # L-6: with a closed/non-tty stdin (CI, scripts) `read` returns instantly
+        # and the user is never asked — proceed, but say so loudly instead of a
+        # silent "install continued over the package" surprise.
+        warn "Girdi terminal değil — etkileşimli onay atlandı. Çakışma riskiyle DEVAM EDİLİYOR."
+    fi
 fi
 
 # ── Gerçek kullanıcı ──────────────────────────────────────────────────────────
@@ -295,7 +302,10 @@ do_install() {
         else
             if [[ -f /etc/rawaccel/settings.json ]] && \
                ! cmp -s "$user_cfg" /etc/rawaccel/settings.json; then
-                local backup="/etc/rawaccel/settings.json.bak.$(date +%Y%m%d-%H%M%S)"
+                # BS-6/L-7: %S-second granularity — two runs in the same second
+                # silently overwrote the previous backup.  Append the PID so the
+                # name is unique even within the same second.
+                local backup="/etc/rawaccel/settings.json.bak.$(date +%Y%m%d-%H%M%S).$$"
                 cp /etc/rawaccel/settings.json "$backup"
                 warn "Mevcut sistem config farklı; yedeklendi: $backup"
             fi

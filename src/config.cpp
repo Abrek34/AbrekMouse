@@ -549,7 +549,10 @@ static int json_get_int_safe(const json& v, int fallback) {
     double d = v.get<double>();
     if (!std::isfinite(d)) return fallback;
     if (d < (double)INT_MIN) return INT_MIN;
-    if (d > (double)INT_MAX) return INT_MAX;
+    // BUG-CRIT-2: (double)INT_MAX == 2147483648.0 — an input of exactly
+    // 2147483648.0 passes the old `> (double)INT_MAX` test and makes the
+    // static_cast<int> below UB.  Use >= so 2147483648.0* clamps to INT_MAX.
+    if (d >= (double)INT_MAX) return INT_MAX;
     return static_cast<int>(d);
 }
 
@@ -605,8 +608,13 @@ static app_config app_config_from_json_obj(const json& j) {
         cfg.use_raw_input = j["use_raw_input"].get<bool>();
 
     if (j.contains("profiles") && j["profiles"].is_array()) {
+        // SEC-9: a hostile IPC client can push an arbitrarily large "profiles"
+        // array (easy to craft, each entry ~1 KB) → unbounded memory growth in
+        // a root daemon.  Cap the count at MAX_PROFILES; extra entries are
+        // silently dropped (sanitize already tolerates malformed entries).
         for (auto& pj : j["profiles"]) {
             if (!pj.is_object()) continue;
+            if (cfg.profiles.size() >= MAX_PROFILES) break;
             cfg.profiles.push_back(device_profile_from_json(pj));
         }
     }
@@ -840,7 +848,13 @@ static void migrate_lookup_gain(app_config& cfg) {
                 double x = a.data[i * 2];
                 double y = a.data[i * 2 + 1];
                 if (!(x > 0)) continue; // first point at speed 0 stays (velocity division is guarded)
-                a.data[i * 2 + 1] = static_cast<float>(y * x);
+                // BUG-MED-1: y*x can overflow to Inf for extreme speed/gain
+                // values, poisoning the LUT with non-finite entries that cause
+                // NaN propagation in the acceleration pipeline.  Drop the
+                // point (leave the old value) if the product is non-finite.
+                double product = y * x;
+                if (std::isfinite(product))
+                    a.data[i * 2 + 1] = static_cast<float>(product);
             }
             // ORTA-BUG-MOTION-04: the odd-length trailing element needs no
             // migration — it is unpaired (no x to multiply), so leave it as-is.
@@ -861,6 +875,14 @@ static bool version_lt(const std::string& lhs, const std::string& rhs) {
             pos = v.find('.', start);
             const std::string tok = (pos == std::string::npos) ? v.substr(start) : v.substr(start, pos - start);
             if (tok.empty()) return false;
+            // BUG-LOW-2: strtoul("-1") does NOT set errno and returns
+            // ULONG_MAX (two's-complement wrap), which then clamps to INT_MAX
+            // — a negative version component became a huge positive one, so a
+            // corrupt stored version like "0.6.-1" compared "newer than"
+            // everything and migration was silently skipped.  A leading '-'
+            // is never valid: flag it and let the history treat the version
+            // as corrupt (lhs → older than everything, rhs → never less).
+            if (tok[0] == '-') return false;
             char* end = nullptr;
             errno = 0;
             const unsigned long n = std::strtoul(tok.c_str(), &end, 10);

@@ -1,0 +1,86 @@
+programı geliştirmeye devam edelim https://github.com/RawAccelOfficial/rawaccel  mesela bunu bir incele istersen sence burda olup bizde olmayan varmı bak ✅ DPI / Sensitivity
+
+✅ Polling rate (cihaz destekliyorsa)
+
+✅ Battery durumu
+
+✅ Lightspeed receiver
+
+✅ Unifying
+
+✅ Bolt
+
+✅ USB bağlantı
+
+✅ Bluetooth
+
+✅ Button diversion
+
+✅ Button actions
+
+✅ Pair / Unpair
+
+✅ Profile benzeri ayarlar
+
+✅ Rule Editor
+
+✅ HID++ doğrudan kontrol
+
+✅ Bazı gelişmiş Logitech özellikleri  gibi özellikleri kontrol çünkü https://github.com/pwr-Solaar/Solaar bu hepsini yaptıgını idaa ediyor  hiç değilse  programları biraz incele bizim projemize faydalı olacak bizim projemizde eksik olanları tamamlayalım
++ Thought: 8.4s
+Bu projeleri kapsamlı inceliyorum — RawAccel (Windows) ve Solaar ile kendi kod tabanımızı karşılaştırıyorum.
+✓General Task — RawAccel Windows features
+↳ 17 toolcalls · 2m 15s
+✓General Task — Solaar features and HID++
+↳ 6 toolcalls · 1m 12s
+ctrl+x down view subagents
++ Thought: 1.0s
+Kapsamlı analiz tamamlandı. Şimdi kendi kod tabanımızla karşılaştırıp hangi özelliklerin eksik olduğunu belirleyeyim.
+✓General Task — AbrekMouse current features
+↳ 10 toolcalls · 52.2s
+ctrl+x down view subagents
++ Thought: 14.0s
+Kapsamlı karşılaştırmayı tamamladım. İşte sonuç:
+Kapsamlı Karşılaştırma: AbrekMouse vs RawAccel (Win) vs Solaar
+✅ Bizde zaten olan (feature parity)
+Kategori	Özellikler
+Hızlandırma	classic/jump/natural/synchronous/power/lookup/noaccel (7 mod, gain/legacy, caps, offset)
+Anizotropi	domain/range weights, lp_norm, whole/by-component
+EMA smoothing	input/scale/output_speed smooth (linear EMA + trend dampening)
+Koordinat	rotation, snap, speed clamp, directional multipliers (lr/ud/yx)
+Çıktı	output DPI normalization, Y/X ratio, LUT 257 noktaya kadar
+Daemon	hot-plug, grab, uinput, raw passthrough, SYN_DROPPED, sub-pixel, latency histogram
+Yeniden yükleme	live reload (SIGHUP/IPC), atomic config, no-op guard
+HID++ (okuma/yazma)	DPI (legacy+extended), polling rate (legacy+8kHz), LOD, battery (multi-source), firmware, device info
+Alıcı desteği	Lightspeed/Unifying/Bolt/Nano receiver slot tarama
+GUI	Grafik (sensitivity/velocity/gain X/Y), LUT editor, mouse test, HID++ panel, profil yönetimi
+❌ Bizde olmayan — RawAccel (Windows) tarafından sunulan
+#	Özellik	Solaar'da var mı?
+1	Per-app profiles (uygulamaya göre profil)	Rule engine ile
+2	Writer/headless mode (servis olarak otomatik başlatma)	—
+3	Poll time lock (sabit polling süresi kilidi)	—
+4	Anti-cheat write delay	—
+❌ Bizde olmayan — Solaar (Logitech HID++) tarafından sunulan
+#	Özellik	RawAccel'da var mı?
+5	Sliding DPI (basılı tut, sağa-sola kaydır → DPI değişir)	Hayır
+6	Button diversion (tuşları HID++'a yönlendirme, kural tetikleme)	Hayır
+7	Per-profile button actions (profil başına tuş atamaları)	Hayır
+8	Pair/Unpair (alıcıya cihaz eşleştirme/çıkarma)	Hayır
+9	Onboard profile yazma (sadece okuma var, yazma yok)	Hayır
+10	Easy-Switch host (çoklu bilgisayar arası geçiş)	Hayır
+11	LED/RGB kontrol (renk, zones, animasyon)	Hayır
+12	Smart-shift wheel (free-spin ↔ ratchet)	Hayır
+13	Charging control (şarj durumu/kontrol)	Hayır
+Öneri: Öncelik sırası
+1. Öncelikli (hemen eklenmeli, yüksek değer):
+- #5 Sliding DPI — DPI ayarınıizzard mouse'tan değiştirmek için Solaar'ın uyguladığı mekanizma: basılı tut, sağa/sola kaydır, bırak. HID++ 0x2201/0x2202 zaten okunuyor; DPISliding feature (0x2201 fn 2) eklemek için sadece logitech_hidpp.cpp'ye küçük bir ekleme + GUI'de buton/iki çizgi overlay.
+- #1 Per-app profiles — RawAccel Windows bunu sarmalayıcıda yapıyor; Linux'ta window manager'dan active window WM_CLASS okunarak uygulanabilir. profil listesine match_app alanı + daemon'da /proc tabanlı tarama.
+- #9 Onboard profile yazma — Solaar'ın OnboardProfiles feature (0x8100) implementasyonu Python'da mevcut. C++'ta analog: write fonksiyonu eklemek mevcut get_onboard_profile_headers/sector_read infra üzerine inşa edilir. Profil depolama/geri yükleme.
+2. Orta öncelik (bir sonraki aşama):
+- #7 Per-profile button actions — HID++ REPROG_CONTROLS_V4 (0x1B04): remap/divert/macro yok, sadece basit tuş atamaları (DPI cycle, profile switch, G-Shift). Mevcut get_keys() altyapısı var.
+- #6 Button diversion — Daha kapsamlı, kurallar motoru gerektirir.
+3. Düşük öncelik (güzellik/konfor):
+- #11 LED/RGB — Kozmetik ama Logitech gaming mouse'lar için önemli.
+- #12 Smart-shift — Tek tekerlekli cihazlar için.
+- #13 Charging — Bazı cihazlarda şarj durumu.
+Hangi özellikleri eklemek istersin? Benim önerim: Sliding DPI (#5) en düşük maliyet/en yüksek değer oranı ile başlamak için ideal.

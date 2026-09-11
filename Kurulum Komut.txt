@@ -1,4 +1,4 @@
 cd /home/a/Masaüstü/rawaccel-linux
   sudo bash setup.sh --reinstall 2>&1 | tee /tmp/rawaccel-setup.log
 
-  cd '/home/a/Masaüstü/rawaccel-linux' && sudo bash setup.sh
+  cd '/home/a/Masaüstü/AbrekMouse-main' && sudo bash setup.sh

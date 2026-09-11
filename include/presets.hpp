@@ -35,6 +35,12 @@ inline device_profile make_preset(const std::string& preset_name, const std::str
         dp.prof.accel_y.exponent_classic = 2.0;
         dp.prof.accel_x.limit = 1.8;
         dp.prof.accel_y.limit = 1.8;
+        // C-5: classic GAIN mode's output asymptote is the cap, not the limit
+        // field.  The default cap {15, 1.5} silently clipped the preset's
+        // "limit=1.8" intent to 1.5x.  Align cap.y with the declared limit so
+        // the preset curves actually reach 1.8 (cap_mode=out → asymptote cap.y).
+        dp.prof.accel_x.cap = { 15, 1.8 };
+        dp.prof.accel_y.cap = { 15, 1.8 };
         dp.prof.accel_x.input_offset = 0;
         dp.prof.accel_y.input_offset = 0;
         dp.prof.output_dpi = 1000;

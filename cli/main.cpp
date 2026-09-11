@@ -271,7 +271,9 @@ static void print_signal_failure(signal_result r, const char* action, const char
 
 static int finite_double_to_int(double v) {
     if (v < static_cast<double>(INT_MIN)) return INT_MIN;
-    if (v > static_cast<double>(INT_MAX)) return INT_MAX;
+    // BUG-CRIT-2: (double)INT_MAX == 2147483648.0 — `>` lets 2147483648.0 fall
+    // through to the cast below, which is UB.  `>=` clamps it to INT_MAX.
+    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
     return static_cast<int>(v);
 }
 
@@ -1035,9 +1037,24 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     else if (key == "snap")             { dp->prof.degrees_snap = v; }
     else if (key == "dpi")              { dp->dev_cfg.dpi = finite_double_to_int(v); }
     else if (key == "polling_rate")     { dp->dev_cfg.polling_rate = finite_double_to_int(v); }
-    else if (key == "speed_min")        { dp->prof.speed_min = v; }
-    else if (key == "speed_max")        { dp->prof.speed_max = v; }
-    else if (key == "output_dpi")        { dp->prof.output_dpi = v; }
+    else if (key == "speed_min")        {
+        dp->prof.speed_min = v;
+        // C-2: warn when speed_min exceeds the existing speed_max (sanitizer
+        // will silently clamp speed_max → speed_min on the next save).
+        if (dp->prof.speed_max > 0 && dp->prof.speed_min > dp->prof.speed_max)
+            std::cerr << "WARNING: speed_min (" << v
+                      << ") > speed_max (" << dp->prof.speed_max
+                      << ") — speed_max will be clamped to speed_min on save.\n";
+    }
+    else if (key == "speed_max")        {
+        dp->prof.speed_max = v;
+        // C-2: same validation in the other direction.
+        if (dp->prof.speed_max > 0 && dp->prof.speed_max < dp->prof.speed_min)
+            std::cerr << "WARNING: speed_max (" << v
+                      << ") < speed_min (" << dp->prof.speed_min
+                      << ") — speed_max will be clamped to speed_min on save.\n";
+    }
+    else if (key == "output_dpi")       { dp->prof.output_dpi = v; }
     else if (key == "lr_ratio")         { dp->prof.lr_output_dpi_ratio = v; }
     else if (key == "ud_ratio")         { dp->prof.ud_output_dpi_ratio = v; }
     else if (key == "yx_ratio")         { dp->prof.yx_output_dpi_ratio = v; }

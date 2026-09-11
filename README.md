@@ -2,8 +2,8 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v0.6.4** — native Logitech HID++ hardware controls for DPI,
-> report rate, and sensor lift-off distance. Release notes: see
+> **Current state: v0.6.7** — stability & hardening release (UB fixes, HID++/IPC hardening,
+> installer fixes). Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
 
 ## Features

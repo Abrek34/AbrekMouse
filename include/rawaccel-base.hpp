@@ -6,7 +6,7 @@
 namespace rawaccel {
 
 /// Single source of truth for the version number — read by GUI and daemon.
-inline constexpr const char* RAWACCEL_VERSION = "0.6.6";
+inline constexpr const char* RAWACCEL_VERSION = "0.6.7";
 
 using milliseconds = double;
 
@@ -18,6 +18,7 @@ inline constexpr milliseconds WRITE_DELAY     = 1000;
 inline constexpr size_t MAX_NAME_LEN         = 256;
 inline constexpr size_t LUT_RAW_DATA_CAPACITY = 514;
 inline constexpr size_t LUT_POINTS_CAPACITY  = LUT_RAW_DATA_CAPACITY / 2;
+inline constexpr size_t MAX_PROFILES         = 256; // SEC-9: bound config size (IPC memory DoS guard)
 inline constexpr double MAX_NORM             = 16;
 inline constexpr double NORMALIZED_DPI       = 1000;
 

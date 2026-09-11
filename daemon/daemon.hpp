@@ -267,6 +267,11 @@ private:
     // IPC server state
     std::thread         ipc_thread_;
     std::atomic<int>    ipc_sock_fd_  { -1 };  // listening socket (atomic: shared with ipc_thread_)
+    // TH-1: ipc_sock_path_ is a plain std::string mutated by stop_ipc_server(),
+    // which the IPC thread's catch handler and the main thread can both call
+    // (concurrent unlink/clear of the same string is a data race → UB).  A
+    // dedicated mutex serialises the path read+clear; it is never on a hot path.
+    std::mutex          ipc_path_mu_;
     std::string         ipc_sock_path_;
     std::atomic<bool>   ipc_running_  { false };
 

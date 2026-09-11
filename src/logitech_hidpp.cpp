@@ -187,7 +187,7 @@ std::optional<hidpp_battery_info> parse_unified_battery(
     // the caller able to distinguish "unknown" from a real 0% battery reading.
     if (discharge == 0 && level == 0 && status == 0xFF) info.level = 255;
 
-    info.charging = status == 0x01 || status == 0x04;
+    info.charging = status == 0x01 || status == 0x02 || status == 0x04;
     info.online = status != 0x05 && status != 0x06 && status != 0xFF;
     return info;
 }
@@ -201,7 +201,8 @@ std::optional<hidpp_battery_info> parse_battery_status_feature(
     // charging flag and must not be interpreted as one.
     info.level = payload[0] == 0 ? 255 : payload[0];
     const uint8_t status = payload[2];
-    info.charging = status == 0x01 || status == 0x04;
+    // B5: 0x02 (almost_full) is also charging, not "discharging".
+    info.charging = status == 0x01 || status == 0x02 || status == 0x04;
     info.online = status != 0x05 && status != 0x06 && status != 0xFF;
     return info;
 }
@@ -387,7 +388,13 @@ std::optional<hidpp_pairing_slot> hidpp_parse_receiver_pairing(
             // Bolt receiver-info pairing payload:
             // kind, WPID high, WPID low, serial[4...].
             if (payload.size() < 4) return std::nullopt;
-            result.occupied = payload[0] != 0;
+            // B1: payload[0] is the echoed subregister byte — it is the
+            // requested register/offset and is always non-zero, so the old
+            // test reported EVERY Bolt slot as occupied.  The real occupied
+            // state lives in the pairing data: kind nibble (payload[1]) and
+            // the 16-bit WPID (payload[2..3]).  An empty slot has all zeros
+            // there.
+            result.occupied = payload[1] != 0 || payload[2] != 0 || payload[3] != 0;
             // Bolt uses a little-endian-looking WPID on the wire: Solaar
             // extracts byte 3 as the high byte and byte 2 as the low byte.
             result.pid = static_cast<uint16_t>(
@@ -499,7 +506,12 @@ hidpp_notification::from_bytes(const uint8_t* data, size_t len) {
     const bool legacy_battery =
         (sub_id == 0x07 || sub_id == 0x0D) && len == 7 && data[6] == 0;
     const bool legacy_illumination = sub_id == 0x17 && len == 7;
-    const bool hidpp20 = (address & 0x0F) == 0;
+    // B2: HID++ 1.0 notifications must not be misclassified as 2.0. 1.0
+    // notifications carry sub-ids 0x40..0x7f, and 1.0 CONNECT_DISCONNECT
+    // events can also have address & 0x0F == 0 — the old test alone would
+    // silently drop them as "fake" 2.0.  Require a genuine 2.0 sub-id
+    // (< 0x40, the 2.0 "feature index" range) in addition to address bits.
+    const bool hidpp20 = sub_id < 0x40 && (address & 0x0F) == 0;
     if (!hidpp10 && !legacy_battery && !legacy_illumination && !hidpp20)
         return std::nullopt;
     // Reject packets with a zero sub-id before they reach feature maps.

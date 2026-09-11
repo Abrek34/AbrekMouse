@@ -21,7 +21,9 @@ ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
-PIDFile=/run/rawaccel.pid
+# BS-11: no PIDFile= — that directive is only honoured for Type=forking and
+# would be dead (systemd warns).  The daemon writes /run/rawaccel.pid for the
+# CLI/GUI's PID discovery, which must not be confused with systemd's notion.
 
 # Security hardening
 PrivateTmp=true

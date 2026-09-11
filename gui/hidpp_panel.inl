@@ -175,6 +175,10 @@ struct HwNotificationTask {
     std::string hidraw_path;
     int device_index;
     std::vector<std::pair<uint16_t, uint8_t>> features;
+    // R2-08: capture the legacy-protocol flag at schedule time.  The idle
+    // callback must NOT re-read S->hidpp_devs at the old index — a completed
+    // rescan may have replaced the vector, mapping idx to a different device.
+    bool legacy_protocol = false;
 };
 
 // Fire-and-forget GLib thread.  We do not join; GLib frees the handle once the
@@ -416,9 +420,13 @@ static gpointer hw_notification_thread(gpointer data) {
         std::string path;
         std::optional<hidpp_battery_info> battery;
         size_t count = 0;
+        // R2-08: device snapshot captured at schedule time.
+        bool legacy_protocol = false;
+        std::vector<std::pair<uint16_t, uint8_t>> features;
     };
     auto* result = new Result{task->S, task->idx, task->hidraw_path,
-                              std::nullopt, 0};
+                              std::nullopt, 0, task->legacy_protocol,
+                              task->features};
     HidppTransport transport(task->hidraw_path);
     if (transport.is_open()) {
         transport.set_device_index(task->device_index);
@@ -469,10 +477,11 @@ static gpointer hw_notification_thread(gpointer data) {
                                  level.c_str(),
                                  r->battery->charging
                                      ? tr(" (charging)") : ""));
+            // R2-08: use the device snapshot captured when the tick scheduled
+            // this task — never S->hidpp_devs[r->idx] after a rescan rebuilt
+            // the vector (the index may now point at a different device).
             hw_set_battery(S, r->idx, r->battery,
-                preferred_battery_source(
-                    S->hidpp_devs[r->idx].features,
-                    S->hidpp_devs[r->idx].info.protocol_version < 2));
+                preferred_battery_source(r->features, r->legacy_protocol));
         }
         // Keep the capability row fresh (daemon-feed battery line etc.).
         hw_render_caps(S, selected);
@@ -498,6 +507,7 @@ static gboolean hw_notification_tick(gpointer user_data) {
     task->hidraw_path = S->hidpp_devs[idx].hidraw_path;
     task->device_index = S->hidpp_devs[idx].device_index;
     task->features = S->hidpp_devs[idx].features;
+    task->legacy_protocol = S->hidpp_devs[idx].info.protocol_version < 2;
     hw_thread("rawaccel-hw-notify", hw_notification_thread, task);
     return G_SOURCE_CONTINUE;
 }

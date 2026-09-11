@@ -239,6 +239,15 @@ public:
         // A non-finite interval is just as unusable as zero: allowing NaN or
         // infinity into the stateful smoothers permanently poisons their
         // accumulators, so later valid events would all produce NaN/zero.
+        // NOTE (BUG-HIGH-2, deliberate): we return without zeroing in.x/in.y.
+        // The daemon's flush_motion() clamps time_ms to [DEFAULT_TIME_MIN,
+        // DEFAULT_TIME_MAX] before ever calling here, so this guard only fires
+        // on hostile unit-level input (NaN/Inf/<=0) — and for a SINGLE event
+        // the reference behaviour is passthrough: dropping the motion would
+        // appear as a cursor stick, while passthrough costs one
+        // unaccelerated frame.  The stateful smoothers must NOT be touched
+        // (that was the poisoning hazard); the rest of modify() is exactly
+        // what we skip.
         if (!std::isfinite(time) || time <= 0) return;
 
         double reference_angle = 0;

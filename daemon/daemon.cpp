@@ -12,6 +12,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <pwd.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <glob.h>
@@ -1484,7 +1485,9 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         // guard in motion_math.hpp). A pathological event batch with millions
         // of REL_X events in one SYN frame would otherwise be UB on cast.
         constexpr double INT_LO = static_cast<double>(INT_MIN);
-        constexpr double INT_HI = static_cast<double>(INT_MAX);
+        // BUG-CRIT-2: static_cast<double>(INT_MAX) rounds up to 2147483648.0 and
+        // casting that back to int is UB.  Largest double whose truncation fits.
+        constexpr double INT_HI = 2147483647.5;
         if (!std::isfinite(dx)) dx = 0;
         if (!std::isfinite(dy)) dy = 0;
         int ix = static_cast<int>(std::clamp(dx, INT_LO, INT_HI));
@@ -1718,43 +1721,65 @@ void AccelDaemon::dump_latency_stats() {
     // Called on SIGUSR1 from the main thread — prints to stdout (journald captures it).
     // Stats cover flush_motion processing time (modifier math + uinput write),
     // NOT the full kernel→userspace round-trip latency.
-    // snapshot_and_reset() atomically reads and clears counters under the mutex.
+    // TH-3: snapshot all device data under the lock, then release it before
+    // doing any stdout I/O.  This prevents the loop thread from being starved
+    // by a slow journald pipe (or a blocking stdout) while the lock is held.
+    struct DevLatSnap {
+        std::string name;
+        bool raw_passthrough;
+        lat_stats::snapshot snap;
+        bool has_data;
+    };
+    std::vector<DevLatSnap> snaps;
+    {
+        std::lock_guard<std::mutex> lk(devices_mutex_);
+        snaps.reserve(devices_.size());
+        for (auto& dev : devices_) {
+            DevLatSnap s;
+            s.name = dev.name;
+            s.raw_passthrough = dev.settings.prof.raw_passthrough;
+            // BUG-21 (GPT-10): in raw_passthrough mode REL_X/REL_Y events bypass
+            // flush_motion() entirely, so dev.lat is never updated.
+            if (s.raw_passthrough) {
+                s.has_data = false;
+            } else {
+                s.snap = dev.lat.snapshot_and_reset();
+                s.has_data = (s.snap.count > 0);
+            }
+            snaps.push_back(std::move(s));
+        }
+    }
+    // Lock released — all stdout I/O is now lock-free.
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "=== RawAccel Processing Latency ===\n";
-    std::lock_guard<std::mutex> lk(devices_mutex_);
-    if (devices_.empty()) {
+    if (snaps.empty()) {
         std::cout << "  No devices currently grabbed.\n";
         std::cout << "===================================\n";
         std::cout.flush();
         return;
     }
-    for (auto& dev : devices_) {
-        std::cout << "  Device: " << dev.name;
-        // BUG-21 (GPT-10): in raw_passthrough mode REL_X/REL_Y events bypass
-        // flush_motion() entirely (forwarded one-by-one straight from
-        // process_device), so dev.lat is never updated.  Make this explicit
-        // in the dump so users don't see a misleading "No motion events".
-        if (dev.settings.prof.raw_passthrough) {
+    for (const auto& s : snaps) {
+        std::cout << "  Device: " << s.name;
+        if (s.raw_passthrough) {
             std::cout << "  [raw passthrough — no per-event measurement]\n";
             std::cout << "    (events forwarded 1:1 to uinput; the clock_gettime\n"
                          "     pair would add ~50 ns per event vs. 0 in raw mode.)\n";
             continue;
         }
         std::cout << "\n";
-        auto s = dev.lat.snapshot_and_reset();
-        if (s.count == 0) {
+        if (!s.has_data) {
             std::cout << "    No motion events recorded yet.\n";
         } else {
             std::cout << std::fixed << std::setprecision(2)
-                      << "    Samples  : " << s.count              << "\n"
-                      << "    Min      : " << s.min_us             << " µs\n"
-                      << "    Avg      : " << s.avg_us()           << " µs\n"
-                      << "    p50      : " << s.percentile(50)     << " µs\n"
-                      << "    p95      : " << s.percentile(95)     << " µs\n"
-                      << "    p99      : " << s.percentile(99)     << " µs\n"
-                      << "    Max      : " << s.max_us             << " µs\n";
-            if (s.over > 0)
-                std::cout << "    Overflow : " << s.over
+                      << "    Samples  : " << s.snap.count              << "\n"
+                      << "    Min      : " << s.snap.min_us             << " µs\n"
+                      << "    Avg      : " << s.snap.avg_us()           << " µs\n"
+                      << "    p50      : " << s.snap.percentile(50)     << " µs\n"
+                      << "    p95      : " << s.snap.percentile(95)     << " µs\n"
+                      << "    p99      : " << s.snap.percentile(99)     << " µs\n"
+                      << "    Max      : " << s.snap.max_us             << " µs\n";
+            if (s.snap.over > 0)
+                std::cout << "    Overflow : " << s.snap.over
                           << " samples > " << lat_stats::RANGE_US << " µs\n";
         }
         std::cout << "    (counters reset)\n";
@@ -1991,7 +2016,10 @@ struct DevSnap {
 }
 
 bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
-    ipc_sock_path_ = sock_path;
+    {
+        std::lock_guard<std::mutex> lk(ipc_path_mu_);
+        ipc_sock_path_ = sock_path;
+    }
 
     // Do not unlink a pathname that may belong to a live daemon.  A second
     // instance must fail rather than silently replacing the first daemon's
@@ -2125,10 +2153,17 @@ void AccelDaemon::stop_ipc_server() {
     // closing it concurrently with poll/accept permits descriptor reuse and
     // can make the worker operate on an unrelated descriptor.
     if (fd >= 0) close(fd);
-    if (!ipc_sock_path_.empty()) {
-        unlink(ipc_sock_path_.c_str());
+    // TH-1: ipc_sock_path_ can be cleared concurrently (the IPC thread's catch
+    // handler and the main thread's normal shutdown may both reach here).  Copy
+    // the path under the mutex, then unlink outside it.
+    std::string path_to_unlink;
+    {
+        std::lock_guard<std::mutex> lk(ipc_path_mu_);
+        path_to_unlink = ipc_sock_path_;
         ipc_sock_path_.clear();
     }
+    if (!path_to_unlink.empty())
+        unlink(path_to_unlink.c_str());
 }
 
 void AccelDaemon::ipc_serve_loop() {
@@ -2155,6 +2190,55 @@ void AccelDaemon::ipc_serve_loop() {
         // with stop_ipc_server() which may close ipc_sock_fd_ between poll() and accept4().
         int client = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) continue;
+        // SEC-1: verify the connecting process belongs to the 'input' group
+        // (or is root) via SO_PEERCRED.  The socket file permissions (0660
+        // root:input) provide DAC-level gating, but a leaked FD or a race
+        // between stale-probe and bind could let an unprivileged process slip
+        // through — the kernel credential check closes that window.
+        {
+            struct ucred cred{};
+            socklen_t clen = sizeof(cred);
+            if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0) {
+                bool allowed = (cred.uid == 0); // root always allowed
+                if (!allowed) {
+                    struct group* grp = getgrnam("input");
+                    if (grp) {
+                        // Check primary group
+                        if (cred.gid == grp->gr_gid) allowed = true;
+                        // Check supplementary groups via the peer's UID
+                        if (!allowed) {
+                            struct passwd* pw = getpwuid(cred.uid);
+                            if (pw) {
+                                int ngroups = 0;
+                                getgrouplist(pw->pw_name, grp->gr_gid,
+                                             nullptr, &ngroups);
+                                if (ngroups > 0) {
+                                    std::vector<gid_t> groups(ngroups);
+                                    if (getgrouplist(pw->pw_name, grp->gr_gid,
+                                                     groups.data(), &ngroups) == 0) {
+                                        for (int i = 0; i < ngroups; i++) {
+                                            if (groups[i] == grp->gr_gid) {
+                                                allowed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!allowed) {
+                    log("IPC: rejecting connection from unprivileged process"
+                        " (uid=" + std::to_string(cred.uid) +
+                        " gid=" + std::to_string(cred.gid) + ")", true);
+                    close(client);
+                    continue;
+                }
+            }
+            // If getsockopt fails (kernel too old?), fall through — the DAC
+            // permissions on the socket file are the fallback gate.
+        }
         // ERR-3: never let a per-client exception (e.g. std::bad_alloc on a
         // huge payload) leak the descriptor or kill the whole IPC server.
         // Log, close, and keep serving the next client.

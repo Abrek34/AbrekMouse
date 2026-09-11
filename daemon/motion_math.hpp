@@ -42,7 +42,11 @@ inline void apply_motion_math(
     // acceleration config (or NaN/Inf from a buggy algorithm) produces a value
     // outside the representable int range.
     constexpr double INT_LO = static_cast<double>(INT_MIN);
-    constexpr double INT_HI = static_cast<double>(INT_MAX);
+    // BUG-CRIT-2: static_cast<double>(INT_MAX) rounds UP to 2147483648.0, so a
+    // pathological value that clamps to INT_HI then casts (static_cast<int>
+    // of 2147483648.0) is UB.  Use the largest double whose truncation still
+    // fits INT_MAX (2147483647.5 → 2147483647).
+    constexpr double INT_HI = 2147483647.5;
     double tx = std::trunc(motion.x);
     double ty = std::trunc(motion.y);
     if (!std::isfinite(tx)) tx = 0;
