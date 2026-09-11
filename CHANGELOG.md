@@ -6,6 +6,30 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.1.0] — 2026-09-11
+
+### Added
+- End-to-end daemon test (`tests/e2e_harness.cpp` + `tests/run_e2e.sh`): drives the
+  REAL daemon against a synthetic uinput mouse and a virtual sink. Accel phase
+  checks frame/SYN structure, SM-2 button buffering, LOW-1 coalesced deferral, and
+  ×3 classic-linear gain (T-A1..T-A4); raw phase verifies byte-identical 1:1
+  passthrough (T-B1). Needs root + `/dev/uinput`; not run in CI.
+
+### Changed
+- P93-BATCH (hot path): `process_device()` accumulates each frame — motion REL,
+  queued non-motion events, and the closing SYN_REPORT — in a stack `write_batch`
+  and submits it in a SINGLE `write()` syscall at the real SYN_REPORT. With the
+  companion 32-event batched evdev reads, the canonical per-motion-frame cost is
+  1 `read()` + 1 `write()` + 2×`clock_gettime` (was ~3-8 syscalls).
+- CFG-1: `output_dpi = 0` now means "no output-DPI normalization" (1:1 counts)
+  instead of being clamped to 1 (which silently produced a near-dead cursor).
+  `sanitize_device_profile()` and the CLI `set-param` domain/`check` warning now
+  treat 0 as a valid sentinel.
+
+### Fixed
+- E2E harness debug: flushed whole-batches produce exactly one SYN per frame (no
+  duplicated trailing SYN).
+
 ## [0.6.6] — 2026-09-11
 
 ### Added
