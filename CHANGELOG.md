@@ -6,6 +6,31 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [0.6.6] — 2026-09-11
+
+### Added
+- Per-application profiles (`match_app`): a profile can be bound to the focused
+  application's WM_CLASS so it applies only while that app is active. The
+  daemon live-switches profiles without dropping the mouse grab (case-insensitive
+  substring matching; empty = always). Config, JSON round-trip, sanitize (128-char
+  cap), and legacy compatibility are covered by tests (33786 assertions).
+- KDE Wayland active-window focus relay: an embedded KWin script watches
+  `workspace.windowActivated` and forwards `resourceClass` to the GUI-owned
+  GDBus service `org.rawaccel.Focus`, which pushes it to the daemon via the new
+  `set_active_app` IPC. Works on X11/KDE too; degrades gracefully on other
+  desktops (GUI "App:" field is then a manual per-profile hint only).
+- GUI "App:" match field on each profile's Device Assignment row.
+- HID++ transport layer (Easy-Switch/LED/reprog groundwork): `get_change_host_info`,
+  `set_change_host`, `get_led_brightness`, `set_led_brightness` (0x8040/0x1982/0x1981),
+  `get_reprog_controls`, and `write_onboard_profile_sector`. Queued for the next
+  GUI hardware panel.
+
+### Fixed
+- Graph pan-zoom: wheel-zooming mid-drag no longer shifts the pan baseline
+  (`drag_zoom_start` is frozen at drag start).
+- Profile name gate now strips surrounding whitespace so a name of only spaces
+  can no longer create a blank/ambiguous profile row.
+
 ## [0.6.4] — 2026-09-08
 
 ### Added
