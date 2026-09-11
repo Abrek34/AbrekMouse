@@ -239,11 +239,14 @@ static profile profile_from_json_obj(const json& j) {
 
     if (j.contains("name") && j["name"].is_string()) {
         auto s = j["name"].get<std::string>();
-        std::strncpy(p.name, s.c_str(), MAX_NAME_LEN - 1);
+        // CFG-6: the CLI/P83 contract allows up to MAX_NAME_LEN (256) chars
+        // and the backing buffer is MAX_NAME_LEN+1, so the full name survives
+        // the hot-path copy — no silent 256→255 truncation on reload.
+        std::strncpy(p.name, s.c_str(), MAX_NAME_LEN);
         // strncpy doesn't write a null terminator when src ≥ N.  Default
         // construction zero-fills the array, but defend in depth in case
         // the caller passes a previously-populated profile.
-        p.name[MAX_NAME_LEN - 1] = '\0';
+        p.name[MAX_NAME_LEN] = '\0';
     }
     // P99: type-guard the remaining scalar fields so a single wrong-typed
     // value (hand-edit, future schema drift) degrades to the default instead
@@ -401,7 +404,11 @@ static void sanitize_accel_args(accel_args& a) {
     //   motion_math NaN guard handle this downstream — don't clamp here.
     // scale: used as pow(scale * x, exp) in power mode.
     //   Negative scale * positive x → negative base → NaN with non-integer exp.
-    if (a.scale < 0) a.scale = 0;
+    //   Zero → pow(0,x)=0 → gain≡0 (dead cursor) with no cap, or a silent
+    //   1.5× constant boost with cap_mode=out (cap_x = gain_inverse(...,0) = 0).
+    //   MATH-2: floor to the same scale floor as the GUI spin (0.01), matching
+    //   the exponent_power floor pattern — a zero curve is never reachable.
+    if (a.scale <= 0) a.scale = 0.01;
     // decay_rate: natural mode divides by limit to get internal accel coefficient.
     //   Negative → exp(+large) → diverging gain.  Clamp to >= 0.
     if (a.decay_rate < 0) a.decay_rate = 0;
@@ -509,15 +516,13 @@ static void sanitize_profile(profile& p) {
     // Upper bound (P155): pow(0.5, 1/hl) rounds to exactly 1.0 for hl ≥ ~1.4e16
     // (1/hl below half-ULP in double), which makes cutOffCoefficient = 1 and every
     // EMA increment twc/tcc = 0 — the smoother silently returns its initial 0
-    // forever and the mouse stops responding.  Clamp to a huge-but-safe ceiling.
-    // SM-7: the old cap was 1e9 ms (~31.7 years) — from the smoothing code's
-    // perspective anything past ~10 s is indistinguishable from "the estimate
-    // never moves" (a per-8ms EMA step of e^-0.0008 ≈ 0.9992) and pins the
-    // smoothed speed at its initial 0, a dead-mouse symptom.  The upper bound
-    // stays at 1e6 ms (~17 min) because the P107 set-param domain contract
-    // asserts 1e6 survives sanitize unchanged — anything below that breaks the
-    // domain tests.  1e6 still removes the absurd 31-year hazard.
-    constexpr double kMaxSmoothHalflifeMs = 1.0e6;
+    // forever and the mouse stops responding.  SM-7: clamping to SMOOTH_HALFLIFE_MAX
+    // (10 s) still removes the hazard while leaving a usable ceiling — anything
+    // past ~10 s is indistinguishable from "the estimate never moves" (a
+    // per-8ms EMA step of e^-0.0008 ≈ 0.9992) and pins the smoothed speed at its
+    // initial 0, a dead-mouse symptom.  The CLI set-param domain uses the same
+    // constant so every in-domain value survives sanitize byte-correct (P107).
+    constexpr double kMaxSmoothHalflifeMs = SMOOTH_HALFLIFE_MAX;
     if (p.speed_processor_args.input_speed_smooth_halflife < 0)
         p.speed_processor_args.input_speed_smooth_halflife = 0;
     if (p.speed_processor_args.input_speed_smooth_halflife > kMaxSmoothHalflifeMs)
@@ -583,10 +588,17 @@ static std::string json_get_string_limited(const json& v,
 static device_profile device_profile_from_json(const json& j) {
     device_profile dp;
     // B4 (P43): type guard + length cap for the free-form string fields.
-    constexpr size_t MAX_DP_NAME = 256;
+    // CFG-6: dp.name cap == top-level profile.name copy cap == MAX_NAME_LEN,
+    // so a 256-char name round-trips identically through both (a single
+    // truncation length for the same JSON, not "256 here vs 255 there").
     constexpr size_t MAX_DP_DEVICE_ID = 256;
-    if (j.contains("name"))       dp.name      = json_get_string_limited(j["name"], "", MAX_DP_NAME);
+    if (j.contains("name"))       dp.name      = json_get_string_limited(j["name"], "", MAX_NAME_LEN);
     if (j.contains("device_id"))  dp.device_id = json_get_string_limited(j["device_id"], "", MAX_DP_DEVICE_ID);
+    // C29-N4: the UI displays empty device_id as "(all)" — accept the same
+    // written form (and common aliases) so a hand-edited JSON/profile can't
+    // silently become a dead literal ID that matches no device.
+    if (dp.device_id == "(all)" || dp.device_id == "all" || dp.device_id == "*")
+        dp.device_id.clear();
     if (j.contains("match_app"))  dp.match_app = json_get_string_limited(j["match_app"], "", 128);
     if (j.contains("dpi"))          dp.dev_cfg.dpi   = json_get_int_safe(j["dpi"], 800);
     if (j.contains("polling_rate")) dp.dev_cfg.polling_rate = json_get_int_safe(j["polling_rate"], 1000);
@@ -599,6 +611,13 @@ static device_profile device_profile_from_json(const json& j) {
     sanitize_profile(dp.prof);
     return dp;
 }
+
+//─── Private helpers ───────────────────────────────────────────────────────────
+
+/// Older-than comparison ("0.0.0"-style semver) used to decide whether a stored
+/// version needs migration / downgrade protection.  Forward-declared for
+/// app_config_to_json_obj() (defined further down).
+static bool version_lt(const std::string& lhs, const std::string& rhs);
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -635,7 +654,17 @@ static app_config app_config_from_json_obj(const json& j) {
 
 static json app_config_to_json_obj(const app_config& cfg) {
     json j;
-    j["version"]          = RAWACCEL_VERSION;
+    // CFG-5: never silently DOWNGRADE a config written by a NEWER binary.
+    // save_config stamps the current schema version, so a config that arrived
+    // as version 2.0 was rewritten as 1.1.0 on the first mutation and every
+    // 2.0-era field was dropped — forward data loss.  Stamp RAWACCEL_VERSION
+    // only when the stored version is absent or older; a newer version is
+    // preserved verbatim (unknown keys are still dropped, but the version no
+    // longer lies and the file does not regress).
+    j["version"] = (cfg.version.empty() ||
+                    version_lt(cfg.version, RAWACCEL_VERSION))
+                   ? RAWACCEL_VERSION
+                   : cfg.version;
     j["active_profile"] = cfg.active_profile;
     j["use_raw_input"]  = cfg.use_raw_input;
     j["profiles"]       = json::array();
@@ -824,18 +853,41 @@ void sanitize_device_profile(device_profile& dp) {
 }
 
 std::string find_config_path() {
+    // CFG-7: if XDG_CONFIG_HOME is set (non-empty), it takes precedence over
+    // a fixed $HOME/.config — that is the whole point of the variable and it
+    // is what various CLI tools honor.
+    auto xdg_override = []() -> std::string {
+        const char* xdg = std::getenv("XDG_CONFIG_HOME");
+        if (xdg && xdg[0] != '\0')
+            return std::string(xdg) + "/rawaccel/settings.json";
+        return {};
+    };
+    std::string xdg = xdg_override();
     // D7: when running under sudo, HOME may be /root — prefer SUDO_USER's home directory.
     const char* sudo_user = std::getenv("SUDO_USER");
     if (sudo_user && sudo_user[0] != '\0') {
         struct passwd  pwd_buf;
         struct passwd* result = nullptr;
-        std::vector<char> buf(16384);
-        int ret = getpwnam_r(sudo_user, &pwd_buf, buf.data(), buf.size(), &result);
-        if (ret == 0 && result && result->pw_dir && result->pw_dir[0] != '\0') {
-            return std::string(result->pw_dir) + "/.config/rawaccel/settings.json";
+        // CFG-7: getpwnam_r can return ERANGE when the caller buffer is too
+        // small for a long passwd line (up to 8 KiB / 64+ KiB with NSS+LDAP).
+        // Retry with a growing buffer instead of silently falling back to the
+        // wrong (possibly /root) home or the hardcoded /etc path.
+        size_t buf_size = 16384;
+        int    ret;
+        std::vector<char> buf;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            buf.assign(buf_size, '\0');
+            ret = getpwnam_r(sudo_user, &pwd_buf, buf.data(), buf.size(), &result);
+            if (ret == 0 && result && result->pw_dir && result->pw_dir[0] != '\0') {
+                if (!xdg.empty()) return xdg;                  // CFG-7
+                return std::string(result->pw_dir) + "/.config/rawaccel/settings.json";
+            }
+            if (ret != ERANGE) break;
+            buf_size *= 2; // up to 256 KiB worst-case on the last attempt
         }
     }
     // Normal user or root (e.g. systemd service)
+    if (!xdg.empty()) return xdg;                               // CFG-7
     const char* home = std::getenv("HOME");
     if (home && home[0] != '\0') {
         return std::string(home) + "/.config/rawaccel/settings.json";

@@ -123,13 +123,25 @@ struct power {
         // ORTA-BUG-ALG-02: GAIN path had no local Inf guard — pow(scale·x, exp)
         // overflows to Inf for extreme inputs, and the value propagated to the
         // downstream modifier.  All other accel modes guard locally; match them.
+        // CUR-3: when the raw curve DOES overflow, a hard fallback to 1.0
+        // (identity) mid-flick is a C0 step — the cursor suddenly drops from a
+        // large (or saturated) gain to 1:1.  When a cap is requested clamp to
+        // cap_y instead (a continuous ceiling the tail already converges to);
+        // only the unbounded curve (cap never requested → cap_y stays DBL_MAX)
+        // falls back to identity, since it has no finite ceiling to sit on and
+        // identity is the safe defensive behavior (never a dead frame).  The
+        // oracle grid never reaches this guard (max speed 1e5, exp ≤ 10 →
+        // ~1e53 « DBL_MAX), so deviation rows are unaffected.
         double out;
         if (speed < cap_x) {
             out = base_fn_impl(speed);
         } else {
             out = cap_y + constant_b / speed;
         }
-        return std::isfinite(out) ? out : 1.0;
+        if (!std::isfinite(out)) {
+            out = cap_y < DBL_MAX ? cap_y : 1.0;
+        }
+        return out;
     }
 
 private:

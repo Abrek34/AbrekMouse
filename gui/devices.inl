@@ -269,7 +269,10 @@ gboolean on_inotify_event(GIOChannel* chan, GIOCondition /*cond*/, gpointer user
 gboolean on_hidraw_inotify_event(GIOChannel* chan, GIOCondition /*cond*/,
                                  gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
-    char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
+    // GUI-Y1: same alignas requirement as on_inotify_event — the buffer is
+    // reinterpret_cast to struct inotify_event*, so force the array's
+    // alignment (ARM strict-alignment / UB otherwise).
+    alignas(struct inotify_event) char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
     gsize bytes_read = 0;
     bool changed = false;
     while (true) {

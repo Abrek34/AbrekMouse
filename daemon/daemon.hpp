@@ -233,6 +233,11 @@ private:
     int inotify_wd_ = -1;
     // Track which paths are already opened (avoid re-grabbing on spurious events)
     std::set<std::string> opened_paths_;
+    // HP-3: track OPEN device_ids so two evdev nodes with the same
+    // VID:PID:serial (multi-interface/HID-composite mice) are not double-
+    // grabbed — a physical report would otherwise reach the compositor twice.
+    // Access only from the loop thread (setup + hotplug) — no sync needed.
+    std::set<std::string> opened_device_ids_;
     // P121/BUG-02: paths with failed I/O are denied re-open until this
     // (ms, CLOCK_MONOTONIC_RAW).  A broken-but-still-listed node would
     // otherwise churn grab/uinput-create/destroy every ~2 s forever.

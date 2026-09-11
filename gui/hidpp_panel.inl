@@ -216,6 +216,10 @@ static gpointer hw_scan_thread(gpointer data) {
         AppState* S = r->S;
         if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
         S->hw_busy = false;
+        // GUI-Y3: the combo model was rebuilt below, so any stashed pending
+        // selection indexes the OLD vector and is stale — discard it; the
+        // hw_query_current() at the end re-queries the re-populated combo.
+        S->hw_pending_query = -1;
         S->hidpp_devs = std::move(r->devs);
         // R2-08: invalidate any in-flight query/notification results — they
         // were snapshotted against the previous vector generation.
@@ -342,6 +346,15 @@ static gpointer hw_query_thread(gpointer data) {
             }
         } else {
             hw_update_ui_state(S);
+        }
+        // GUI-Y3: user selected another device while this query was in flight
+        // — re-issue the query now that we are free (stale pending cleared by
+        // the fresh hw_query_current()).
+        if (S->hw_pending_query >= 0) {
+            int pq = S->hw_pending_query;
+            S->hw_pending_query = -1;
+            if (pq < (int)S->hidpp_devs.size())
+                hw_query_current(S);
         }
         delete r;
         return G_SOURCE_REMOVE;
@@ -574,7 +587,16 @@ void hw_start_scan(AppState* S) {
 void hw_query_current(AppState* S) {
     if (!S->hw_dev_combo) return;
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
-    if (S->hw_busy || idx < 0 || idx >= (int)S->hidpp_devs.size()) return;
+    if (idx < 0 || idx >= (int)S->hidpp_devs.size()) { S->hw_pending_query = -1; return; }
+    // GUI-Y3: a busy scan/query/apply would previously drop this selection
+    // silently, leaving stale onboard values on screen.  Stash it and let the
+    // in-flight task's completion idle callback re-issue the query.
+    if (S->hw_busy) {
+        S->hw_pending_query = idx;
+        return;
+    }
+    // Consume any stashed pending selection (a fresh query supersedes it).
+    S->hw_pending_query = -1;
     S->hw_busy = true;
     hw_update_ui_state(S);
     auto* task = new HwQueryTask();

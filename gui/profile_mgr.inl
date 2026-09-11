@@ -389,6 +389,10 @@ void on_delete_profile(GtkButton*, gpointer user_data) {
 void on_duplicate_profile(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (S->config.profiles.empty()) return;
+    // GUI-D3: flush any pending widget edits before copying — otherwise a
+    // value changed but not yet committed (e.g. the spin's own handler still
+    // holding the change) is duplicated stale.
+    if (!S->updating) widgets_to_profile(S);
     // BUG-08: naive "… (copy)" collided with an existing profile name, silently
     // leaving two profiles with the same name (ambiguous combo + daemon lookup).
     // Auto-uniquify: "<orig> (copy)", then "<orig> (copy) 2", 3, … — same rule
@@ -481,12 +485,22 @@ std::string msg = trf("Reset \"%s\" to default values?\nThis cannot be undone.",
 static void export_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     auto* S = static_cast<AppState*>(ud);
     GtkFileDialog* dlg = GTK_FILE_DIALOG(src);
-    GFile* file = gtk_file_dialog_save_finish(dlg, res, nullptr);
-    if (!file) return; // user cancelled
+    // GUI-D4: report the real error rather than treating failure as "cancel".
+    GError* err = nullptr;
+    GFile* file = gtk_file_dialog_save_finish(dlg, res, &err);
+    if (!file) {
+        if (err && !g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            set_status(S, trf("Export failed: %s", err->message));
+        g_clear_error(&err);
+        return; // cancelled (no message) or error already shown
+    }
     gchar* path = g_file_get_path(file);
     g_object_unref(file);
     if (!path) return;
     try {
+        // G27-N1: export must reflect the CURRENT widget state, not the last
+        // applied profile — sync widgets into the profile before serializing.
+        widgets_to_profile(S);
         std::string json = profile_to_json(cur_prof(S)) + "\n";
         if (!write_text_file(path, json))
             set_status(S, trf("Export failed: cannot write %s", path));
@@ -511,18 +525,25 @@ void on_export_profile(GtkButton*, gpointer user_data) {
 static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     auto* S = static_cast<AppState*>(ud);
     GtkFileDialog* dlg = GTK_FILE_DIALOG(src);
-    GFile* file = gtk_file_dialog_open_finish(dlg, res, nullptr);
-    if (!file) return; // user cancelled
+    // GUI-D4: report the real error rather than treating failure as "cancel".
+    GError* err = nullptr;
+    GFile* file = gtk_file_dialog_open_finish(dlg, res, &err);
+    if (!file) {
+        if (err && !g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+            set_status(S, trf("Import failed: %s", err->message));
+        g_clear_error(&err);
+        return; // cancelled (no message) or error already shown
+    }
     gchar* path = g_file_get_path(file);
     g_object_unref(file);
     if (!path) return;
 
-    GError* err = nullptr;
+    GError* err2 = nullptr;
     gchar* data = nullptr;
     gsize   len  = 0;
-    if (!g_file_get_contents(path, &data, &len, &err)) {
-        set_status(S, trf("Import failed: %s", err ? err->message : "read error"));
-        g_clear_error(&err);
+    if (!g_file_get_contents(path, &data, &len, &err2)) {
+        set_status(S, trf("Import failed: %s", err2 ? err2->message : "read error"));
+        g_clear_error(&err2);
         g_free(path);
         return;
     }

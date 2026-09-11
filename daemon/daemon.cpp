@@ -769,7 +769,9 @@ bool AccelDaemon::create_virtual_device(mouse_device& dev) {
     const int udev_fd = uinput_fd(uidev);
     if (udev_fd >= 0) {
         int flags = fcntl(udev_fd, F_GETFL);
-        if (flags >= 0) fcntl(udev_fd, F_SETFL, flags | O_NONBLOCK);
+        if (flags >= 0 && fcntl(udev_fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            log("create_virtual_device: fcntl(F_SETFL|O_NONBLOCK) failed: " +
+                std::string(strerror(errno)) + " — sink stays blocking.", true);
     }
     log("Created virtual device: " + vname, true); // verbose: not needed in normal operation
     return true;
@@ -837,6 +839,19 @@ bool AccelDaemon::setup_devices() {
             continue;
         }
 
+        // HP-3: same physical device already open under another eventN node
+        // (HID-composite / multi-interface mice expose several REL nodes with
+        // one device_id).  Grab only the first — double-grab would duplicate
+        // every physical report through two uinput devices.
+        if (!dev.device_id.empty() &&
+            opened_device_ids_.count(dev.device_id)) {
+            log("Skipping duplicate device_id: " + dev.name + " (" +
+                dev.device_id + ")", true);
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+            continue;
+        }
+
         const device_profile* prof = find_profile(dev.device_id);
 
         // PAS-2: per-device disable flag — leave the device untouched so the
@@ -871,6 +886,7 @@ bool AccelDaemon::setup_devices() {
         }
 
         opened_paths_.insert(path);
+        if (!dev.device_id.empty()) opened_device_ids_.insert(dev.device_id);
         {
             std::lock_guard<std::mutex> lk(devices_mutex_);
             fd_to_dev_[dev.fd_in] = devices_.size(); // index before push
@@ -901,6 +917,7 @@ void AccelDaemon::teardown_devices() {
         to_destroy = std::move(devices_);
         devices_.clear();
         opened_paths_.clear();
+        opened_device_ids_.clear();
         fd_to_dev_.clear();
     }
     for (auto& dev : to_destroy) {
@@ -939,16 +956,21 @@ const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const
             if (p.device_id.empty() &&
                 profile_matches_app(p, current_app_)) return &p;
     }
-    // 1. Device-specific assignment takes priority
+    // 1. Device-specific assignment takes priority (C29-N1: apply the same
+    //    app gate as the app-aware pass above — an app-scoped binding must
+    //    NEVER leak into this generic pass, or it becomes a catch-all for
+    //    every non-matching app / no-focus state).
     for (auto& p : config_.profiles)
-        if (!p.device_id.empty() && p.device_id == dev_id) return &p;
+        if (!p.device_id.empty() && p.device_id == dev_id &&
+            profile_matches_app(p, current_app_)) return &p;
     // 2. "All devices" catch-all (P121/BUG-03): an empty device_id means the
     //    profile binds to every mouse without a device-specific match — the
     //    documented contract (config.hpp:18) and the GUI's "All devices"
     //    combo entry.  Previously these records were silently skipped unless
     //    they happened to be the active profile or profiles[0].
+    //    (C29-N1: same app gate — empty match_app passes, app-bound does not.)
     for (auto& p : config_.profiles)
-        if (p.device_id.empty()) return &p;
+        if (p.device_id.empty() && profile_matches_app(p, current_app_)) return &p;
     // 3. Active profile
     for (auto& p : config_.profiles)
         if (p.name == config_.active_profile) return &p;
@@ -1009,6 +1031,13 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     dev.telemetry->speed_ips.store(0.0, std::memory_order_relaxed);
     dev.telemetry->out_ips.store(0.0, std::memory_order_relaxed);
     dev.telemetry->gain.store(0.0, std::memory_order_relaxed);
+    // SYN-1: clear the remaining seqlock payload fields too.  An odd/even
+    // counter mismatch would already make the reader drop the sample, but a
+    // reader that loaded the OLD even counter could still pair it with stale
+    // dx/dy/wall_ms values — writing them matters vs. leaving the old sample.
+    dev.telemetry->dx.store(0.0, std::memory_order_relaxed);
+    dev.telemetry->dy.store(0.0, std::memory_order_relaxed);
+    dev.telemetry->wall_ms.store(0.0, std::memory_order_relaxed);
     dev.telemetry->samples.store(0, std::memory_order_release);
     // R3-NEW-3: re-anchor the speed interval.  last_time_ms starts at 0 and —
     // critically — is NOT updated while the previous profile was in raw
@@ -1143,6 +1172,27 @@ void AccelDaemon::do_hotplug_scan() {
             deny_reopen(path, dev.device_id, path_deny_until_ms_, dev_deny_until_ms_);
             continue;
         }
+
+        // HP-1: honour the same PAS-1/PAS-2 gates as setup_devices. Without
+        // this, the idle rescan re-captures mice that use_raw_input=false or a
+        // dev_cfg.disable profile said to leave alone — "safe mode" silently
+        // violated on every hot-plug cycle.
+        if (!raw_input_enabled_) {
+            log("Hot-plug: raw-input disabled in config — skipping device: " +
+                dev.name, true);
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+            continue;
+        }
+        const device_profile* prof = find_profile(dev.device_id);
+        if (prof && prof->dev_cfg.disable) {
+            log("Hot-plug: skipping disabled device: " + dev.name +
+                " [" + dev.device_id + "]", true);
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+            continue;
+        }
+
         if (!create_virtual_device(dev)) {
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
@@ -1150,7 +1200,6 @@ void AccelDaemon::do_hotplug_scan() {
         }
 
         // Apply per-device profile assignment (same logic as setup_devices)
-        const device_profile* prof = find_profile(dev.device_id);
         if (prof) apply_profile(dev, *prof);
 
         epoll_event eev{};
@@ -1166,6 +1215,7 @@ void AccelDaemon::do_hotplug_scan() {
         }
 
         opened_paths_.insert(path);
+        if (!dev.device_id.empty()) opened_device_ids_.insert(dev.device_id);
         {
             std::lock_guard<std::mutex> lk(devices_mutex_);
             fd_to_dev_[dev.fd_in] = devices_.size();
@@ -1190,6 +1240,8 @@ void AccelDaemon::do_hotplug_scan() {
                     log("hot-plug: epoll_ctl(del) failed for " + it->path + ": " +
                         std::string(strerror(errno)), true);
                 opened_paths_.erase(it->path);
+                if (!it->device_id.empty())
+                    opened_device_ids_.erase(it->device_id);
                 to_destroy.push_back(std::move(*it));
                 it = devices_.erase(it);
             } else {
@@ -1506,6 +1558,8 @@ void AccelDaemon::run_loop() {
                             dit->path + ": " + std::string(strerror(errno)), true);
                     fd_to_dev_.erase(dit->fd_in);
                     opened_paths_.erase(dit->path);
+                    if (!dit->device_id.empty())
+                        opened_device_ids_.erase(dit->device_id);
                     // P121/BUG-02: an I/O error often means the node is dead but
                     // still listed in /dev/input.  Deny immediate re-open so the
                     // ~2 s empty-rescan doesn't re-grab/uinput-churn it forever.
@@ -1719,7 +1773,23 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // toward zero and spike the gain — the poll period is what the device
     // actually reported, not what the process got around to.
     if (dev.last_frame_ev_us != 0 && frame_ev_us != 0 && frame_ev_us > dev.last_frame_ev_us) {
-        time_ms = static_cast<double>(frame_ev_us - dev.last_frame_ev_us) / 1000.0;
+        // SM-1: true USB poll period from the kernel frame stamps.
+        double gap_ms = static_cast<double>(frame_ev_us - dev.last_frame_ev_us) / 1000.0;
+        // SM-4: after a genuine idle pause (no SYN of any kind for ≥ idle-gap
+        // threshold) the first motion frame would measure the WHOLE gap —
+        // clamped to DEFAULT_TIME_MAX → speed ≈ 0 → gain ≈ 1: the first flick
+        // arrives one frame late ("post-idle kick").  Re-measure the fresh
+        // motion against ONE nominal poll period so it is judged at real speed.
+        // Devices that keep emitting empty SYN_REPORTs during idle are covered
+        // by the empty-frame re-anchor (the SYN_REPORT handler advances
+        // last_frame_ev_us even when has_motion == false), so they rarely reach
+        // this threshold; silent devices rely on it.
+        const double kIdleGapMs = DEFAULT_TIME_MAX; // ≥100 ms without frames = true idle
+        if (gap_ms >= kIdleGapMs) {
+            time_ms = 1000.0 / std::max(dev.poll_rate, static_cast<int>(POLL_RATE_MIN));
+        } else {
+            time_ms = gap_ms;
+        }
     } else {
         // Fallback / first frame: wall clock.  last_time_ms==0 on the first
         // call, so time_ms is huge → clamped to DEFAULT_TIME_MAX — correct.
@@ -1902,9 +1972,22 @@ for (size_t i = 0; i < read_count; ++i) {
             if (ev.type == EV_SYN) {
             if (ev.code == SYN_DROPPED) {
                 // Kernel dropped events due to buffer overflow.
-                // Per the Linux input protocol, ALL events between SYN_DROPPED
-                // and the next SYN_REPORT are unreliable and must be discarded.
-                // Set a flag so subsequent events in this batch are ignored.
+                // Per the Linux input protocol, only events AFTER SYN_DROPPED
+                // (until the next SYN_REPORT) are unreliable and must be
+                // discarded.  Motion that ALREADY accumulated in this batch was
+                // written into the kernel buffer BEFORE the overflow — it is
+                // legal and must not be silently lost (RAC-4).  Park it into the
+                // same LOW-1 tail mechanism a split batch uses, so the next
+                // genuine SYN_REPORT flushes it with a real interval instead of
+                // dropping it (loss becomes at most one poll frame of delay).
+                if (has_motion || queued_count > 0) {
+                    dev.pending_dx   += dx;
+                    dev.pending_dy   += dy;
+                    dev.has_pending_motion = true;
+                    for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
+                        dev.pending_events[dev.pending_ev_count++] = queued_events[i];
+                    queued_count = 0;
+                }
                 dx = dy = 0;
                 has_motion = false;
                 syn_dropped = true;
@@ -1960,6 +2043,17 @@ for (size_t i = 0; i < read_count; ++i) {
             }
             if (!flush_pending_motion(frame_ev_us)) return;
             if (!flush_queued()) return;
+            // SM-4: a device that keeps emitting EMPTY SYN_REPORTs during idle
+            // must still advance the SM-1 interval base here.  Previously only
+            // the motion path (flush_motion) advanced last_frame_ev_us, so the
+            // first motion frame after a pause measured the WHOLE idle gap
+            // (→ DEFAULT_TIME_MAX → under-gained kick).  When flush_pending_motion
+            // did run, flush_motion already advanced both anchors to this same
+            // SYN's values — setting them again is idempotent.  Silent devices
+            // (no frames at all during idle) are covered by the kIdleGapMs
+            // re-measurement inside flush_motion instead.
+            if (frame_ev_us != 0) dev.last_frame_ev_us = frame_ev_us;
+            dev.last_time_ms = now_ms();
             // P93-BATCH: close this frame with ONE write() syscall — the motion
             // REL plus any queued non-motion events and the closing SYN_REPORT
             // are all in the same buffer (the kernel injects every input_event
@@ -2352,10 +2446,11 @@ struct DevSnap {
 }
 
 bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
-    {
-        std::lock_guard<std::mutex> lk(ipc_path_mu_);
-        ipc_sock_path_ = sock_path;
-    }
+    // D26-N1: ipc_sock_path_ is claimed only on SUCCESS (right before the
+    //        worker thread starts), NOT here.  If it were set up-front and
+    //        any probe/bind/listen step failed, stop_ipc_server() on the
+    //        way out would unconditional-unlink a pathname that may belong
+    //        to the PREVIOUS* live daemon — killing this instance's IPC.
 
     // Do not unlink a pathname that may belong to a live daemon.  A second
     // instance must fail rather than silently replacing the first daemon's
@@ -2450,6 +2545,12 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
         log("IPC: listen() failed: " + std::string(strerror(errno)));
         close(fd);
         return false;
+    }
+    // Claim the socket path for stop_ipc_server() only now that the socket
+    // is bound, listening and being served (D26-N1).
+    {
+        std::lock_guard<std::mutex> lk(ipc_path_mu_);
+        ipc_sock_path_ = sock_path;
     }
     ipc_sock_fd_.store(fd);
 

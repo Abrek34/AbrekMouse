@@ -88,6 +88,12 @@ struct AppState {
     int         hidraw_inotify_wd = -1;
     guint       hidraw_inotify_src = 0;
     guint       hidpp_notify_poll_id = 0;
+    // GUI-O4: the pkexec child-watch source is a GLib main-context source that
+    // outlives the window (pkexec+systemctl can take seconds).  Its callback
+    // touches status-bar widgets, so it must be torn down with the window or a
+    // late pkexec exit would write into destroyed widgets.  Tracked so the
+    // destroy handler can g_source_remove() it.
+    guint       pkexec_watch_id = 0;
 
     // Graph interaction
     double graph_zoom     = 1.0;
@@ -218,6 +224,11 @@ struct AppState {
     bool       hw_busy          = false;      // a scan/apply thread is running
     bool       hw_notify_busy   = false;      // bounded notification poll worker
     bool       hw_cancel        = false;      // set on destroy: idle callbacks must bail
+    // GUI-Y3: combo index of a device the user selected WHILE hw_busy was set.
+    // hw_query_current() used to silently drop such selections, leaving the
+    // onboard DPI/rate/LOD widgets showing the previous device's values.  The
+    // completion idle callback re-runs the query for this index once free.
+    int        hw_pending_query = -1;
     // P169 — battery / capability rows (read-only, updated by the same worker
     // threads that run the scan/query/notification loops).
     GtkWidget* hw_battery_lbl   = nullptr;    // live level/charging/online + family

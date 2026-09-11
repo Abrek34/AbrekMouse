@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${ROOT}/build-manual/rawaccel-daemon"
 HARNESS="${ROOT}/tests/e2e_harness"
 CPP_HARNESS="${ROOT}/tests/e2e_harness.cpp"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 
 echo "=== RawAccel E2E harness ==="
 
@@ -58,7 +58,11 @@ run_phase() {
     echo "── phase: $phase ──"
     "$HARNESS" --daemon "$DAEMON" --phase "$phase"
     local rc=$?
-    if [[ $rc -eq 0 ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+    # T30-N2: rc=77 ("environment unusable") is NOT a failed check — it must
+    # propagate as a skip (exit 77) so CI can distinguish infra from failure.
+    if [[ $rc -eq 0 ]]; then PASS=$((PASS+1));
+    elif [[ $rc -eq 77 ]]; then SKIP=$((SKIP+1));
+    else FAIL=$((FAIL+1)); fi
     return $rc
 }
 
@@ -66,5 +70,6 @@ run_phase accel
 run_phase raw
 
 echo
-echo "=== RESULT: phases=$((PASS+FAIL)) passed=$PASS failed=$FAIL ==="
+echo "=== RESULT: phases=$((PASS+FAIL+SKIP)) passed=$PASS skipped=$SKIP failed=$FAIL ==="
+if [[ $SKIP -gt 0 ]]; then exit 77; fi
 [[ $FAIL -eq 0 ]] && exit 0 || exit 1

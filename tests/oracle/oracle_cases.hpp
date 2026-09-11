@@ -243,10 +243,10 @@ inline std::vector<Case> cases() {
         c.push_back(x);
     }
     {
-        Case x; // apex (R37: output_offset 0.2 -> 0.9, sub-1:1 muddy fix)
+        Case x; // apex (R37: output_offset 0.2 -> 1.0, sub-1:1 muddy fix;
         x.name = "game_apex_power"; x.mode = "power"; x.gain = true;
         x.scale = 2.2; x.exponent_power = 0.8;
-        x.input_offset = 0.02; x.output_offset = 0.9;
+        x.input_offset = 0.02; x.output_offset = 1.0;
         x.cap_x = 28; x.cap_y = 2.2; x.cap_mode = 2;
         x.speeds = S;
         c.push_back(x);
@@ -260,10 +260,10 @@ inline std::vector<Case> cases() {
         c.push_back(x);
     }
     {
-        Case x; // gaming (presets.hpp) — classic, default cap {15,1.5} out
+        Case x; // gaming (presets.hpp) — classic, cap {15,1.8} out (C-5: preset
         x.name = "game_gaming_classic"; x.mode = "classic"; x.gain = true;
         x.acceleration = 0.005; x.exponent_classic = 2.0; x.limit = 1.8;
-        x.input_offset = 0; x.cap_x = 15; x.cap_y = 1.5; x.cap_mode = 2;
+        x.input_offset = 0; x.cap_x = 15; x.cap_y = 1.8; x.cap_mode = 2;
         x.sync_speed = 5; x.speeds = S;
         c.push_back(x);
     }
@@ -276,10 +276,10 @@ inline std::vector<Case> cases() {
         c.push_back(x);
     }
     {
-        Case x; // precision (presets.hpp) — classic exp 1.5 (the only shipped
+        Case x; // precision (presets.hpp) — classic exp 1.5. cap.y mirrors the
         x.name = "game_precision_classic"; x.mode = "classic"; x.gain = true;
         x.acceleration = 0.002; x.exponent_classic = 1.5; x.limit = 1.2;
-        x.input_offset = 0; x.cap_x = 15; x.cap_y = 1.5; x.cap_mode = 2;
+        x.input_offset = 0; x.cap_x = 24; x.cap_y = 1.2; x.cap_mode = 2;
         x.sync_speed = 5; x.speeds = S;
         c.push_back(x);
     }

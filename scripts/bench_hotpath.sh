@@ -39,7 +39,12 @@ fi
     echo "=== RawAccel Hot-Path Benchmark ==="
     echo "Date: $(date)"
     echo "Host: $(hostname)"
-    echo "CPU: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
+    # SH-1: on non-x86 (/proc/cpuinfo uses 'Hardware'/'CPU implementer') the
+    # 'model name' grep would exit non-zero under `set -euo pipefail` aborting
+    # the whole benchmark for a cosmetic host line.  Try the common names.
+    CPU_MODEL="$(grep -m1 -E 'model name|Hardware|CPU implementer' /proc/cpuinfo \
+             | cut -d: -f2 | xargs || true)"
+    echo "CPU: ${CPU_MODEL:-unknown}"
     echo "Kernel: $(uname -r)"
     echo "Iterations per run: $ITERATIONS"
     echo "Perf runs per config: $PERF_RUNS"

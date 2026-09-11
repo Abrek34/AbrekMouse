@@ -6,8 +6,15 @@ This file documents build, test, and verification commands.
 
 The **single source of truth for installation is `setup.sh`** at the repo root.
 It installs ALL system dependencies, cleans any previous install, builds,
-installs binaries/systemd/udev/polkit/desktop/libinput-quirk, enables the
+installs binaries/systemd/udev/desktop-file/libinput-quirk, enables the
 service, and applies the KDE Plasma flat-acceleration fix.
+
+> DOC-1: the polkit integration is GONE since 0.6.4 (BUG-02 — the pkexec action
+> and rules.d were inert and are no longer installed; `clean_old_install`
+> removes them and `do_install` never installs them).  The `polkit` *package*
+> dependency in `install_deps()`/PKGBUILD intentionally remains — the GUI still
+> uses `pkexec` (default action) for privileged daemon control — but there is
+> no `org.rawaccel.policy`/`49-rawaccel.rules` integration.
 
 ```bash
 sudo bash setup.sh             # full install (deps + build + system-wide + KDE fix)
@@ -95,11 +102,13 @@ gain row. Rows that intentionally deviate (classic exponent<=1 "linear path"
 constant gain, `power`/`synchronous` identity at speed 0, and the power
 `io` cap.y=0 identity guard — ref yields NaN/0 for that degenerate input,
 P155) are listed in `tests/oracle/known_deviations.txt` and do not fail the
-run. Current grid: **1071 rows compared, 68 documented deviations** (R3-NEW-2
+run. Current grid: **1071 rows compared, 67 documented deviations** (R3-NEW-2
 added `power_tinyexp_floor` with exponent_power=5e-4 inside the BUG-02 floor
 band — the local port evaluates a shared exponent floored at 1e-3, the
 reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
-because both sides reduce to 1^n with scale=1 exactly).
+because both sides reduce to 1^n with scale=1 exactly.  PRE-3 raised the apex
+`output_offset` to 1.0, which made the power identity row at speed 0 line up
+with the reference — `game_apex_power 0` was removed from the deviation list).
 The `io`-gain cap.y=0 rows are intentionally NOT listed: the reference emits
 NaN there and `NaN > tol` is never true, so they can never appear as a
 deviation — listing them would raise a stale-row error. Run this after

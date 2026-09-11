@@ -91,6 +91,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             gtk_string_list_append(sl, label.c_str());
         }
         S->profile_combo = gtk_drop_down_new(G_LIST_MODEL(sl), nullptr);
+        g_object_unref(sl); // GUI-D1: local model ref must be dropped
         // Select the persisted active profile (set before the notify::selected
         // handler is connected so no callback fires on a half-built UI).
         gtk_drop_down_set_selected(GTK_DROP_DOWN(S->profile_combo),
@@ -518,7 +519,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     GtkWidget* dg = append_grid();
     S->dpi_spin        = make_spin(100, 32000, 50, 800, 0);
     S->polling_spin    = make_spin(125, 8000, 125, 1000, 0);
-    S->output_dpi_spin = make_spin(100, 32000, 50, 1000, 0);
+    S->output_dpi_spin = make_spin(0, 32000, 50, 1000, 0);
     connect_spin(S->dpi_spin, S);
     connect_spin(S->polling_spin, S);
     connect_spin(S->output_dpi_spin, S);
@@ -640,6 +641,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         }
 
         S->device_id_combo = gtk_drop_down_new(G_LIST_MODEL(mlist), nullptr);
+        g_object_unref(mlist); // GUI-D1: local model ref must be dropped
         gtk_widget_set_hexpand(S->device_id_combo, TRUE);
         g_signal_connect(S->device_id_combo, "notify::selected",
                          G_CALLBACK(on_notify_param_changed), S);
@@ -656,8 +658,11 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                                        tr("App class (e.g. firefox) — optional"));
         gtk_entry_set_max_length(GTK_ENTRY(S->match_app_entry), 128);
         gtk_widget_set_hexpand(S->match_app_entry, TRUE);
+        // GUI-K1: "changed" is a 2-arg GtkEditable signal (instance, user_data).
+        // Binding the 3-arg on_notify_param_changed here feeds a GParamSpec* in
+        // place of AppState* → SIGSEGV on the first keystroke in the App field.
         g_signal_connect(S->match_app_entry, "changed",
-                         G_CALLBACK(on_notify_param_changed), S);
+                         G_CALLBACK(on_param_changed), S);
         grid_row(da_grid, 1, "App:", S->match_app_entry);
 
         // Yenile butonu — fare listesini yeniden tara
@@ -990,8 +995,16 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                 g_source_remove(S2->hidpp_notify_poll_id);
                 S2->hidpp_notify_poll_id = 0;
             }
+            // GUI-O4: drop the pkexec child-watch source.  Without this a
+            // pkexec+systemctl child that exits AFTER the window is gone would
+            // fire pkexec_child_report() → set_status() into destroyed widgets.
+            if (S2->pkexec_watch_id) {
+                g_source_remove(S2->pkexec_watch_id);
+                S2->pkexec_watch_id = 0;
+            }
             // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
             S2->hw_cancel = true;
+            S2->hw_pending_query = -1;
             // P-APP: unload the KWin focus script, release the GDBus name
             kwin_focus_uninstall(S2);
         }), S);

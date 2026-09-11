@@ -320,8 +320,18 @@ do_install() {
 
     # udev kuralı
     install -Dm644 "$ROOT/scripts/99-rawaccel.rules" /etc/udev/rules.d/99-rawaccel.rules
-    udevadm control --reload-rules
-    udevadm trigger
+    # BS-7: `udevadm control`/`trigger` sistemde udev yokken (container/CI,
+    # systemd-less chroot) fail eder ve `set -eo pipefail` altında tüm kurulumu
+    # abort ederdi.  Kural dosyası zaten yerinde; reload/trigger yalnızca
+    # çalışan bir udev'in kuralları hemen yeniden okumasını istiyor — bu adım
+    # sessizce atlanabilir (bir sonraki udev trigger/reboot'ta otomatik uygulanır).
+    udevadm control --reload-rules 2>/dev/null || \
+        warn "udevadm control başarısız (container/CI?). 264u kuralı reboot'ta uygulanır."
+    # SH-4: selectorless `udevadm trigger` replays the full system device
+    # inventory (thousands of events, pointless churn).  The rules installed
+    # here only concern input devices — scope the trigger to them.
+    udevadm trigger --subsystem-match=input --action=change 2>/dev/null || \
+        warn "udevadm trigger başarısız (container/CI?). Mekanik cihazlar ulaşılabilir olmayabilir."
 
     # libinput quirk: RawAccel sanal cihazını "trackball" olarak işaretle.
     # Use a dedicated vendor-style file so existing local overrides are never
@@ -346,6 +356,15 @@ do_install() {
     # systemd servis → /usr/lib/systemd/system'e kur (/etc'de gölgeleme yapmaz)
     install -Dm644 "$ROOT/scripts/rawaccel.service" /usr/lib/systemd/system/rawaccel.service
     systemctl daemon-reload
+
+    # SH-3: a leftover USER-level unit (an earlier --user install) runs a
+    # second rawaccel daemon in the user session and silently shadows the
+    # system service.  Warn instead of silently uninstalling the user's copy.
+    if [[ -f /etc/systemd/user/rawaccel.service ]] || \
+       [[ -n "$REAL_HOME" && -f "$REAL_HOME/.config/systemd/user/rawaccel.service" ]]; then
+        warn "Kullanıcı seviyesi rawaccel.service mevcut (kullanıcı oturumunda ikinci bir daemon)."
+        warn "Sistem servisiyle çakışır — kaldırın: systemctl --user disable --now rawaccel; rm /etc/systemd/user/rawaccel.service (veya ~/.config/systemd/user/rawaccel.service)"
+    fi
 
     # input grubu
     if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then

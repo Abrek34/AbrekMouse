@@ -58,16 +58,21 @@ case "$(uname -m)" in
     *) FCF="" ;;
 esac
 
+# Base C++ flags
+BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wno-unused-parameter"
+
 # If the environment already defines _FORTIFY_SOURCE (e.g. makepkg.conf
 # -D_FORTIFY_SOURCE=3, or the caller exported CFLAGS/CXXFLAGS with it), DON'T
 # re-define =2 — that trips a "redefined" warning.  L-3: the probe MUST run
-# with the exact final compile flags.  BASE_CXXFLAGS carries -O3/$MARCH, and
-# gcc's distro spec files only define _FORTIFY_SOURCE when optimization is on
-# (Fedora) — probing without them would wrongly suppress the define and build
-# a non-fortified binary.  The probe deliberately excludes HARDENING/FORTIFY
-# themselves so the -D we are about to add cannot self-report as "already set".
+# with the exact final compile flags.  BASE_CXXFLAGS (defined above — it was
+# historically defined AFTER this probe, silently probing without -O3/$MARCH)
+# carries -O3/$MARCH, and gcc's distro spec files only define _FORTIFY_SOURCE
+# when optimization is on (Fedora) — probing without them would wrongly
+# suppress the define and build a non-fortified binary.  The probe deliberately
+# excludes HARDENING/FORTIFY themselves so the -D we are about to add cannot
+# self-report as "already set".
 FORTIFY="-D_FORTIFY_SOURCE=2"
-if printf 'int main(){return 0;}' | $CXX $BASE_CXXFLAGS $CFLAGS $CXXFLAGS \
+if printf 'int main(){return 0;}' | $CXX $BASE_CXXFLAGS ${CFLAGS:-} ${CXXFLAGS:-} \
         -dM -E -x c++ - 2>/dev/null | grep -q '^#define _FORTIFY_SOURCE'; then
     FORTIFY=""
 fi
@@ -79,9 +84,6 @@ $FORTIFY -D_GLIBCXX_ASSERTIONS -fPIE -Wformat -Wformat-security"
 # -z,separate-code: keep .text and .rodata in separate PT_LOAD segments so
 #                  read-only data isn't mappable as executable.
 LDFLAGS_HARDEN="-pie -Wl,-z,relro,-z,now,-z,noexecstack,-z,separate-code"
-
-# Base C++ flags
-BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wno-unused-parameter"
 
 if [ "${USE_CMAKE:-0}" = "1" ]; then
     # CMake build path
@@ -119,7 +121,7 @@ echo "[1/3] Building rawaccel-daemon..."
 
     if [ "$HAVE_GTK4" = "1" ]; then
         echo "[3/3] Building rawaccel-gui..."
-        $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS -I"$ROOT/include" \
+        $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS $HARDENING -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \

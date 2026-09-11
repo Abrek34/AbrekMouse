@@ -7693,6 +7693,46 @@ static void test_p96_param_extreme_sweep() {
 }
 
 
+// ── CUR-3: power GAIN overflow guard clamps to cap ceiling ───────────────────
+
+static void test_cur3_power_inf_guard() {
+    SECTION("CUR-3 — power Inf guard clamps to cap_y instead of snapping to 1.0");
+    {
+        // Realistic sanitized params can never overflow (SCALE_MAX=100,
+        // EXP_POWER_MAX=5 → pow(100·1e9,5)=1e55 « DBL_MAX), so craft the struct
+        // directly to force base_fn_impl overflow while staying below cap_x.
+        accel_args args = make_args(accel_mode::power);
+
+        // Cap requested (cap_y finite): overflow must clamp ONTO the ceiling —
+        // a continuous continuation of the tail, NOT a hard identity snap.
+        power cap;
+        cap.gain_mode = true;
+        cap.offset    = {};
+        cap.scale     = 1e300; // pow(1e300·1e5, 2) = 1e610 → Inf
+        cap.exponent  = 2.0;
+        cap.constant  = 0.0;
+        cap.cap_x     = 1e6;   // finite cap requested
+        cap.cap_y     = 2.0;
+        cap.constant_b = 0.0;
+        EXPECT_NEAR(cap(1e5, args), 2.0, 1e-9);
+
+        // No cap requested (cap_y stays DBL_MAX): unbounded curve keeps the
+        // defensive identity fallback (never a dead frame / NaN downstream).
+        power none;
+        none = cap;
+        none.cap_x = DBL_MAX;
+        none.cap_y = DBL_MAX;
+        EXPECT_NEAR(none(1e5, args), 1.0, 1e-9);
+
+        // Finite (sub-overflow) base output passes through untouched — a speed
+        // small enough that pow(1e300·s, 2) stays finite yields the raw curve.
+        power finite_p;
+        finite_p = cap;
+        EXPECT(std::isfinite(finite_p(1e-160, args)));
+    }
+}
+
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 static void print_usage(const char* argv0) {
@@ -7945,12 +7985,12 @@ static void test_p107_param_domain() {
         p.accel_x.gamma = 0;
         p.accel_x.input_offset = 0;
         p.accel_x.output_offset = 0;
-        p.accel_x.scale = 0;
+        p.accel_x.scale = 0.01;                 // MATH-2: min (0 is dead-curve/silent-boost)
         p.speed_min = 0;
         p.speed_max = 0;
-        p.speed_processor_args.input_speed_smooth_halflife = 1e6;
-        p.speed_processor_args.scale_smooth_halflife = 1e6;
-        p.speed_processor_args.output_speed_smooth_halflife = 1e6;
+        p.speed_processor_args.input_speed_smooth_halflife = SMOOTH_HALFLIFE_MAX;
+        p.speed_processor_args.scale_smooth_halflife = SMOOTH_HALFLIFE_MAX;
+        p.speed_processor_args.output_speed_smooth_halflife = SMOOTH_HALFLIFE_MAX;
 
         sanitize_device_profile(dp);
 
@@ -7973,10 +8013,10 @@ static void test_p107_param_domain() {
         EXPECT(std::fabs(p.accel_x.decay_rate) < 1e-9 && std::fabs(p.accel_x.smooth) < 1e-9);
         EXPECT(std::fabs(p.accel_x.motivity) < 1e-9 && std::fabs(p.accel_x.gamma) < 1e-9);
         EXPECT(std::fabs(p.accel_x.input_offset) < 1e-9 && std::fabs(p.accel_x.output_offset) < 1e-9);
-        EXPECT(std::fabs(p.accel_x.scale) < 1e-9);
-        EXPECT(p.speed_processor_args.input_speed_smooth_halflife == 1e6);
-        EXPECT(p.speed_processor_args.scale_smooth_halflife == 1e6);
-        EXPECT(p.speed_processor_args.output_speed_smooth_halflife == 1e6);
+        EXPECT(std::fabs(p.accel_x.scale - 0.01) < 1e-9);
+        EXPECT(p.speed_processor_args.input_speed_smooth_halflife == SMOOTH_HALFLIFE_MAX);
+        EXPECT(p.speed_processor_args.scale_smooth_halflife == SMOOTH_HALFLIFE_MAX);
+        EXPECT(p.speed_processor_args.output_speed_smooth_halflife == SMOOTH_HALFLIFE_MAX);
     }
 }
 
@@ -8915,6 +8955,9 @@ int main(int argc, char** argv) {
     test_p96_power_io_degenerate_cap();
     test_p96_jump_smooth_extremes_finite();
     test_p96_param_extreme_sweep();
+
+    // CUR-3 — power GAIN overflow guard clamp (cap ceiling, not identity snap)
+    test_cur3_power_inf_guard();
 
     // P99 — config-layer deep-scan regressions
     test_p99_config_guards();

@@ -51,6 +51,10 @@ struct kwin_focus_ctx {
     guint            bus_name_id   = 0;   // g_bus_own_name id
     std::atomic<int> kwin_script_id{-1};  // script id (set by worker thread)
     bool             installed     = false;
+    // GUI-Y2: keep the worker joinable instead of detached.  kwin_focus_uninstall
+    // MUST join it before releasing session_conn — otherwise the worker may still
+    // be mid-Call on a connection we have already unref'd (UAF).
+    std::thread      worker;
 };
 
 // ── GDBus method handler ─────────────────────────────────────────────────────
@@ -193,10 +197,9 @@ static bool kwin_focus_install(AppState* S) {
 
     // 3. Load + run the KWin script on a worker thread (can block ~200–500 ms).
     ctx.kwin_script_id.store(-1, std::memory_order_relaxed);
-    auto* task = new std::thread([ctxPtr = &ctx]() {
+    ctx.worker = std::thread([ctxPtr = &ctx]() {
         ctxPtr->kwin_script_id = kwin_script_load_and_run_sync(ctxPtr->session_conn);
     });
-    task->detach();
     ctx.installed = true;
 
     S->kwin_focus_ctx = &ctx;
@@ -208,6 +211,10 @@ static void kwin_focus_uninstall(AppState* S) {
     auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
     if (!ctx || !ctx->installed) return;
     ctx->installed = false;
+    // GUI-Y2: join the loader worker BEFORE touching session_conn (the worker
+    // holds a raw pointer to it while running D-Bus calls).  Its D-Bus calls
+    // carry a timeout so the join completes within a bounded time.
+    if (ctx->worker.joinable()) ctx->worker.join();
     // Unload script (best-effort).
     int sid = ctx->kwin_script_id.load(std::memory_order_relaxed);
     if (ctx->session_conn && sid >= 0)

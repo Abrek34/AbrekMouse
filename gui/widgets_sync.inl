@@ -414,6 +414,9 @@ struct pkexec_watch_ctx {
 static void pkexec_child_report(GPid p, gint status, gpointer d) {
     auto* ctx = static_cast<pkexec_watch_ctx*>(d);
     if (ctx && ctx->S) {
+        // GUI-O4: this source has fired — the tracked id is now stale.
+        if (ctx->S->pkexec_watch_id)
+            ctx->S->pkexec_watch_id = 0;
         std::string detail;
         if (WIFEXITED(status)) {
             int code = WEXITSTATUS(status);
@@ -436,6 +439,10 @@ static void pkexec_child_report(GPid p, gint status, gpointer d) {
 
 /// fork+exec hijacking pkexec; child is watchdogged via the GLib SIGCHLD
 /// mechanism.  Returns the child pid (>0) on success, -1 on fork failure.
+/// GUI-O4: the child-watch source id is stashed on AppState so the window
+/// destroy handler can remove it — pkexec+systemctl can run for seconds and
+/// pkexec_child_report() writes to status-bar widgets that would already be
+/// destroyed if the user closes the GUI before the child exits.
 static pid_t pkexec_spawn(char* const argv[], AppState* S, std::string what) {
     pid_t pid = fork();
     if (pid < 0) return -1;
@@ -444,8 +451,14 @@ static pid_t pkexec_spawn(char* const argv[], AppState* S, std::string what) {
         execvp(argv[0], argv);
         _exit(127); // execvp failed (e.g. pkexec not installed)
     }
+    // If a previous pkexec watch is still pending (rare double-click) detach it
+    // before slotting in the new one; the old child's report would be dropped.
+    if (S->pkexec_watch_id) {
+        g_source_remove(S->pkexec_watch_id);
+        S->pkexec_watch_id = 0;
+    }
     auto* ctx = new pkexec_watch_ctx{S, std::move(what)};
-    g_child_watch_add(pid, pkexec_child_report, ctx);
+    S->pkexec_watch_id = g_child_watch_add(pid, pkexec_child_report, ctx);
     return pid;
 }
 

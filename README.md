@@ -2,7 +2,7 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v0.6.4** — native Logitech HID++ hardware controls for DPI,
+> **Current state: v1.1.0** — native Logitech HID++ hardware controls for DPI,
 > report rate, and sensor lift-off distance. Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
 
@@ -69,7 +69,7 @@ Compiled binaries are placed in `build-manual/`.
 The **canonical one-shot installer is `setup.sh`** at the repo root. It installs
 all system dependencies (for your distro), cleans any previous install, builds,
 installs binaries + systemd/udev/desktop/libinput-quirk (no polkit policy is
-installed — RawAccel 0.6.4+ relies on the `input` group and default pkexec),
+installed — RawAccel 1.1.0+ relies on the `input` group and default pkexec),
 enables the service, and applies the KDE Plasma flat-acceleration fix:
 
 ```bash
@@ -82,7 +82,7 @@ sudo bash setup.sh --reinstall    # clean old install, then reinstall (default)
 backwards compatibility).
 
 > **Arch package coexistence**: on Arch-based distros you can instead install
-> the packaged binary (`packaging/rawaccel-linux-0.6.4-1-x86_64.pkg.tar.zst`,
+> the packaged binary (`packaging/rawaccel-linux-1.1.0-1-x86_64.pkg.tar.zst`,
 > `sudo pacman -U ...`) or publish it via an AUR package. Do **not** mix
 > `setup.sh` and the pacman package: both install the systemd unit to the same
 > path (`/usr/lib/systemd/system/rawaccel.service`), while binaries land in

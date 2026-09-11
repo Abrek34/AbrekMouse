@@ -273,7 +273,7 @@ PYEOF
     # are the user's own restorable snapshots.)
     if command -v python3 &>/dev/null; then
         python3 - "$KWINRC" << 'PYEOF'
-import sys, os, re
+import sys, os, re, tempfile
 kwinrc = sys.argv[1]
 try:
     with open(kwinrc) as f:
@@ -319,10 +319,32 @@ def upsert(text, header, kv):
 
 text = upsert(text, "[Libinput]", [("PointerAccelerationProfile", "2"),
                                    ("PointerAcceleration", "-0.5")])
-tmp = kwinrc + ".tmp"
-with open(tmp, "w") as f:
-    f.write(text)
-os.replace(tmp, kwinrc)
+# Atomic rename, O31-H5 (HIDPP C3): mirror the --fix writer's pattern
+# (mkstemp + realpath + fsync, kde-fix-accel.sh:122-145) instead of a fixed
+# "kwinrc.tmp" name + plain os.replace.  The old path replaced the symlink
+# inode itself (dotfiles-managed kwinrc broke) and could leave a stale
+# non-hidden tmp behind.
+d = os.path.dirname(kwinrc) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kwinrc.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    target = os.path.realpath(kwinrc)
+    os.replace(tmp, target)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print(f"  ✓ Removed (RawAccel) per-device sections and restored adaptive global.")
 PYEOF
     else

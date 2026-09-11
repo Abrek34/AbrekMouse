@@ -30,6 +30,7 @@ jobs:
       - name: Build (warning-as-failure gate)
         run: |
           set -o pipefail
+          set -e
           # Capture full output, then fail if any compiler diagnostic appears.
           bash scripts/build.sh 2>&1 | tee build.log
           # R4-L-10: the old `grep -E "warning:|error:"` matched ANY line

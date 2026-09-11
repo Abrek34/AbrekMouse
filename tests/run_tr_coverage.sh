@@ -15,6 +15,7 @@ SRC=(
   gui/ui_builder.inl
   gui/hidpp_panel.inl
   gui/mouse_test.inl
+  gui/kwin_focus.inl
 )
 CXX="${CXX:-g++}"
 # Compile to a unique temp path (mktemp) instead of a predictable

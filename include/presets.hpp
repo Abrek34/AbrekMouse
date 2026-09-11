@@ -69,6 +69,15 @@ inline device_profile make_preset(const std::string& preset_name, const std::str
         dp.prof.accel_y.exponent_classic = 1.5;
         dp.prof.accel_x.limit = 1.2;
         dp.prof.accel_y.limit = 1.2;
+        // PRE-2: classic GAIN mode's output asymptote is the cap (cap_mode=out
+        // → cap.y), NOT the `limit` field.  With no cap configured the default
+        // {15, 1.5} clipped the declared "precision" bound to 1.5x (gain ≈1.41
+        // already at 100 ips, ~25% over the documented 1.2).  Align cap.y with
+        // the declared limit like every other classic preset (gaming 1.8/1.8,
+        // cs2 1.6/1.6, fps 1.8/1.8); cap.x 24 ≈ where the 1.2 gain lands
+        // (~21.5 ips), matching the siblings' "slightly above arrival" style.
+        dp.prof.accel_x.cap = { 24, 1.2 };
+        dp.prof.accel_y.cap = { 24, 1.2 };
         dp.prof.output_dpi = 1000;
     } else if (preset_name == "disable" || preset_name == "none" || preset_name == "off") {
         // Raw passthrough — no acceleration
@@ -118,8 +127,11 @@ inline device_profile make_preset(const std::string& preset_name, const std::str
         dp.prof.output_dpi = 1000;
     } else if (preset_name == "apex") {
         // Apex Legends: tracking-heavy + verticality. Power mode ramps fast for
-        // 180° flicks while light smoothing keeps track. output_offset floor ~0.9
-        // keeps slow micro-aim close to 1:1 (avoid sub-1:1 muddy feel at 2-10 mm/s).
+        // 180° flicks while light smoothing keeps track. output_offset = 1.0
+        // (PRE-3): the old 0.9 plateau made gain 0.900 below 0.191 ips — i.e.
+        // the whole 2-10 mm/s micro-aim band stayed sub-1:1, contradicting the
+        // comment's "avoid sub-1:1 muddy feel" intent.  A 1.0 plateau is a true
+        // 1:1 base; accel lifts it above 1.0 only through the power curve.
         dp.prof.accel_x.mode = accel_mode::power;
         dp.prof.accel_y.mode = accel_mode::power;
         dp.prof.accel_x.gain = true;
@@ -130,8 +142,8 @@ inline device_profile make_preset(const std::string& preset_name, const std::str
         dp.prof.accel_y.exponent_power = 0.8;
         dp.prof.accel_x.input_offset = 0.02;
         dp.prof.accel_y.input_offset = 0.02;
-        dp.prof.accel_x.output_offset = 0.9;
-        dp.prof.accel_y.output_offset = 0.9;
+        dp.prof.accel_x.output_offset = 1.0;
+        dp.prof.accel_y.output_offset = 1.0;
         dp.prof.accel_x.cap = { 28.0, 2.2 };
         dp.prof.accel_y.cap = { 28.0, 2.2 };
         dp.prof.accel_x.cap_mode_val = cap_mode::out;

@@ -217,7 +217,11 @@ std::optional<hidpp_battery_info> parse_battery_charge(
     switch (payload[2] & 0xF0) {
     case 0x50: info.charging = true; break;       // recharging
     case 0x30: case 0x90: break;                  // discharging/full
-    default: info.online = false; break;          // unknown/invalid state
+    default: break;  // B6: unknown status nibble must NOT mark the device
+                     // offline — a battery answer proves the link is alive
+                     // (same invariant as the legacy 0x07 path, where a reply
+                     // unconditionally sets online=true).  Keep struct default
+                     // online=true.
     }
     return info;
 }
@@ -1775,8 +1779,14 @@ std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_i
         if (auto reply = send_feature_request(*index, 0x2, nullptr, 0,
                                               std::chrono::milliseconds(500),
                                               target_device_index);
-            reply && !reply->empty())
-            return rate_code_to_hz(true, (*reply)[0]);
+            reply && !reply->empty()) {
+            // B3: a reply whose code decodes to no known Hz (out-of-range /
+            // garbage byte) must NOT be treated as a negative answer — fall
+            // through to the legacy 0x8060 report-rate path instead of
+            // giving up.  A device that advertised 0x8061 may still only
+            // honour the legacy feature.
+            if (auto hz = rate_code_to_hz(true, (*reply)[0])) return hz;
+        }
     }
     if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
                                             target_device_index)) {

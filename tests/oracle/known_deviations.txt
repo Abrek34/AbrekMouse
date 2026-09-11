@@ -80,7 +80,6 @@ sync_legacy_p2	0
 sync_legacy_p1	0
 sync_legacy_mot05_gam2	0
 sync_gain_mot2_gam05	0
-game_apex_power	0
 p155_io_cap0_legacy	0.0001
 p155_io_cap0_legacy	0.001
 p155_io_cap0_legacy	0.01

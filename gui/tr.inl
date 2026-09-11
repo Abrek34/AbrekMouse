@@ -608,7 +608,18 @@ static void save_lang_pref(const std::string& path, int ov) {
     // following and two-writer races (same policy as kde_atomic_write).
     std::string tmp_path = path + ".tmp";
     int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
-    if (fd < 0) return;
+    if (fd < 0) {
+        // GUI-D2: a stale .tmp left by an earlier crash blocks O_EXCL forever.
+        // It cannot be a concurrent write (we hold the main thread), so remove
+        // it and retry once — otherwise the language preference silently stops
+        // persisting after any crash.
+        if (errno == EEXIST) {
+            unlink(tmp_path.c_str());
+            fd = open(tmp_path.c_str(),
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+        }
+        if (fd < 0) return;
+    }
     FILE* f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(tmp_path.c_str()); return; }
     if (ov <= -1) fputs("auto\n", f);
@@ -642,11 +653,22 @@ static void refresh_language(AppState* S) {
         "Lookup (LUT)", nullptr };
     static const char* CAP_KEYS[] = {"Output (out)", "Input (in)", "I/O (io)", nullptr};
     static const char* DIST_KEYS[] = {"Euclidean", "Max", "Lp", "Separate", nullptr};
+    static const char* LOD_KEYS[]  = {"Low", "Medium", "High", nullptr};
 
     if (S->mode_combo)      tr_combo_fill(S->mode_combo, MODE_KEYS);
     if (S->mode_combo_y)    tr_combo_fill(S->mode_combo_y, MODE_KEYS);
     if (S->cap_mode_combo)  tr_combo_fill(S->cap_mode_combo, CAP_KEYS);
     if (S->dist_mode_combo) tr_combo_fill(S->dist_mode_combo, DIST_KEYS);
+
+    // GUI-O3: the HID++ lift-off combo is built with tr()'d entries at
+    // construction; without a rebuild here, switching language leaves stale
+    // strings in a device they were never set in.  Selection survives (indices
+    // are stable across languages).
+    if (S->hw_lod_combo) {
+        guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo));
+        tr_combo_fill(S->hw_lod_combo, LOD_KEYS);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(S->hw_lod_combo), sel);
+    }
 
     // Device combo: "All devices (default)" plus device labels (names untranslated).
     if (S->device_id_combo) {

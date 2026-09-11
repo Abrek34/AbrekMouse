@@ -35,8 +35,13 @@ done
 # R4-L-1: TOL env'den veya --tolerance bayrağından GELDİĞİNDE parse öncesi
 # doğrulama atlanır (--tolerance abc, tanımsız env TOL, ...). Çözüm: değeri
 # parse SONRASI yeniden doğrula — geçersiz değer python traceback'e gitmez.
-[[ "$TOL" =~ ^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
+# ORAC-TOL: TOL must be a POSITIVE number.  A leading '-' (or a 0 value) made
+# every row exceed the tolerance → spurious whole-run failure.  Only an
+# optional '+' sign and an exponent-sign are allowed; `TOL` must also be > 0.
+[[ "$TOL" =~ ^\+?([0-9]+\.?[0-9]*|\.?[0-9]+)([eE][+-]?[0-9]+)?$ ]] \
     || { echo "Hata: TOL geçerli bir sayı değil: '$TOL'" >&2; exit 2; }
+(( $(echo "$TOL" | LC_ALL=C awk '{ print ($1 > 0) ? 1 : 0 }') == 1 )) \
+    || { echo "Hata: TOL pozitif olmalı (0/negatif kabul edilmez): '$TOL'" >&2; exit 2; }
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

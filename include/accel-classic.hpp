@@ -156,7 +156,16 @@ private:
                 accel_raised = std::isfinite(ar) ? ar : 0.0;
             }
             if (args.cap.x > 0) {
+                // BUG-7 symmetry (O31-C1): the io branch clamps the breakpoint
+                // up to input_offset; without the same guard here, cap_x inside
+                // the offset band gives base_fn a non-positive base → a finite
+                // NEGATIVE cap_y (gain(cap_x) for exp integer) and a flipped
+                // (reverse-direction) accelerated tail, while non-integer
+                // exponents degrade to the NaN guard (cap_y=DBL_MAX, absürd
+                // curve).  Config load is sanitized already, but the GUI live
+                // preview runs init_gain() on unsanitized widget values.
                 cap_x = args.cap.x;
+                if (cap_x < args.input_offset) cap_x = args.input_offset;
                 cap_y = gain(cap_x, args.acceleration, args.exponent_classic, args.input_offset);
                 constant = (base_fn(cap_x, accel_raised, args) - cap_y) * cap_x;
             }

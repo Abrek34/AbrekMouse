@@ -348,8 +348,9 @@ static void print_profile(const device_profile& dp) {
     // invisible in every listing — status claimed the profile was active while
     // its acceleration was actually bypassed.
     if (dp.dev_cfg.disable)
-        std::cout << "  disabled:     true  (stored flag — dormant: daemon hot path ignores it; "
-                     "real 1:1 bypass = set-param <profile> raw true)\n";
+        std::cout << "  disabled:     true  (C29-N6: honored at setup/hot-plug — the "
+                     "daemon skips the device; toggling a live device applies on "
+                     "the next rescan; full 1:1 bypass = set-param <profile> raw true)\n";
     std::cout << "  device_id:    " << (dp.device_id.empty() ? "(all)" : dp.device_id) << "\n";
     if (p.raw_passthrough) {
         std::cout << "  raw:          true  (all processing bypassed)\n";
@@ -448,9 +449,9 @@ static int cmd_create(app_config& cfg, const std::string& config_path, const std
         return 1;
     }
     // P82-MED-1: a >256-char name persists full now but the load-side cap
-    // (MAX_DP_NAME=256 in config.cpp) silently truncates it to 256 on any
-    // reload+resave.  Reject up front so the stored name always matches what
-    // the user supplied.  256 chars is allowed (round-trips intact).
+    // (MAX_NAME_LEN=256 in config.cpp) truncates anything longer to 256 on
+    // reload.  Reject up front so the stored name always matches what the
+    // user supplied.  256 chars is allowed (round-trips intact).
     if (name.size() > MAX_NAME_LEN) {
         std::cerr << "Profile name too long: " << name.size()
                   << " chars (max " << MAX_NAME_LEN << ").\n";
@@ -462,6 +463,17 @@ static int cmd_create(app_config& cfg, const std::string& config_path, const std
             std::cerr << "Profile already exists: " << name << "\n";
             return 1;
         }
+    }
+    // CFG-3: SEC-9 caps the profile count at MAX_PROFILES, but until now the
+    // cap was only enforced on LOAD (config.cpp silently kept the first 256).
+    // A create beyond the cap used to write the extra profile to disk, only
+    // for it to vanish on the next load+save — silent data loss.  Refuse up
+    // front instead of truncating.
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot create '" << name << "': config is at the "
+                  << MAX_PROFILES << "-profile maximum (SEC-9). Delete a "
+                  << "profile first.\n";
+        return 1;
     }
     device_profile dp;
     dp.name = name;
@@ -539,6 +551,13 @@ static int cmd_duplicate(app_config& cfg, const std::string& config_path,
         std::cerr << "Source profile not found: " << src_name << "\n";
         return 1;
     }
+    // CFG-3: refuse when the SEC-9 load cap is already reached (a duplicate
+    // would otherwise write past MAX_PROFILES and vanish on next load).
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot duplicate: config is at the " << MAX_PROFILES
+                  << "-profile maximum (SEC-9). Delete a profile first.\n";
+        return 1;
+    }
     // Deep copy
     device_profile dst = *src;
     dst.name = dst_name;
@@ -574,6 +593,15 @@ static int cmd_create_preset(app_config& cfg, const std::string& config_path,
     if (dp.name.empty()) {
         std::cerr << "Unknown preset: '" << preset_name
                   << "'.  Available: gaming, office, precision, disable, cs2, valorant, apex, fps\n";
+        return 1;
+    }
+    // CFG-3: refuse when the SEC-9 load cap is already reached (creating a
+    // preset profile past MAX_PROFILES wrote it to disk only for it to vanish
+    // on the next load+save).
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot create preset profile: config is at the "
+                  << MAX_PROFILES << "-profile maximum (SEC-9). Delete a "
+                  << "profile first.\n";
         return 1;
     }
     cfg.profiles.push_back(dp);
@@ -652,33 +680,15 @@ static int cmd_validate(const std::string& config_path) {
                 std::cerr << "ERROR: Profile with empty name found.\n";
                 has_errors = true;
             }
-            // C-5: mirror the load-side MAX_NAME_LEN cap so validate() reports
-            // an over-long name as an error instead of silently accepting it
-            // only to be truncated at the next load.
-            if (dp.name.size() > MAX_NAME_LEN) {
-                std::cerr << "ERROR: Profile name exceeds " << MAX_NAME_LEN
-                          << " chars in profile '" << dp.name << "'\n";
-                has_errors = true;
-            }
-            // Sanitize and check for clamping (would have happened on load)
+            // CFG-2: the numeric range/order checks that used to live here
+            // (speed_min>speed_max, output_dpi/dpi/polling_rate range, name
+            // length) were DEAD CODE — load_config sanitizes every profile on
+            // the way in (dpi→[1,32000], polling_rate→[125,8000],
+            // output_dpi→[0,32000] with (0,1)→1, speed_max≥speed_min, name →)
+            //  so a file with `"dpi":999999, speed_min 20 speed_max 5,
+            //  output_dpi 50000` always printed "All checks OK".  The real
+            //  clamped-vs-stored cross-check runs against the RAW JSON below.
             auto& p = dp.prof;
-            if (p.speed_min > p.speed_max && p.speed_max > 0) {
-                std::cerr << "WARNING: speed_min > speed_max in profile '" << dp.name << "'\n";
-                has_warnings = true;
-            }
-            if (p.output_dpi < 0 || p.output_dpi > 32000) {
-                std::cerr << "WARNING: output_dpi out of range [0, 32000] in profile '" << dp.name << "'\n";
-                has_warnings = true;
-            }
-            if (dp.dev_cfg.dpi < 1 || dp.dev_cfg.dpi > 32000) {
-                std::cerr << "WARNING: dpi out of range [1, 32000] in profile '" << dp.name << "'\n";
-                has_warnings = true;
-            }
-            if (dp.dev_cfg.polling_rate < POLL_RATE_MIN || dp.dev_cfg.polling_rate > POLL_RATE_MAX) {
-                std::cerr << "WARNING: polling_rate out of range ["
-                          << POLL_RATE_MIN << ", " << POLL_RATE_MAX << "] in profile '" << dp.name << "'\n";
-                has_warnings = true;
-            }
             // Check accel_x/accel_y for LUT length consistency
             if (p.accel_x.mode == accel_mode::lookup && p.accel_x.length % 2 != 0) {
                 std::cerr << "WARNING: LUT data length is odd in profile '" << dp.name
@@ -689,6 +699,53 @@ static int cmd_validate(const std::string& config_path) {
                 std::cerr << "WARNING: LUT data length is odd in profile '" << dp.name
                           << "' (Y axis) — should be even (speed, gain pairs)\n";
                 has_warnings = true;
+            }
+        }
+
+        // CFG-2: cross-check the RAW JSON (pre-sanitize) against the values
+        // load_config actually stored, so structurally broken files that were
+        // silently clamped now surface as warnings ("dpi 999999 → 32000") and
+        // the summary can honestly say "passed" vs "passed with warnings".
+        {
+            std::ifstream rawf(config_path, std::ios::in | std::ios::binary);
+            nlohmann::json raw;
+            if (rawf) { try { raw = nlohmann::json::parse(rawf); } catch (...) { raw = nlohmann::json(nullptr); } }
+            if (raw.is_object() && raw.contains("profiles") && raw["profiles"].is_array()) {
+                const auto& rps = raw["profiles"];
+                for (size_t i = 0; i < rps.size() && i < cfg.profiles.size(); ++i) {
+                    const auto& rp = rps[i];
+                    const auto& sp = cfg.profiles[i];
+                    if (!rp.is_object()) continue;
+                    auto clamp_warn = [&](const char* field,
+                                          const nlohmann::json& host,
+                                          double stored) {
+                        if (!host.contains(field) || !host[field].is_number())
+                            return;
+                        double rawv = host[field].get<double>();
+                        if (std::fabs(rawv - stored) < 1e-9) return;
+                        std::cerr << "WARNING: '" << field << "' = " << rawv
+                                  << " in profile '" << sp.name << "' will be "
+                                  << "stored as " << stored << " (sanitize "
+                                  << "clamps on load)\n";
+                        has_warnings = true;
+                    };
+                    clamp_warn("dpi", rp, (double)sp.dev_cfg.dpi);
+                    clamp_warn("polling_rate", rp, (double)sp.dev_cfg.polling_rate);
+                    if (rp.contains("profile") && rp["profile"].is_object()) {
+                        const auto& rpr = rp["profile"];
+                        clamp_warn("output_dpi", rpr, sp.prof.output_dpi);
+                        clamp_warn("rotation", rpr, sp.prof.degrees_rotation);
+                        clamp_warn("snap", rpr, sp.prof.degrees_snap);
+                    }
+                    if (rp.contains("name") && rp["name"].is_string() &&
+                        rp["name"].get<std::string>().size() > MAX_NAME_LEN) {
+                        std::cerr << "WARNING: profile name is "
+                                  << rp["name"].get<std::string>().size()
+                                  << " chars; it will be truncated to "
+                                  << MAX_NAME_LEN << " on load\n";
+                        has_warnings = true;
+                    }
+                }
             }
         }
 
@@ -915,8 +972,13 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // P156: output_dpi is a double field in the config schema — an integer
         // coercion rejected legitimate fractional values (e.g. DPI != 1).  The
         // sanitizer clamps the range anyway; 0 = "no output-DPI normalization"
-        // (CFG-1) is now a valid sentinel, so the domain is [0, 32000].
-        if (!range_ok("output_dpi", 0, 32000)) return 1;
+        // is a valid sentinel.
+        // CLI-2 (P107): the sanitizer maps the (0,1) band onto 1 — a fractional
+        // normalization below the 1-DPI floor is meaningless — so accepting
+        // `output_dpi 0.5` stored 1 while exiting 0 (silent mutation).  The CLI
+        // domain is therefore {0 sentinel} ∪ [1, 32000].
+        if (v == 0) { /* sentinel: no output-DPI normalization */ }
+        else if (!range_ok("output_dpi", 1, 32000)) return 1;
     } else if (key == "polling_rate") {
         if (!int_ok("polling_rate", POLL_RATE_MIN, POLL_RATE_MAX)) return 1;
     } else if (key == "snap") {
@@ -946,14 +1008,19 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // P120-FAZ2: GUI gauge max OUTPUT_OFFSET_MAX.
         if (!range_ok(key.c_str(), 0, OUTPUT_OFFSET_MAX)) return 1;
     } else if (key == "scale") {
-        // P120-FAZ2: GUI gauge max SCALE_MAX.
-        if (!range_ok(key.c_str(), 0, SCALE_MAX)) return 1;
+        // P120-FAZ2: GUI gauge max SCALE_MAX.  MATH-2: scrub 0/negative (dead
+        // cursor / silent 1.5x boost) — sanitize floors those to 0.01, so the
+        // CLI domain must start at the same floor to keep P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0.01, SCALE_MAX)) return 1;
     } else if (key == "limit" || key == "decay_rate" || key == "motivity" ||
                key == "gamma" || key == "input_offset" || key == "smooth" ||
-               key == "speed_min" || key == "speed_max" ||
-               key == "input_smooth_halflife" || key == "scale_smooth_halflife" ||
-               key == "output_smooth_halflife") {
+               key == "speed_min" || key == "speed_max") {
         if (!min_ok(key.c_str(), 0)) return 1;
+    } else if (key == "input_smooth_halflife" || key == "scale_smooth_halflife" ||
+               key == "output_smooth_halflife") {
+        // SM-7: bounded by the shared SMOOTH_HALFLIFE_MAX so the CLI never
+        // accepts a value sanitize would re-clamp — P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0, SMOOTH_HALFLIFE_MAX)) return 1;
     } else if (key == "domain_weights" || key == "domain_weight_x" ||
                key == "domain_weight_y" || key == "range_weights" ||
                key == "range_weight_x" || key == "range_weight_y") {
@@ -969,9 +1036,10 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // C-8: with mode=lookup but no LUT data the daemon gets an empty
         // curve; warn loudly instead of letting the user believe it took.
         if (val == "lookup" && a.length == 0) {
-            std::cerr << "WARNING: mode=lookup has no LUT data yet — set it "
-                         "with `rawaccel-cli set-param lut-data` before it "
-                         "does anything useful.\n";
+            std::cerr << "WARNING: mode=lookup has no LUT data yet — there is no "
+                         "set-param lut-data key; import a profile that already "
+                         "carries a lookup curve (e.g. `rawaccel-cli export "
+                         "<profile>` output) instead.\n";
         }
     }
     else if (key == "gain")             {
@@ -1022,17 +1090,22 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // (profile then applies to all unmatched mice).  Non-empty values are
         // matched against the daemon's composite ID "usb:VVVV:PPPP:serial" or a
         // /dev/input/{by-id,eventN} node path — copy verbatim.
+        // C29-N4: "(all)" is the display form of "no constraint" (the load
+        // side normalizes it) — mirror that here so a literal "(all)"
+        // assignment can't dead-lock the profile.
+        std::string id = val;
+        if (id == "(all)" || id == "all" || id == "*") id.clear();
         // P115-A5-01: the load-side cap is MAX_DP_DEVICE_ID (256) in
         // src/config.cpp.  A longer value used to be accepted and then silently
         // truncated on the next reload+resave — same trap P82-MED-1 fixed for
         // names.  Reject up front so the stored ID always equals what the user
         // supplied.
-        if (val.size() > 256) {
-            std::cerr << "device_id too long: " << val.size()
+        if (id.size() > 256) {
+            std::cerr << "device_id too long: " << id.size()
                       << " chars (max 256).\n";
             return 1;
         }
-        dp->device_id = val;
+        dp->device_id = id;
     }
     else if (key == "rotation")         { dp->prof.degrees_rotation = v; }
     else if (key == "snap")             { dp->prof.degrees_snap = v; }
@@ -1164,9 +1237,11 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
     //   3. a newline-delimited stream of profile objects (the export format),
     //   4. a bare JSON array of profile objects.
     std::vector<std::string> frags;
+    nlohmann::json wrapper_app; // C29-N2: capture a {"profiles":[...]} wrapper's app-level fields
     try {
         auto all = nlohmann::json::parse(content);
         if (all.is_object() && all.contains("profiles") && all["profiles"].is_array()) {
+            wrapper_app = all;
             for (auto& jp : all["profiles"]) frags.push_back(jp.dump());
         } else if (all.is_object()) {
             frags.push_back(content); // single profile object
@@ -1284,6 +1359,38 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
         batch.push_back(dp);
     }
 
+    // CFG-3: SEC-9 caps profiles at MAX_PROFILES, enforced on load.  A batch
+    // import past the cap used to write all entries, and only the first 256
+    // survived the next load+save — silent profile loss.  Check the full
+    // batch head-room up front and refuse rather than truncate.
+    if (cfg.profiles.size() + batch.size() > MAX_PROFILES) {
+        std::cerr << "Import rejected: importing " << batch.size()
+                  << " profile(s) would exceed the " << MAX_PROFILES
+                  << "-profile maximum (config already has "
+                  << cfg.profiles.size() << "). Delete profiles or split the "
+                  << "import file and try again.\n";
+        return 1;
+    }
+    // C29-N2: `list --json` emits a full app_config — its destructive import
+    // previous dropped active_profile/use_raw_input/version, so round-tripping
+    // a whole config silently lost which profile was active and the raw
+    // passthrough default.  Restore those from the wrapper (type-guarded).
+    if (!wrapper_app.is_null()) {
+        if (wrapper_app.contains("active_profile")) {
+            if (wrapper_app["active_profile"].is_string())
+                cfg.active_profile = wrapper_app["active_profile"].get<std::string>();
+            else
+                std::cerr << "Warning: ignoring non-string active_profile in wrapper\n";
+        }
+        if (wrapper_app.contains("use_raw_input")) {
+            if (wrapper_app["use_raw_input"].is_boolean())
+                cfg.use_raw_input = wrapper_app["use_raw_input"].get<bool>();
+            else
+                std::cerr << "Warning: ignoring non-boolean use_raw_input in wrapper\n";
+        }
+        if (wrapper_app.contains("version") && wrapper_app["version"].is_string())
+            cfg.version = wrapper_app["version"].get<std::string>();
+    }
     for (auto& dp : batch) {
         cfg.profiles.push_back(dp);
         std::cout << "Imported profile: " << dp.name << "\n";
@@ -1541,6 +1648,13 @@ static int cmd_status(const std::string& config_path) {
                                 std::cout << "  (active)";
                             else
                                 std::cout << "  (first-profile fallback)";
+                            // CLI-1: the daemon's effective-profile lookup also
+                            // gates on match_app (focused app); print it so the
+                            // CLI status guess does not silently claim a global
+                            // profile while the daemon applies an app-scoped one.
+                            if (!matched->match_app.empty())
+                                std::cout << "  (app-scoped \"" << matched->match_app
+                                          << "\" — only while the focused app matches)";
                             std::cout << "\n";
                         }
 
@@ -2130,9 +2244,9 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
   yx_ratio          Y-axis output DPI ratio (relative to X). Domain 0.01–100. Default 1.
   distance_mode     euclidean|max|lp|separate  (speed calculation method). Default euclidean.
   lp_norm           Lp-norm value (when distance_mode=lp). Domain > 0. Default 2.
-  input_smooth_halflife   Input speed EMA halflife (ms). Domain ≥ 0; 0=off. Default 0.
-  scale_smooth_halflife   Scale EMA halflife (ms). Domain ≥ 0; 0=off. Default 0.
-  output_smooth_halflife  Output speed EMA halflife (ms). Domain ≥ 0; 0=off. Default 0.
+  input_smooth_halflife   Input speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
+  scale_smooth_halflife   Scale EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
+  output_smooth_halflife  Output speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
   domain_weights    Both-axis domain weight. Domain 0–1e6. Default 1.
   domain_weight_x / domain_weight_y
                     Per-axis domain weight. Domain 0–1e6. Default 1.
@@ -2373,6 +2487,28 @@ int main(int argc, char* argv[]) {
             std::cerr << "Config is unreadable or invalid: " << config_path << "\n"
                       << "  Refusing to overwrite it — run `rawaccel-cli validate` for details.\n";
             return 1;
+        }
+        // CLI-3: a config that exists but holds zero profiles is what
+        // `delete` on the last profile deliberately writes (empty
+        // {"active_profile":"","profiles":[]}).  cmd_delete promises "a fresh
+        // 'default' is recreated on the next run" — make that true so the
+        // config self-heals instead of staying permanently empty (which also
+        // left active_profile dangling).  Mirrors the missing-file branch; a
+        // read-only `list`/`show` on such a config now regenerates it rather
+        // than reporting "no profiles".
+        if (cfg.profiles.empty()) {
+            device_profile dp;
+            dp.name = "default";
+            dp.dev_cfg.dpi = 800;
+            dp.dev_cfg.polling_rate = 1000;
+            cfg.profiles.push_back(dp);
+            cfg.active_profile = dp.name;
+            try { save_config(cfg, config_path); }
+            catch (const std::exception& e) {
+                std::cerr << "ERROR: could not save recreated default config: "
+                          << e.what() << "\n";
+                return 1;
+            }
         }
     }
 

@@ -15,6 +15,13 @@ inline constexpr int    POLL_RATE_MAX        = 8000;
 inline constexpr milliseconds DEFAULT_TIME_MIN = 1000.0 / POLL_RATE_MAX / 2;
 inline constexpr milliseconds DEFAULT_TIME_MAX = 100;
 inline constexpr milliseconds WRITE_DELAY     = 1000;
+// SM-7: smoothing EMA halflife upper bound in ms (10 s).  Beyond ~10 s the
+// per-8ms EMA step (e^-0.0008 ≈ 0.9992) makes the estimate effectively static
+// and pins smoothed speed at its initial 0 — a dead-mouse symptom.  Shared by
+// sanitize (src/config.cpp), the CLI set-param domain (cli/main.cpp) and the
+// P107 contract test so the CLI-accepted domain always survives sanitize
+// unchanged.
+inline constexpr double SMOOTH_HALFLIFE_MAX = 10000;
 inline constexpr size_t MAX_NAME_LEN         = 256;
 inline constexpr size_t LUT_RAW_DATA_CAPACITY = 514;
 inline constexpr size_t LUT_POINTS_CAPACITY  = LUT_RAW_DATA_CAPACITY / 2;
@@ -95,7 +102,9 @@ struct speed_args {
 };
 
 struct profile {
-    char   name[MAX_NAME_LEN]       = "default";
+    // +1 so a full MAX_NAME_LEN (256) name round-trips with its NUL
+    // terminator (config.cpp loads up to MAX_NAME_LEN chars — CFG-6).
+    char   name[MAX_NAME_LEN + 1] = "default";
     bool   raw_passthrough          = false; // true → bypass entire pipeline, 1:1 raw input
     vec2d  domain_weights           = { 1, 1 };
     vec2d  range_weights            = { 1, 1 };

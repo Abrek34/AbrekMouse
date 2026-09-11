@@ -80,25 +80,27 @@ static void remove_pid() {
 // daemon.  kill(pid,0) alone treats a recycled PID (kernel reused the number
 // after a crash) as "live", so a stale file can block startup forever.  The
 // kernel caps comm at TASK_COMM_LEN (15 bytes); "rawaccel-daemon" fits.
-// Best-effort: a failed /proc read returns false and the caller decides how
-// conservative to be.
-static bool proc_comm_matches(pid_t pid, const char* expected) {
+// Tri-state result so callers can distinguish "readable and different(from a
+// recycled PID)" from "comm unreadable (hidepid/ProtectProc)".  PID-3: an
+// unreadable comm must NEVER be treated as "recycled" — that would let a live
+// daemon's PID file be deleted and a second instance start.
+static int comm_state(pid_t pid, const char* expected) {
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/%d/comm", static_cast<int>(pid));
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
+    if (fd < 0) return -1; // unreadable — caller treats as possibly-live
     char buf[64];
     const ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
-    if (n <= 0) return false;
+    if (n <= 0) return -1; // empty/read failure — unverifiable
     buf[n] = '\0';
     char* nl = std::strchr(buf, '\n');
     if (nl) *nl = '\0';
     // Linux caps comm at TASK_COMM_LEN (16 bytes incl. NUL → 15 chars); the
     // constant is not exported to userspace, so keep the bound local.
     constexpr size_t kTaskCommLen = 15;
-    if (std::strlen(expected) > kTaskCommLen) return false;
-    return std::strcmp(buf, expected) == 0;
+    if (std::strlen(expected) > kTaskCommLen) return -1;
+    return std::strcmp(buf, expected) == 0 ? 1 : 0;
 }
 
 // K3: atomic flag for SIGUSR1 — dump_latency_stats() is not async-signal-safe
@@ -325,25 +327,101 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // SIG-1: install handlers BEFORE the PID file is written.  A SIGTERM that
+    // arrives after write_pid() but before sigaction() would take the default
+    // disposition, kill the process and leave a 0-byte PID file behind
+    // (SPLIT == PID-2 brick).  handle_signal is safe against a null g_daemon.
+    struct sigaction sa{};
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP,  &sa, nullptr);
+    sigaction(SIGUSR1, &sa, nullptr); // latency stats dump
+    // Ignore SIGPIPE so a broken IPC client connection just returns EPIPE
+    // from send() instead of killing the daemon.  (MSG_NOSIGNAL also covers
+    // this on the send-site, but defending in depth is cheap.)
+    struct sigaction sa_ign{};
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sigaction(SIGPIPE, &sa_ign, nullptr);
+
     // K1: Atomic PID write via O_CREAT|O_EXCL — fail if already running.
     // D5: Priority: $XDG_RUNTIME_DIR (user runtime), /run/ (root), /tmp/ (fallback).
     std::string xdg_pid = xdg_pid_path();
+
+    // PID-1: the liveness gate must run BEFORE the first write_pid().  The
+    // old OR-chain (write_pid(xdg) || write_pid(/run) || write_pid(/tmp))
+    // returned true whenever ANY candidate succeeded, so a second instance
+    // could win the /tmp fallback while a live daemon owned the XDG file —
+    // the write-won path skipped the liveness check below entirely.
+    // Check every candidate here so killing/refusing a live daemon is
+    // monotonic with respect to which file it holds.
+    auto pid_file_is_live = [](const char* path) {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        char buf[32] = {};
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return false;
+        errno = 0;
+        char* end = nullptr;
+        long val = std::strtol(buf, &end, 10);
+        if (end == buf || errno != 0 || val <= 0 || val > INT_MAX)
+            return false;
+        // R1-14: only count a live process as "another instance" when it
+        // is actually rawaccel-daemon.  kill(pid,0) alone would mark a
+        // recycled, unrelated PID as alive and refuse every future boot.
+        const int rc = kill(static_cast<pid_t>(val), 0);
+        const int kerrno = errno; // capture before comm_state() clobbers errno
+        if (rc == 0 || kerrno == EPERM) {
+            if (kerrno == EPERM)
+                return true; // exists but cannot be signaled → can't verify → refuse
+            // PID-3: only clear when the comm is READABLE and different (a
+            // truly recycled PID).  An unreadable comm under hidepid/ProtectProc
+            // must be treated as a live daemon — clearing it deletes a running
+            // instance's lock and lets a second daemon grab the devices.
+            const int cs = comm_state(static_cast<pid_t>(val), "rawaccel-daemon");
+            if (cs == 1) return true;  // readable + ours → really up → refuse
+            if (cs == 0) return false; // readable + different → recycled → stale
+            return true;               // comm unreadable → stay conservative
+        }
+        return false; // ESRCH or error: not a live process
+    };
+    const bool another_alive =
+        (!xdg_pid.empty() && pid_file_is_live(xdg_pid.c_str())) ||
+        pid_file_is_live(PID_FILE) || pid_file_is_live(PID_FILE2);
+    if (another_alive) {
+        std::cerr << "[rawaccel] Another instance may already be running "
+                     "(PID file exists). Use 'rawaccel-cli stop' to stop it.\n";
+        return 1;
+    }
+
     bool pid_written = (!xdg_pid.empty() && write_pid(xdg_pid))
                     || write_pid(PID_FILE)
                     || write_pid(PID_FILE2);
     if (pid_written)
         std::cout << "PID file: " << g_pid_file << "\n";
     if (!pid_written) {
-        // Both attempts failed — daemon is likely already running.
-        // Check for a stale PID file (left behind by a crashed previous instance):
-        // if the recorded PID no longer exists, delete the file and retry.
+        // Both write attempts failed (EEXIST on every candidate) but no file
+        // holds a live daemon (checked above) → clear the stale file(s) and
+        // retry.  Try all candidates so one stale file can't keep blocking.
         auto try_clear_stale = [](const char* path) -> bool {
             int fd = open(path, O_RDONLY | O_CLOEXEC);
             if (fd < 0) return false;
             char buf[32] = {};
             ssize_t n = read(fd, buf, sizeof(buf) - 1);
             close(fd);
-            if (n <= 0) { unlink(path); return false; }
+            if (n <= 0) {
+                // PID-2: a 0-byte file cannot belong to a live daemon (a live
+                // one wrote "pid\n" successfully or failed and unlinked).
+                // Previously we unlinked but returned false, so `cleared`
+                // stayed false and every boot was refused until a manual
+                // delete — a permanent brick from a single torn write.
+                if (unlink(path) == 0) return true;
+                return false;
+            }
             errno = 0;
             char* end = nullptr;
             long val = std::strtol(buf, &end, 10);
@@ -361,13 +439,11 @@ int main(int argc, char* argv[]) {
                 unlink(path);
                 return true;
             }
-            // R1-14: PID alive but its comm is not rawaccel-daemon — the PID
-            // was recycled by the kernel after a crash and now belongs to some
-            // other program, so this file can never belong to a live copy of
-            // us.  Clear it.  A comm that cannot be read (unverifiable) is
-            // deliberately NOT cleared here — stay on the conservative side.
+            // PID-3: clear only when the comm is READABLE and different.  An
+            // unreadable comm (hidepid/ProtectProc) stays on the conservative
+            // side — a live daemon must never have its PID file deleted.
             if (pid > 0 && kill(pid, 0) == 0 &&
-                !proc_comm_matches(pid, "rawaccel-daemon")) {
+                comm_state(pid, "rawaccel-daemon") == 0) {
                 unlink(path);
                 return true;
             }
@@ -375,42 +451,10 @@ int main(int argc, char* argv[]) {
         };
 
         // D5: also include the XDG path in the stale-check list
-        // Do not clear one stale fallback file and then start while another
-        // PID file belongs to a live daemon.  The old OR-chain could do that
-        // (for example, stale XDG_RUNTIME_DIR + live /run/rawaccel.pid),
-        // allowing two daemons to grab the same devices.
-        auto pid_file_is_live = [](const char* path) {
-            int fd = open(path, O_RDONLY | O_CLOEXEC);
-            if (fd < 0) return false;
-            char buf[32] = {};
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            close(fd);
-            if (n <= 0) return false;
-            errno = 0;
-            char* end = nullptr;
-            long val = std::strtol(buf, &end, 10);
-            if (end == buf || errno != 0 || val <= 0 || val > INT_MAX)
-                return false;
-            // R1-14: only count a live process as "another instance" when it
-            // is actually rawaccel-daemon.  kill(pid,0) alone would mark a
-            // recycled, unrelated PID as alive and refuse every future boot.
-            const int rc = kill(static_cast<pid_t>(val), 0);
-            if (rc == 0 || errno == EPERM) {
-                if (proc_comm_matches(static_cast<pid_t>(val),
-                                      "rawaccel-daemon"))
-                    return true; // our daemon really is up → refuse
-                if (rc == 0) return false; // alive but not us → stale/clearable
-                return true;      // live but comm unreadable → stay conservative
-            }
-            return false; // ESRCH or error: not a live process
-        };
-        const bool another_alive =
-            (!xdg_pid.empty() && pid_file_is_live(xdg_pid.c_str())) ||
-            pid_file_is_live(PID_FILE) || pid_file_is_live(PID_FILE2);
-        bool cleared = !another_alive &&
-                       ((!xdg_pid.empty() && try_clear_stale(xdg_pid.c_str()))
-                        || try_clear_stale(PID_FILE)
-                        || try_clear_stale(PID_FILE2));
+        bool cleared =
+            ((!xdg_pid.empty() && try_clear_stale(xdg_pid.c_str()))
+             || try_clear_stale(PID_FILE)
+             || try_clear_stale(PID_FILE2));
         bool retry_ok = cleared &&
                         ((!xdg_pid.empty() && write_pid(xdg_pid))
                          || write_pid(PID_FILE)
@@ -488,24 +532,9 @@ int main(int argc, char* argv[]) {
     daemon.set_log_cb(log_cb);
     daemon.set_verbose(verbose);
 
-    // Use sigaction (POSIX) instead of std::signal (implementation-defined).
-    // SA_RESTART makes blocking syscalls (read/recv/poll) restart automatically
-    // instead of failing with EINTR, simplifying the loop's error handling.
-    struct sigaction sa{};
-    sa.sa_handler = handle_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGINT,  &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-    sigaction(SIGHUP,  &sa, nullptr);
-    sigaction(SIGUSR1, &sa, nullptr); // latency stats dump
-    // Ignore SIGPIPE so a broken IPC client connection just returns EPIPE
-    // from send() instead of killing the daemon.  (MSG_NOSIGNAL also covers
-    // this on the send-site, but defending in depth is cheap.)
-    struct sigaction sa_ign{};
-    sa_ign.sa_handler = SIG_IGN;
-    sigemptyset(&sa_ign.sa_mask);
-    sigaction(SIGPIPE, &sa_ign, nullptr);
+    // Use sigaction handled setup at the top of main() — SIG-1: it must
+    // precede write_pid() so an early SIGTERM can never strand a 0-byte PID
+    // file.  (The handlers are async-signal-safe: flag stores only.)
 
     std::cout << "RawAccel Linux Daemon v" << VERSION << "\n";
 
@@ -573,9 +602,14 @@ int main(int argc, char* argv[]) {
             daemon.consume_latency_dump_request())
             daemon.dump_latency_stats();
     }
-    // request_stop() was called from signal handler; now safe to join the loop thread.
-    daemon.stop();
+    // SAVE-1: IPC must stop BEFORE stop() joins the save worker.  The old
+    // order (stop() then stop_ipc_server()) left the IPC thread alive after
+    // save_thread_ was joined, so a final set_config could ack ok:true onto an
+    // unterminated queue and vanish.  Stopping the server first means every
+    // already-acked config sits on the queue when save_worker's last drain
+    // runs.
     daemon.stop_ipc_server();
+    daemon.stop();
 
     // K2: prevent the signal handler from accessing the daemon after this point — null first, then clean up
     g_daemon.store(nullptr);

@@ -21,6 +21,11 @@ ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
+# SVC-1: make the restart burst limit explicit (systemd defaults are
+# StartLimitIntervalSec=10s / StartLimitBurst=5 — an invisible surprise if
+# RestartSec is ever tuned).  60s window / 10 attempts.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 # BS-11: no PIDFile= — that directive is only honoured for Type=forking and
 # would be dead (systemd warns).  The daemon writes /run/rawaccel.pid for the
 # CLI/GUI's PID discovery, which must not be confused with systemd's notion.

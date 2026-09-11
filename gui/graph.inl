@@ -430,6 +430,11 @@ void on_lut_spin_changed(GtkSpinButton* spin, gpointer) {
 /// Fully rebuild the LUT list widget (after adding or removing a point).
 void rebuild_lut_list(AppState* S) {
     if (!S->lut_list_box) return;
+    // O31-G2: save/restore instead of an absolute reset (devices.inl pattern).
+    // An enclosing operation may hold S->updating = true (e.g. profile_to_widgets
+    // mid-flight); force-clearing it here would let re-entrant widget signals
+    // reach widgets_to_profile() and mark a partially-loaded profile unsaved.
+    bool prev_updating = S->updating;
     S->updating = true;
 
     // Remove all existing rows
@@ -489,7 +494,7 @@ void rebuild_lut_list(AppState* S) {
         g_signal_connect(del_btn, "clicked", G_CALLBACK(on_lut_row_delete), row_widget);
     }
 
-    S->updating = false;
+    S->updating = prev_updating;
 }
 
 /// Re-read LUT data whenever a spin value changes.
