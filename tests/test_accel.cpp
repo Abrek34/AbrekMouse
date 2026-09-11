@@ -2287,6 +2287,20 @@ static void test_lat_stats() {
         EXPECT(p99 > 0.0);
     }
 
+    // ── BUG-HIGH-1: NaN percentile must not reach the uint64_t cast ───────
+    {
+        lat_stats ls;
+        for (int i = 0; i < 10; i++) ls.record(2.0);
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double inf = std::numeric_limits<double>::infinity();
+        EXPECT_NEAR(ls.percentile(nan), 0.0, 1e-12);
+        // +Inf is not NaN: it falls into the pct >= 100 branch → max_us
+        EXPECT_NEAR(ls.percentile(inf), ls.max_us, 1e-12);
+        auto s = ls.snapshot_and_reset();
+        EXPECT_NEAR(s.percentile(nan), 0.0, 1e-12);
+        EXPECT_NEAR(s.percentile(inf), s.max_us, 1e-12);
+    }
+
     // ── Move constructor: data transfers, mutex is fresh ──────────────────
     {
         lat_stats a;
@@ -5385,13 +5399,16 @@ struct sim {
     }
 
     void end_batch() {
-        // Daemon process_device() tail (daemon.cpp:1391-1396): a frame that
-        // never reached SYN_REPORT is NOT lost — pending motion is flushed
-        // and, if any event was written unsynced, a synthetic SYN_REPORT
-        // closes the frame.  Locals are per-invocation, so reset them.
-        if (!has_syn) {
+        // Daemon process_device() tail (BUG-CRIT-1): a frame is closed whenever
+        // anything is still pending — pending motion OR events forwarded without
+        // a trailing SYN_REPORT.  The old `!has_syn` guard dropped motion that
+        // accumulated after a mid-batch SYN_REPORT (kernel coalesced a second
+        // frame whose own SYN was not yet queued when the batch ended).  Pending
+        // motion is flushed and the frame is closed with a synthetic SYN_REPORT.
+        // Locals are per-invocation, so reset them.
+        if (has_motion || wrote_unsynced) {
             flush();
-            if (wrote_unsynced) out.push_back({ev_syn, syn_report, 0});
+            out.push_back({ev_syn, syn_report, 0});
         }
         has_syn = false;
         wrote_unsynced = false;
@@ -5553,6 +5570,24 @@ static void test_syn_dropped_event_stream() {
         EXPECT(has_rel(s.out, 3, 0));
         EXPECT(s.out.back().type == ev_syn && s.out.back().code == syn_report);
         EXPECT(!s.wrote_unsynced);
+    }
+
+    SECTION("T24 — mid-batch SYN then tail motion is NOT lost (BUG-CRIT-1)");
+    {
+        // Kernel coalesced [REL:+5, SYN, REL:+3] and the batch ended (EAGAIN)
+        // before the second frame's own SYN_REPORT was queued.  Even though a
+        // SYN already arrived this invocation (has_syn=true), the tail +3 must
+        // be flushed and the frame closed with a synthetic SYN_REPORT.
+        sim s;
+        s.handle(ev_rel, rel_x, 5);
+        s.handle(ev_syn, syn_report, 0);      // frame 1 closes
+        s.handle(ev_rel, rel_x, 3);            // tail of frame 2, no SYN yet
+        s.end_batch();
+        EXPECT(s.out.size() == 6);             // REL5 SYN REL3 SYN
+        EXPECT(has_rel(s.out, 5, 0));
+        EXPECT(has_rel(s.out, 3, 0));
+        EXPECT(s.out[5].type == ev_syn && s.out[5].code == syn_report);
+        EXPECT(!s.has_motion && !s.has_syn);
     }
 
     SECTION("T24 — motion then button (no SYN): relative order preserved, one closing SYN");

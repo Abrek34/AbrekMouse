@@ -1501,7 +1501,6 @@ void AccelDaemon::process_device(mouse_device& dev) {
     // Accumulate relative motion in this batch
     double dx = 0, dy = 0;
     bool has_motion  = false;
-    bool has_syn     = false;
     bool wrote_unsynced_event = false;
     // BUG-18: syn_dropped is now a device-state field (mouse_device::syn_dropped)
     // so a SYN_DROPPED event in one read batch is correctly remembered until
@@ -1576,7 +1575,6 @@ void AccelDaemon::process_device(mouse_device& dev) {
                 // window ends here; fresh data starts from the next event batch).
                 continue;
             }
-            has_syn = true;
             if (!flush_pending_motion()) return;
             // Forward SYN
             if (!uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
@@ -1621,10 +1619,17 @@ void AccelDaemon::process_device(mouse_device& dev) {
         }
     }
 
-    // If events were forwarded but no SYN arrived (rare edge case), flush with synthetic SYN
-    if (!has_syn) {
+    // Close the frame at batch end whenever anything is still pending.
+    // BUG-CRIT-1: the old guard was `!has_syn`, which dropped motion that
+    // accumulated AFTER a mid-batch SYN_REPORT — the kernel coalesced a second
+    // frame ([REL_X:+5, SYN, REL_X:+3]) and read() hit EAGAIN before that
+    // frame's own SYN_REPORT was queued.  The tail +3 was silently lost
+    // because has_syn=true skipped this block.  Constrain on pending state
+    // instead: flush leftover motion, then close the unterminated frame with
+    // a synthetic SYN_REPORT (a no-op when nothing was written unsynced).
+    if (has_motion || wrote_unsynced_event) {
         if (!flush_pending_motion()) return;
-        if (wrote_unsynced_event && !uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
+        if (!uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
             { dev.disconnected = true; return; }
     }
 }
@@ -2029,7 +2034,14 @@ void AccelDaemon::stop_ipc_server() {
     if (fd >= 0) {
         shutdown(fd, SHUT_RDWR);
     }
-    if (ipc_thread_.joinable()) ipc_thread_.join();
+    // ERR-1: never join the IPC thread from itself.  The thread-body catch
+    // handler calls stop_ipc_server() on an abnormal exit; joining the current
+    // thread throws std::system_error and the escaping exception would hit
+    // std::terminate(), killing the daemon.  When called from the IPC thread
+    // itself, skip the join (the thread unwinds right after this call) and let
+    // the caller / normal stop() join it.
+    if (ipc_thread_.joinable() && ipc_thread_.get_id() != std::this_thread::get_id())
+        ipc_thread_.join();
     // The accept loop may still be returning from poll() when shutdown()
     // wakes it.  Do not close the descriptor until that thread has stopped:
     // closing it concurrently with poll/accept permits descriptor reuse and
@@ -2065,7 +2077,16 @@ void AccelDaemon::ipc_serve_loop() {
         // with stop_ipc_server() which may close ipc_sock_fd_ between poll() and accept4().
         int client = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (client < 0) continue;
-        handle_ipc_client(client);
+        // ERR-3: never let a per-client exception (e.g. std::bad_alloc on a
+        // huge payload) leak the descriptor or kill the whole IPC server.
+        // Log, close, and keep serving the next client.
+        try {
+            handle_ipc_client(client);
+        } catch (const std::exception& e) {
+            log(std::string("ipc client error: ") + e.what());
+        } catch (...) {
+            log("ipc client error: unknown exception");
+        }
         close(client);
     }
 }

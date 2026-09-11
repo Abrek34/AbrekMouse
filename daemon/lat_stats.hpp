@@ -100,6 +100,10 @@ struct lat_stats {
         // BUG-NEW-72: pct outside [0,100] previously made
         // static_cast<uint64_t>(ceil(count·pct/100)) UB (negative)
         // or returned max_us (pct > 100).  Clamp to the valid domain.
+        // BUG-HIGH-1: NaN is not caught by <=/>= and would flow into the
+        // out-of-range uint64_t cast — guard it explicitly (Inf still lands
+        // in the pct >= 100 branch as max_us).
+        if (std::isnan(pct)) return 0.0;
         if (pct <= 0.0) return 0.0;
         if (pct >= 100.0) return max_us;
         uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
@@ -128,6 +132,8 @@ struct lat_stats {
         double percentile(double pct) const {
             if (count == 0) return 0.0;
             // BUG-NEW-72: same guard as the live percentile() above.
+            // BUG-HIGH-1: NaN flows past <=/>= into the cast — guard it.
+            if (std::isnan(pct)) return 0.0;
             if (pct <= 0.0) return 0.0;
             if (pct >= 100.0) return max_us;
             uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
