@@ -237,13 +237,13 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
     S->accel_spin      = make_spin(0,    20,    0.001, 0.005);
     S->exponent_spin   = make_spin(1,    10,    0.05,  2.0);
-    S->power_exp_spin  = make_spin(0.01, 5,     0.01,  0.05);
-    S->limit_spin      = make_spin(0.1,  100,   0.05,  1.5);
+    S->power_exp_spin  = make_spin(0.0001, 5, 0.01,  0.05, 4);   // O31-G4: min == sanitize exponent_power floor (1e-4)
+    S->limit_spin      = make_spin(0,    100,   0.05,  1.5);    // O31-G4: sanitize floors limit at 0, not 0.1
     S->offset_spin     = make_spin(0,    100,   0.5,   0.0);
     S->decay_spin      = make_spin(0,    10,    0.01,  0.1);
     S->cap_x_spin      = make_spin(0,    500,   1,     15, 0);
     S->cap_y_spin      = make_spin(0,    100,   0.05,  1.5);
-    S->sync_speed_spin = make_spin(0.1,  100,   0.5,   5.0);
+    S->sync_speed_spin = make_spin(0.0001, 100,  0.5,   5.0, 4); // O31-G4: min == sanitize sync_speed floor (1e-4)
     S->smooth_spin     = make_spin(0,    1,     0.01,  0.5);
     S->motivity_spin      = make_spin(0.01, 10,    0.01,  1.5);
     S->gamma_spin         = make_spin(0.01, 10,    0.01,  1.0);
@@ -408,7 +408,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
     S->accel_spin_y      = make_spin(0,   20,   0.001, 0.005);
     S->exponent_spin_y   = make_spin(1,   10,   0.05,  2.0);
-    S->limit_spin_y      = make_spin(0.1, 100,  0.05,  1.5);
+    S->limit_spin_y      = make_spin(0,   100,  0.05,  1.5);   // O31-G4: min == sanitize limit floor (0)
     S->offset_spin_y     = make_spin(0,   100,  0.5,   0.0);
     S->cap_y_spin_y      = make_spin(0,   100,  0.05,  1.5);
     for (auto* s : {S->accel_spin_y, S->exponent_spin_y,
@@ -489,9 +489,14 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         gtk_widget_set_visible(S->lp_norm_label, FALSE); // hidden until Lp is selected
         gtk_widget_set_visible(S->lp_norm_spin,  FALSE);
 
-        S->input_hl_spin  = make_spin(0, 200, 0.5, 0.0);
-        S->scale_hl_spin  = make_spin(0, 200, 0.5, 0.0);
-        S->output_hl_spin = make_spin(0, 200, 0.5, 0.0);
+        // R5-F: half-life gauges previously capped at 200 ms while the engine
+        // (SMOOTH_HALFLIFE_MAX) accepts 0–10000 ms — loading a hand-edited
+        // config with e.g. hl=5000 clamps the spin to 200 and a *save* then
+        // persists the clamped value.  Widened to the engine ceiling so every
+        // engine-legal value round-trips without mutation.
+        S->input_hl_spin  = make_spin(0, 10000, 0.5, 0.0);
+        S->scale_hl_spin  = make_spin(0, 10000, 0.5, 0.0);
+        S->output_hl_spin = make_spin(0, 10000, 0.5, 0.0);
         connect_spin(S->input_hl_spin, S);
         connect_spin(S->scale_hl_spin, S);
         connect_spin(S->output_hl_spin, S);
@@ -517,7 +522,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     // ── Device ────────────────────────────────────────────────────────────────
     append_section("<b>Device</b>");
     GtkWidget* dg = append_grid();
-    S->dpi_spin        = make_spin(100, 32000, 50, 800, 0);
+    S->dpi_spin        = make_spin(1, 32000, 50, 800, 0);
     S->polling_spin    = make_spin(125, 8000, 125, 1000, 0);
     S->output_dpi_spin = make_spin(0, 32000, 50, 1000, 0);
     connect_spin(S->dpi_spin, S);
@@ -593,7 +598,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         gtk_widget_set_margin_top(S->hw_apply_btn, 2);
         gtk_grid_attach(GTK_GRID(hg), S->hw_apply_btn, 1, 4, 1, 1);
 
-        S->hw_status_lbl = trlbl("—");
+        S->hw_status_lbl = gtk_label_new(tr("—")); // O31-G3: dynamic content — must NOT be in the tr registry
         gtk_label_set_xalign(GTK_LABEL(S->hw_status_lbl), 0.0);
         gtk_label_set_wrap(GTK_LABEL(S->hw_status_lbl), TRUE);
         gtk_widget_set_margin_top(S->hw_status_lbl, 2);
@@ -604,13 +609,13 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         // status line (scan/query/notification); feature-derived capability
         // widgets that a device does not advertise are disabled in
         // hidpp_panel.inl and the reason is spelled out here.
-        S->hw_battery_lbl = trlbl("Battery: —");
+        S->hw_battery_lbl = gtk_label_new(tr("Battery: —")); // O31-G3: dynamic content — must NOT be in the tr registry
         gtk_label_set_xalign(GTK_LABEL(S->hw_battery_lbl), 0.0);
         gtk_label_set_wrap(GTK_LABEL(S->hw_battery_lbl), TRUE);
         gtk_widget_set_margin_top(S->hw_battery_lbl, 2);
         gtk_grid_attach(GTK_GRID(hg), S->hw_battery_lbl, 0, 6, 3, 1);
 
-        S->hw_caps_lbl = trlbl("Capabilities: —");
+        S->hw_caps_lbl = gtk_label_new(tr("Capabilities: —")); // O31-G3: dynamic content — must NOT be in the tr registry
         gtk_label_set_xalign(GTK_LABEL(S->hw_caps_lbl), 0.0);
         gtk_label_set_wrap(GTK_LABEL(S->hw_caps_lbl), TRUE);
         gtk_label_set_justify(GTK_LABEL(S->hw_caps_lbl), GTK_JUSTIFY_LEFT);
@@ -821,6 +826,12 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             double spd  = (cx - GRAPH_ML) / PW * max_speed;
             double gain = (1.0 - (cy - GRAPH_MT) / PH) * max_gain;
             spd  = std::max(0.0, spd);
+            // O31-G5: mirror on_lut_add_point's BUG-NEW-51 clamp.  A zoomed/
+            // panned click can produce a speed above the LUT speed spin max
+            // (10000); without this the finished point would sit above the
+            // spin range and be silently rewritten on the next rebuild.
+            constexpr double LUT_CLICK_SPEED_MAX = 10000.0;
+            spd  = std::min(spd, LUT_CLICK_SPEED_MAX);
             gain = std::max(0.01, gain);
 
             auto& ax = cur_prof(S2).prof.accel_x;
@@ -874,10 +885,15 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             double best_dist2 = 20.0 * 20.0; // 20px threshold
             bool vel_hit = ax.gain;
             for (int i = 0; i < (int)pts.size(); i++) {
-                double px = GRAPH_ML + (pts[i].first  / max_speed) * PW;
-                double py = GRAPH_MT + PH - (lut_stored_to_gain(pts[i].first,
-                                                               pts[i].second,
-                                                               vel_hit) / max_gain) * PH;
+                // P-HIT: mirror the DRAW coordinates exactly (graph.inl:244-245
+                // clamps px to the plot box and to_cy clamps gain to [0,1]) — a
+                // point beyond max_speed/max_gain otherwise rendered at a
+                // different pixel than the hit-test probed, so its visual
+                // position could not be right-clicked away.
+                double px = std::clamp(GRAPH_ML + (pts[i].first  / max_speed) * PW,
+                                       GRAPH_ML, GRAPH_ML + PW);
+                double gain = lut_stored_to_gain(pts[i].first, pts[i].second, vel_hit);
+                double py = GRAPH_MT + PH - std::clamp(gain / max_gain, 0.0, 1.0) * PH;
                 double d2 = (cx - px) * (cx - px) + (cy - py) * (cy - py);
                 if (d2 < best_dist2) { best_dist2 = d2; best_idx = i; }
             }
@@ -925,7 +941,11 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
     // Latency stats view: read-only display + a button that pulls the daemon's
     // latency snapshot over IPC (see on_perf_clicked in widgets_sync.inl).
-    S->latency_lbl = trlbl("Latency: —");
+    // O31-G3: latency_lbl carries live stats — registering it in the tr
+    // registry would make refresh_language() reset it to "Latency: —" on a
+    // language switch (stale until the next Performance click).  Use a plain
+    // label translated at creation; the dynamic writers re-render each time.
+    S->latency_lbl = gtk_label_new(tr("Latency: —"));
     gtk_label_set_xalign(GTK_LABEL(S->latency_lbl), 0.0);
     gtk_widget_add_css_class(S->latency_lbl, "latency-label");
     gtk_widget_set_margin_end(S->latency_lbl, 4);
@@ -998,13 +1018,17 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             // GUI-O4: drop the pkexec child-watch source.  Without this a
             // pkexec+systemctl child that exits AFTER the window is gone would
             // fire pkexec_child_report() → set_status() into destroyed widgets.
-            if (S2->pkexec_watch_id) {
-                g_source_remove(S2->pkexec_watch_id);
-                S2->pkexec_watch_id = 0;
-            }
+            // P-LEAK: the detach frees the ctx and async-reaps the child; the
+            // child itself is NOT killed so a started daemon/stopped service
+            // operation initiated by the user completes in the background.
+            pkexec_watch_detach(S2, /*kill_child=*/false);
             // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
             S2->hw_cancel = true;
             S2->hw_pending_query = -1;
+            // O31-G1: the async KDE-fix idle callback must also bail — it has
+            // no source id to remove, so flag the window as destroyed and let
+            // kde_fix_finish() drop its result instead of touching widgets.
+            S2->window_destroyed = true;
             // P-APP: unload the KWin focus script, release the GDBus name
             kwin_focus_uninstall(S2);
         }), S);
@@ -1272,7 +1296,12 @@ static bool kde_atomic_write(const std::string& path,
             return false;
         }
     }
-    if (fflush(fw) != 0 || ferror(fw) || fsync(fileno(fw)) != 0 || fclose(fw) != 0) {
+    // P-LEAK: `||` short-circuit used to skip fclose() when fflush/ferror/fsync
+    // failed first — leaking the FILE*/fd on every bogus disk write.  Always
+    // fclose before reporting the error path.
+    bool flush_ok = (fflush(fw) == 0) && !ferror(fw) && (fsync(fileno(fw)) == 0);
+    if (fclose(fw) != 0) flush_ok = false;
+    if (!flush_ok) {
         unlink(tmp.c_str());
         return false;
     }
@@ -1487,6 +1516,12 @@ struct kde_fix_task {
 static gboolean kde_fix_finish(gpointer p) {
     auto* t = static_cast<kde_fix_task*>(p);
     AppState* S = t->S;
+    S->kde_fix_running = false;
+    // O31-G1: widget-lifetime cancel-gate.  If the window was destroyed while
+    // the worker ran, S->status_bar / S->kde_warn_bar are gone — drop the
+    // task without touching them.  S itself is stack-owned, so reading the
+    // flag is safe; only the widgets were torn down.
+    if (S->window_destroyed) { delete t; return G_SOURCE_REMOVE; }
     if (t->ok) {
         kde_fix_marker_write(S, kde_enumerate_rawaccel_devices());
         S->kde_accel_ok = true;

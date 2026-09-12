@@ -35,7 +35,7 @@ static std::string g_pid_file;
 /// K1: Atomically write PID file using O_CREAT|O_EXCL.
 /// Returns false if the file already exists (another daemon instance is running).
 static bool write_pid(const std::string& path) {
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) return false; // EEXIST → daemon already running
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
@@ -60,9 +60,6 @@ static bool write_pid(const std::string& path) {
     }
     if (fsync(fd) != 0) // L-BUG-3: a failed fsync = PID may not survive a crash
         std::cerr << "[rawaccel] warning: fsync PID file failed: "
-                  << strerror(errno) << "\n";
-    else if (fchmod(fd, 0644) != 0) // L-BUG-3: keep the "running" probe readable
-        std::cerr << "[rawaccel] warning: fchmod PID file failed: "
                   << strerror(errno) << "\n";
     close(fd);
     g_pid_file = path;
@@ -295,6 +292,13 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[rawaccel] Option '" << arg << "' requires a path argument.\n";
                 return 1;
             }
+            // O31-H3: don't let a following option (`-c -v`) be swallowed as a
+            // path — that silently flipped global setting meaning.
+            if (argv[i + 1][0] == '-') {
+                std::cerr << "[rawaccel] Option '" << arg << "' requires a path argument "
+                             "(got '" << argv[i + 1] << "').\n";
+                return 1;
+            }
             config_path = argv[++i];
         } else if (const char* v = eq_val("--config")) {
             if (v[0] == '\0') {
@@ -307,6 +311,12 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-f" || arg == "--log-format") {
             if (i + 1 >= argc) {
                 std::cerr << "[rawaccel] Option '" << arg << "' requires a format argument.\n";
+                return 1;
+            }
+            // O31-H3: same guard as -c — `-f -c` must not read "-c" as a format.
+            if (argv[i + 1][0] == '-') {
+                std::cerr << "[rawaccel] Option '" << arg << "' requires a format argument "
+                             "(got '" << argv[i + 1] << "').\n";
                 return 1;
             }
             log_format = argv[++i];

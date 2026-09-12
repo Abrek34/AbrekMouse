@@ -1204,6 +1204,42 @@ static void test_json_roundtrip_lut() {
     }
 }
 
+// ── Test 10b: JSON round-trip — LUT survives a mode switch (R6-1) ───────────
+
+static void test_json_roundtrip_lut_mode_switch() {
+    SECTION("JSON round-trip — LUT lookup→natural→lookup korunur");
+
+    device_profile dp;
+    dp.name = "lut-mode-switch";
+    auto& ax = dp.prof.accel_x;
+    ax.mode = accel_mode::lookup;
+    float pts[] = { 0.0f, 1.0f, 5.0f, 1.3f, 15.0f, 1.7f, 30.0f, 2.0f };
+    ::memcpy(ax.data, pts, sizeof(pts));
+    ax.length = 8; // 4 çift
+    dp.prof.accel_y = ax;
+
+    // CLI `set-param <p> mode natural` keeps the LUT in memory but switches the
+    // mode; the automatic save used to drop lut_data (serialized only for
+    // lookup) — back-to-lookup came back with an empty curve.
+    ax.mode               = accel_mode::natural;
+    dp.prof.accel_y.mode  = accel_mode::natural;
+    std::string json_str  = profile_to_json(dp);
+    device_profile dp2    = profile_from_json(json_str);
+
+    EXPECT(dp2.prof.accel_x.mode == accel_mode::natural);
+    EXPECT(dp2.prof.accel_x.length == ax.length);
+
+    // The curve travels with the profile; switching back restores it.
+    dp2.prof.accel_x.mode = accel_mode::lookup;
+    dp2.prof.accel_y.mode = accel_mode::lookup;
+    const auto& ax2 = dp2.prof.accel_x;
+    EXPECT(ax2.mode == accel_mode::lookup);
+    for (int i = 0; i < ax2.length; i++) {
+        EXPECT_NEAR(static_cast<double>(ax2.data[i]),
+                    static_cast<double>(ax.data[i]), 1e-4f);
+    }
+}
+
 // ── Test 11: app_config dosya round-trip ─────────────────────────────────────
 
 static void test_file_roundtrip() {
@@ -1564,7 +1600,10 @@ static void test_modifier_end_to_end() {
         EXPECT_NEAR(in.y, 4.0, 1e-9);
     }
 
-    // ── 2. time <= 0 guard: modify must be a no-op ────────────────────────
+    // ── 2. time <= 0 guard: BUG-HIGH-2 — input zeroed, no raw 1:1 leak ────
+    // (The daemon clamps time before reaching modify(); this guard only fires
+    //  on hostile unit-level input.  Zeroing is the documented FIX — the raw
+    //  delta must NOT pass through unmodified 1:1.)
     {
         profile p;
         p.accel_x.mode = accel_mode::classic;
@@ -1577,8 +1616,8 @@ static void test_modifier_end_to_end() {
 
         vec2d in = { 5.0, 0.0 };
         mod.modify(in, sp, ms, 1.0, 0.0 /*time=0*/);
-        // time<=0 → early return, in unchanged
-        EXPECT_NEAR(in.x, 5.0, 1e-9);
+        // time<=0 → early return with in zeroed (BUG-HIGH-2)
+        EXPECT_NEAR(in.x, 0.0, 1e-9);
         EXPECT_NEAR(in.y, 0.0, 1e-9);
     }
 
@@ -2181,15 +2220,19 @@ static void test_nonfinite_time_does_not_poison_smoothers() {
 
     double rx = 0, ry = 0;
     int ox = 0, oy = 0;
+    // BUG-HIGH-2: a non-finite interval must NOT leak the raw delta 1:1 — the
+    // input is zeroed (the smoothers stay untouched, so no poisoning).  What
+    // matters here is that no valid-motion raw leak occurs, then the stateful
+    // smoothers still produce a finite, non-zero result on the next valid event.
     apply_motion_math(mod, sp, settings, 1.0,
                       std::numeric_limits<double>::quiet_NaN(),
                       4.0, 2.0, rx, ry, ox, oy);
-    EXPECT(ox == 4 && oy == 2);
+    EXPECT(ox == 0 && oy == 0);
 
     apply_motion_math(mod, sp, settings, 1.0,
                       std::numeric_limits<double>::infinity(),
                       4.0, 2.0, rx, ry, ox, oy);
-    EXPECT(ox == 4 && oy == 2);
+    EXPECT(ox == 0 && oy == 0);
 
     apply_motion_math(mod, sp, settings, 1.0, 1.0,
                       4.0, 2.0, rx, ry, ox, oy);
@@ -2271,6 +2314,28 @@ static void test_lat_stats() {
         // Snapshot percentile works independently
         double sp50 = s.percentile(50);
         EXPECT(sp50 > 0.0);
+    }
+
+    // ── R12-LATRAW: reset() zeroes the histogram without a snapshot ────────
+    // Mirrors the accel→raw transition in apply_profile (daemon.cpp): the raw
+    // contract mandates stale accel-era lat_* fields stop being published.
+    {
+        lat_stats ls;
+        for (int i = 1; i <= 10; i++) ls.record(static_cast<double>(i));
+        ls.record(lat_stats::RANGE_US + 100.0);          // overflow bucket
+        EXPECT(ls.count == 11);
+        EXPECT(ls.max_us > lat_stats::RANGE_US);
+        ls.reset();
+        EXPECT(ls.count == 0);
+        EXPECT_NEAR(ls.avg_us(), 0.0, 1e-12);
+        EXPECT(ls.min_us == 1e9 && ls.max_us == 0 && ls.over == 0);
+        // percentile() on an empty histogram must not crash or leak old data
+        EXPECT(ls.percentile(50) == 0.0);
+        EXPECT(ls.percentile(100) == 0.0);
+        // fresh recording after reset starts a clean histogram
+        ls.record(5.0);
+        EXPECT(ls.count == 1);
+        EXPECT_NEAR(ls.min_us, 5.0, 0.5 + 1e-9);
     }
 
     // ── Monotone: p50 ≤ p95 ≤ p99 ────────────────────────────────────────
@@ -2499,20 +2564,20 @@ static void test_modifier_zero_time() {
     init_settings(settings);
     sp.init(settings.prof.speed_processor_args);
 
-    // time = 0 → modify should return early, leaving input unchanged
+    // time = 0 → modify returns early with input zeroed (BUG-HIGH-2)
     {
         vec2d in = { 5.0, 3.0 };
         mod.modify(in, sp, settings, 1.0, 0.0);
-        EXPECT_NEAR(in.x, 5.0, 1e-9);
-        EXPECT_NEAR(in.y, 3.0, 1e-9);
+        EXPECT_NEAR(in.x, 0.0, 1e-9);
+        EXPECT_NEAR(in.y, 0.0, 1e-9);
     }
 
-    // time = negative → also returns early
+    // time = negative → also zeroes the input
     {
         vec2d in = { 5.0, 3.0 };
         mod.modify(in, sp, settings, 1.0, -1.0);
-        EXPECT_NEAR(in.x, 5.0, 1e-9);
-        EXPECT_NEAR(in.y, 3.0, 1e-9);
+        EXPECT_NEAR(in.x, 0.0, 1e-9);
+        EXPECT_NEAR(in.y, 0.0, 1e-9);
     }
 }
 
@@ -8020,6 +8085,69 @@ static void test_p107_param_domain() {
     }
 }
 
+// ── O31-C2/C3: config-layer regressions ─────────────────────────────────────
+static void test_o31_config_c2_c3() {
+    SECTION("O31-C2 — truncated lut_length is pinned to actually-parsed pairs");
+    {
+        // 514-element length with only 4 floats → must not leave dead (0,0)
+        // front segment; length is clamped to the 2 pairs actually present.
+        // A current-format version field keeps migrate_lookup_gain() from
+        // re-scaling the y values (that migration is out of scope here).
+        std::string js = R"({"version":")";
+        js += RAWACCEL_VERSION;
+        js += R"(","profiles":[{"name":"l","profile":
+                          {"accel_x":{"mode":"lookup","lut_length":514,
+                                      "lut_data":[1.0,1.0, 2.0,4.0]}}}]})";
+        std::string tmp = "/tmp/rawaccel_test_o31c2.json";
+        { std::ofstream f(tmp); f << js; }
+        app_config cfg = load_config(tmp);
+        std::remove(tmp.c_str());
+        auto& p = cfg.profiles[0].prof.accel_x;
+        EXPECT(p.length == 4);
+        EXPECT(p.data[0] == 1.0f);
+        EXPECT(p.data[1] == 1.0f);
+        EXPECT(p.data[2] == 2.0f);
+        EXPECT(p.data[3] == 4.0f);
+    }
+    {
+        // Odd count: 3 floats → only 1 complete pair survives.
+        std::string js = R"({"version":")";
+        js += RAWACCEL_VERSION;
+        js += R"(","profiles":[{"name":"l","profile":
+                          {"accel_x":{"mode":"lookup","lut_length":3,
+                                      "lut_data":[1.0,1.0, 5.0]}}}]})";
+        std::string tmp = "/tmp/rawaccel_test_o31c2b.json";
+        { std::ofstream f(tmp); f << js; }
+        app_config cfg = load_config(tmp);
+        std::remove(tmp.c_str());
+        EXPECT(cfg.profiles[0].prof.accel_x.length == 2);
+        EXPECT(cfg.profiles[0].prof.accel_x.data[0] == 1.0f);
+        EXPECT(cfg.profiles[0].prof.accel_x.data[1] == 1.0f);
+    }
+    SECTION("O31-C3 — numeric 0/1 for gain & raw_passthrough accepted like booleans");
+    {
+        // gain:1 & raw:1 → both true; gain:0 & raw:0 → both false;
+        // gain:2 (non 0/1 integer) → silently keeps default (true).
+        std::string js = R"({"version":")";
+        js += RAWACCEL_VERSION;
+        js += R"(","profiles":[
+            {"name":"g1","profile":{"accel_x":{"gain":1},"raw_passthrough":1}},
+            {"name":"g0","profile":{"accel_x":{"gain":0},"raw_passthrough":0}},
+            {"name":"gb","profile":{"accel_x":{"gain":2}}}
+        ]})";
+        std::string tmp = "/tmp/rawaccel_test_o31c3.json";
+        { std::ofstream f(tmp); f << js; }
+        app_config cfg = load_config(tmp);
+        std::remove(tmp.c_str());
+        EXPECT(cfg.profiles[0].prof.accel_x.gain == true);
+        EXPECT(cfg.profiles[0].prof.raw_passthrough == true);
+        EXPECT(cfg.profiles[1].prof.accel_x.gain == false);
+        EXPECT(cfg.profiles[1].prof.raw_passthrough == false);
+        // gain:2 is not 0/1 integer → out-of-accepted set → keeps default true
+        EXPECT(cfg.profiles[2].prof.accel_x.gain == true);
+    }
+}
+
 // ── P106: per-parameter-family sınır (uç değer) regresyon tablosu ────────────
 // (R47 emri: her parametre ailesi için KİLİTLENMİŞ sınır regresyonu. Aile başına
 //  0/tiny/MAX san-unrange'li değerler + aileye özgü ayrım noktaları. Beklenen
@@ -8381,6 +8509,53 @@ static void test_p106_extremes_table() {
         device_profile dp = profile_from_json(j.dump());
         EXPECT(dp.device_id.size() == 256);
         EXPECT(dp.name == "cap");
+    }
+
+    // name uzunluk sınırı: JSON yolunda 256'ya kesilir (R12-DUPNM, CFG-6).
+    // A 257-char name must not survive the load — the round-trip is what the
+    // duplicate dialog's generated-name cap guards against.
+    {
+        std::string long_name(257, 'c');
+        nlohmann::json j = nlohmann::json::object();
+        j["name"] = long_name; j["device_id"] = "";
+        j["dpi"] = 800; j["polling_rate"] = 1000;
+        j["profile"] = nlohmann::json::object();
+        device_profile dp = profile_from_json(j.dump());
+        EXPECT(dp.name.size() <= MAX_NAME_LEN);
+        // A full MAX_NAME_LEN (256) name round-trips intact (P83: 256 OK).
+        std::string exact(MAX_NAME_LEN, 'n');
+        j["name"] = exact;
+        EXPECT(profile_from_json(j.dump()).name == exact);
+    }
+
+    // R12-IMPLUT: check_import_lut_size — over-capacity and odd LUT tables must
+    // be rejected BEFORE the sanitizer clamps/floors them (GUI import mirror of
+    // the CLI O31-L1 / P120-FAZ2 gate).
+    {
+        auto lut_json = [](size_t n_elems) {
+            nlohmann::json j = nlohmann::json::object();
+            j["name"] = "lut"; j["device_id"] = "";
+            j["dpi"] = 800; j["polling_rate"] = 1000;
+            j["profile"] = nlohmann::json::object();
+            auto ax = nlohmann::json::object();
+            nlohmann::json lut = nlohmann::json::array();
+            for (size_t i = 0; i < n_elems; i++)
+                lut.push_back(static_cast<double>(i));
+            ax["lut_data"] = lut;
+            j["profile"]["accel_x"] = ax;
+            j["profile"]["accel_y"] = nlohmann::json::object();
+            return j.dump();
+        };
+        // max capacity: 514 raw = 257 points — acceptable, no message
+        EXPECT(check_import_lut_size(lut_json(LUT_RAW_DATA_CAPACITY)).empty());
+        // over capacity: 516 raw = 258 points — rejected with a message
+        EXPECT(!check_import_lut_size(lut_json(LUT_RAW_DATA_CAPACITY + 2)).empty());
+        // odd element count: 515 raw — rejected (O31-L1 never silently floors)
+        EXPECT(!check_import_lut_size(lut_json(LUT_RAW_DATA_CAPACITY + 1)).empty());
+        // malformed JSON parses nowhere — must not throw, returns ""
+        EXPECT(check_import_lut_size("not json").empty());
+        // non-LUT profile (no profile wrapper) is acceptable
+        EXPECT(check_import_lut_size("{\"name\":\"x\"}").empty());
     }
 
     // P-APP: match_app — boş/dolu round-trip korur, JSON yolunda 128'e kesilir,
@@ -8812,6 +8987,7 @@ int main(int argc, char** argv) {
     test_accel_union();
     test_json_roundtrip();
     test_json_roundtrip_lut();
+    test_json_roundtrip_lut_mode_switch();
     test_file_roundtrip();
     test_save_config_relative_path();
     test_monotonic();
@@ -8964,6 +9140,9 @@ int main(int argc, char** argv) {
 
     // P107 — set-param domain contract (CLI accepted-domain values survive sanitize)
     test_p107_param_domain();
+
+    // O31-C2/C3 — config-layer regressions (LUT length pin + numeric gain/raw)
+    test_o31_config_c2_c3();
 
     // P106 — per-parameter-family sınır (uç değer) regresyon tablosu
     test_p106_extremes_table();

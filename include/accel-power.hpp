@@ -63,6 +63,11 @@ struct power {
         offset.x = gain_inverse(args.output_offset, n, scale);
         offset.y = args.output_offset;
         constant = offset.x * offset.y * n / (n + 1);
+        // Audit-POW-1: gain_inverse clamps offset.x to DBL_MAX (BUG-NEW-11/16),
+        // so offset.x*offset.y can overflow to Inf.  Dormant today (base_fn_impl
+        // short-circuits at x <= offset.x, and the reference overflows the same
+        // way), but keep the struct's "Inf-free" invariant like classic does.
+        if (!std::isfinite(constant)) constant = 0;
 
         if (!gain_mode) {
             switch (args.cap_mode_val) {

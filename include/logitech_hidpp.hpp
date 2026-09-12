@@ -431,7 +431,11 @@ public:
 
 private:
     int fd_ = -1;
-    uint8_t next_sw_id_ = 0;
+    // sw_id 0 (0x00) is reserved: the device uses it for every notification,
+    // so a command issued with sw_id 0 could be mistaken for a notification
+    // (raw-byte matcher) or a mid-request response.  Start at 1 so the first
+    // command's response id never collides with a notification.
+    uint8_t next_sw_id_ = 1;
     std::string hidraw_path_;
     uint16_t vendor_id_ = 0;
     uint16_t product_id_ = 0;

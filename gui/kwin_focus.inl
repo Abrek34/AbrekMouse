@@ -51,6 +51,9 @@ struct kwin_focus_ctx {
     guint            bus_name_id   = 0;   // g_bus_own_name id
     std::atomic<int> kwin_script_id{-1};  // script id (set by worker thread)
     bool             installed     = false;
+    // R8-RESEND: last WM_CLASS the relay reported (cache so the poll can
+    // re-send it after a daemon down/up cycle).
+    std::string      last_app;
     // GUI-Y2: keep the worker joinable instead of detached.  kwin_focus_uninstall
     // MUST join it before releasing session_conn — otherwise the worker may still
     // be mid-Call on a connection we have already unref'd (UAF).
@@ -59,15 +62,89 @@ struct kwin_focus_ctx {
 
 // ── GDBus method handler ─────────────────────────────────────────────────────
 
-static void focus_method_call(GDBusConnection*, const gchar*,
+static void focus_method_call(GDBusConnection* conn, const gchar*,
                               const gchar*, const gchar* interface,
                               const gchar* method, GVariant* params,
-                              GDBusMethodInvocation* inv, gpointer) {
+                              GDBusMethodInvocation* inv, gpointer user_data) {
     if (g_strcmp0(interface, "org.rawaccel.Focus") == 0 &&
         g_strcmp0(method, "setActiveApp") == 0) {
+        // R13-KWINARG: harden the handler.  (a) Type-check the signature — a
+        // hostile caller passing a non-"(s)" variant could make g_variant_get
+        // read past the variant.  (b) Best-effort sender filter: only accept
+        // calls whose sender resolves to a KWin process.  Any app on the
+        // session bus can otherwise flip the daemon's active-app profile to a
+        // spoofed class.  If the sender CANNOT be identified (bus denial,
+        // /proc restricted) we accept — preserving the old best-effort
+        // contract rather than breaking legit setups.
+        if (!g_variant_is_of_type(params, G_VARIANT_TYPE("(s)"))) {
+            g_dbus_method_invocation_return_value(inv, nullptr);
+            return;
+        }
+        const gchar* sender = g_dbus_method_invocation_get_sender(inv);
+        if (sender) {
+            bool accepted = false;
+            GError* derr = nullptr;
+            GVariant* r = g_dbus_connection_call_sync(
+                conn, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+                g_variant_new("(s)", sender), G_VARIANT_TYPE("(u)"),
+                G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &derr);
+            if (r) {
+                guint32 pid = 0;
+                g_variant_get(r, "(u)", &pid);
+                g_variant_unref(r);
+                char comm_path[64];
+                snprintf(comm_path, sizeof(comm_path), "/proc/%u/comm", pid);
+                FILE* cf = fopen(comm_path, "r");
+                if (cf) {
+                    char comm[64] = {};
+                    (void)!fgets(comm, sizeof(comm), cf);
+                    fclose(cf);
+                    accepted = strncmp(comm, "kwin", 4) == 0;
+                } else {
+                    accepted = true; // PID unreachable — fall back to accepting
+                }
+            } else {
+                if (derr) g_error_free(derr);
+                accepted = true; // bus refused the lookup — fall back to accepting
+            }
+            if (!accepted) {
+                // Non-KWin caller — spoofed or stale; ignore silently.
+                g_dbus_method_invocation_return_value(inv, nullptr);
+                return;
+            }
+        }
         const gchar* wm_class = nullptr;
         g_variant_get(params, "(&s)", &wm_class);
-        if (wm_class) daemon_ipc_set_active_app(wm_class);
+        auto* ctx = static_cast<kwin_focus_ctx*>(user_data);
+        if (ctx) ctx->last_app = wm_class ? wm_class : "";
+        {
+            // R12-STALERT: unify dropped-report handling for BOTH app-scoped
+            // and clear ("", no app focused) reports.  R11-FOCR only retried
+            // non-empty classes, so a dropped CLEAR left the previous
+            // app-scoped profile applied until the next focus change.
+            std::string reported = wm_class ? wm_class : "";
+            if (!daemon_ipc_set_active_app(reported)) {
+                // A dropped report (the one-shot 150 ms IPC read timed out
+                // against a busy serial daemon) is retried once after the
+                // contention has likely cleared — but ONLY if focus is STILL
+                // the class we queued at fire time.  A newer report that
+                // already reached the daemon must never be overwritten by this
+                // stale replay (that would REVERT the correct app-scoped
+                // profile until the next focus change).  Retries stay bounded
+                // to one: a failed replay is dropped, not re-queued.
+                struct FocusRetry { kwin_focus_ctx* ctx; std::string queued; };
+                auto* r = new FocusRetry{ctx, reported};
+                g_timeout_add_full(G_PRIORITY_DEFAULT, 1000,
+                    [](gpointer p) -> gboolean {
+                        auto* R = static_cast<FocusRetry*>(p);
+                        std::string now = R->ctx ? R->ctx->last_app : R->queued;
+                        bool same = (now == R->queued);
+                        if (same) daemon_ipc_set_active_app(now);
+                        return G_SOURCE_REMOVE; // destroy-notify then reclaims R
+                    }, r, [](gpointer p) { delete static_cast<FocusRetry*>(p); });
+            }
+        }
         g_dbus_method_invocation_return_value(inv, nullptr);
         return;
     }
@@ -178,6 +255,17 @@ static void on_name_lost(GDBusConnection*, const gchar*, gpointer user_data) {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/// R8-RESEND: forward-declared in app_state.hpp so daemon_comm.inl's 3 s poll
+/// can call this on a daemon up-transition.  The KWin relay only fires on a
+/// focus CHANGE (its script caches the last-reported class), so after a daemon
+/// down/up cycle app-scoped profiles would stay dormant until the user switches
+/// windows — re-send the last known WM_CLASS.
+static void kwin_focus_resend_current(AppState* S) {
+    auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
+    if (!ctx || !ctx->installed || ctx->last_app.empty()) return;
+    daemon_ipc_set_active_app(ctx->last_app);
+}
+
 /// Install the KWin focus relay.  Best-effort: returns true if relay is active.
 static bool kwin_focus_install(AppState* S) {
     static kwin_focus_ctx ctx;
@@ -193,7 +281,14 @@ static bool kwin_focus_install(AppState* S) {
     // 2. Connect to session bus (needed for KWin D-Bus calls and our relay).
     GError* err = nullptr;
     ctx.session_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
-    if (!ctx.session_conn) { g_error_free(err); return false; }
+    if (!ctx.session_conn) {
+        g_error_free(err);
+        // R13-KWINOWN: we already own the name — release it so this failed
+        // install cannot leave org.rawaccel.Focus owned for the whole session
+        // (a second instance's g_bus_own_name would then always fail).
+        if (ctx.bus_name_id) { g_bus_unown_name(ctx.bus_name_id); ctx.bus_name_id = 0; }
+        return false;
+    }
 
     // 3. Load + run the KWin script on a worker thread (can block ~200–500 ms).
     ctx.kwin_script_id.store(-1, std::memory_order_relaxed);
@@ -219,7 +314,10 @@ static void kwin_focus_uninstall(AppState* S) {
     int sid = ctx->kwin_script_id.load(std::memory_order_relaxed);
     if (ctx->session_conn && sid >= 0)
         kwin_script_unload_sync(ctx->session_conn);
-    // Release GDBus name.
+    // Release GDBus name + unregister the /Focus object (R13-KWINOWN — symmetry
+    // with on_bus_acquired; the object would otherwise die only at exit).
+    if (ctx->obj_reg_id && ctx->session_conn)
+        g_dbus_connection_unregister_object(ctx->session_conn, ctx->obj_reg_id);
     if (ctx->bus_name_id) g_bus_unown_name(ctx->bus_name_id);
     if (ctx->session_conn) g_object_unref(ctx->session_conn);
     ctx->session_conn = nullptr;

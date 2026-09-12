@@ -14,11 +14,16 @@ fi
 # Stop and disable service
 if systemctl is-active --quiet rawaccel 2>/dev/null; then
     echo "[1/4] Stopping service..."
-    systemctl stop rawaccel
+    # R6-7: guard against `set -e` aborting the whole uninstall when systemctl
+    # stop itself fails (e.g. a unit flapping into activating between the
+    # is-active guard and the stop) — every other destructive step in this
+    # script already tolerates failure, so a partial teardown must not leave
+    # the remaining rm/udev/desktop cleanup unrun.
+    systemctl stop rawaccel || true
 fi
 if systemctl is-enabled --quiet rawaccel 2>/dev/null; then
     echo "      Disabling service..."
-    systemctl disable rawaccel
+    systemctl disable rawaccel || true
 fi
 # Kill any rawaccel-daemon started outside systemd (e.g. directly via pkexec).
 # Without this, removing the binary leaves the running process holding /dev/uinput.
@@ -70,6 +75,10 @@ echo "[4/4] Removing system files..."
 rm -f /etc/udev/rules.d/99-rawaccel.rules
 rm -f /usr/lib/udev/rules.d/99-rawaccel.rules
 rm -f /etc/modules-load.d/rawaccel.conf
+# R10-UNMLL: CMakeLists.txt installs to /usr/lib/modules-load.d (and the
+# PKGBUILD ships the same path) — uninstall.sh previously only removed the
+# /etc copy, leaving the module-load entry behind on such installs.
+rm -f /usr/lib/modules-load.d/rawaccel.conf
 rm -f /usr/share/applications/rawaccel.desktop
 # 0.6.4 (BUG-02) sonrası polkit bölümleri kurulmuyor; eski kurulum kalıntısıysa temizle:
 rm -f /usr/share/polkit-1/actions/org.rawaccel.policy

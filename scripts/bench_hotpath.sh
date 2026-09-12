@@ -23,10 +23,18 @@ if [[ ! -f "$BENCH_BIN" ]]; then
     else
         MARCH="-march=native"
     fi
-    "$CXX" -O3 $MARCH -std=c++20 \
+    # Hardening flags (mirror build.sh)
+    case "$(uname -m)" in
+        x86_64|amd64|i[3-6]86) FCF="-fcf-protection=full" ;;
+        *) FCF="" ;;
+    esac
+    HARDENING="-fstack-protector-strong -fstack-clash-protection $FCF -D_FORTIFY_SOURCE=2 -D_GLIBCXX_ASSERTIONS -fPIE -Wformat -Wformat-security"
+    LDFLAGS_HARDEN="-pie -Wl,-z,relro,-z,now,-z,noexecstack,-z,separate-code"
+    "$CXX" -O3 $MARCH -std=c++20 $HARDENING \
         -I"$PROJECT_ROOT/include" \
         -I"$PROJECT_ROOT/include/nlohmann" \
         "$PROJECT_ROOT/tests/bench_hotpath.cpp" \
+        $LDFLAGS_HARDEN \
         -o "$BENCH_BIN"
 fi
 
@@ -60,8 +68,15 @@ fi
     # Run with perf if available
     if command -v perf &> /dev/null; then
         echo "=== Hardware Counters (perf stat) ==="
-        perf stat -r "$PERF_RUNS" -e cycles,instructions,syscalls -- "$BENCH_BIN" "$ITERATIONS" 2>&1 | \
-            grep -E "(cycles|instructions|syscalls|ns/event|SUMMARY|===|Performance counter)"
+        # ROUND4-FIX: perf stat can fail even when the binary exists —
+        # perf_event_paranoid (kernel.perf_event_paranoid=3+) or the lack of
+        # CAP_PERFMON blocks counter access on modern distros/sandboxes.  Under
+        # `set -euo pipefail` that aborted the WHOLE benchmark (timing section
+        # above already printed) for a non-fatal, optional feature.  The timing
+        # results are the gate's source of truth; counters are best-effort.
+        perf stat -r "$PERF_RUNS" -e cycles,instructions,syscalls:sys_enter -- "$BENCH_BIN" "$ITERATIONS" 2>&1 | \
+            grep -E "(cycles|instructions|syscalls|ns/event|SUMMARY|===|Performance counter)" || \
+            echo "  perf counters unavailable (permission/paranoia) — timing results above are valid."
         echo ""
     else
         echo "=== Hardware Counters ==="

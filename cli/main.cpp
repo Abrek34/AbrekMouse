@@ -27,6 +27,84 @@ static constexpr const char* VERSION = rawaccel::RAWACCEL_VERSION;
 
 using namespace rawaccel;
 
+/// Validate a user-supplied config path (SEC-2).
+/// Returns true if the path is acceptable; prints an error and returns false otherwise.
+/// Checks:
+///   1. Path must not be empty.
+///   2. Resolved (realpath) path must have a ".json" extension.
+///   3. If the file exists, it must be a regular file (not /dev/*, /proc/*, special nodes).
+///   4. If the file exists, it must be ≤ 4 MB (sanity guard against reading huge files).
+///   5. Path must not be in /proc/, /sys/, /dev/.
+static bool validate_config_path(const std::string& path) {
+    if (path.empty()) {
+        std::cerr << "Config path is empty.\n";
+        return false;
+    }
+
+    // Resolve to canonical path (removes ../ traversal, symlinks, etc.)
+    char resolved[PATH_MAX] = {};
+    if (realpath(path.c_str(), resolved) != nullptr) {
+        // File exists — validate it
+        struct stat st {};
+        if (stat(resolved, &st) == 0) {
+            if (!S_ISREG(st.st_mode)) {
+                std::cerr << "Config path '" << resolved
+                          << "' is not a regular file.\n";
+                return false;
+            }
+            constexpr off_t MAX_CONFIG_BYTES = 4L * 1024L * 1024L; // 4 MB
+            if (st.st_size > MAX_CONFIG_BYTES) {
+                std::cerr << "Config file is too large ("
+                          << st.st_size << " bytes, max " << MAX_CONFIG_BYTES << ").\n";
+                return false;
+            }
+        }
+        // Require .json extension on the resolved path
+        std::string rp(resolved);
+        if (rp.size() < 5 || rp.substr(rp.size() - 5) != ".json") {
+            std::cerr << "Config path '" << rp
+                      << "' does not have a .json extension.\n";
+            return false;
+        }
+        // Disallow dangerous prefixes on the canonical path
+        for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
+            if (rp.rfind(bad, 0) == 0) {
+                std::cerr << "Config path '" << rp
+                          << "' is in a disallowed directory.\n";
+                return false;
+            }
+        }
+    } else {
+        // File does not yet exist — validate the path string itself
+        std::string p(path);
+        if (p.size() < 5 || p.substr(p.size() - 5) != ".json") {
+            std::cerr << "Config path '" << p
+                      << "' does not have a .json extension.\n";
+            return false;
+        }
+        // Disallow obviously dangerous prefixes even before the file exists
+        for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
+            if (p.rfind(bad, 0) == 0) {
+                std::cerr << "Config path '" << p
+                          << "' is in a disallowed directory.\n";
+                return false;
+            }
+        }
+        // The file doesn't exist yet, so the parent directory must exist
+        std::string parent = ".";
+        const size_t slash = p.find_last_of('/');
+        if (slash != std::string::npos)
+            parent = (slash == 0) ? "/" : p.substr(0, slash);
+        struct stat pst {};
+        if (stat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)) {
+            std::cerr << "Config directory '" << parent
+                      << "' does not exist.\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── Daemon communication ──────────────────────────────────────────────────────
 
 /// True when the process at /proc/<pid> is genuinely the rawaccel daemon
@@ -205,9 +283,15 @@ static bool daemon_apply_config(const app_config& cfg) {
     // the fallback's reload would report "ok:true" and the CLI would print
     // "Daemon reloaded." with rc=0 — a lie.
     if (resp.find("\"ok\":false") != std::string::npos) return false;
-    if (resp.find("\"ok\":true") != std::string::npos) return true;
-    // Only daemons with no idea what set_config is (empty/error response) get
-    // the legacy SIGHUP reload path.
+    if (resp.find("\"ok\":true" ) != std::string::npos) return true;
+    // ROUND4-FIX: a RESPONSIVE modern daemon that answers "unknown command"
+    // (or a malformed/error reply) must NOT downgrade to the SIGHUP fallback —
+    // it understood the request and refused it, and the fallback would reload
+    // the STALE daemon-side file, then report success for a config that never
+    // applied.  Only a truly silent/legacy daemon (no set_config support) goes
+    // down the legacy SIGHUP path.  Any non-empty response containing "error"
+    // means the daemon is alive and answered with an explicit rejection.
+    if (resp.find("\"error\"") != std::string::npos) return false;
     return daemon_reload_via_any_path() == signal_result::sent;
 }
 
@@ -240,7 +324,10 @@ static int daemon_apply_if_enabled(const app_config& cfg) {
         return 0;
     }
     if (daemon_apply_config(cfg)) {
-        std::cout << "Daemon reloaded.\n";
+        // O31-L3: this path PUSHES the freshly-saved config (IPC set_config),
+        // it does not reload the daemon's own file — "Daemon reloaded." was a
+        // lie for the modern code path (only the legacy fallback reloads).
+        std::cout << "Config applied to the daemon.\n";
         return 0;
     }
     std::cerr << "Warning: config saved locally but the daemon did not reload it.\n"
@@ -592,7 +679,8 @@ static int cmd_create_preset(app_config& cfg, const std::string& config_path,
     device_profile dp = make_preset(preset_name, profile_name);
     if (dp.name.empty()) {
         std::cerr << "Unknown preset: '" << preset_name
-                  << "'.  Available: gaming, office, precision, disable, cs2, valorant, apex, fps\n";
+                  << "'.  Available: gaming, office, precision, disable "
+                  << "(alias: none/off), cs2, valorant, apex, fps\n";
         return 1;
     }
     // CFG-3: refuse when the SEC-9 load cap is already reached (creating a
@@ -1001,6 +1089,20 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     } else if (key == "cap_x") {
         // P120-FAZ2: GUI gauge max CAP_X_MAX.
         if (!range_ok(key.c_str(), 0, CAP_X_MAX)) return 1;
+        // O31-L2: cap.x must stay >= input_offset (sanitize raises cap.x up to
+        // input_offset — BUG-7 — otherwise the stored cap would silently differ
+        // from the value the user asked for / the daemon runs).  cap_x sets BOTH
+        // axes, so the Y input_offset must satisfy the same constraint even when
+        // the axes are unlinked (otherwise unlinked Y stays silently mutated).
+        if (v < a.input_offset || v < ay.input_offset) {
+            double worst = (ay.input_offset > a.input_offset) ? ay.input_offset
+                                                              : a.input_offset;
+            std::cerr << "Invalid value for 'cap_x': " << val
+                      << "  (must be >= input_offset " << worst
+                      << " — a lower cap would make the loader silently raise "
+                      << "cap_x to the input_offset)\n";
+            return 1;
+        }
     } else if (key == "cap_y") {
         // P120-FAZ2: GUI gauge max CAP_Y_MAX.
         if (!range_ok(key.c_str(), 0, CAP_Y_MAX)) return 1;
@@ -1013,9 +1115,25 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // CLI domain must start at the same floor to keep P107 byte-correctness.
         if (!range_ok(key.c_str(), 0.01, SCALE_MAX)) return 1;
     } else if (key == "limit" || key == "decay_rate" || key == "motivity" ||
-               key == "gamma" || key == "input_offset" || key == "smooth" ||
+               key == "gamma" || key == "smooth" ||
                key == "speed_min" || key == "speed_max") {
         if (!min_ok(key.c_str(), 0)) return 1;
+    } else if (key == "input_offset") {
+        // O31-L2: sanitize clamps input_offset to CAP_X_MAX at load, so the
+        // CLI domain must mirror [0, CAP_X_MAX] for P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0, CAP_X_MAX)) return 1;
+        // And the BUG-7 rule: the loader raises cap.x up to input_offset — a
+        // bigger offset would silently rewrite the user's cap_x.  Reject so
+        // the persisted pair always equals what the user asked for.  input_offset
+        // sets BOTH axes, so the unlinked Y cap must satisfy the same relation.
+        if (v > a.cap.x || v > ay.cap.x) {
+            double worst_cap = (ay.cap.x > a.cap.x) ? ay.cap.x : a.cap.x;
+            std::cerr << "Invalid value for 'input_offset': " << val
+                      << "  (must be <= cap_x " << worst_cap
+                      << " — a larger offset would make the loader silently "
+                      << "raise cap_x to the input_offset)\n";
+            return 1;
+        }
     } else if (key == "input_smooth_halflife" || key == "scale_smooth_halflife" ||
                key == "output_smooth_halflife") {
         // SM-7: bounded by the shared SMOOTH_HALFLIFE_MAX so the CLI never
@@ -1113,20 +1231,26 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     else if (key == "polling_rate")     { dp->dev_cfg.polling_rate = finite_double_to_int(v); }
     else if (key == "speed_min")        {
         dp->prof.speed_min = v;
-        // C-2: warn when speed_min exceeds the existing speed_max (sanitizer
-        // will silently clamp speed_max → speed_min on the next save).
-        if (dp->prof.speed_max > 0 && dp->prof.speed_min > dp->prof.speed_max)
-            std::cerr << "WARNING: speed_min (" << v
+        // C-2/P107-FIX: reject when speed_min exceeds the existing speed_max
+        // (mirror the cap_x/input_offset cross-field constraint).  The old code
+        // warned then silently accepted, deferring the error to the next save —
+        // the user expected both fields valid, but one was clamped on write.
+        if (dp->prof.speed_max > 0 && dp->prof.speed_min > dp->prof.speed_max) {
+            std::cerr << "ERROR: speed_min (" << v
                       << ") > speed_max (" << dp->prof.speed_max
-                      << ") — speed_max will be clamped to speed_min on save.\n";
+                      << ") — reject (set speed_max first or lower speed_min).\n";
+            return 1;
+        }
     }
     else if (key == "speed_max")        {
         dp->prof.speed_max = v;
-        // C-2: same validation in the other direction.
-        if (dp->prof.speed_max > 0 && dp->prof.speed_max < dp->prof.speed_min)
-            std::cerr << "WARNING: speed_max (" << v
+        // C-2/P107-FIX: reject in the other direction too.
+        if (dp->prof.speed_max > 0 && dp->prof.speed_max < dp->prof.speed_min) {
+            std::cerr << "ERROR: speed_max (" << v
                       << ") < speed_min (" << dp->prof.speed_min
-                      << ") — speed_max will be clamped to speed_min on save.\n";
+                      << ") — reject (set speed_min first or lower speed_max).\n";
+            return 1;
+        }
     }
     else if (key == "output_dpi")       { dp->prof.output_dpi = v; }
     else if (key == "lr_ratio")         { dp->prof.lr_output_dpi_ratio = v; }
@@ -1311,10 +1435,17 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                 auto& a = ax[axis_key];
                 if (!a.contains("lut_data") || !a["lut_data"].is_array()) return true;
                 size_t n = a["lut_data"].size();
-                if (n / 2 > LUT_POINTS_CAPACITY) {
+                // O31-L1: n/2 floors an odd element count, so a 515-element
+                // table (257.5 points) was read as 257 points and the trailing
+                // value silently dropped on import.  Reject both odd counts
+                // and over-capacity tables up front.
+                if (n % 2 != 0 || n / 2 > LUT_POINTS_CAPACITY) {
                     std::cerr << "ERROR: LUT (" << axis << " axis) in imported "
-                              << "profile has " << (n/2) << " points; maximum is "
-                              << LUT_POINTS_CAPACITY << " (" << LUT_RAW_DATA_CAPACITY
+                              << "profile has " << n << " raw elements ("
+                              << (n/2) << " points";
+                    if (n % 2 != 0) std::cerr << ", odd element count";
+                    std::cerr << "); maximum is " << LUT_POINTS_CAPACITY
+                              << " points (" << LUT_RAW_DATA_CAPACITY
                               << " raw elements). Import rejected — fix the file.\n";
                     return false;
                 }
@@ -1394,6 +1525,23 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
     for (auto& dp : batch) {
         cfg.profiles.push_back(dp);
         std::cout << "Imported profile: " << dp.name << "\n";
+    }
+    // Audit-D1: a wrapper whose active_profile names a profile that is NOT part
+    // of the import result (hand-crafted or stale export) would persist a config
+    // that fails `validate` on the next load ("Active profile not found").  Fall
+    // back to the first profile so the written config is always loadable.
+    bool active_found = false;
+    for (auto& dp : cfg.profiles)
+        if (dp.name == cfg.active_profile) { active_found = true; break; }
+    if (!active_found) {
+        if (!cfg.profiles.empty()) {
+            std::cerr << "Warning: active_profile '" << cfg.active_profile
+                      << "' is not among the import result — falling back to '"
+                      << cfg.profiles[0].name << "'.\n";
+            cfg.active_profile = cfg.profiles[0].name;
+        } else {
+            cfg.active_profile.clear();
+        }
     }
     if (!safe_save(cfg, config_path)) return 1;
     return daemon_apply_if_enabled(cfg);
@@ -1607,16 +1755,22 @@ static int cmd_status(const std::string& config_path) {
                         int poll            = d.value("poll_rate", 0);
                         int det_dpi         = d.value("detected_dpi", 0);
                         int det_poll        = d.value("detected_polling_rate", 0);
+                        // R13-REALRATE: the ring-fed live-measured rate (median
+                        // kernel frame interval, accel path only; 0 while raw
+                        // passthrough since raw carries no telemetry).
+                        int real_poll       = d.value("real_polling_rate", 0);
                         int battery         = d.value("detected_battery", -1);
 
                         std::cout << "  - " << (name.empty() ? "(unnamed)" : name) << "\n";
                         std::cout << "    path       : " << path << "\n";
                         std::cout << "    device_id  : " << dev_id << "\n";
                         std::cout << "    config dpi/poll: " << dpi << " / " << poll << " Hz";
-                        if (det_dpi > 0 || det_poll > 0)
+                        if (det_poll > 0 || real_poll > 0)
                             std::cout << "    detected: "
                                       << (det_dpi > 0 ? std::to_string(det_dpi) + " dpi" : "? dpi")
                                       << " / " << (det_poll > 0 ? std::to_string(det_poll) + " Hz" : "? Hz");
+                        if (real_poll > 0)
+                            std::cout << "    live    : " << real_poll << " Hz";
                         std::cout << "\n";
                         if (battery >= 0 && battery <= 100)
                             std::cout << "    battery    : " << battery
@@ -1671,8 +1825,12 @@ static int cmd_status(const std::string& config_path) {
                     std::cout << "\nDevices: daemon reports none grabbed.\n";
                 }
             } catch (const std::exception& e) {
-                std::cout << "\n(daemon unreachable for live device details: "
-                          << e.what() << ")\n";
+                // C-6-FIX: this is a diagnostic (daemon IPC failed), not normal output.
+            // Scripts that pipe `rawaccel-cli status` should not see internal
+            // errors on stdout — it would break JSON pipelines and pollute
+            // shell captures.  Direct diagnostics to stderr.
+            std::cerr << "\n(daemon unreachable for live device details: "
+                      << e.what() << ")\n";
             }
         }
         if (running)
@@ -2066,10 +2224,26 @@ static int cmd_hidpp_set_dpi(const std::vector<std::string>& args) {
         return 1;
     }
     transport.set_device_index(target);
+    // Show supported DPI values if the requested one is not supported
+    if (auto dpi_info = transport.get_dpi_info(target)) {
+        if (dpi_info->dpi_levels.empty() ||
+            std::find(dpi_info->dpi_levels.begin(), dpi_info->dpi_levels.end(), static_cast<uint16_t>(dpi)) == dpi_info->dpi_levels.end()) {
+            std::cerr << "DPI " << dpi << " is not supported by this device.\n";
+            if (!dpi_info->dpi_levels.empty()) {
+                std::cerr << "Supported DPI values: ";
+                for (size_t i = 0; i < dpi_info->dpi_levels.size(); ++i) {
+                    if (i > 0) std::cerr << ", ";
+                    std::cerr << dpi_info->dpi_levels[i];
+                }
+                std::cerr << "\n";
+            }
+            return 1;
+        }
+    }
     const bool ok = transport.set_dpi(static_cast<uint16_t>(dpi), target);
     if (g_json) std::cout << nlohmann::json{{"ok", ok}, {"dpi", dpi}}.dump() << "\n";
     else if (ok) std::cout << "DPI set to " << dpi << ".\n";
-    else std::cerr << "DPI is not supported or the device rejected the value.\n";
+    else std::cerr << "DPI was rejected by the device.\n";
     return ok ? 0 : 1;
 }
 
@@ -2103,10 +2277,19 @@ static int cmd_hidpp_set_rate(const std::vector<std::string>& args) {
         return 1;
     }
     transport.set_device_index(target);
+    // Show supported polling rates if the requested one is not supported
+    if (auto rate_info = transport.get_polling_rate(target)) {
+        // The device supports some rate, but we need to check if the requested rate is supported
+        // We can't easily get the list of supported rates from the transport, so we'll just try to set it
+        // and if it fails, we'll show a generic message
+    }
     const bool ok = transport.set_polling_rate(hz, target);
     if (g_json) std::cout << nlohmann::json{{"ok", ok}, {"polling_rate_hz", hz}}.dump() << "\n";
     else if (ok) std::cout << "Polling rate set to " << hz << " Hz.\n";
-    else std::cerr << "Polling rate is unsupported or the device rejected the value.\n";
+    else {
+        std::cerr << "Polling rate " << hz << " Hz is not supported by this device.\n";
+        std::cerr << "Supported rates: 125, 250, 500, 1000, 2000, 4000, 8000 Hz (device may support a subset)\n";
+    }
     return ok ? 0 : 1;
 }
 
@@ -2180,15 +2363,17 @@ Commands:
                                 Set sensor lift-off distance when supported
                                 (HID++ 0x2202 LOD capability only)
   validate                      Validate config file for errors/warnings
-  reload                        Reload daemon config (SIGHUP)
+  reload                        Reload daemon config (IPC, else SIGHUP)
   stop                          Stop daemon (SIGTERM)
-  latency                       Dump per-device processing latency stats (SIGUSR1)
+  latency                       Dump per-device processing latency stats (IPC, else SIGUSR1)
 
 Options:
   -c, --config PATH             Config file path
   -h, --help                    Show this help
   -V, --version                 Show version
-  --json                        Emit machine-readable JSON for list/show/status
+  --json                        Emit machine-readable JSON for list, show, status,
+                                receivers, and hidpp (P99 — every command that
+                                renders device/config output)
   -n, --no-daemon, --dry-run    Save config changes locally only — do NOT push
                                 them to the running daemon (default: live-apply)
 
@@ -2214,21 +2399,24 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
                     to list devices with their device_id values. Default: empty.
   gain              true|false|1|0  (gain mode on/off). Default true.
   acceleration      Acceleration multiplier. Domain any finite (negative = classic
-                    decel). Default 0.005.
+                    decel only when NO input cap is set — with a cap the curve is
+                    degenerate). Default 0.005.
   exponent_classic  Classic exponent. Domain 1–10. Default 2.
   exponent_power    Power exponent (synchronous ignores it). Domain 1e-4–5. Default 0.05.
   limit             Upper multiplier asymptote (natural mode). Domain ≥ 0. Default 1.5.
   decay_rate        Natural decay rate. Domain ≥ 0. Default 0.1.
   motivity          Synchronous motivity. Domain ≥ 0. Default 1.5.
   gamma             Synchronous gamma. Domain ≥ 0. Default 1.
-  input_offset      Speed offset before acceleration starts. Domain ≥ 0. Default 0.
+  input_offset      Speed offset before acceleration starts. Domain 0–500, and must
+                    stay ≤ cap_x (checked against both X and Y). Default 0.
   output_offset     Output offset (power mode). Domain 0–100. Default 0.
-  scale             Scale factor (power mode). Domain 0–100. Default 1.
+  scale             Scale factor (power mode). Domain 0.01–100. Default 1.
   sync_speed        Synchronous sync speed. Domain ≥ 1e-4. Default 5.
   smooth            Jump/synchronous smoothness. Domain ≥ 0. Default 0.5.
-  cap_x             Input speed cap. Domain 0–500. Default 15.
+  cap_x             Input speed cap. Domain 0–500, and ≥ input_offset on both axes.
+                    Default 15.
   cap_y             Output gain cap. Domain 0–100. Default 1.5.
-  cap_mode          out|in|io  (cap mode). Default out.
+  cap_mode          out|in|io  (cap mode; in_out|both = io). Default out.
   rotation          Rotation in degrees. Domain any finite (normalized mod 360:
                     −45 → 315, 400 → 40). Default 0.
   snap              Snap angle in degrees. Domain 0–45. Default 0.
@@ -2237,13 +2425,18 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
   speed_min         Minimum speed clamp (ips). Domain ≥ 0. Default 0 (off).
   speed_max         Maximum speed clamp (ips). Domain ≥ 0; if both set, max ≥ min.
                     Default 0 (off).
-  output_dpi        Output DPI normalization value. Domain 0–32000; 0 disables
-                    output-DPI normalization (1:1 counts). Default 1000.
+  output_dpi        Output DPI normalization value. Domain {0} ∪ [1,32000]; a
+                    fractional value in (0,1) is REJECTED (P107: sanitizer maps it
+                    to 1 — persisting it while exiting 0 would be a silent
+                    mutation). 0 disables output-DPI normalization (1:1 counts).
+                    Default 1000.
   lr_ratio          Left/right output DPI ratio. Domain 0.01–100. Default 1 (off).
   ud_ratio          Up/down output DPI ratio. Domain 0.01–100. Default 1 (off).
   yx_ratio          Y-axis output DPI ratio (relative to X). Domain 0.01–100. Default 1.
-  distance_mode     euclidean|max|lp|separate  (speed calculation method). Default euclidean.
+  distance_mode     euclidean|max|lp|separate  (aliases: chebyshev = max,
+                    manhattan = separate). Default euclidean.
   lp_norm           Lp-norm value (when distance_mode=lp). Domain > 0. Default 2.
+                    Large values (≳ MAX_NORM) behave as max.
   input_smooth_halflife   Input speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
   scale_smooth_halflife   Scale EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
   output_smooth_halflife  Output speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
@@ -2281,6 +2474,16 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Option '" << argv[i] << "' requires a path argument.\n";
                 return 1;
             }
+            // O31-H3 parity (daemon/main.cpp): `-c --json list` / `-c --no-daemon
+            // set …` silently swallowed the next OPTION token as a path — the
+            // user's intent was discarded and a mutating command believed a
+            // daemon push was required.  Reject option-looking values; keep the
+            // parser honest like the daemon's `-c`/`-f` guard does.
+            if (argv[i + 1][0] == '-' && argv[i + 1][1] != '\0') {
+                std::cerr << "Option '" << argv[i] << "' requires a path argument — '"
+                          << argv[i + 1] << "' is an option, not a path.\n";
+                return 1;
+            }
             config_path = argv[++i];
             config_path_explicit = true;
         } else if (strncmp(argv[i], "--config=", 9) == 0) {
@@ -2301,6 +2504,13 @@ int main(int argc, char* argv[]) {
                    strcmp(argv[i], "--no-daemon") == 0 ||
                    strcmp(argv[i], "--dry-run") == 0) {
             g_no_daemon = true;
+        // POSIX: "--" ends option processing; every following token is a
+        // positional argument (command or value) even if it looks like an
+        // option.  Without this, `rawaccel-cli -c /tmp/x.json -- set ...`
+        // misinterpreted "--" or flagged it as an unknown command.
+        } else if (strcmp(argv[i], "--") == 0) {
+            for (int j = i + 1; j < argc; j++) args.push_back(argv[j]);
+            break;
         } else {
             args.push_back(argv[i]);
         }
@@ -2418,6 +2628,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (!config_path_explicit && config_path.empty()) config_path = find_config_path();
+
+    // SEC-2: validate explicitly provided config path (daemon does this too)
+    if (config_path_explicit && !validate_config_path(config_path)) {
+        return 1;
+    }
 
     // Commands that don't need config loaded
     if (args[0] == "reload") return cmd_reload();

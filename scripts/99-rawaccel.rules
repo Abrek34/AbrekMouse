@@ -2,7 +2,7 @@
 #
 # Grants the 'input' group read-write access to:
 #   /dev/uinput       — needed to create the virtual output mouse
-#   /dev/input/event* — needed to grab the physical mouse
+#   /dev/input/event* — needed to grab the physical mouse (Logitech mice only)
 #   /dev/hidraw*      — Logitech HID++ hardware control in the GUI/CLI
 #                       (onboard DPI / report rate / lift-off distance)
 #
@@ -18,10 +18,10 @@
 # uinput: virtual device creation
 KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
 
-# Physical input event nodes
-KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0660", TAG+="uaccess"
+# Physical input event nodes — only for Logitech mice (vendor ID 0x046d)
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="046d", GROUP="input", MODE="0660", TAG+="uaccess"
 
 # Logitech HID++ interface — GUI/CLI onboard device control (DPI, report
 # rate, lift-off distance) without root.  uaccess additionally grants the
 # active seat user access regardless of group membership.
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", GROUP="input", MODE="0660", TAG+="uaccess"

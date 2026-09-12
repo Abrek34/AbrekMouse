@@ -59,20 +59,21 @@ case "$(uname -m)" in
 esac
 
 # Base C++ flags
-BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wno-unused-parameter"
+BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wpedantic -Wno-unused-parameter"
 
 # If the environment already defines _FORTIFY_SOURCE (e.g. makepkg.conf
-# -D_FORTIFY_SOURCE=3, or the caller exported CFLAGS/CXXFLAGS with it), DON'T
-# re-define =2 — that trips a "redefined" warning.  L-3: the probe MUST run
-# with the exact final compile flags.  BASE_CXXFLAGS (defined above — it was
-# historically defined AFTER this probe, silently probing without -O3/$MARCH)
-# carries -O3/$MARCH, and gcc's distro spec files only define _FORTIFY_SOURCE
-# when optimization is on (Fedora) — probing without them would wrongly
-# suppress the define and build a non-fortified binary.  The probe deliberately
-# excludes HARDENING/FORTIFY themselves so the -D we are about to add cannot
-# self-report as "already set".
+# -D_FORTIFY_SOURCE=3), DON'T re-define =2 — that trips a "redefined" warning.
+# L-3: the probe MUST run with the exact final compile flags used by the real
+# compile sites below (they use $BASE_CXXFLAGS + $HARDENING; they do NOT pull
+# ${CFLAGS:-}/${CXXFLAGS:-} from the environment).  ROUND4-FIX: the probe
+# previously appended ${CFLAGS:-} ${CXXFLAGS:-}, so a caller exporting
+# CFLAGS=-D_FORTIFY_SOURCE=3 made the probe see "already defined" and drop the
+# built-in =2 — while the compile sites never saw those env flags and shipped
+# an UNFORTIFIED binary.  Probe == compile now: if a distro spec file injects
+# _FORTIFY_SOURCE for optimized builds, it appears in both, and the built-in
+# -D_FORTIFY_SOURCE=2 is likewise applied at both.
 FORTIFY="-D_FORTIFY_SOURCE=2"
-if printf 'int main(){return 0;}' | $CXX $BASE_CXXFLAGS ${CFLAGS:-} ${CXXFLAGS:-} \
+if printf 'int main(){return 0;}' | $CXX $BASE_CXXFLAGS \
         -dM -E -x c++ - 2>/dev/null | grep -q '^#define _FORTIFY_SOURCE'; then
     FORTIFY=""
 fi
@@ -101,7 +102,7 @@ else
 echo "[1/3] Building rawaccel-daemon..."
     # EVDEV_CFLAGS (-I/usr/include/libevdev-1.0) is required for
     # "libevdev/libevdev-uinput.h" — EVDEV_LIBS alone only covers linking.
-    $CXX $BASE_CXXFLAGS $HARDENING $EVDEV_CFLAGS -I"$ROOT/include" \
+    "$CXX" $BASE_CXXFLAGS $HARDENING $EVDEV_CFLAGS -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
@@ -111,7 +112,7 @@ echo "[1/3] Building rawaccel-daemon..."
         -o "$BUILD/rawaccel-daemon"
 
     echo "[2/3] Building rawaccel-cli..."
-    $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $HARDENING -I"$ROOT/include" \
+    "$CXX" $BASE_CXXFLAGS $EVDEV_CFLAGS $HARDENING -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \
@@ -121,7 +122,7 @@ echo "[1/3] Building rawaccel-daemon..."
 
     if [ "$HAVE_GTK4" = "1" ]; then
         echo "[3/3] Building rawaccel-gui..."
-        $CXX $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS $HARDENING -I"$ROOT/include" \
+        "$CXX" $BASE_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS $HARDENING -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
         "$ROOT/src/logitech_hidpp.cpp" \

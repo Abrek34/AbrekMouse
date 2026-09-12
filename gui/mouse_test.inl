@@ -173,6 +173,7 @@ static void mouse_test_set_status(AppState* S, int state) {
         case 1: txt = tr("Awaiting motion…"); break;
         case 2: txt = tr("Daemon is not running."); break;
         case 3: txt = tr("Mouse test: pointer lock released (window unfocused)."); break;
+        case 4: txt = tr("Raw 1:1 passthrough — no telemetry is produced (accelerated mode only)."); break;
         default: txt = ""; break;
     }
     gtk_label_set_text(GTK_LABEL(S->test_status_lbl), txt);
@@ -221,6 +222,16 @@ static void mouse_test_stop_poll(AppState* S) {
 /// a dead-but-listening daemon can never wedge the UI (BUG-05).  One status
 /// query per tick does double duty as the up-check — no separate ping round
 /// trip.  A missing/unreachable daemon shows "—" but keeps the timer alive.
+
+/// R12-WALLMS: current time on the same clock the daemon stamps telem_wall_ms
+/// (CLOCK_MONOTONIC_RAW, ms since boot) so sample staleness can be computed.
+static double now_mono_raw_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
 static gboolean mouse_test_poll(gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (!S->mouse_test_win) return G_SOURCE_REMOVE; // popup closed earlier
@@ -246,8 +257,25 @@ static gboolean mouse_test_poll(gpointer user_data) {
     double in  = daemon_device_field(resp, S, "telem_in_ips");
     double out = daemon_device_field(resp, S, "telem_out_ips");
     double gain = daemon_device_field(resp, S, "telem_gain");
-    if (in < 0) {
-        // Daemon answered but has not seen a motion sample yet.
+    // R12-WALLMS: the daemon stamps telem_wall_ms (CLOCK_MONOTONIC_RAW ms since
+    // boot, P121/BUG-06) next to every sample.  A sample older than ~2 s is no
+    // longer "live" — a handle the old code lacked entirely.  Separately, a
+    // device in raw 1:1 passthrough emits NO telemetry at all (flush_motion
+    // never runs there), so waiting "until motion" would spin forever: detect
+    // it from the active profile and show a definitive state instead.
+    double wall = daemon_device_field(resp, S, "telem_wall_ms");
+    bool fresh = wall >= 0 && (now_mono_raw_ms() - wall) < 2000.0;
+    if (cur_prof(S).prof.raw_passthrough) {
+        // Raw 1:1 passthrough — readouts are guaranteed empty, show loss markers.
+        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
+        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
+        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+        mouse_test_set_status(S, 4); // raw passthrough — no telemetry
+        return G_SOURCE_CONTINUE;
+    }
+    if (in < 0 || !fresh) {
+        // Daemon answered but has not seen a motion sample yet (or the only
+        // sample it has is stale — >2 s old).
         // R2-07: zero out the readouts too — otherwise the in/out/gain labels
         // keep showing the LAST sample (stale) while the status says "awaiting".
         if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
@@ -277,7 +305,12 @@ static gboolean mouse_test_escape(GtkEventControllerKey*, guint keyval, guint,
         mouse_test_release(S); // ungrab BEFORE the surface disappears
         gtk_window_destroy(GTK_WINDOW(S->mouse_test_win));
     }
-    set_status(S, tr("Mouse test: pointer released (ESC)."));
+    // INFO-1 defensive gap: if the main window were destroyed while the test
+    // window lingered, S->status_bar would be freed here (UAF).  Unreachable
+    // today (the test window is not a GtkApplication window, so it dies with
+    // the process), but guard it like every other callback in the codebase.
+    if (!S->window_destroyed)
+        set_status(S, tr("Mouse test: pointer released (ESC)."));
     return GDK_EVENT_STOP;
 }
 

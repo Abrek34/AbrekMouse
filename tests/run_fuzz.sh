@@ -37,7 +37,8 @@ fi
 
 echo ""
 echo "=== [2/2] Building & running fuzz_accel (acceleration pipeline) ==="
-clang++ "${FUZZ_FLAGS[@]}" "$SCRIPT_DIR/fuzz_accel.cpp" "$ROOT/src/config.cpp" -o "$BUILD/fuzz_accel"
+clang++ "${FUZZ_FLAGS[@]}" "$SCRIPT_DIR/fuzz_accel.cpp" "$ROOT/src/config.cpp" \
+    "$ROOT/src/logitech_receiver.cpp" "$ROOT/src/logitech_hidpp.cpp" -o "$BUILD/fuzz_accel"
 if [ "$DURATION" = "0" ]; then
     "$BUILD/fuzz_accel" "$CORPUS_ACCEL" -max_len=256 -timeout=5
 else

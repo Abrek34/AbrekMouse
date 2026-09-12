@@ -42,7 +42,7 @@ if [ ! -x "$CLI" ]; then
     exit 1   # P114 BUG-B: eksik CLI artık sessiz SKIP + exit 0 veremez
 fi
 if [ -x "$CLI" ]; then
-    TMPCFG=$(mktemp)
+    TMPCFG=$(mktemp --suffix=.json)   # SEC-2: config paths must end in .json
     TMP_FILES+=( "$TMPCFG" )
     rm -f "$TMPCFG"   # P42: var olan bos config uzerine yazilmaz; dosya yokken seed olusur
     TMPN256=$(mktemp)
@@ -88,7 +88,7 @@ PY
     # ── P99: arity + -c "" kapıları ───────────────────────────────────────────
     # Ekstra argümanlar sessizce yutulmuyor; hepsi rc=1 + usage. "-c ''" reel
     # config'e düşüp onu değiştirmemeli (P74 BULGU-2 sınıfı).
-    TMPA=$(mktemp)
+    TMPA=$(mktemp --suffix=.json)   # SEC-2: config path must end in .json
     TMP_FILES+=( "$TMPA" )
     rm -f "$TMPA"
     set +e
@@ -126,7 +126,7 @@ PY
     # ── P107: set-param domain kapısı (sessiz clamp → red) ──────────────────
     # Out-of-domain set-param values must exit 1 AND leave the config file
     # byte-identical (previously snap 90 silently stored 45 and exited 0).
-    TMPP=$(mktemp)
+    TMPP=$(mktemp --suffix=.json)   # SEC-2: config path must end in .json
     TMP_FILES+=( "$TMPP" "$TMPP.bak" )
     rm -f "$TMPP" "$TMPP.bak"
     "$CLI" -c "$TMPP" --no-daemon create-preset gaming g >/dev/null 2>&1
@@ -155,5 +155,81 @@ PY
         fi
     done
     echo "CLI P107 set-param domain kapısı: out-of-domain red + config dokunulmadı ✓"
+
+    # ── O31-L2: input_offset üst sınır + cap_x ↔ input_offset çapraz kısıtı ─
+    # input_offset CLI domain'i [0, CAP_X_MAX=500] olmalı (sanitize 500'e
+    # klamp ettiği için P107 bytes-birebir); ayrıca BUG-7 kuralı gereği
+    # cap_x >= input_offset olmalı — aksi halde loader sessizce cap_x'i
+    # input_offset'e çeker (kullanıcının istediği değer yazılmaz).
+    set +e
+    OUT=$("$CLI" -c "$TMPP" --no-daemon set-param g input_offset 501 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "valid range"; then
+        echo "FAIL: O31-L2 'input_offset 501' (above CAP_X_MAX) accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    set +e
+    OUT=$("$CLI" -c "$TMPP" --no-daemon set-param g input_offset 30 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "input_offset"; then
+        echo "FAIL: O31-L2 'input_offset 30' with cap_x 15 accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    "$CLI" -c "$TMPP" --no-daemon set-param g cap_x 30 >/dev/null 2>&1
+    set +e
+    "$CLI" -c "$TMPP" --no-daemon set-param g input_offset 30 >/dev/null 2>&1
+    RC=$?
+    set -e
+    if [ $RC -ne 0 ]; then
+        echo "FAIL: O31-L2 'input_offset 30' with cap_x 30 rejected (rc=$RC)"
+        exit 1
+    fi
+    L2BEFORE=$(cat "$TMPP")
+    set +e
+    OUT=$("$CLI" -c "$TMPP" --no-daemon set-param g cap_x 20 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "input_offset"; then
+        echo "FAIL: O31-L2 'cap_x 20' with input_offset 30 accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    if [ "$L2BEFORE" != "$(cat "$TMPP")" ]; then
+        echo "FAIL: O31-L2 rejected set-param mutated config"
+        exit 1
+    fi
+    echo "CLI O31-L2 kapısı: input_offset [0,500] + cap_x>=input_offset çapraz kısıt ✓"
+
+    # ── O31-L1: tek (odd) sayıda LUT eleman içeren import reddedilmeli ─────
+    # 515 eleman (257.5 nokta): n/2=257 kapasiteyi "geçmiyordu" ve 515. eleman
+    # sessizce düşüyordu.  n%2 koruması ile import rc=1 + net mesaj.
+    TMPLUT=$(mktemp)
+    TMP_FILES+=( "$TMPLUT" )
+    python3 - "$TMPLUT" <<'PY'
+import sys, json
+flat = []
+for i in range(257):
+    flat.extend([float(i+1), 1.0])
+flat.append(999999.0)   # 515 eleman = tek (odd)
+blob = {
+    "name": "oddlut",
+    "profile": {
+        "accel_x": {"mode": "lookup", "lut_length": len(flat), "lut_data": flat},
+        "accel_y": {"mode": "lookup", "lut_length": 0, "lut_data": []}
+    }
+}
+json.dump(blob, open(sys.argv[1], 'w'))
+PY
+    set +e
+    OUT=$("$CLI" -c "$TMPP" --no-daemon import "$TMPLUT" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -qiE "odd"; then
+        echo "FAIL: O31-L1 odd-element LUT import accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    rm -f "$TMPLUT"
+    echo "CLI O31-L1 kapısı: odd-lut import reddi ✓"
     rm -f "$TMPP" "$TMPP.bak"
 fi

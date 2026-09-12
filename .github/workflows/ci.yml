@@ -25,7 +25,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config \
-            libevdev-dev libgtk-4-dev
+            libevdev-dev libgtk-4-dev python3
 
       - name: Build (warning-as-failure gate)
         run: |
@@ -37,8 +37,10 @@ jobs:
           # containing those strings — innocent output (e.g. a filename with
           # "error" in it, scripts echoing the words) false-failed the gate.
           # Match only compiler/linker diagnostic shapes: FILE:LINE[:COL]:
-          # (warning|fatal error|error):, plus ld:/collect2 errors.
-          if grep -E ":[0-9]+(:[0-9]+)?: (warning|fatal error|error):| (ld|collect2): (error|warning):" build.log; then
+          # (warning|fatal error|error):, plus ld:/collect2: errors — with a
+          # non-alnum prefix so "/usr/bin/ld:" matches but a token like
+          # "collect2_test.c:" does not (R10-LDREG).
+          if grep -E ":[0-9]+(:[0-9]+)?: (warning|fatal error|error):|(^|[^[:alnum:]_])(ld|collect2): (fatal error|error|warning):" build.log; then
             echo "::error::Build produced compiler warnings or errors (see above)."
             exit 1
           fi
@@ -52,6 +54,11 @@ jobs:
 
       - name: Run unit tests
         run: bash tests/run_tests.sh
+
+      - name: Run translation coverage (R10-CITRC)
+        # Every translatable GUI string must have a Turkish entry; exits 1 on
+        # a MISSING key, so a new untranslated string now fails CI.
+        run: bash tests/run_tr_coverage.sh
 
       - name: Run oracle (reference cross-check)
         # Differential check vs the vendored official RawAccel reference.
@@ -75,7 +82,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libevdev-dev
+            build-essential pkg-config libevdev-dev python3
 
       - name: Build & run tests with -fsanitize=address,undefined
         env:
@@ -130,7 +137,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libevdev-dev
+            build-essential pkg-config libevdev-dev python3
 
       - name: Run hot-path perf gate
         run: |

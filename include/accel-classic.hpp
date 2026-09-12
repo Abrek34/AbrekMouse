@@ -226,7 +226,18 @@ private:
     }
 
     static double gain_inverse(double y, double accel, double power, double offset) {
-        if (accel == 0 || power <= 1.0) return offset;
+        // R9-CAP0: accel == 0 makes the accelerated body identically 0
+        // (pow(0, power-1) = 0 for power > 1), so the reference's inverse —
+        // (accel·offset + pow(y/power, 1/(power-1))) / accel — divides by 0 and
+        // yields cap.x = +Inf, i.e. the cap is reached only at infinite speed
+        // and the whole curve collapses to identity.  The old guard returned
+        // `offset` here, which made the GAIN out-branch (constant/x + cap_y)
+        // activate at every speed x >= offset → a silent CONSTANT ×cap.y boost
+        // (e.g. cap {15, 2} → gain 2.0 everywhere) where the reference is
+        // inert.  Match the reference: unreachable cap.
+        if (accel == 0)
+            return DBL_MAX;
+        if (power <= 1.0) return offset;
         return (accel * offset + std::pow(y / power, 1.0 / (power - 1))) / accel;
     }
 

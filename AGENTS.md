@@ -134,7 +134,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 184 test groups, 33764 runtime assertions covering: algorithms, JSON round-trips,
+- 193 test groups, 33832 runtime assertions covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -179,16 +179,20 @@ Seed corpus: `tests/corpus_config/`
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
-Three jobs run on every push/PR (Ubuntu 24.04):
+Four jobs run on every push/PR (Ubuntu 24.04):
 - **build-and-test** — portable build (`RAWACCEL_PORTABLE=1`), warning-as-failure gate
-  via `grep -E "warning:|error:"`, then `tests/run_tests.sh`, then the differential
-  oracle (`bash tests/oracle/run_oracle.sh`) which fails if any gain row drifts
-  outside `tests/oracle/known_deviations.txt`.
+  via `grep -E "warning:|error:"`, then `tests/run_tests.sh`, then `tests/run_tr_coverage.sh`,
+  then the differential oracle (`bash tests/oracle/run_oracle.sh`) which fails if any
+  gain row drifts outside `tests/oracle/known_deviations.txt`.
 - **sanitizers** — rebuilds tests with `-fsanitize=address,undefined` and runs them
   with `halt_on_error=1` so any leak/UB fails CI.
 - **fuzz-smoke** — 60 s per harness via `tests/run_fuzz.sh 60`. Skipped on PRs to
-  keep them fast; runs on push to main and on `workflow_dispatch`. Crash inputs
-  are uploaded as artifacts on failure.
+  keep them fast; runs on any push (`!= pull_request`) and `workflow_dispatch`.
+  Crash inputs are uploaded as artifacts on failure.
+- **perf-gate** — hot-path performance regression gate (P137): runs
+  `scripts/bench_hotpath.sh` against `tests/perf_baseline.json` (6 configs,
+  median-of-3, dynamic iteration count from `_meta.iterations`); fails if any
+  config is more than 5% slower than the baseline, otherwise skips on a missing baseline.
 
 Concurrency group cancels superseded runs on the same ref.
 
@@ -227,7 +231,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33764 assertions, 184 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (33832 assertions, 193 groups) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -291,7 +295,7 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **CLI `--no-daemon` flag**: mutating commands (create, set, set-param, rename, duplicate, delete, import, create-preset) save the config locally and push it to the daemon by default; `rawaccel-cli --no-daemon` (or `--dry-run`) skips the daemon push so one-shot edits to a `-c /tmp/...` config never touch the live daemon config or /etc/rawaccel/settings.json. Apply later with `rawaccel-cli reload` (P82-CRIT-1)
 - **Daemon option parsing**: `--config=PATH` / `--log-format=FMT` (`=` forms) are accepted next to `-c PATH` / `--config PATH`; a missing value is a hard parse error (exit 1); explicit `--config=` paths receive the same validation as `-c` (P53)
 - **JSON log escaping**: `--log-format json` escapes log `message` strings (`\" \\ \n \r \t \b \f`, control chars → `\uXXXX`) so device names/paths/errno text can never corrupt the log stream (P53)
-- **Subnormal time guard**: `modifier::modify()` clamps `ips_factor` to 0 when `dpi_factor/time` overflows to Inf (subnormal time values like 1e-309)
+- **Subnormal time guard**: `modifier::modify()` clamps `ips_factor` to `IPS_FACTOR_MAX` (1e6) when `dpi_factor/time` overflows to Inf (subnormal time values like 1e-309)
 - **Modify output guard**: defense-in-depth `isfinite()` check at the end of `modifier::modify()` ensures no NaN/Inf escapes to motion_math
 - **Duplicate device_id warning**: GUI warns on startup and on save if multiple profiles share the same device_id (first-match-wins in daemon)
 - **lat_stats move safety**: move constructor/assignment lock the source mutex before copying data (defense-in-depth against concurrent record() during vector reallocation)

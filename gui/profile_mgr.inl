@@ -183,6 +183,10 @@ void show_new_profile_dialog(AppState* S) {
     ctx->cb = [S](const std::string& name, const std::string& preset) {
             for (auto& p : S->config.profiles)
                 if (p.name == name) { set_status(S, tr("A profile with that name already exists.")); return; }
+            if (S->config.profiles.size() >= MAX_PROFILES) {
+                set_status(S, trf("Maximum number of profiles (%d) reached.", MAX_PROFILES));
+                return;
+            }
             device_profile dp;
             if (!preset.empty())
                 dp = rawaccel::make_preset(preset, name);
@@ -397,7 +401,16 @@ void on_duplicate_profile(GtkButton*, gpointer user_data) {
     // leaving two profiles with the same name (ambiguous combo + daemon lookup).
     // Auto-uniquify: "<orig> (copy)", then "<orig> (copy) 2", 3, … — same rule
     // as the create/rename dialog's duplicate check, applied to the whole list.
-    std::string base = cur_prof(S).name + tr(" (copy)");
+    // R12-DUPNM: the generated name must stay under MAX_NAME_LEN (256).  A
+    // longer one survives in memory but the JSON round-trip (config load caps
+    // names at 256) truncates it BACK to the source name, silently recreating
+    // the exact two-identical-profile collision this loop exists to prevent.
+    // " 1001" (5) is the longest numeric suffix the 1..1000 loop can append.
+    const std::string sufx = tr(" (copy)");
+    std::string src = cur_prof(S).name;
+    if (src.size() + sufx.size() + 5 > MAX_NAME_LEN)
+        src.resize(MAX_NAME_LEN - sufx.size() - 5);
+    std::string base = src + sufx;
     std::string name = base;
     for (int n = 1; n <= 1000; n++) {
         bool taken = false;
@@ -414,6 +427,10 @@ void on_duplicate_profile(GtkButton*, gpointer user_data) {
             set_status(S, tr("Could not duplicate profile: no free name."));
             return;
         }
+    if (S->config.profiles.size() >= MAX_PROFILES) {
+        set_status(S, trf("Maximum number of profiles (%d) reached.", MAX_PROFILES));
+        return;
+    }
     device_profile copy = cur_prof(S);
     copy.name = name;
     copy.device_id.clear();
@@ -485,9 +502,19 @@ std::string msg = trf("Reset \"%s\" to default values?\nThis cannot be undone.",
 static void export_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     auto* S = static_cast<AppState*>(ud);
     GtkFileDialog* dlg = GTK_FILE_DIALOG(src);
-    // GUI-D4: report the real error rather than treating failure as "cancel".
+    // O31-G6: GTK4 GtkFileDialog is a plain GObject (no floating ref) — the
+    // caller owns one reference that must be released here or every
+    // export/import leaks a dialog object.
     GError* err = nullptr;
     GFile* file = gtk_file_dialog_save_finish(dlg, res, &err);
+    g_object_unref(dlg);
+    // Audit-GUI-1: the window may have been destroyed while the async dialog
+    // was pending — no widget touch is safe after that.
+    if (S->window_destroyed) {
+        if (file) g_object_unref(file);
+        g_clear_error(&err);
+        return;
+    }
     if (!file) {
         if (err && !g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
             set_status(S, trf("Export failed: %s", err->message));
@@ -525,9 +552,18 @@ void on_export_profile(GtkButton*, gpointer user_data) {
 static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     auto* S = static_cast<AppState*>(ud);
     GtkFileDialog* dlg = GTK_FILE_DIALOG(src);
-    // GUI-D4: report the real error rather than treating failure as "cancel".
+    // O31-G6: release the caller's GtkFileDialog reference (these async
+    // dialogs were never unref'd — one leak per import).
     GError* err = nullptr;
     GFile* file = gtk_file_dialog_open_finish(dlg, res, &err);
+    g_object_unref(dlg);
+    // Audit-GUI-1: the window may have been destroyed while the async dialog
+    // was pending — no widget touch is safe after that.
+    if (S->window_destroyed) {
+        if (file) g_object_unref(file);
+        g_clear_error(&err);
+        return;
+    }
     if (!file) {
         if (err && !g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
             set_status(S, trf("Import failed: %s", err->message));
@@ -556,6 +592,19 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     }
     std::string content(data, len);
     g_free(data);
+    // R12-IMPLUT: reject over-capacity (> 514 raw elements, i.e. > 257 points)
+    // and odd-element count LUT tables BEFORE parsing.  profile_from_json()
+    // (via sanitize_profile → sort_lut_data) would silently CLAMP an oversized
+    // curve and FLOOR an odd count — the GUI previously accepted a curve that
+    // differed from the file.  Mirrors the CLI import's O31-L1 / P120-FAZ2
+    // up-front rejection (dead widgets_sync.inl truncation warning removed).
+    std::string lut_issue = check_import_lut_size(content);
+    if (!lut_issue.empty()) {
+        set_status(S, trf("Import failed: %s. Fix the file and try again.",
+                          lut_issue.c_str()));
+        g_free(path);
+        return;
+    }
     device_profile dp;
     try {
         dp = profile_from_json(content);
@@ -575,6 +624,11 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
             g_free(path);
             return;
         }
+    }
+    if (S->config.profiles.size() >= MAX_PROFILES) {
+        set_status(S, trf("Maximum number of profiles (%d) reached.", MAX_PROFILES));
+        g_free(path);
+        return;
     }
     S->config.profiles.push_back(dp);
     rebuild_profile_combo(S);

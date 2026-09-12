@@ -60,6 +60,11 @@ same hardening flags: stack protector/clash protection, `-D_FORTIFY_SOURCE=2`,
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
+# Install: use /usr (NOT the /usr/local default) so binaries land where the
+# systemd service expects them.  The install preserves an existing
+# /etc/rawaccel/settings.json, installs udev + modules-load.d + quirks, and
+# a /usr/local prefix emits a configure-time warning.
+sudo cmake --install . --prefix /usr
 ```
 
 Compiled binaries are placed in `build-manual/`.
@@ -85,9 +90,9 @@ backwards compatibility).
 > the packaged binary (`packaging/rawaccel-linux-1.1.0-1-x86_64.pkg.tar.zst`,
 > `sudo pacman -U ...`) or publish it via an AUR package. Do **not** mix
 > `setup.sh` and the pacman package: both install the systemd unit to the same
-> path (`/usr/lib/systemd/system/rawaccel.service`), while binaries land in
-> `/usr/local/bin` (setup.sh) vs `/usr/bin` (package) — a stale copy on PATH
-> keeps grabbing your mouse after the other install. Since 0.5.0-2 the package
+> path (`/usr/lib/systemd/system/rawaccel.service`) and both install the
+> binaries to `/usr/bin`, so the last install wins — a stale copy on PATH keeps
+> grabbing your mouse after the other install. Since 0.5.0-2 the package
 > auto-cleans legacy setup.sh files in its pre-install hook (the old
 > `/etc/systemd/system` shadow unit plus `/usr/local/bin` and `~/.local/bin`
 > binaries) and never overwrites your existing `/etc/rawaccel/settings.json`.
@@ -105,9 +110,9 @@ Manual install (equivalent steps, for reference):
 # Build
 bash scripts/build.sh
 
-sudo cp build-manual/rawaccel-daemon /usr/local/bin/
-sudo cp build-manual/rawaccel-cli    /usr/local/bin/
-sudo cp build-manual/rawaccel-gui    /usr/local/bin/
+sudo cp build-manual/rawaccel-daemon /usr/bin/
+sudo cp build-manual/rawaccel-cli    /usr/bin/
+sudo cp build-manual/rawaccel-gui    /usr/bin/
 
 # System config dir + default config (used by the systemd service)
 sudo mkdir -p /etc/rawaccel
@@ -118,6 +123,13 @@ sudo install -m644 scripts/99-rawaccel.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 echo uinput | sudo tee /etc/modules-load.d/rawaccel.conf
 sudo modprobe uinput
+
+# libinput quirk (R7-README parity — disables libinput's flat-pointing
+# acceleration for the virtual device, else you get double acceleration)
+sudo install -m644 scripts/rawaccel.quirks /usr/share/libinput/50-rawaccel.quirks
+
+# GUI launcher
+sudo install -m644 scripts/rawaccel.desktop /usr/share/applications/
 
 # Start the daemon at boot
 sudo systemctl enable --now rawaccel

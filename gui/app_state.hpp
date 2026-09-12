@@ -51,7 +51,7 @@ struct InputDeviceInfo {
     std::string name;
     std::string event_node;
     std::string uniq;
-    std::string stable_id;   // "usb:VVVV:PPPP:serial" if vendor+product available, else event_node
+    std::string stable_id;   // "usb:VVVV:PPPP:serial" if vendor+product, else uniq/resolved event_node (daemon parity)
     uint16_t    vendor  = 0;
     uint16_t    product = 0;
     bool        has_rel_xy  = false;
@@ -94,6 +94,11 @@ struct AppState {
     // late pkexec exit would write into destroyed widgets.  Tracked so the
     // destroy handler can g_source_remove() it.
     guint       pkexec_watch_id = 0;
+    // P-LEAK: the pkexec child-watch user-data (pkexec_watch_ctx*) + child pid
+    // are tracked so a replaced or window-destroyed watch can free the context
+    // and prompt-reap the abandoned pkexec child instead of leaking both.
+    GPid        pkexec_watch_pid  = 0;
+    void*       pkexec_watch_ctx  = nullptr;
 
     // Graph interaction
     double graph_zoom     = 1.0;
@@ -113,6 +118,11 @@ struct AppState {
     bool   kde_accel_ok    = true;    // false = libinput accel NOT disabled → double-accel!
     bool   kde_fix_running = false;   // an async KDE fix worker is in flight
     GtkWidget* kde_warn_bar = nullptr; // infobar shown when kde_accel_ok == false
+    // O31-G1: set in the window destroy handler.  The async KDE-fix worker
+    // marshals its result back through an idle callback that touches widgets;
+    // after destroy those are gone, so the idle callback must bail (it still
+    // releases its heap task) instead of writing into unparented widgets.
+    bool   window_destroyed = false;
 
     // Auto-detected device properties (from daemon status_json)
     int    detected_dpi          = 0;  // 0 = unknown
@@ -155,6 +165,8 @@ struct AppState {
     GtkWidget* profile_combo     = nullptr;
     GtkWidget* status_bar        = nullptr;
     GtkWidget* daemon_status     = nullptr;
+    bool       daemon_prev_running = false; // R8-RESEND: last poll's daemon state (up-transition trigger)
+    double     lp_norm_mem = 2.0;           // R9-LPNRM: last real Lp norm (before the Max=9999 sentinel)
     GtkWidget* graph_area        = nullptr;
     GtkWidget* apply_btn         = nullptr;
     GtkWidget* daemon_start_btn  = nullptr;
@@ -288,8 +300,11 @@ std::string check_duplicate_device_ids(const app_config& cfg);
 pid_t read_daemon_pid();
 bool  daemon_running();
 bool  daemon_send_signal(int sig, std::string* err_out = nullptr);
-bool  daemon_ipc_push_config(const std::string& json);
+int  daemon_ipc_push_config(const std::string& json, std::string* resp_out = nullptr);
 void  update_daemon_status(AppState* S);
+/// Re-send the last known WM_CLASS to a (re)started daemon (defined in
+/// kwin_focus.inl, which is included AFTER daemon_comm.inl).
+static void kwin_focus_resend_current(AppState* S);
 /// Best-match device JSON slice of a daemon status response (Bug-02).
 double daemon_device_field(const std::string& resp, AppState* S, const char* key);
 

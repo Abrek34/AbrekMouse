@@ -218,6 +218,7 @@ clean_old_install() {
         /etc/udev/rules.d/99-rawaccel.rules
         /usr/lib/udev/rules.d/99-rawaccel.rules
         /etc/modules-load.d/rawaccel.conf
+        /usr/lib/modules-load.d/rawaccel.conf   # PKGBUILD kurulum yolu (R7-UNMLU)
         /etc/modprobe.d/rawaccel.conf
         /usr/share/libinput/50-rawaccel.quirks
         /usr/share/applications/rawaccel.desktop
@@ -300,17 +301,24 @@ do_install() {
         elif [[ ! -f "$user_cfg" ]]; then
             warn "Kullanıcı config geçerli bir dosya değil, atlanıyor."
         else
-            if [[ -f /etc/rawaccel/settings.json ]] && \
-               ! cmp -s "$user_cfg" /etc/rawaccel/settings.json; then
-                # BS-6/L-7: %S-second granularity — two runs in the same second
-                # silently overwrote the previous backup.  Append the PID so the
-                # name is unique even within the same second.
-                local backup="/etc/rawaccel/settings.json.bak.$(date +%Y%m%d-%H%M%S).$$"
-                cp /etc/rawaccel/settings.json "$backup"
-                warn "Mevcut sistem config farklı; yedeklendi: $backup"
+            # SEC-4: validate ownership of user config before copying to system location
+            local cfg_uid=$(stat -c %u "$user_cfg" 2>/dev/null || echo "")
+            local real_uid=$(id -u "$REAL_USER" 2>/dev/null || echo "")
+            if [[ -n "$cfg_uid" && -n "$real_uid" && "$cfg_uid" != "$real_uid" ]]; then
+                warn "Kullanıcı config sahipliği uyuşmuyor (cfg_uid=$cfg_uid, real_uid=$real_uid), güvenlik nedeniyle atlanıyor."
+            else
+                if [[ -f /etc/rawaccel/settings.json ]] && \
+                   ! cmp -s "$user_cfg" /etc/rawaccel/settings.json; then
+                    # BS-6/L-7: %S-second granularity — two runs in the same second
+                    # silently overwrote the previous backup.  Append the PID so the
+                    # name is unique even within the same second.
+                    local backup="/etc/rawaccel/settings.json.bak.$(date +%Y%m%d-%H%M%S).$$"
+                    cp /etc/rawaccel/settings.json "$backup"
+                    warn "Mevcut sistem config farklı; yedeklendi: $backup"
+                fi
+                install -Dm644 -o root -g root "$user_cfg" /etc/rawaccel/settings.json
+                ok "Kullanıcı config /etc/rawaccel/'a senkronlandı."
             fi
-            install -Dm644 -o root -g root "$user_cfg" /etc/rawaccel/settings.json
-            ok "Kullanıcı config /etc/rawaccel/'a senkronlandı."
         fi
     fi
 
@@ -355,7 +363,12 @@ do_install() {
 
     # systemd servis → /usr/lib/systemd/system'e kur (/etc'de gölgeleme yapmaz)
     install -Dm644 "$ROOT/scripts/rawaccel.service" /usr/lib/systemd/system/rawaccel.service
-    systemctl daemon-reload
+    # BS-7 pattern: a systemd-less chroot/container has no PID1 to reload and
+    # `set -eo pipefail` turns that into a hard install abort (the unit file is
+    # already in place; a later systemctl/reboot picks it up).  Mirror the
+    # udevadm guard above.
+    systemctl daemon-reload 2>/dev/null || \
+        warn "systemctl daemon-reload başarısız (systemd-less ortam?). Servis reboot'ta tanınır."
 
     # SH-3: a leftover USER-level unit (an earlier --user install) runs a
     # second rawaccel daemon in the user session and silently shadows the
@@ -439,18 +452,34 @@ fix_kde_plasma() {
 verify_install() {
     say "Kurulum doğrulanıyor..."
     local missing=0
-    for b in rawaccel-daemon rawaccel-cli rawaccel-gui; do
+    for b in rawaccel-daemon rawaccel-cli; do
         if command -v "$b" >/dev/null 2>&1; then ok "Binary mevcut: $(command -v "$b")"
         else err "Binary EKSİK: $b"; missing=1; fi
     done
+    # rawaccel-gui is optional (requires GTK4 at build time). Only check if it was built.
+    if [[ -f "$ROOT/build-manual/rawaccel-gui" ]]; then
+        if command -v rawaccel-gui >/dev/null 2>&1; then ok "Binary mevcut: $(command -v rawaccel-gui)"
+        else err "Binary EKSİK: rawaccel-gui"; missing=1; fi
+    else
+        ok "GUI atlandı (GTK4 build-time dependency not met)"
+    fi
     [[ -f /etc/rawaccel/settings.json ]]   && ok "Config: /etc/rawaccel/settings.json" || { err "Config EKSİK"; missing=1; }
-    local udev_rule=/etc/udev/rules.d/99-rawaccel.rules
-    if [[ -f "$udev_rule" ]]; then
+    # udev: accept EITHER install path (setup.sh installs /etc/udev/rules.d,
+    # the PKGBUILD/pacman package installs /usr/lib/udev/rules.d — a system
+    # provisioned only via the package would otherwise false-negative as
+    # "EKSİK").  Content-check whichever copy is present (hidraw rule).
+    local udev_rule=""
+    if [[ -f /etc/udev/rules.d/99-rawaccel.rules ]]; then
+        udev_rule=/etc/udev/rules.d/99-rawaccel.rules
+    elif [[ -f /usr/lib/udev/rules.d/99-rawaccel.rules ]]; then
+        udev_rule=/usr/lib/udev/rules.d/99-rawaccel.rules
+    fi
+    if [[ -n "$udev_rule" ]]; then
         [[ -s "$udev_rule" ]] || { err "udev kuralı BOŞ: $udev_rule"; missing=1; }
         grep -q "KERNEL==\"hidraw\*" "$udev_rule" \
             || { err "udev kuralı GÜNCEL DEĞİL (hidraw eksik): $udev_rule"; missing=1; }
-        [[ $missing -eq 1 ]] || ok "udev kuralı mevcut (uinput+hidraw)"
-    else err "udev kuralı EKSİK: $udev_rule"; missing=1; fi
+        [[ $missing -eq 1 ]] || ok "udev kuralı mevcut (uinput+hidraw): $udev_rule"
+    else err "udev kuralı EKSİK (ne /etc ne /usr/lib): 99-rawaccel.rules"; missing=1; fi
     [[ -f /usr/share/libinput/50-rawaccel.quirks ]] && ok "libinput quirk mevcut" || { err "libinput quirk EKSİK"; missing=1; }
     if systemctl is-active --quiet rawaccel.service; then ok "Servis ÇALIŞIYOR"
     else err "Servis ÇALIŞMIYOR — journalctl -u rawaccel -n 50"; missing=1; fi

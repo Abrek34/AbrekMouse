@@ -28,6 +28,13 @@ struct mouse_device {
         std::atomic<double> dx { 0.0 };
         std::atomic<double> dy { 0.0 };
         std::atomic<double> wall_ms { 0.0 };
+        // R7-PRATE: real polling rate (Hz, 0 = unknown) — computed by the loop
+        // thread (process_device) from median kernel frame intervals but read by
+        // the IPC thread (status_json).  Every other status field is written
+        // under devices_mutex_; a plain int here was a C++ data race (UB under
+        // TSan, torn median on weak-memory hardware).  Kept atomic alongside the
+        // other loop→IPC fields instead of re-adding a per-frame lock.
+        std::atomic<int> real_polling_rate { 0 };
     };
     std::string      name;
     std::string      path;           // e.g. /dev/input/event3
@@ -79,6 +86,15 @@ struct mouse_device {
     // batch (loop-thread stall, scheduler preemption) can no longer shrink
     // time_ms toward zero and spike the gain.
     uint64_t last_frame_ev_us = 0;
+
+    // Real polling rate detection from event timestamps (POLL-1 fix).
+    // We track the kernel timestamps of SYN_REPORT events and compute the
+    // median interval over recent frames. This gives the actual device polling
+    // rate regardless of what sysfs reports.
+    static constexpr int POLL_RATE_SAMPLES = 16;
+    uint64_t frame_ev_us_samples[POLL_RATE_SAMPLES] = {};
+    int      frame_ev_us_count = 0;
+    int      frame_ev_us_next = 0;
 
     // BUG-18: SYN_DROPPED state must persist across process_device() calls.
     // The Linux input protocol says all events between a SYN_DROPPED and the
@@ -184,13 +200,19 @@ private:
     bool create_virtual_device(mouse_device& dev);
     void process_device(mouse_device& dev);
     void apply_profile(mouse_device& dev, const device_profile& prof);
+    /// LIVE-DISABLE: drop a grabbed device (epoll del, map erases, grab
+    /// release, uinput destroy, fd close) when a live reload / app-switch marks
+    /// its matched profile disabled.  Caller must hold devices_mutex_.
+    void release_device(mouse_device& dev);
     /// Shared apply path for both the SIGHUP reload and the IPC config push.
     /// Runs on the loop thread; live-updates open devices without dropping the
     /// grab, and falls back to a full setup when no devices are open yet.
     void apply_new_config(const app_config& new_cfg);
-    /// Searches by device_id match first, then active_profile, then the first profile.
-    /// P-APP: when current_app_ is non-empty, a profile whose match_app CLASSNOT
-    /// matches the focused application is preferred over the global fallback.
+    /// Search order: device_id+app match, then "all devices"+app match, then
+    /// device_id, then "all devices", then active_profile, then profiles[0].
+    /// P-APP: an app-scoped profile (non-empty match_app) applies only while the
+    /// focused application (current_app_) matches its substring; while a match
+    /// exists it is preferred over generic bindings for the same device.
     const device_profile* find_profile(const std::string& dev_id) const;
     /// P-APP: applies the profile that matches the currently focused application.
     /// Called from the loop thread when the GUI reports a focus change via
@@ -199,10 +221,12 @@ private:
     void apply_active_app();
     void handle_hotplug();
     void do_hotplug_scan();
-    /// P168: non-blocking HID++ notification drain hook.  Runs on the loop
-    /// thread at a bounded cadence, re-scans Logitech hidraw nodes, and
-    /// forwards classified battery/link events to log().  Never touches the
-    /// evdev/uinput motion hot path.
+    /// P168: non-blocking HID++ notification drain hook.  Runs on a DEDICATED
+    /// worker thread (not the loop thread) at a bounded cadence: re-scans
+    /// Logitech hidraw nodes, re-identifies replugged devices, drains each
+    /// transport ONCE and routes notifications to their owning device
+    /// (R8-HIDN), and forwards classified battery/link events to log().  Never
+    /// touches the evdev/uinput motion hot path.
     void poll_hidpp_notifications();
     void log(const std::string& msg, bool verbose_only = false);
 
@@ -216,6 +240,7 @@ private:
     std::thread         hidpp_thread_;
     app_config          config_;
     std::string         config_path_;
+    size_t              config_hash_ = 0;  // hash of config_ JSON for fast no-op guard (PERF-2)
     std::vector<mouse_device> devices_;
     // Guards devices_ against concurrent access from ipc_thread_ (status_json)
     // and loop_thread_ (setup/hotplug/cleanup).  Always held briefly (< 1µs typical).
@@ -259,6 +284,11 @@ private:
     // When devices_ is empty (no mice at boot, permission/conflict fixed later),
     // the loop re-scans every ~2 s instead of giving up — self-healing startup.
     double empty_rescan_ms_ = 0;
+    // R5-B: at least one candidate mouse failed transiently during the last
+    // scan and is still waiting to be reopened — keep the ~2 s self-heal
+    // rescan running even while other devices are open (declared/read on the
+    // loop thread + written by do_hotplug_scan on the same thread).
+    std::atomic<bool> rescan_needed_ { false };
 
     // ── P168: HID++ device tracking & notification drain state ─────────────
     // Only touched from the hidpp thread (no sync needed).
@@ -312,8 +342,10 @@ private:
     // Previously dormant (parsed + serialized but never read anywhere).  It is
     // now honored as a global "intercept" gate: when false the daemon does NOT
     // grab any mouse (devices stay owned by the desktop — raw passthrough at
-    // the OS level), so the flag is no longer misleading.  Loop thread only.
-    bool raw_input_enabled_ = true;
+    // the OS level), so the flag is no longer misleading.
+    // N-BUG: atomic because a SIGHUP/IPC reload may now flip it on a worker
+    // thread while the loop thread reads it inside setup_devices()/hot-plug.
+    std::atomic<bool> raw_input_enabled_ = true;
 
     // IPC server state
     std::thread         ipc_thread_;

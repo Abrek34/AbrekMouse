@@ -91,6 +91,11 @@ std::vector<uint16_t> decode_dpi_levels(const std::vector<uint8_t>& list_bytes) 
                     uint32_t next = static_cast<uint32_t>(levels.back()) + step;
                     for (; next <= last; next += step) {
                         if (next > 0xFFFF) break; // guard against uint32→uint16 truncation
+                        // R6-6: a step=1 / last=0xFFFF marker pair would
+                        // otherwise inflate the list to ~65k synthetic levels
+                        // (device-driven enumeration); no real DPI table has
+                        // more than a few hundred entries, so cap defensively.
+                        if (levels.size() >= 2048) break;
                         levels.push_back(static_cast<uint16_t>(next));
                     }
                 }
@@ -199,7 +204,10 @@ std::optional<hidpp_battery_info> parse_battery_status_feature(
     // BATTERY_STATUS is a different feature from UNIFIED_BATTERY.  Its
     // payload is discharge, next-discharge, status; the middle byte is not a
     // charging flag and must not be interpreted as one.
-    info.level = payload[0] == 0 ? 255 : payload[0];
+    // R8-BAT100: a battery instruction byte above 100 (seen on some devices)
+    // is not a valid charge level — clamp to "unknown" (255) like
+    // parse_battery_charge() already does, so the level can never exceed 100.
+    info.level = (payload[0] == 0 || payload[0] > 100) ? 255 : payload[0];
     const uint8_t status = payload[2];
     // B5: 0x02 (almost_full) is also charging, not "discharging".
     info.charging = status == 0x01 || status == 0x02 || status == 0x04;
@@ -631,6 +639,11 @@ void HidppTransport::clear_feature_cache() {
 uint8_t HidppTransport::next_sw_id() {
     const uint8_t id = static_cast<uint8_t>(next_sw_id_ & 0x0F);
     next_sw_id_ = static_cast<uint8_t>((next_sw_id_ + 1) & 0x0F);
+    // N-SWID2: the 0x0F mask wraps 15 → 0, but sw_id 0 is reserved — the
+    // device stamps every notification with it, so a command issued with 0
+    // would be served by a notification in the raw-byte matcher.  Cycle the
+    // 15 valid ids (1..15) only.
+    if (next_sw_id_ == 0) next_sw_id_ = 1;
     return id;
 }
 
@@ -641,6 +654,21 @@ bool HidppTransport::write_packet(const uint8_t* data, size_t len) {
     while (left > 0) {
         ssize_t written = write(fd_, p, left);
         if (written < 0 && errno == EINTR) continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // N-EAGAIN: the fd is opened O_NONBLOCK, so a momentarily busy
+            // device (output report queue full) returns EAGAIN instead of
+            // blocking.  Previously this was treated as fatal and the request
+            // dropped.  Wait briefly for POLLOUT and retry; only a dead/hung
+            // fd (POLLERR/HUP) or a hard error fails the write.
+            struct pollfd pfd = { fd_, POLLOUT, 0 };
+            int pr;
+            do {
+                pr = poll(&pfd, 1, 100);
+            } while (pr < 0 && errno == EINTR);
+            if (pr <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                return false;
+            continue;
+        }
         if (written <= 0) return false;
         p += written;
         left -= static_cast<size_t>(written);
@@ -652,6 +680,19 @@ bool HidppTransport::read_packet(uint8_t* buf, size_t max_len, size_t& out_len,
                                   std::chrono::milliseconds timeout) {
     out_len = 0;
     if (fd_ < 0 || !buf || max_len == 0) return false;
+    // N-FDERR: a persistent protocol-level failure (POLLERR/HUP/NVAL, EOF, or a
+    // hard read error) means the hidraw fd is dead even though the path may
+    // still exist in /dev.  Invalidate it so the daemon's drain loop re-creates
+    // the transport and re-negotiates the feature cache instead of blacking
+    // out battery/link notifications until restart.  Request-mutex serialized,
+    // so the fd_ write is safe.
+    auto dead = [this]() {
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+        return false;
+    };
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -663,8 +704,8 @@ bool HidppTransport::read_packet(uint8_t* buf, size_t max_len, size_t& out_len,
         do {
             ret = poll(&pfd, 1, static_cast<int>(poll_ms));
         } while (ret < 0 && errno == EINTR);
-        if (ret <= 0) return false;
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+        if (ret <= 0) return false; // timeout is transient — caller may retry
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return dead();
         const ssize_t n = read(fd_, buf, max_len);
         if (n > 0) {
             out_len = static_cast<size_t>(n);
@@ -672,7 +713,7 @@ bool HidppTransport::read_packet(uint8_t* buf, size_t max_len, size_t& out_len,
         }
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-        return false;
+        return dead(); // n < 0 (hard error) or n == 0 (clean EOF) → fd dead
     }
 }
 
@@ -1389,22 +1430,27 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
                != features.end();
     };
 
-    // BATTERY_STATUS function 0 and UNIFIED_BATTERY function 0x10 are
-    // intentionally separate.  Their first three bytes look similar but the
-    // middle byte means "next discharge level" only for BATTERY_STATUS.
-    if (has_feature(hidpp_feature_index::battery_status))
-        if (auto payload = feature_request(
-                static_cast<uint16_t>(hidpp_feature_index::battery_status), 0x00,
-                nullptr, 0, std::chrono::milliseconds(500),
-                target_device_index)) {
-            if (auto info = hidpp_parse_battery_status(*payload)) return info;
-        }
+    // R6-3: probe order must match preferred_battery_source()
+    // (logitech_quirks.hpp) — unified_battery → battery_status → voltage — so
+    // the GUI's capability/source display and the daemon's active battery query
+    // decode the SAME feature on devices advertising several.  Previously this
+    // probed battery_status first, disagreeing with the GUI's preference.
+    // BATTERY_STATUS fn 0 and UNIFIED_BATTERY fn 0x10 stay separate: their
+    // first three bytes look similar but the middle byte means "next discharge
+    // level" only for BATTERY_STATUS.
     if (has_feature(hidpp_feature_index::unified_battery))
         if (auto payload = feature_request(
                 static_cast<uint16_t>(hidpp_feature_index::unified_battery), 0x10,
                 nullptr, 0, std::chrono::milliseconds(500),
                 target_device_index)) {
             if (auto info = hidpp_parse_unified_battery(*payload)) return info;
+        }
+    if (has_feature(hidpp_feature_index::battery_status))
+        if (auto payload = feature_request(
+                static_cast<uint16_t>(hidpp_feature_index::battery_status), 0x00,
+                nullptr, 0, std::chrono::milliseconds(500),
+                target_device_index)) {
+            if (auto info = hidpp_parse_battery_status(*payload)) return info;
         }
     if (has_feature(hidpp_feature_index::battery_voltage))
         if (auto rsp = send_short(hidpp_feature_index::battery_voltage, 0x00,
@@ -1541,9 +1587,16 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
         info.supports_y = ((*caps)[2] & 0x01) != 0;
         info.supports_lift_off_distance = ((*caps)[2] & 0x02) != 0;
 
+        // R6-5: if the device advertises 0x2202 but its GetDpi (fn 0x05)
+        // errors out / returns a short payload, fall back to the legacy 0x2201
+        // branch below instead of failing the whole query — same shape as the
+        // B3 polling-rate fallback (a device can advertise the extended
+        // feature yet not answer the current-format read).
+        bool query_ok = false;
         if (auto current = request(hidpp_feature_index::extended_adjustable_dpi,
                                    0x5, get_caps, sizeof(get_caps));
             current && current->size() >= 5) {
+            query_ok = true;
             const uint16_t current_x = read_be16(&(*current)[1]);
             info.dpi_default = read_be16(&(*current)[3]);
             info.dpi_current = current_x != 0 ? current_x : info.dpi_default;
@@ -1554,8 +1607,6 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
             }
             if (info.supports_lift_off_distance && current->size() >= 10)
                 info.lift_off_distance = (*current)[9];
-        } else {
-            return std::nullopt;
         }
 
         // GetDpiList returns chunks.  Each chunk starts with three bytes of
@@ -1563,6 +1614,7 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
         // A device that never sends the 0x0000 terminator must not burn the
         // full 256 × 700 ms budget (BUG-01): cap with the shared budget and
         // bail after a short timeout streak.
+        if (query_ok) {
         std::vector<uint8_t> list_bytes;
         const auto dpi_deadline =
             std::chrono::steady_clock::now() + kIdentifyBudget;
@@ -1592,6 +1644,7 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
             info.dpi_max = info.dpi_levels.back();
         }
         return info;
+        }   // GetDpi failed → fall through to the legacy 0x2201 branch.
     }
 
     // ADJUSTABLE_DPI (0x2201) uses one sensor and a five-byte current/default
@@ -1992,10 +2045,14 @@ bool HidppTransport::write_onboard_profile_sector(
     uint8_t target_device_index) {
     // 0x8100 OnboardProfiles — write a single flash sector.
     // fn=0x48 write_sector: params = sector (u16 BE) + up to 16 bytes.
+    // O31-H1: chunk must be 14, NOT 16 — with chunk=16 the param vector is
+    // 2+16=18 bytes, and send_feature_request() rejects any param_len > 16
+    // (the HID++ 0x11 short-message envelope only has 16 payload bytes), so
+    // every write call returned std::nullopt → this could never write.
     auto index = resolve_feature_index(hidpp_feature_index::onboard_profiles,
                                        target_device_index);
     if (!index) return false;
-    const size_t chunk = 16;
+    const size_t chunk = 14;
     for (size_t off = 0; off < data.size(); off += chunk) {
         std::vector<uint8_t> params(2 + chunk, 0);
         params[0] = static_cast<uint8_t>(sector >> 8);

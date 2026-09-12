@@ -22,6 +22,7 @@
 #include <string>
 #include <fstream>
 #include <filesystem>
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace rawaccel;
@@ -63,10 +64,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         } guard{tmp};
 
         try {
-            {
-                std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-                f.write(input.c_str(), input.size());
-            }
+            // ROUND4-FIX (TOCTOU/symlink): a writeable fixed-name /tmp target
+            // could be pre-seeded by another local process as a symlink
+            // (std::ofstream happily follows it).  Open with O_NOFOLLOW so a
+            // symlink is refused (ELOOP → skip this input), never followed.
+            int fd = ::open(tmp.c_str(),
+                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                            0600);
+            if (fd < 0) return 0; // symlink planted or fs error — skip input
+            ssize_t w = ::write(fd, input.c_str(), input.size());
+            ::close(fd);
+            if (w < 0) return 0;
             app_config cfg = load_config(tmp);
 
             // Verify sanitization invariants on every loaded profile.

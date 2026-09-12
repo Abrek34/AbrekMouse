@@ -191,6 +191,20 @@ void widgets_to_profile(AppState* S) {
         ay.gamma            = ax.gamma;
         ay.smooth           = ax.smooth;
         ay.sync_speed       = ax.sync_speed;
+        // G2-FIX: the LUT editor only targets accel_x, so when Y is unlinked
+        // and set to "Lookup" mode its lookup data/length were never populated
+        // from the UI (no dedicated Y LUT editor).  Copy ax's raw LUT data
+        // so Y lookup mode applies the same curve rather than an empty default.
+        // R7-YLUT: only do this when Y carries NO LUT of its own.  Previously
+        // the copy was unconditional, so a config loaded from the CLI/JSON with
+        // a DISTINCT Y curve (or hand-edited asymmetric axes) silently lost the
+        // Y data on the first GUI edit + save — invisible until the daemon used
+        // it.  Preserve an existing Y LUT; keep the X→Y copy purely as the
+        // "Y never had a curve" initialization.
+        if (ay.length == 0) {
+            ay.length           = ax.length;
+            memcpy(ay.data, ax.data, sizeof(ax.data));
+        }
         // Y-axis-specific widgets:
         ay.mode             = idx_to_mode(DD(mode_combo_y));
         ay.acceleration     = SPIN(accel_spin_y);
@@ -205,6 +219,14 @@ void widgets_to_profile(AppState* S) {
     dp.prof.degrees_snap        = SPIN(snap_spin);
     dp.prof.speed_min           = SPIN(speed_min_spin);
     dp.prof.speed_max           = SPIN(speed_max_spin);
+    // R11-SPMIN: mirror the daemon's sanitize (speed_max >= speed_min when both
+    // nonzero) so an invalid combo can never be persisted — the daemon load
+    // would otherwise silently rewrite speed_max and the GUI would drift from
+    // the running config.  Snap the spin so the UI shows what is saved.
+    if (dp.prof.speed_max > 0 && dp.prof.speed_max < dp.prof.speed_min) {
+        dp.prof.speed_max = dp.prof.speed_min;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(S->speed_max_spin), dp.prof.speed_max);
+    }
     dp.prof.output_dpi          = SPIN(output_dpi_spin);
     dp.prof.lr_output_dpi_ratio = SPIN(lr_ratio_spin);
     dp.prof.ud_output_dpi_ratio = SPIN(ud_ratio_spin);
@@ -215,6 +237,12 @@ void widgets_to_profile(AppState* S) {
     {
         auto& sp = dp.prof.speed_processor_args;
         int dist_sel = DD(dist_mode_combo);
+        // R9-LPNRM: remember the last REAL Lp norm before the "Max" entry
+        // rewrites sp.lp_norm to the 9999 sentinel — the reload path restores
+        // the spin from this memory, so switching back to Lp never resurrects
+        // 9999 (which would read as "Max" and snap the combo back to Max,
+        // silently erasing the user's Lp setting on every round-trip).
+        if (dist_sel != 1) S->lp_norm_mem = SPIN(lp_norm_spin);
         // 0=Euclidean, 1=Max, 2=Lp, 3=Separate
         if      (dist_sel == 3) { sp.whole = false; }
         else if (dist_sel == 1) { sp.whole = true;  sp.lp_norm = 9999; }
@@ -344,7 +372,13 @@ void profile_to_widgets(AppState* S) {
         else if (std::fabs(sp.lp_norm - 2.0) > 1e-9)  dist_idx = 2; // lp
         else                                        dist_idx = 0; // euclidean
         SET_DD(dist_mode_combo, (guint)dist_idx);
-        SET_SPIN(lp_norm_spin,  sp.lp_norm > 0 ? sp.lp_norm : 2.0);
+        // R9-LPNRM: never feed the 9999 "Max" sentinel back into the spin —
+        // the spin's bound is 1.0..15.5 (MAX_NORM-0.5), and GTK would display
+        // a clamped value that re-saves as >= MAX_NORM (still Max).  Surface
+        // the remembered real norm instead; the combo still shows Max.
+        const double lp_shown = (sp.lp_norm >= 16 || sp.lp_norm <= 0)
+            ? S->lp_norm_mem : sp.lp_norm;
+        SET_SPIN(lp_norm_spin,  lp_shown > 0 ? lp_shown : 2.0);
         SET_SPIN(input_hl_spin,  sp.input_speed_smooth_halflife);
         SET_SPIN(scale_hl_spin,  sp.scale_smooth_halflife);
         SET_SPIN(output_hl_spin, sp.output_speed_smooth_halflife);
@@ -360,7 +394,9 @@ void profile_to_widgets(AppState* S) {
         gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo),
                                    (guint)device_combo_select(S, dp.device_id));
 
-    // P-APP: match_app entry (only when not mid-update to avoid clearing user input)
+    // P-APP: match_app entry.  Runs inside profile_to_widgets() (S->updating is
+    // true), so widgets_to_profile()'s S->updating guard ignores it — the entry
+    // write cannot clobber user input mid-typing.
     if (S->match_app_entry)
         gtk_editable_set_text(GTK_EDITABLE(S->match_app_entry),
                               dp.match_app.c_str());
@@ -413,10 +449,15 @@ struct pkexec_watch_ctx {
 
 static void pkexec_child_report(GPid p, gint status, gpointer d) {
     auto* ctx = static_cast<pkexec_watch_ctx*>(d);
-    if (ctx && ctx->S) {
+    AppState* S = ctx ? ctx->S : nullptr;
+    if (ctx && S) {
+        // P-LEAK: this watch fired and owns the ctx — clear the AppState
+        // forward-pointers so a later detach/replace doesn't double-free.
+        if (S->pkexec_watch_ctx == ctx) S->pkexec_watch_ctx = nullptr;
+        if (S->pkexec_watch_pid == p)   S->pkexec_watch_pid = 0;
         // GUI-O4: this source has fired — the tracked id is now stale.
-        if (ctx->S->pkexec_watch_id)
-            ctx->S->pkexec_watch_id = 0;
+        if (S->pkexec_watch_id)
+            S->pkexec_watch_id = 0;
         std::string detail;
         if (WIFEXITED(status)) {
             int code = WEXITSTATUS(status);
@@ -437,6 +478,33 @@ static void pkexec_child_report(GPid p, gint status, gpointer d) {
     g_spawn_close_pid(p);
 }
 
+/// Detach a pending (or finished-but-stale) pkexec watch without touching any
+/// widget: drop the source, free the ctx, and optionally SIGTERM + async-reap
+/// the abandoned child.  Reaping stays event-driven — GLib's child-watch closes
+/// the pid when the child exits, so no zombie is left behind and nothing blocks
+/// the graphics thread.  Safe to call when nothing is pending.
+/// `kill_child` = true on REPLACE (double-click: the newest user action wins),
+/// false on window destroy (an in-flight daemon start/stop should be allowed
+/// to complete in the background rather than be aborted mid-polkit).
+static void pkexec_watch_detach(AppState* S, bool kill_child) {
+    if (S->pkexec_watch_id) {
+        g_source_remove(S->pkexec_watch_id);
+        S->pkexec_watch_id = 0;
+    }
+    if (S->pkexec_watch_ctx) {
+        delete static_cast<pkexec_watch_ctx*>(S->pkexec_watch_ctx);
+        S->pkexec_watch_ctx = nullptr;
+    }
+    if (S->pkexec_watch_pid) {
+        const GPid old = S->pkexec_watch_pid;
+        S->pkexec_watch_pid = 0;
+        if (kill_child) kill(old, SIGTERM);
+        g_child_watch_add(old, [](GPid p, gint, gpointer) {
+            g_spawn_close_pid(p);
+        }, nullptr);
+    }
+}
+
 /// fork+exec hijacking pkexec; child is watchdogged via the GLib SIGCHLD
 /// mechanism.  Returns the child pid (>0) on success, -1 on fork failure.
 /// GUI-O4: the child-watch source id is stashed on AppState so the window
@@ -453,11 +521,13 @@ static pid_t pkexec_spawn(char* const argv[], AppState* S, std::string what) {
     }
     // If a previous pkexec watch is still pending (rare double-click) detach it
     // before slotting in the new one; the old child's report would be dropped.
-    if (S->pkexec_watch_id) {
-        g_source_remove(S->pkexec_watch_id);
-        S->pkexec_watch_id = 0;
-    }
+    // P-LEAK: detach also frees the old ctx and prompt-reaps the old child
+    // instead of leaking the heap context and leaving a zombie.
+    if (S->pkexec_watch_id || S->pkexec_watch_ctx || S->pkexec_watch_pid)
+        pkexec_watch_detach(S, /*kill_child=*/true);
     auto* ctx = new pkexec_watch_ctx{S, std::move(what)};
+    S->pkexec_watch_pid = pid;
+    S->pkexec_watch_ctx = ctx;
     S->pkexec_watch_id = g_child_watch_add(pid, pkexec_child_report, ctx);
     return pid;
 }
@@ -607,6 +677,10 @@ static void save_profile_as_dialog(AppState* S) {
                 S->config.profiles[existing] = dp;
                 S->current_profile_idx = existing;
             } else {
+                if (S->config.profiles.size() >= MAX_PROFILES) {
+                    set_status(S, trf("Maximum number of profiles (%d) reached.", MAX_PROFILES));
+                    return;
+                }
                 S->config.profiles.push_back(dp);
                 S->current_profile_idx = (int)S->config.profiles.size() - 1;
             }

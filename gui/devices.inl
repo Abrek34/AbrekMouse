@@ -115,7 +115,9 @@ static std::vector<InputDeviceInfo> list_mice() {
 
     fclose(f);
 
-    // Replace volatile eventN paths with stable /dev/input/by-id/... paths where possible.
+    // Replace volatile eventN paths with stable /dev/input/by-id/... paths where
+    // possible — a profile bound to by-id stays matched after a reboot even if
+    // the event numbers reshuffle.
     for (auto& m : result)
         m.event_node = resolve_stable_id(m.event_node);
 
@@ -142,8 +144,20 @@ static std::vector<InputDeviceInfo> list_mice() {
                << std::setw(4) << iid.vendor << ":"
                << std::setw(4) << iid.product << ":" << m.uniq;
             m.stable_id = ss.str();
+        } else if (!m.uniq.empty()) {
+            // R5-E: no VID/PID but a serial present — mirror the daemon's
+            // 3-tier device_id (daemon.cpp open_device: serial alone), so
+            // per-device overrides keyed on device_id still match for such
+            // devices instead of drifting apart on a by-id event_node path.
+            m.stable_id = m.uniq;
         } else {
-            m.stable_id = m.event_node; // fallback
+            // R3-NEW-3 / R8-IDT0-R: no vid/pid and no serial — use the RESOLVED
+            // event node as stable_id.  The daemon's own tier-3 fallback is its
+            // resolved dev.path (find_mice applies resolve_stable_id, daemon.cpp),
+            // so the GUI must key on the same resolved path or per-device
+            // profiles drift apart for such devices (R7-IDT0 wrongly used the
+            // raw /dev/input/eventN here — corrected in round 8).
+            m.stable_id = m.event_node;
         }
         close(tfd);
     }

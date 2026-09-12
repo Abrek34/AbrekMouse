@@ -12,6 +12,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(CheckCXXSourceCompiles)
 include(GNUInstallDirs)
 
+# R7-CMOME: warn if the install prefix is /usr/local (the cmake default).
+# The shipped systemd service hardcodes ExecStart=/usr/bin/rawaccel-daemon
+# and the udev rule installs to /usr/lib/udev/rules.d; a /usr/local install
+# places binaries there instead, breaking both.  setup.sh and PKGBUILD use /usr.
+if(CMAKE_INSTALL_PREFIX STREQUAL "/usr/local")
+    message(WARNING "CMAKE_INSTALL_PREFIX=/usr/local — the shipped "
+        "rawaccel.service expects binaries in /usr/bin.  Use "
+        "-DCMAKE_INSTALL_PREFIX=/usr or install via setup.sh/PKGBUILD.")
+endif()
+
 # ── Build options ─────────────────────────────────────────────────────────────
 option(BUILD_GUI    "Build GTK4 GUI"    ON)
 option(BUILD_DAEMON "Build daemon"      ON)
@@ -149,10 +159,31 @@ endif()
 install(FILES scripts/rawaccel.service
         DESTINATION /usr/lib/systemd/system)
 
+# ── Udev rules (level of setup.sh: input group rw on /dev/uinput + event*) ───
+install(FILES scripts/99-rawaccel.rules
+        DESTINATION /usr/lib/udev/rules.d)
+
 # ── Config dir ────────────────────────────────────────────────────────────────
-install(FILES config/default.json
-        DESTINATION /etc/rawaccel
-        RENAME settings.json)
+# R7-CMOME: never clobber a live /etc/rawaccel/settings.json — setup.sh
+# preserves it, PKGBUILD protects it via backup=(), but a plain install(FILES)
+# overwrote it unconditionally.  Copy the default only when absent.
+set(RAWACCEL_DEFAULT_CONFIG "${CMAKE_SOURCE_DIR}/config/default.json")
+install(CODE "
+    file(MAKE_DIRECTORY \"/etc/rawaccel\")
+    if(NOT EXISTS \"/etc/rawaccel/settings.json\")
+        file(COPY \"${RAWACCEL_DEFAULT_CONFIG}\" DESTINATION \"/etc/rawaccel\"
+             RENAME settings.json)
+        message(STATUS \"RawAccel: installed default config to /etc/rawaccel/settings.json\")
+    else()
+        message(STATUS \"RawAccel: keeping existing /etc/rawaccel/settings.json\")
+    endif()
+")
+
+# ── uinput module autoload (parity with setup.sh + PKGBUILD) ─────────────────
+file(WRITE "${CMAKE_BINARY_DIR}/rawaccel-modules.conf" "uinput\n")
+install(FILES "${CMAKE_BINARY_DIR}/rawaccel-modules.conf"
+        DESTINATION /usr/lib/modules-load.d
+        RENAME rawaccel.conf)
 
 # ── libinput quirks ───────────────────────────────────────────────────────────
 install(FILES scripts/rawaccel.quirks

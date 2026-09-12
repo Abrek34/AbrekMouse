@@ -9,3 +9,6 @@ yayına hazır/
 # Derleme çıktıları (setup.sh/build.sh uretir)
 build-manual/
 build/
+
+# E2E harness binary (tests/run_e2e.sh uretir) — R10-E2EBIN
+tests/e2e_harness

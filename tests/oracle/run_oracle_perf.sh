@@ -44,6 +44,14 @@ rt=$(grep '^TOTAL' "$work/ref.out"   | sed 's/.*mean_ns=\([0-9.]*\).*/\1/')
 ls=$(grep '^TOTAL' "$work/local.out" | sed 's/.*mean_cyc=\([0-9]*\).*/\1/')
 rs=$(grep '^TOTAL' "$work/ref.out"   | sed 's/.*mean_cyc=\([0-9]*\).*/\1/')
 echo "=== COMPARE: local total ns/apply = $lt ($ls cyc) | ref total ns/apply = $rt ($rs cyc)"
+# ROUND4-FIX: a run that produced no ^TOTAL line (benchmark aborted, regression
+# in oracle_perf.cpp, or a build mismatch) previously fed empty strings to
+# float() and died with a python traceback — an opaque failure.  Report the
+# real cause explicitly instead of a stack trace.
+if ! grep -Eq '^[0-9]+\.?[0-9]*$' <<<"$lt" || ! grep -Eq '^[0-9]+\.?[0-9]*$' <<<"$rt"; then
+    echo "ERROR: ^TOTAL mean_ns not found (local='$lt' ref='$rt') — oracle-perf comparison skipped." >&2
+    exit 1
+fi
 python3 - "$lt" "$rt" <<'PY'
 import sys
 l = float(sys.argv[1]); r = float(sys.argv[2])

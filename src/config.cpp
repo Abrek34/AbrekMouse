@@ -84,11 +84,16 @@ static json accel_args_to_json(const accel_args& a) {
     j["smooth"]           = a.smooth;
     j["cap"]              = { a.cap.x, a.cap.y };
     j["cap_mode"]         = cap_to_str(a.cap_mode_val);
-    // LUT data — only meaningful for lookup mode.  Guard: synchronous (GAIN)
-    // writes its internal LUT into args.data in memory; without this gate a
-    // synchronous profile would serialize those floats as if they were user
-    // lookup points (clobbering a previously saved lookup curve on reload).
-    if (a.mode == accel_mode::lookup && a.length > 0) {
+    // LUT data — meaningful in lookup mode, but the LOADED user curve must
+    // also survive a mode switch: `CLI set-param <p> mode natural` on a lookup
+    // profile followed by the automatic save used to drop lut_data (it was
+    // serialized only for lookup), silently erasing the curve forever — the
+    // next `mode lookup` came back empty.  Serializing it whenever present is
+    // safe here: this serializer only ever sees config-file args (profile_to_json
+    // callers), never the live device args that the synchronous (GAIN) internal
+    // LUT generator writes into (apply_profile mutates device.args, not the
+    // config copy the save path serializes).
+    if (a.length > 0) {
         json pts = json::array();
         for (int i = 0; i < a.length && i < (int)LUT_RAW_DATA_CAPACITY; i++)
             pts.push_back(a.data[i]);
@@ -119,8 +124,17 @@ static accel_args accel_args_from_json(const json& j) {
             throw std::runtime_error("unknown accel mode: '" + mode_str + "'");
         a.mode = m;
     }
-    if (j.contains("gain") && j["gain"].is_boolean())
-        a.gain = j["gain"].get<bool>();
+    // O31-C3: accept numeric 0 / 1 for gain as well as booleans — hand-edited
+    // config / older exporters emit 0/1, which a lenient `is_number()` read
+    // used to accept; a strict is_boolean check since P120 silently dropped
+    // such values back to the default.  Anything that is neither bool nor an
+    // integral 0/1 keeps the default (never throws).
+    if (j.contains("gain")) {
+        const auto& g = j["gain"];
+        if (g.is_boolean()) a.gain = g.get<bool>();
+        else if (g.is_number_integer() && (g.get<long long>() == 0 || g.get<long long>() == 1))
+            a.gain = (g.get<long long>() == 1);
+    }
     // P120-FAZ2 (A5-02): the 12 numeric accel_args fields are strictly
     // validated.  Administrative decision: a wrong-typed (string/object/array)
     // or non-finite (NaN/Inf, incl. overflow like 1e999) value for ANY of them
@@ -173,8 +187,13 @@ static accel_args accel_args_from_json(const json& j) {
         a.cap_mode_val = str_to_cap(cap_str);
     }
     if (j.contains("lut_data") && j["lut_data"].is_array() &&
-        j.contains("lut_length") &&
-        a.mode == accel_mode::lookup) {
+        j.contains("lut_length")) {
+        // R6-1: no mode gate (was `&& a.mode == accel_mode::lookup`) so a
+        // stored curve survives the lookup→other→lookup round-trip just like
+        // the writer above.  The reader only ever consumes JSON-serialized
+        // user state (never live device args), so loading a non-lookup profile
+        // that carries a curve is safe — the engine simply ignores it until
+        // the mode is lookup again.
         // BUG-5: nlohmann::json::get<int>() invokes UB when the JSON value
         // doesn't fit in `int` (libFuzzer + UBSan caught this with payloads
         // like `"lut_length": 1e26`).  Read as a double first, range-clamp,
@@ -199,6 +218,13 @@ static accel_args accel_args_from_json(const json& j) {
             if (v < -FLT_HI) v = -FLT_HI;
             a.data[i] = static_cast<float>(v);
         }
+        // O31-C2: a hand-edited lut_length may claim MORE pairs than lut_data
+        // actually holds (e.g. lut_length 514 with 2 floats).  Trailing slots
+        // stay at 0, so sort_lut_data lifts the dead (0,0) segment to the
+        // front and lookup() snaps every speed to gain 0 — a dead cursor that
+        // config.test_accel's round-trip would happily persist.  Pin the
+        // length to the truly-parsed pair count (even; odd tails drop).
+        a.length = static_cast<int>((n / 2) * 2);
     }
     return a;
 }
@@ -252,8 +278,14 @@ static profile profile_from_json_obj(const json& j) {
     // value (hand-edit, future schema drift) degrades to the default instead
     // of throwing type_error and making the entire config unloadable (which
     // would also leave the daemon falling back to defaults).
-    if (j.contains("raw_passthrough") && j["raw_passthrough"].is_boolean())
-        p.raw_passthrough = j["raw_passthrough"].get<bool>();
+    // O31-C3: accept numeric 0 / 1 for raw_passthrough as well as booleans
+    // (symmetric with gain above) — never throws on a wrong type.
+    if (j.contains("raw_passthrough")) {
+        const auto& rp = j["raw_passthrough"];
+        if (rp.is_boolean()) p.raw_passthrough = rp.get<bool>();
+        else if (rp.is_number_integer() && (rp.get<long long>() == 0 || rp.get<long long>() == 1))
+            p.raw_passthrough = (rp.get<long long>() == 1);
+    }
     if (j.contains("domain_weights")) {
         auto& dw = j["domain_weights"];
         if (dw.is_array() && dw.size() >= 2) {
@@ -692,7 +724,20 @@ app_config load_config(const std::string& path) {
     return cfg;
 }
 
-void save_config(const app_config& cfg, const std::string& path) {
+void save_config(const app_config& cfg, const std::string& arg_path) {
+    // O31-C5: an atomic tmp+rename overwrite of a SYMLINKED config path would
+    // replace the symlink itself with a regular file, silently detaching the
+    // user's `~/.config/rawaccel/settings.json -> /etc/rawaccel/settings.json`
+    // link.  Resolve any symlink to its real target up front (the rename and
+    // the .bak hard-link then operate on the target inode, and the symlink
+    // keeps working).  A nonexistent or dangling link just keeps arg_path —
+    // canoncal() cannot resolve it, so the first save creates a real file.
+    std::string path = arg_path;
+    {
+        std::error_code ec_canon;
+        fs::path canon = fs::canonical(arg_path, ec_canon);
+        if (!ec_canon) path = canon.string();
+    }
     fs::path parent_path = fs::path(path).parent_path();
     if (!parent_path.empty())
         fs::create_directories(parent_path);
@@ -844,6 +889,55 @@ std::string profile_to_json(const device_profile& p) {
 device_profile profile_from_json(const std::string& json_str) {
     // device_profile_from_json already calls sanitize_* on load
     return device_profile_from_json(json::parse(json_str));
+}
+
+/// R12-IMPLUT: pre-sanitize LUT size validation for importers (GUI; CLI has its
+/// own copy at cli/main.cpp).  The parsing path below *clamps* an over-capacity
+/// LUT and *floors* an odd element count during load, so a naive import silently
+/// accepts a curve that differs from the file on disk — the CLI rejects these
+/// up front (O31-L1 size check, P120-FAZ2) and the GUI must too.  Returns "" on
+/// OK, else a human-readable problem description (not a tr() key — callers wrap
+/// it with their own context).
+///
+/// The raw JSON is re-parsed here because every structured parser that can
+/// report lengths is also a sanitizer; we deliberately DON'T reuse
+/// profile_from_json for the check.  That would leave the GUI's LUT-max guard
+/// dead code (widgets_sync.inl truncation warning) — identical mismatch as the
+/// CLI import proved worth rejecting.
+std::string check_import_lut_size(const std::string& json_str) {
+    try {
+        const json j = json::parse(json_str);
+        auto check = [](const json& root, const char* axis_key,
+                        const char* axis_name) -> std::string {
+            if (!root.contains("profile") || !root["profile"].is_object())
+                return std::string();
+            const json& args = root["profile"];
+            if (!args.contains(axis_key) || !args[axis_key].is_object())
+                return std::string();
+            const json& ax = args[axis_key];
+            if (!ax.contains("lut_data") || !ax["lut_data"].is_array())
+                return std::string();
+            const size_t n = ax["lut_data"].size();
+            if (n % 2 != 0 || n / 2 > LUT_POINTS_CAPACITY) {
+                std::string msg = "LUT (" + std::string(axis_name) + " axis) has " +
+                                  std::to_string(n) + " raw elements (" +
+                                  std::to_string(n / 2) + " points";
+                if (n % 2 != 0) msg += ", with an odd element count";
+                msg += "); maximum is " + std::to_string(LUT_POINTS_CAPACITY) +
+                       " points (" + std::to_string(LUT_RAW_DATA_CAPACITY) +
+                       " raw elements).";
+                return msg;
+            }
+            return std::string();
+        };
+        std::string x = check(j, "accel_x", "X");
+        if (!x.empty()) return x;
+        return check(j, "accel_y", "Y");
+    } catch (const std::exception&) {
+        // Malformed JSON is reported properly by profile_from_json on the
+        // actual import; the size pre-check is best-effort only.
+        return std::string();
+    }
 }
 
 /// Sanitize a device_profile in-place (useful for values set programmatically).

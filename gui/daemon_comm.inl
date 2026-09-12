@@ -3,6 +3,7 @@
 #include <sys/un.h>
 #include <cerrno>
 #include <climits>
+#include <charconv>
 
 // ── KDE / libinput acceleration detection ────────────────────────────────────
 
@@ -145,8 +146,14 @@ static std::string daemon_ipc_send_raw(const std::string& req, int timeout_ms = 
         struct timeval tv;
         tv.tv_sec  = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // P-SOCK: a failed setsockopt (invalid fd/socket type) leaves the
+        // socket with unbounded timeouts — a wedged daemon could then block
+        // the GUI's main thread indefinitely.  Fail the candidate loudly.
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
+            close(fd);
+            continue;
+        }
 
         sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
@@ -184,6 +191,9 @@ static std::string daemon_ipc_send_raw(const std::string& req, int timeout_ms = 
         while (resp.size() < MAX_IPC_RESPONSE_BYTES) {
             ssize_t n = recv(fd, buf, sizeof(buf), 0);
             if (n == 0) { complete = true; break; } // peer closed — clean EOF
+            // R12-EINTR: mirror the send loop — a signal (e.g. SIGCHLD reaping
+            // a pkexec child) must not discard a perfectly good response.
+            if (n < 0 && errno == EINTR) continue;
             if (n < 0)  break;                      // timeout / error — incomplete
             resp.append(buf, (size_t)n);
             if (resp.find('\n') != std::string::npos) { complete = true; break; }
@@ -204,21 +214,28 @@ static std::string daemon_ipc_query(const std::string& cmd, int timeout_ms = 150
 /// the daemon so app-scoped profiles (`match_app`) can be live-applied.  The
 /// daemon stashes the value on the loop thread and re-applies profiles only
 /// when the app actually changed.  Empty string = "no app focused".
-static void daemon_ipc_set_active_app(const std::string& wm_class) {
+/// Returns true only if the daemon acknowledged the report ("ok":true).
+/// false = the one-shot 150 ms report timed out (busy serial IPC server) or the
+/// daemon is down — the caller may schedule a bounded retry.
+static bool daemon_ipc_set_active_app(const std::string& wm_class) {
     std::string norm;
     norm.reserve(wm_class.size());
     for (char c : wm_class) {
         // Keep it to safe ASCII: WM_CLASS class is lowercase ASCII already, but
-        // guard against hostile/spread values from the compositor.
+        // guard against hostile/spread values from the compositor.  R8-DIGIT:
+        // digits MUST survive (e.g. WM_CLASS "1password") — dropping them made
+        // digit-containing classes unmatchable by the daemon's match_app.
         if (c >= 'a' && c <= 'z') norm.push_back(c);
         else if (c >= 'A' && c <= 'Z') norm.push_back(static_cast<char>(c + ('a' - 'A')));
+        else if (c >= '0' && c <= '9') norm.push_back(c);
         else if (c == '.' || c == '_' || c == '-' || c == '/' || c == '@')
             norm.push_back(c);
         // anything else dropped — substring matching in the daemon only ever
         // sees a trimmed, URL-safe-ish class token.
     }
-    daemon_ipc_query("set_active_app " + (norm.empty() ? std::string("none") : norm),
-                     /*timeout_ms=*/150);
+    return daemon_ipc_query("set_active_app " + (norm.empty() ? std::string("none") : norm),
+                             /*timeout_ms=*/150)
+               .find("\"ok\":true") != std::string::npos;
 }
 
 /// Push the full config to the daemon over IPC (the daemon's "set_config" RPC).
@@ -227,14 +244,24 @@ static void daemon_ipc_set_active_app(const std::string& wm_class) {
 /// user's ~/.config — and live-applies it.  Uses a 5 s timeout: the daemon
 /// blocks only until it has fsync'd its root-owned config file (that path was
 /// tighter than 100 ms in the original design).  Works for any input-group user.
-/// Returns true only if the daemon acknowledged the config.
-bool daemon_ipc_push_config(const std::string& json) {
+/// Returns 1 = acknowledged ("ok":true), 0 = responded but REJECTED
+/// ("ok":false — the running daemon kept its old config), -1 = no usable
+/// response (daemon down, pre-RPC daemon binary, or 5 s timeout).  The caller
+/// must NOT treat 0 like "no response": a SIGHUP fallback on 0 would make a
+/// root systemd daemon re-read its own STALE config file and fake success.
+int daemon_ipc_push_config(const std::string& json, std::string* resp_out) {
     std::string req = "set_config " + std::to_string(json.size()) + "\n" + json;
-    return daemon_ipc_send_raw(req, 5000)
-        .find("\"ok\":true") != std::string::npos;
+    std::string resp = daemon_ipc_send_raw(req, 5000);
+    if (resp_out) *resp_out = resp;
+    if (resp.find("\"ok\":true") != std::string::npos) return 1;
+    if (resp.find("\"ok\":false") != std::string::npos) return 0;
+    return -1;
 }
 
-/// True when the process at /proc/<pid> is genuinely the rawaccel daemon.
+/// 1 = the process at /proc/<pid> is genuinely the rawaccel daemon,
+/// 0 = definitely NOT the daemon (a different readable binary, or the process
+///     is gone),
+/// -1 = unverifiable (the kernel hid the identity — restricted /proc).
 /// Guards against stale PID files whose PID was recycled by an unrelated
 /// process (BUG-07) AND against the R5-S-1 comm-spoofing vector: /proc/<pid>/comm
 /// can be faked by any process with prctl(PR_SET_NAME), but /proc/<pid>/exe is a
@@ -245,7 +272,11 @@ bool daemon_ipc_push_config(const std::string& json) {
 /// it can return EACCES.  In that case we fall back to the comm check alone so a
 /// permission restriction never silently kills daemon detection — the attack
 /// surface is still reduced wherever the kernel lets us verify the real binary.
-static bool pid_is_rawaccel_daemon(pid_t pid) {
+/// R12-PIDUNL: callers must treat -1 conservatively — NEVER unlink a PID file
+/// whose owner could not be identified, because a hardened /proc makes a LIVE
+/// root daemon look exactly like a stale file.  This mirrors the daemon's own
+/// PID-3 rule (daemon/main.cpp) which refuses to clear possibly-live entries.
+static int pid_probe_rawaccel_daemon(pid_t pid) {
     char proc_root[64];
     snprintf(proc_root, sizeof(proc_root), "/proc/%d", (int)pid);
 
@@ -259,10 +290,10 @@ static bool pid_is_rawaccel_daemon(pid_t pid) {
             exe[n] = '\0';
             const char* base = strrchr(exe, '/');
             base = base ? base + 1 : exe;
-            if (strcmp(base, "rawaccel-daemon") != 0) return false;
-        } else if (errno == ENOENT || errno == ESRCH) {
-            return false; // process gone
+            if (strcmp(base, "rawaccel-daemon") == 0) return 1;
+            return 0; // readable binary that is NOT our daemon — definitively stale
         }
+        if (errno == ENOENT || errno == ESRCH) return 0; // process gone
         // else EACCES/EPERM (restricted /proc): fall through to the comm check.
     }
 
@@ -270,14 +301,20 @@ static bool pid_is_rawaccel_daemon(pid_t pid) {
     char comm_path[96];
     snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_root);
     FILE* cf = fopen(comm_path, "r");
-    if (!cf) return false; // no such process (or no permission)
+    if (!cf) {
+        // Preserve 0-vs--1: a gone process is definitive, an unreadable comm
+        // without ENOENT/ESRCH means the identity could not be verified.
+        if (errno == ENOENT || errno == ESRCH) return 0;
+        return -1;
+    }
     char comm[64] = {};
     // Zero-init guarantees a NUL terminator even if fgets yields nothing.
     (void)!fgets(comm, sizeof(comm), cf);
     fclose(cf);
     size_t len = strlen(comm);
     if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
-    return strcmp(comm, "rawaccel-daemon") == 0;
+    if (strcmp(comm, "rawaccel-daemon") == 0) return 1;
+    return 0;
 }
 
 pid_t read_daemon_pid() {
@@ -304,11 +341,18 @@ pid_t read_daemon_pid() {
                 pid = static_cast<pid_t>(v);
         }
         fclose(fp);
-        if (pid > 0 && pid_is_rawaccel_daemon(pid)) return pid;
+        if (pid > 0 && pid_probe_rawaccel_daemon(pid) == 1) return pid;
         // BUG-07: stale PID file (PID recycled, or a dead daemon left it
         // behind) — remove it so future lookups never signal the wrong
         // process and the /proc fallback below gets a clean slate.
-        if (pid > 0) unlink(path.c_str());
+        // R12-PIDUNL: remove ONLY a DEFINITIVELY stale file (probe == 0 — a
+        // readable process that is NOT the daemon, or a PID that is gone).  A
+        // probe of -1 (unverifiable identity, restricted /proc) must NEVER be
+        // unlinked: hidepid makes a LIVE root daemon indistinguishable from a
+        // stale file, and the GUI would otherwise destroy the daemon's own lock
+        // file it copied into $XDG_RUNTIME_DIR.  Mirrors the daemon's PID-3
+        // conservatism (daemon/main.cpp pid_file_is_live).
+        if (pid > 0 && pid_probe_rawaccel_daemon(pid) == 0) unlink(path.c_str());
     }
 
     // 2. Fallback: scan /proc for rawaccel-daemon process name
@@ -326,14 +370,15 @@ pid_t read_daemon_pid() {
             // BUG-6: atoi(d_name) is UB if the directory name doesn't fit in
             // `int`.  /proc only exposes numeric PIDs (pid_t, typically
             // 4194304 max) but be defensive — strtol + range check first, then
-            // delegate to pid_is_rawaccel_daemon() (identical identity logic to
-            // the PID-file path, including the /proc/<pid>/exe anti-spoof check).
+            // delegate to pid_probe_rawaccel_daemon() (identical identity
+            // logic to the PID-file path, including the /proc/<pid>/exe
+            // anti-spoof check).
             errno = 0;
             char* end = nullptr;
             long v = strtol(ent->d_name, &end, 10);
             if (end != ent->d_name && errno == 0 && v > 0 && v <= INT_MAX) {
                 pid_t pid = static_cast<pid_t>(v);
-                if (pid_is_rawaccel_daemon(pid)) {
+                if (pid_probe_rawaccel_daemon(pid) == 1) {
                     closedir(proc);
                     return pid;
                 }
@@ -471,15 +516,35 @@ double daemon_device_field(const std::string& resp, AppState* S, const char* key
     size_t end = slice.find_first_of(",}", start);
     if (end == std::string::npos || end <= start) return -1;
     std::string val = slice.substr(start, end - start);
-    errno = 0;
-    char* e = nullptr;
-    double v = std::strtod(val.c_str(), &e);
-    if (e == val.c_str() || errno != 0 || !std::isfinite(v)) return -1;
+    // R6-2: the daemon emits C-locale decimals (append_fixed style `45.703`),
+    // but the GUI calls setlocale(LC_ALL,"") for i18n — std::strtod honors the
+    // new LC_NUMERIC and silently truncated at a comma separator (de_DE,
+    // fr_FR, …), showing whole-number telemetry/latency.  std::from_chars is
+    // locale-independent; it also requires the WHOLE slice to be consumed, so
+    // a stray trailing byte can't pass as a valid number.
+    double v = 0;
+    const char* begin = val.c_str();
+    const char* endp  = begin + val.size();
+    const auto res =
+        std::from_chars(begin, endp, v, std::chars_format::general);
+    if (res.ec != std::errc() || res.ptr != endp || !std::isfinite(v)) return -1;
     return v;
 }
 
 void update_daemon_status(AppState* S) {
+    // Audit-GUI-1: this is also reachable from one-shot g_timeout_add
+    // callbacks (on_daemon_start/stop/reload) that are NOT tracked for
+    // g_source_remove — a destroyed window must not touch widgets.
+    if (S->window_destroyed) return;
     bool running = daemon_running();
+    if (running && !S->daemon_prev_running) {
+        // R8-RESEND: daemon (re)started since the last poll.  App focus is
+        // normally pushed by the KWin relay ONLY on a focus change, so a
+        // daemon down/up cycle would leave app-scoped profiles inactive until
+        // the user switches windows.  Re-send the last known WM_CLASS.
+        kwin_focus_resend_current(S);
+    }
+    S->daemon_prev_running = running;
     if (running) {
         gtk_label_set_markup(GTK_LABEL(S->daemon_status),
             tr("<span foreground='#40c040'>● Daemon running</span>"));

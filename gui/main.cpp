@@ -51,9 +51,16 @@ void save_config_now(AppState* S) {
         // A plain SIGHUP only makes the daemon re-read its own (stale) config.
         // Fall back to SIGHUP for old daemons that predate the IPC RPC.
         std::string json = app_config_to_json(S->config);
-        bool applied = daemon_ipc_push_config(json);
+        std::string push_resp;
+        int push_rc = daemon_ipc_push_config(json, &push_resp);
+        bool applied = (push_rc == 1);
+        bool rejected = (push_rc == 0);
         bool sighup_fallback = false;
-        if (!applied) {
+        // SIGHUP fallback ONLY for "no response" (pre-RPC daemon binary /
+        // daemon busy / daemon down).  On an explicit REJECTION a SIGHUP would
+        // make a root systemd daemon re-read its own STALE config file and
+        // fake success — keep the honest error instead.
+        if (push_rc < 0) {
             std::string sig_err;
             applied = daemon_send_signal(SIGHUP, &sig_err);
             sighup_fallback = applied;
@@ -67,9 +74,25 @@ void save_config_now(AppState* S) {
             // SIGHUP only makes the daemon re-read its OWN config at
             // /etc/rawaccel/settings.json — not the GUI's config file.
             status_msg = trf("Saved locally & signaled daemon (reload only): %s", S->config_path.c_str());
+        } else if (rejected) {
+            // Daemon is up and explicitly refused the new config — the running
+            // daemon still has the OLD config.  Surface the daemon's reason.
+            std::string daemon_err;
+            const std::string pat = "\"error\":\"";
+            size_t e0 = push_resp.find(pat);
+            if (e0 != std::string::npos) {
+                size_t b = e0 + pat.size();
+                size_t e1 = push_resp.find('"', b);
+                if (e1 != std::string::npos)
+                    daemon_err = push_resp.substr(b, e1 - b);
+            }
+            status_msg = trf("Saved locally, but the daemon REJECTED the new config (old config kept): %s",
+                             S->config_path.c_str());
+            if (!daemon_err.empty())
+                status_msg += std::string(" — ") + daemon_err;
         } else {
-            // Distinguish "daemon is down" from "daemon is up but rejected the
-            // config" — both mean the running daemon still has the OLD config.
+            // Distinguish "daemon is down" from "daemon is up but unresponsive"
+            // — both mean the running daemon still has the OLD config.
             status_msg = daemon_running()
                 ? trf("Saved locally, but the daemon was not updated: %s", S->config_path.c_str())
                 : trf("Saved locally, but the daemon is not running: %s", S->config_path.c_str());
@@ -157,29 +180,36 @@ int main(int argc, char* argv[]) {
     }
     state.lang_path = (fs::path(state.config_path).parent_path() / "gui_lang").string();
 
-    try {
-        state.config = load_config(state.config_path);
-    } catch (const std::exception& e) {
-        // M-8/R2-04: never silently overwrite a corrupt config with defaults.
-        // Stash the offending file aside (best-effort) so its contents are
-        // recoverable, then load a default profile and surface the warning.
-        std::string backup = state.config_path + ".corrupt-" +
-                             std::to_string(time(nullptr));
-        std::error_code ec;
-        fs::copy_file(state.config_path, backup,
-                      fs::copy_options::overwrite_existing, ec);
-        if (ec)
-            state.config_load_warn = trf("Config load error (%s) — defaults loaded; could not back up %s.",
-                                         e.what(), state.config_path.c_str());
-        else
-            state.config_load_warn = trf("Config load error (%s) — corrupt file backed up to %s; defaults loaded.",
-                                         e.what(), backup.c_str());
-        device_profile dp;
-        dp.name = "default";
-        dp.dev_cfg.dpi = 800;
-        dp.dev_cfg.polling_rate = 1000;
-        state.config.profiles.push_back(dp);
+    if (fs::exists(state.config_path)) {
+        try {
+            state.config = load_config(state.config_path);
+        } catch (const std::exception& e) {
+            // M-8/R2-04: never silently overwrite a corrupt config with defaults.
+            // Stash the offending file aside (best-effort) so its contents are
+            // recoverable, then load a default profile and surface the warning.
+            std::string backup = state.config_path + ".corrupt-" +
+                                 std::to_string(time(nullptr));
+            std::error_code ec;
+            fs::copy_file(state.config_path, backup,
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec)
+                state.config_load_warn = trf("Config load error (%s) — defaults loaded; could not back up %s.",
+                                             e.what(), state.config_path.c_str());
+            else
+                state.config_load_warn = trf("Config load error (%s) — corrupt file backed up to %s; defaults loaded.",
+                                             e.what(), backup.c_str());
+            device_profile dp;
+            dp.name = "default";
+            dp.dev_cfg.dpi = 800;
+            dp.dev_cfg.polling_rate = 1000;
+            state.config.profiles.push_back(dp);
+        }
     }
+    // R5-D: a missing config is a normal first-run, not a corrupt one — don't
+    // flash the ".corrupt-" backup alarm for a file that never existed (the
+    // old catch-all copied a nonexistent file, failed, and called the failed
+    // copy a "corrupt config" worth warning about).  The empty-profiles guard
+    // below seeds the default profile either way.
     if (state.config.profiles.empty()) {
         device_profile dp; dp.name = "default";
         state.config.profiles.push_back(dp);

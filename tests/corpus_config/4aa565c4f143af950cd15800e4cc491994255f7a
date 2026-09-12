@@ -1,0 +1,1 @@
+{"le":"a","profiles":[{"ningYrate":1000,"profile":{"accel_x":{"limitdecay_limit":2},"accel_y":{"mode":"pnwer","":0.5,"uxponent_power":1.5}}},{"name":"b","profile":{"accel_x":{"mode":"jump","smoo":[[20,2]]}}}]}

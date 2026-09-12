@@ -71,5 +71,8 @@ run_phase raw
 
 echo
 echo "=== RESULT: phases=$((PASS+FAIL+SKIP)) passed=$PASS skipped=$SKIP failed=$FAIL ==="
+# R10-E2EX: a real failed check must not be masked as an environment skip
+# (77) just because another phase also skipped — check FAIL before SKIP.
+if [[ $FAIL -gt 0 ]]; then exit 1; fi
 if [[ $SKIP -gt 0 ]]; then exit 77; fi
-[[ $FAIL -eq 0 ]] && exit 0 || exit 1
+exit 0

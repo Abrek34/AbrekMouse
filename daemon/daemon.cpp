@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <set>
+#include <functional>
 #include <time.h>
 
 namespace rawaccel {
@@ -478,8 +479,9 @@ bool AccelDaemon::start(const std::string& config_path) {
             config_.profiles.push_back(dp);
             config_.active_profile = "default";
         }
+        config_hash_ = std::hash<std::string>{}(app_config_to_json(config_));
         // PAS-1: the top-level use_raw_input flag is now a real master switch.
-        raw_input_enabled_ = config_.use_raw_input;
+        raw_input_enabled_.store(config_.use_raw_input, std::memory_order_relaxed);
     }
 
     // ── epoll setup ───────────────────────────────────────────────────────────
@@ -598,22 +600,56 @@ bool AccelDaemon::push_config(const std::string& json_str) {
         // and make save_config() operate on an empty path.
         if (!running_.load(std::memory_order_acquire) || config_path_.empty())
             return false;
+        // R10-PUSHG: a revert pushed while the PREVIOUS push is still armed
+        // but not yet applied would slip through the guard below (it compares
+        // against the APPLIED config).  Snapshot the pending config up front;
+        // push_cfg_mu_ is released before devices_mutex_ is taken below to
+        // keep the same lock order as the loop thread (push_cfg_mu_ →
+        // devices_mutex_, never simultaneously here).
+        bool has_pending = false;
+        std::string pending_json;
+        {
+            std::lock_guard<std::mutex> lk(push_cfg_mu_);
+            if (push_cfg_pending_) {
+                pending_json = app_config_to_json(push_cfg_);
+                has_pending = true;
+            }
+        }
         app_config cfg = app_config_from_json(json_str);
         {
-            // T8 — no-op guard: if the pushed config matches the currently
-            // effective one, skip the disk write and the re-apply entirely.
-            // config_ is guarded by devices_mutex_ (written in apply_new_config),
-            // so read it under the same mutex.
+            // PERF-2: no-op guard using hash of JSON (avoids double serialization).
+            // config_hash_ is guarded by devices_mutex_ (updated in apply_new_config).
             std::lock_guard<std::mutex> lk(devices_mutex_);
-            if (app_config_to_json(cfg) == app_config_to_json(config_)) {
+            std::string new_json = app_config_to_json(cfg);
+            if (has_pending && new_json == pending_json) {
+                log("Config push skipped (matches pending un-applied config).", true);
+                return true;
+            }
+            size_t new_hash = std::hash<std::string>{}(new_json);
+            if (new_hash == config_hash_) {
+                log("Config push skipped (no-op guard: hash unchanged).", true);
+                return true;
+            }
+            // Hash differs — do full JSON comparison as fallback (hash collision defense).
+            if (new_json == app_config_to_json(config_)) {
+                config_hash_ = new_hash; // sync hash for future fast path
                 log("Config push skipped (no-op guard: content unchanged).", true);
                 return true;
             }
         }
-        {
+            {
             // Enqueue for the save worker.  Off the IPC thread: a slow disk
             // must never stall a status/save IPC round-trip.
+            // N-SAVEQ: each entry is a FULL config snapshot and the daemon only
+            // ever applies the newest one, so any backlog ahead of this push is
+            // already obsolete — coalesce (drop the backlog) instead of letting
+            // a fast client grow the deque without bound at fsync speed.  An
+            // in-flight save has already been popped, so it is never disturbed.
             std::lock_guard<std::mutex> lk(save_q_mu_);
+            if (!save_q_.empty()) {
+                save_q_.clear();
+                log("Config push coalesced (N pending saves dropped).", true);
+            }
             save_q_.emplace_back(std::move(cfg), config_path_);
         }
         log("Config push queued for save (" + config_path_ + ").", true);
@@ -747,7 +783,23 @@ bool AccelDaemon::create_virtual_device(mouse_device& dev) {
         return false;
     }
 
-    std::string vname = dev.name + " (RawAccel)";
+    std::string vname;
+    {
+        // R8-VNAME: uinput truncates the device name at 79 bytes.  A long
+        // source name would silently clip the trailing "(RawAccel)"
+        // self-identification marker — the daemon's name filter
+        // (is_physical_mouse) would then no longer recognize its own vdev,
+        // and a later hot-plug scan could grab the output device → double
+        // acceleration.  Truncate the BASE name so the marker always survives.
+        constexpr size_t kMaxUinputName = 79;          // UINPUT_MAX_NAME_SIZE - 1
+        constexpr size_t kMarkerLen = 11;              // strlen(" (RawAccel)")
+        constexpr const char* kMarker = " (RawAccel)";
+        if (dev.name.size() + kMarkerLen > kMaxUinputName)
+            vname = dev.name.substr(0, kMaxUinputName - kMarkerLen);
+        else
+            vname = dev.name;
+        vname += kMarker;
+    }
     libevdev_set_name(src, vname.c_str());
     libevdev_set_uniq(src, nullptr);
 
@@ -832,7 +884,7 @@ bool AccelDaemon::setup_devices() {
 
         // PAS-1: honour the top-level use_raw_input master switch (formerly
         // dormant — wired as the daemon's "intercept" gate).
-        if (!raw_input_enabled_) {
+        if (!raw_input_enabled_.load(std::memory_order_relaxed)) {
             log("Raw-input disabled in config — skipping device: " + dev.name, true);
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
@@ -867,6 +919,14 @@ bool AccelDaemon::setup_devices() {
         if (!create_virtual_device(dev)) {
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
+            // R7-UVIRT: uinput create failures (missing/unpermitted /dev/uinput)
+            // are usually persistent — without a deny entry the setup scan
+            // re-opens, re-grabs, re-releases the same node every cycle (log +
+            // syscall churn while the failure persists).  Not setting missed_any
+            // / rescan_needed_ here: the deny window gates the retry cadence and
+            // the ~2 s empty/transient rescan stays available for transient cases.
+            deny_reopen(dev.path, dev.device_id,
+                        path_deny_until_ms_, dev_deny_until_ms_);
             continue;
         }
 
@@ -999,11 +1059,31 @@ void AccelDaemon::apply_active_app() {
     current_app_ = next;
 
     // Recompute the active profile for every open device, live (no grab drop).
+    // LIVE-DISABLE: a profile that the app-switch just enabled/disabled is
+    // applied/released in place — a device switched to a disabled profile is
+    // released immediately instead of staying grabbed until replug.
     std::lock_guard<std::mutex> lk(devices_mutex_);
-    for (auto& dev : devices_) {
-        const device_profile* prof = find_profile(dev.device_id);
-        if (prof) apply_profile(dev, *prof);
+    for (auto it = devices_.begin(); it != devices_.end();) {
+        const device_profile* prof = find_profile(it->device_id);
+        if (prof && prof->dev_cfg.disable) {
+            log("Active profile became disabled — releasing: " + it->name, true);
+            release_device(*it);
+            it = devices_.erase(it);
+        } else {
+            if (prof) apply_profile(*it, *prof);
+            ++it;
+        }
     }
+    fd_to_dev_.clear();
+    for (size_t i = 0; i < devices_.size(); i++)
+        fd_to_dev_[devices_[i].fd_in] = i;
+    // R10-REGRB: the focus switch may have re-enabled a profile for a device
+    // that a previous switch live-released (it is no longer in devices_, so
+    // the loop above could not apply it).  Kick the self-heal scan — it re-
+    // opens devices that now match an enabled profile and skips still-disabled
+    // ones (HP-1 gate), so a released device reappears within the ~2 s cadence
+    // once its profile is active again.
+    rescan_needed_.store(true);
 }
 
 void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
@@ -1028,6 +1108,16 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     // the GUI.  Zeroing samples makes status_json() report telem_ok=false
     // (cheap: two relaxed stores + a release; not on the per-event path, only
     // on profile applies).
+    // R7-TELSR: seqlock-safe reset.  The hot path (flush_motion) bumps samples
+    // ODD → writes payload → bumps EVEN, so the reader only pairs a snapshot
+    // when both acquire-loads of the counter match.  The old reset zeroed the
+    // payload and then store(0) directly: a reader that had already loaded the
+    // PREVIOUS even counter could pair it with a partially-zeroed payload on
+    // weak-memory hardware and pass s1==s2.  Mark the generation ODD (fetch_add
+    //  release) BEFORE zeroing, then close with the 0 sentinel (release) — any
+    // in-flight reader now observes ODD (mismatch/derailed) or 0 (telem_ok
+    // =false), and never a stale-even pairing with torn zeros.
+    dev.telemetry->samples.fetch_add(1, std::memory_order_release); // odd: in-progress
     dev.telemetry->speed_ips.store(0.0, std::memory_order_relaxed);
     dev.telemetry->out_ips.store(0.0, std::memory_order_relaxed);
     dev.telemetry->gain.store(0.0, std::memory_order_relaxed);
@@ -1039,6 +1129,24 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     dev.telemetry->dy.store(0.0, std::memory_order_relaxed);
     dev.telemetry->wall_ms.store(0.0, std::memory_order_relaxed);
     dev.telemetry->samples.store(0, std::memory_order_release);
+    // R12-LATRAW: the in-place telemetry reset above handles telem_* fields,
+    // but the per-device latency histogram (lat_stats) is separate and only
+    // flushed by flush_motion() — which never runs in raw passthrough.  On the
+    // transition INTO raw 1:1 passthrough, clear it so the status JSON stops
+    // publishing stale accel-era lat_* fields (AGENTS.md: raw passthrough must
+    // NOT carry telemetry).  Narrow to raw so a live accel tuning reload never
+    // wipes a histogram a user is actively reading.
+    // R13-REALRATE: the measured polling rate has the exact same contract — it
+    // is produced only by the flush_motion ring feed (below), which never runs
+    // in raw mode.  Zero it AND drop the ring's sample history so the status
+    // JSON stops publishing the last accel-era rate and a raw→accel switch
+    // re-measures fresh from real frame intervals.
+    if (prof.prof.raw_passthrough) {
+        dev.lat.reset();
+        dev.telemetry->real_polling_rate.store(0, std::memory_order_relaxed);
+        dev.frame_ev_us_count = 0;
+        dev.frame_ev_us_next = 0;
+    }
     // R3-NEW-3: re-anchor the speed interval.  last_time_ms starts at 0 and —
     // critically — is NOT updated while the previous profile was in raw
     // passthrough (flush_motion() never runs there).  Without this refresh, the
@@ -1056,6 +1164,31 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     }
 }
 
+void AccelDaemon::release_device(mouse_device& dev) {
+    // LIVE-DISABLE: called from apply_new_config()/apply_active_app() while
+    // holding devices_mutex_.  Mirrors the disconnect-cleanup teardown
+    // (daemon.cpp cleanup loop) for a device whose matched profile just became
+    // disabled on a live reload — without this, the disable checkbox was only
+    // honoured at setup/hotplug time and the device stayed grabbed+accelerated
+    // until replug.
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, dev.fd_in, nullptr) < 0)
+        log("disable-release: epoll_ctl(del) failed for " + dev.path + ": " +
+            std::string(strerror(errno)), true);
+    fd_to_dev_.erase(dev.fd_in);
+    opened_paths_.erase(dev.path);
+    if (!dev.device_id.empty())
+        opened_device_ids_.erase(dev.device_id);
+    if (dev.uidev) {
+        libevdev_uinput_destroy(dev.uidev);
+        dev.uidev = nullptr;
+    }
+    if (dev.fd_in >= 0) {
+        ioctl(dev.fd_in, EVIOCGRAB, 0);
+        close(dev.fd_in);
+        dev.fd_in = -1;
+    }
+}
+
 // ── Shared config apply path (SIGHUP reload + IPC config push) ────────────────
 
 void AccelDaemon::apply_new_config(const app_config& new_cfg) {
@@ -1068,14 +1201,30 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
     {
         std::lock_guard<std::mutex> lk(devices_mutex_);
         config_ = new_cfg;
-        for (auto& dev : devices_) {
-            const device_profile* prof = find_profile(dev.device_id);
-            if (prof) {
-                apply_profile(dev, *prof);
+        config_hash_ = std::hash<std::string>{}(app_config_to_json(config_));
+        for (auto it = devices_.begin(); it != devices_.end();) {
+            const device_profile* prof = find_profile(it->device_id);
+            if (prof && prof->dev_cfg.disable) {
+                // LIVE-DISABLE: a reload/push that turned a device's profile off
+                // must release the grab RIGHT NOW (release_device removes it from
+                // epoll + the open sets and closes fd/uinput) — the old code
+                // skipped applying but left the device grabbed+accelerated until
+                // replug.
+                log("Live reload disabled a grabbed device — releasing: " + it->name, true);
+                release_device(*it);
+                it = devices_.erase(it);
+            } else if (prof) {
+                apply_profile(*it, *prof);
                 any_live = true;
-                log("Live-updated profile for: " + dev.name, true);
+                log("Live-updated profile for: " + it->name, true);
+                ++it;
+            } else {
+                ++it;
             }
         }
+        fd_to_dev_.clear();
+        for (size_t i = 0; i < devices_.size(); i++)
+            fd_to_dev_[devices_[i].fd_in] = i;
     }
 
     if (!any_live) {
@@ -1103,6 +1252,28 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
                 log("Reload: no devices available after reload.");
         }
     }
+
+    // N-BUG: the PAS-1 use_raw_input master switch was read only at start(), so
+    // a reload/push that toggled it silently kept the OLD grab state — devices
+    // stayed grabbed after the flag turned false (the daemon kept accelerating
+    // a "raw" config), and re-enabling grabbed nothing until a restart.  The
+    // grab set must follow the flag, so release everything on a turn-off and
+    // re-scan on a turn-on (teardown/setup take devices_mutex_ themselves).
+    const bool raw_now = config_.use_raw_input;
+    if (raw_now != raw_input_enabled_.load(std::memory_order_relaxed)) {
+        teardown_devices();
+        raw_input_enabled_.store(raw_now, std::memory_order_relaxed);
+        if (raw_now) {
+            if (!setup_devices())
+                log("Reload: no devices available after raw-input re-enable.");
+        }
+    }
+    // R10-REGRB: this push may have re-enabled a profile whose device was
+    // live-released earlier (it is no longer in devices_, so the loop above
+    // cannot touch it).  Ask the self-heal scan to re-open now-matching
+    // devices; do_hotplug_scan skips still-disabled profiles (HP-1), and the
+    // flag clears itself once nothing is left to pick up.
+    rescan_needed_.store(true);
     log("Config reloaded.");
 }
 
@@ -1137,6 +1308,15 @@ void AccelDaemon::do_hotplug_scan() {
     // Check for newly added mice
     auto mice = find_mice();
 
+    // R5-B: does any candidate mouse still need to be (re)opened?  Set on
+    // transient failures (EIO, reopen-backoff, uinput/create error) so the
+    // ~2 s self-heal rescan keeps running even while another device is open —
+    // previously a second failed mouse was NEVER retried once devices_ was
+    // non-empty.  Permanent gates (raw_input disabled, profile disabled,
+    // duplicate device_id) intentionally do NOT set it — retrying them is a
+    // no-op and would spam the log.
+    bool missed_any = false;
+
     // P121/BUG-02: prune the deny list — a path that is no longer listed in
     // /dev/input (real unplug) or whose backoff window expired is retryable.
     const double nowt = now_ms();
@@ -1148,7 +1328,15 @@ void AccelDaemon::do_hotplug_scan() {
         // P121/BUG-02: skip paths still in a backoff window (recent I/O error).
         auto dn = path_deny_until_ms_.find(path);
         if (dn != path_deny_until_ms_.end()) {
-            if (nowt < dn->second) continue;
+            if (nowt < dn->second) {
+                // R10-EIO: keep the self-heal cadence alive THROUGH the deny
+                // window.  The window gates how often a transiently-failed
+                // device is retried (P121/BUG-02), so skipping it must leave
+                // missed_any set — otherwise rescan_needed_ clears after one
+                // scan and the periodic rescan (and the retry) stops forever.
+                missed_any = true;
+                continue;
+            }
             path_deny_until_ms_.erase(dn); // window expired — allow retry
         }
         log("Hot-plug: new mouse detected at " + path);
@@ -1158,6 +1346,7 @@ void AccelDaemon::do_hotplug_scan() {
         if (!open_input_device(dev)) {
             // P121/BUG-02: opening keeps failing on a dead-but-listed node
             // (EIO etc.); back it off so we don't retry every ~2 s forever.
+            missed_any = true; // transient — keep the periodic rescan going
             deny_reopen(path, dev.device_id, path_deny_until_ms_, dev_deny_until_ms_);
             continue;
         }
@@ -1169,7 +1358,23 @@ void AccelDaemon::do_hotplug_scan() {
                 " (" + dev.device_id + ")", true);
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
+            missed_any = true; // backoff window may expire later — keep rescanning
             deny_reopen(path, dev.device_id, path_deny_until_ms_, dev_deny_until_ms_);
+            continue;
+        }
+
+        // HP-3 (hot-plug): same physical device already open under another
+        // eventN node (HID-composite / multi-interface mice expose several REL
+        // nodes with one device_id).  setup_devices() guards this with
+        // opened_device_ids_ but do_hotplug_scan only checked opened_paths_ —
+        // a second node for a grabbed device was re-grabbed, duplicating every
+        // physical report through a second uinput.
+        if (!dev.device_id.empty() &&
+            opened_device_ids_.count(dev.device_id)) {
+            log("Hot-plug: duplicate device_id already grabbed — skipping: " +
+                dev.name + " (" + dev.device_id + ")", true);
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
             continue;
         }
 
@@ -1177,7 +1382,7 @@ void AccelDaemon::do_hotplug_scan() {
         // this, the idle rescan re-captures mice that use_raw_input=false or a
         // dev_cfg.disable profile said to leave alone — "safe mode" silently
         // violated on every hot-plug cycle.
-        if (!raw_input_enabled_) {
+        if (!raw_input_enabled_.load(std::memory_order_relaxed)) {
             log("Hot-plug: raw-input disabled in config — skipping device: " +
                 dev.name, true);
             ioctl(dev.fd_in, EVIOCGRAB, 0);
@@ -1196,6 +1401,13 @@ void AccelDaemon::do_hotplug_scan() {
         if (!create_virtual_device(dev)) {
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
+            missed_any = true; // uinput/create failure is transient — retry soon
+            // R7-UVIRT: deny under both keys so the rescan skips this node until
+            // the window expires (usb:VVVV:...: + eventN paths) instead of
+            // re-opening/re-grabbing/re-releasing it every ~2 s while the
+            // failure persists.  remove-after plan in deny_reopen comment.
+            deny_reopen(dev.path, dev.device_id,
+                        path_deny_until_ms_, dev_deny_until_ms_);
             continue;
         }
 
@@ -1211,6 +1423,7 @@ void AccelDaemon::do_hotplug_scan() {
             if (dev.uidev) libevdev_uinput_destroy(dev.uidev);
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
+            missed_any = true; // registration failure is transient — retry soon
             continue;
         }
 
@@ -1260,6 +1473,11 @@ void AccelDaemon::do_hotplug_scan() {
             close(dev.fd_in);
         }
     }
+
+    // R5-B: publish whether a self-heal rescan is still pending so run_loop
+    // keeps the ~2 s retry cadence alive until every candidate either opens or
+    // lands in a permanent gate.
+    rescan_needed_.store(missed_any);
 }
 
 // ── P171-BFIX: HID++ notification drain (background-thread hook) ───────────
@@ -1280,25 +1498,32 @@ void AccelDaemon::run_hidpp_worker() {
 
 /// BUG-24 (aj2): a HID++ battery reading (live notification or active query)
 /// is merged into the evdev mouse_device whose stable id matches the hidpp
-/// device's vendor:product.  When several mice share the id (typical for mice
-/// behind one Unifying receiver) we deliberately label nothing rather than
-/// risk painting the wrong device; the reading is still logged.
+/// device.  For directly connected mice, match by vendor:product.  For mice
+/// behind a Unifying receiver, the HID++ device info contains the mouse's
+/// serial number — match by that instead.  When several mice share the same
+/// identifier we deliberately label nothing rather than risk painting the wrong
+/// device; the reading is still logged.
 void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
                                       const hidpp_battery_info& b) {
     if (b.level == 255) return; // unknown level — nothing meaningful to merge
-    char needle[16] = {};
-    char needle_dash[16] = {};
-    std::snprintf(needle, sizeof(needle), "%04x:%04x", dev.vendor_id, dev.product_id);
-    std::snprintf(needle_dash, sizeof(needle_dash), "%04x-%04x",
-                  dev.vendor_id, dev.product_id);
-    std::string haystack = std::string(needle) + "/" + needle_dash;
+
+    std::string needle;
+    // Prefer the HID++ device's serial number (mouse's serial) for matching,
+    // as this uniquely identifies the mouse even behind a Unifying receiver.
+    // Fall back to vendor:product for directly connected mice without serial.
+    if (!dev.info.serial.empty()) {
+        needle = dev.info.serial;
+    } else {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04x:%04x", dev.vendor_id, dev.product_id);
+        needle = buf;
+    }
 
     std::lock_guard<std::mutex> lk(devices_mutex_);
     mouse_device* match = nullptr;
     int match_count = 0;
     for (auto& m : devices_) {
-        if (m.device_id.find(needle) != std::string::npos ||
-            m.device_id.find(needle_dash) != std::string::npos) {
+        if (m.device_id.find(needle) != std::string::npos) {
             match = &m;
             match_count++;
         }
@@ -1311,10 +1536,10 @@ void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
         }
     } else if (match_count == 0) {
         log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
-                "% (no evdev mouse matched vid:pid " + haystack + ")", true);
+                "% (no evdev mouse matched id " + needle + ")", true);
     } else {
         log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
-                "% (multiple mice share vid:pid " + haystack +
+                "% (multiple mice share id " + needle +
                 " — not merged)", true);
     }
 }
@@ -1350,14 +1575,19 @@ void AccelDaemon::poll_hidpp_notifications() {
                 hidpp_devs_.begin(), hidpp_devs_.end(),
                 [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
             if (known) continue; // already identified; drain only
-            if (auto dev = identify_logitech_device(path)) {
+            // Use identify_logitech_devices (plural) to detect all device indices
+            // on this hidraw node (receiver 0xFF, direct 0x00, paired 0x01-0x06).
+            // identify_logitech_device (singular) only tries 0xFF/0x00 and would
+            // miss mice behind a Unifying receiver.
+            for (auto& dev : identify_logitech_devices(path)) {
                 // protocol_version 0 = Logitech hidraw node with no HID++
                 // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
                 // UI/CLI display entry only and has no battery or notification
                 // stream to subscribe to.
-                if (dev->info.protocol_version == 0) continue;
-                log("HID++ device detected: " + path, true);
-                hidpp_devs_.push_back(std::move(*dev));
+                if (dev.info.protocol_version == 0) continue;
+                log("HID++ device detected: " + path + " (idx=0x" +
+                    std::to_string(static_cast<int>(dev.device_index)) + ")", true);
+                hidpp_devs_.push_back(std::move(dev));
             }
         }
     }
@@ -1375,40 +1605,6 @@ void AccelDaemon::poll_hidpp_notifications() {
             if (!transport_ptr->is_open()) continue;
             transport_ptr->clear_feature_cache();
         }
-        transport_ptr->set_device_index(dev.device_index);
-        drain_hidpp_notifications(
-            *transport_ptr, dev, 8,
-            [this, &dev](const hidpp_notification_event& event) {
-                switch (event.kind) {
-                case hidpp_notification_event_kind::battery:
-                    if (event.battery) {
-                        // BUG-24 (aj2): surface live battery notifications on
-                        // the mouse device, not just the log line.
-                        dev.battery_level = event.battery->level;
-                        apply_hidpp_battery(dev, *event.battery);
-                        const std::string level = event.battery->level == 255
-                            ? "unknown" : std::to_string(event.battery->level) + "%";
-                        log("HID++ battery: dev " +
-                                std::to_string(event.device_index) + " " + level +
-                                (event.battery->charging ? " (charging)" : ""),
-                            true);
-                    }
-                    break;
-                case hidpp_notification_event_kind::connection:
-                    log("HID++ link: dev " + std::to_string(event.device_index) +
-                            (event.connected ? " connected" : " disconnected"),
-                        true);
-                    break;
-                case hidpp_notification_event_kind::illumination:
-                    log("HID++ illumination event: dev " +
-                            std::to_string(event.device_index),
-                        true);
-                    break;
-                case hidpp_notification_event_kind::generic:
-                case hidpp_notification_event_kind::unhandled:
-                    break;
-                }
-            });
 
         // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.  Wireless
         // receivers/pairings that advertise neither a sysfs power-supply tree
@@ -1419,6 +1615,77 @@ void AccelDaemon::poll_hidpp_notifications() {
             if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
                 dev.battery_level = b->level;
                 apply_hidpp_battery(dev, *b);
+            }
+        }
+    }
+
+    // R8-HIDN: a Unifying/Nano receiver exposes ONE hidraw node shared by all
+    // paired devices.  The old loop drained that SAME kernel fd once PER device;
+    // the 0xFF "shell" entry (always first in hidpp_devs_) consumed every queued
+    // notification, and the R6-4 filter then dropped the events that named other
+    // device indexes — so paired mice receiver NO live battery/link notifications
+    // (only the 60 s active query, which is why the symptom was "battery only
+    // updates once a minute").  Drain ONCE per unique transport and route every
+    // notification to the device its device_index names, classifying it against
+    // that device's OWN feature map.
+    std::vector<std::string> drained_paths;
+    for (const auto& anchor : hidpp_devs_) {
+        if (std::find(drained_paths.begin(), drained_paths.end(),
+                      anchor.hidraw_path) != drained_paths.end())
+            continue;
+        drained_paths.push_back(anchor.hidraw_path);
+        auto& transport_ptr = hidpp_transports_[anchor.hidraw_path];
+        if (!transport_ptr || !transport_ptr->is_open()) continue;
+
+        for (const auto& notification :
+             transport_ptr->drain_notifications(8, std::chrono::milliseconds(0))) {
+            // Route to the OWNING device: notifications are classified against
+            // the target's own feature cache (hidpp_device::notification_feature_id).
+            hidpp_device* target = nullptr;
+            for (auto& d : hidpp_devs_) {
+                if (d.hidraw_path != anchor.hidraw_path) continue;
+                if (d.device_index == notification.device_index) { target = &d; break; }
+            }
+            if (!target) {
+                // 0xFF broadcast, or a device index we have not identified yet:
+                // attach to the first device on this transport (same attribution
+                // the old code produced for whichever device it happened to drain).
+                for (auto& d : hidpp_devs_) {
+                    if (d.hidraw_path == anchor.hidraw_path) { target = &d; break; }
+                }
+            }
+            if (!target) continue;
+
+            const auto event = classify_hidpp_notification(*target, notification);
+            if (event.kind == hidpp_notification_event_kind::unhandled) continue;
+            switch (event.kind) {
+            case hidpp_notification_event_kind::battery:
+                if (event.battery) {
+                    // BUG-24 (aj2): surface live battery notifications on
+                    // the mouse device, not just the log line.
+                    target->battery_level = event.battery->level;
+                    apply_hidpp_battery(*target, *event.battery);
+                    const std::string level = event.battery->level == 255
+                        ? "unknown" : std::to_string(event.battery->level) + "%";
+                    log("HID++ battery: dev " +
+                            std::to_string(event.device_index) + " " + level +
+                            (event.battery->charging ? " (charging)" : ""),
+                        true);
+                }
+                break;
+            case hidpp_notification_event_kind::connection:
+                log("HID++ link: dev " + std::to_string(event.device_index) +
+                        (event.connected ? " connected" : " disconnected"),
+                    true);
+                break;
+            case hidpp_notification_event_kind::illumination:
+                log("HID++ illumination event: dev " +
+                        std::to_string(event.device_index),
+                    true);
+                break;
+            case hidpp_notification_event_kind::generic:
+            case hidpp_notification_event_kind::unhandled:
+                break;
             }
         }
     }
@@ -1441,9 +1708,21 @@ void AccelDaemon::run_loop() {
         {
             std::lock_guard<std::mutex> lk(push_cfg_mu_);
             if (push_cfg_pending_) {
-                apply_new_config(push_cfg_);
-                push_cfg_pending_ = false;
-                log("Applied config pushed over IPC.", true);
+                // R10-PUSHTC: mirror the SIGHUP reload path below — if the
+                // apply throws (allocations in the profile/logging string
+                // paths), the loop thread must not die via std::terminate.
+                // Clear the flag either way so a stuck config is never
+                // re-applied on every iteration (it stays on disk and takes
+                // effect on the next daemon start).
+                try {
+                    apply_new_config(push_cfg_);
+                    push_cfg_pending_ = false;
+                    log("Applied config pushed over IPC.", true);
+                } catch (std::exception& e) {
+                    log("Config push apply failed (keeping current): " +
+                        std::string(e.what()));
+                    push_cfg_pending_ = false;
+                }
             }
         }
 
@@ -1478,6 +1757,9 @@ void AccelDaemon::run_loop() {
         // permission/conflict that later cleared), force a scan every ~2 s even
         // without an inotify event — so the daemon converges on its own instead
         // of waiting for an unplug/replug.  Cheap: find_mice() on retired fds.
+        // R5-B: also keeps scanning while rescan_needed_ is set — a device that
+        // failed with a transient error gets retried even when others are open
+        // (previously a second failed mouse was never revisited).
         // L-BUG-2: snapshot the emptiness under the lock — devices_ is a
         // std::vector and reading .empty() unsynchronized while another thread
         // (hotplug) mutates it is a data race.
@@ -1486,7 +1768,7 @@ void AccelDaemon::run_loop() {
             std::lock_guard<std::mutex> lk(devices_mutex_);
             devices_empty = devices_.empty();
         }
-        if (devices_empty) {
+        if (devices_empty || rescan_needed_.load()) {
             const double t = now_ms();
             if (t >= empty_rescan_ms_) {
                 empty_rescan_ms_ = t + 2000.0;
@@ -1567,6 +1849,13 @@ void AccelDaemon::run_loop() {
                     // renumber (eventN → eventM) can't bypass the backoff.
                     deny_reopen(dit->path, dit->device_id,
                                 path_deny_until_ms_, dev_deny_until_ms_);
+                    // R10-EIO: a transient I/O error dropped this device from
+                    // the grab set while another device is still open.  Kick
+                    // the self-heal rescan so it is revisited once the 5 s
+                    // deny window expires (do_hotplug_scan keeps the cadence
+                    // alive through the window — see R10-EIO there); without
+                    // this the device was never re-grabbed until replug.
+                    rescan_needed_.store(true);
                     disc_devs.push_back(std::move(*dit));
                     dit = devices_.erase(dit);
                 } else {
@@ -1601,13 +1890,6 @@ static inline uint64_t now_ns() {
            static_cast<uint64_t>(ts.tv_nsec);
 }
 
-/// Write a single event to uinput; returns false if the write fails
-/// (indicating the virtual device is dead — caller should mark dev as disconnected).
-static inline bool uinput_write(libevdev_uinput* uidev, unsigned int type,
-                                unsigned int code, int value) {
-    return libevdev_uinput_write_event(uidev, type, code, value) == 0;
-}
-
 /// Retry a uinput write after EAGAIN.  RAC-1: the uinput fd is O_NONBLOCK (set
 /// in create_virtual_device) so a slow consumer (compositor stall) can NEVER
 /// block the hot path — when the kernel buffer is full a write returns EAGAIN
@@ -1616,7 +1898,11 @@ static inline bool uinput_write(libevdev_uinput* uidev, unsigned int type,
 /// (EPIPE/ENODEV/EBADF) that the caller turns into a disconnect.  The attempt
 /// budget is bounded so a fully-stuck consumer costs at most ~120 ms of motor
 /// stutter (dropping the tail) instead of a deadlocked loop thread.
-static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbytes) {
+/// always-respected no-op default keeps the single-event raw-path callers
+/// unchanged (a lone dropped event is harmless); the batched flush passes the
+/// daemon's log() so a dropped SYN frame is visible.
+static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbytes,
+                               const std::function<void(const std::string&)>& report = {}) {
     constexpr int   kMaxAttempts = 32;
     constexpr int   kMinDelayUs  = 50;
     constexpr int   kMaxDelayUs  = 4000;
@@ -1642,7 +1928,46 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
         done += static_cast<size_t>(got);
         if (done >= nbytes) return true;
     }
+    // R5-A: attempt budget exhausted with `done < nbytes` — the tail (usually
+    // the closing SYN_REPORT) was dropped.  The documented RAC-1 trade-off
+    // keeps this behavior (drop the tail, never disconnect — a torn frame
+    // merges with the next one; tearing down the device mid-stall is worse),
+    // but the caller must not be told "all clear": a silent drop masked these
+    // on every compositor/kernel stall.  Surface it through the report hook,
+    // throttled to one message per ~2 s so a fully-stuck consumer can't flood
+    // the log.
+    if (done < nbytes) {
+        static double last_log_ms = -1e9;
+        const double   now_l      = now_ms();
+        if (last_log_ms < 0 || now_l - last_log_ms >= 2000.0) {
+            last_log_ms = now_l;
+            if (report) report("uinput write stalled: dropped " +
+                               std::to_string(nbytes - done) +
+                               " tail byte(s) of a " +
+                               std::to_string(nbytes) +
+                               "-byte frame after " +
+                               std::to_string(kMaxAttempts) + " attempts).");
+        }
+    }
     return true;
+}
+
+/// RAC-1 (raw path): single-event variant with the same bounded EAGAIN
+/// absorption as the batched path.  The raw-passthrough and overflow paths
+/// originally called libevdev_uinput_write_event() directly — on the
+/// O_NONBLOCK uinput fd (set in create_virtual_device) a transient
+/// compositor/kernel stall returns -EAGAIN, which used to tear the virtual
+/// device down and flap the mouse until the next ~2 s scan.
+static inline bool uinput_write_retry_ev(libevdev_uinput* uidev,
+                                         unsigned int type, unsigned int code,
+                                         int value) {
+    const int fd = uinput_fd(uidev);
+    if (fd < 0) return false;
+    input_event ev{};
+    ev.type  = type;
+    ev.code  = code;
+    ev.value = value;
+    return uinput_write_retry(fd, &ev, sizeof(ev));
 }
 
 /// P93-BATCH (PERF): accumulate output events in a small stack buffer and submit
@@ -1654,6 +1979,10 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
 struct write_batch {
     input_event evs[16];
     size_t      n = 0;
+    // R5-A: invoked when the bounded EAGAIN budget runs out and a whole frame
+    // tail (usually the closing SYN) is dropped.  Set by process_device to the
+    // daemon's log() so the silent-drop case becomes diagnosable.
+    std::function<void(const std::string&)> drop_report;
 
     bool add(unsigned int type, unsigned int code, int value) {
         if (n >= 16) return false;
@@ -1691,7 +2020,8 @@ struct write_batch {
         if (n == 0) return true;
         const int fd = uinput_fd(uidev);
         if (fd < 0) return false;
-        const bool ok = uinput_write_retry(fd, evs, n * sizeof(input_event));
+        const bool ok = uinput_write_retry(fd, evs, n * sizeof(input_event),
+                                           drop_report);
         n = 0;
         return ok;
     }
@@ -1786,7 +2116,15 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         // this threshold; silent devices rely on it.
         const double kIdleGapMs = DEFAULT_TIME_MAX; // ≥100 ms without frames = true idle
         if (gap_ms >= kIdleGapMs) {
-            time_ms = 1000.0 / std::max(dev.poll_rate, static_cast<int>(POLL_RATE_MIN));
+            // SM-4/…-FIX: re-measure against the best-known polling rate.
+            // Priority: real-time measured (from event timestamps) > sysfs-detected > profile nominal.
+            // The real_polling_rate is computed from median kernel frame intervals (POLL-1 fix).
+            const double det_hz = dev.telemetry->real_polling_rate.load(std::memory_order_relaxed) > 0
+                ? static_cast<double>(dev.telemetry->real_polling_rate.load(std::memory_order_relaxed))
+                : (dev.detected_polling_rate > 0
+                    ? static_cast<double>(dev.detected_polling_rate)
+                    : static_cast<double>(dev.poll_rate));
+            time_ms = 1000.0 / std::max(det_hz, static_cast<double>(POLL_RATE_MIN));
         } else {
             time_ms = gap_ms;
         }
@@ -1804,6 +2142,49 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     if (time_ms < DEFAULT_TIME_MIN) time_ms = DEFAULT_TIME_MIN;
     if (time_ms > DEFAULT_TIME_MAX) time_ms = DEFAULT_TIME_MAX;
     dev.last_time_ms = now;
+    // R11-POLL-1: feed the real polling-rate ring HERE, while last_frame_ev_us
+    // still holds the PREVIOUS frame base (the SM-1 interval above is exactly
+    // what we measure).  The old feed site lived in the SYN handler's
+    // empty-frame path and sampled AFTER this function had advanced the anchor,
+    // so on this motion path it always measured interval 0 and the ring only
+    // ever filled from empty frames — a device that always moves silently
+    // starved real_polling_rate and SM-4 / the status JSON fell back to
+    // sysfs/nominal.
+    if (dev.last_frame_ev_us != 0 && frame_ev_us > dev.last_frame_ev_us) {
+        uint64_t interval_us = frame_ev_us - dev.last_frame_ev_us;
+        // Only accept reasonable intervals (0.1ms - 10ms = 100Hz-10kHz)
+        if (interval_us >= 100 && interval_us <= 10000) {
+            dev.frame_ev_us_samples[dev.frame_ev_us_next] = interval_us;
+            dev.frame_ev_us_next =
+                (dev.frame_ev_us_next + 1) % mouse_device::POLL_RATE_SAMPLES;
+            if (dev.frame_ev_us_count < mouse_device::POLL_RATE_SAMPLES)
+                dev.frame_ev_us_count++;
+            // Compute median polling rate from samples
+            if (dev.frame_ev_us_count >= 4) {
+                uint64_t sorted[mouse_device::POLL_RATE_SAMPLES];
+                int n = dev.frame_ev_us_count;
+                for (int k = 0; k < n; ++k)
+                    sorted[k] = dev.frame_ev_us_samples[k];
+                // Simple insertion sort for small array
+                for (int k = 1; k < n; ++k) {
+                    uint64_t key = sorted[k];
+                    int j = k - 1;
+                    while (j >= 0 && sorted[j] > key) {
+                        sorted[j + 1] = sorted[j];
+                        j--;
+                    }
+                    sorted[j + 1] = key;
+                }
+                uint64_t median_us = sorted[n / 2];
+                if (median_us > 0) {
+                    int rate_hz = static_cast<int>(1000000.0 / median_us + 0.5);
+                    if (rate_hz >= 100 && rate_hz <= 10000)
+                        dev.telemetry->real_polling_rate.store(
+                            rate_hz, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
     // Advance the kernel-frame anchor so consecutive frames measure their own
     // true intervals (the SYN that closed this frame is the next frame's base).
     if (frame_ev_us != 0) dev.last_frame_ev_us = frame_ev_us;
@@ -1860,6 +2241,7 @@ void AccelDaemon::process_device(mouse_device& dev) {
     // Everything a frame produces (motion REL, queued buttons, SYN) flushes in
     // ONE write() at the real SYN_REPORT instead of one syscall per event.
     write_batch out;
+    out.drop_report = [this](const std::string& m) { log(m); };
 
     // R1-08: a pathological/foreign device that never signals EAGAIN could
     // spin this drain loop forever and hold the whole loop thread.  Cap each
@@ -2024,12 +2406,29 @@ for (size_t i = 0; i < read_count; ++i) {
             }
             if (ev.code != SYN_REPORT) {
                 // RAC-5: only a genuine SYN_REPORT delimits an output frame.
-                // Other SYN subtypes (SYN_MT_REPORT, SYN_CONFIG…) are forwarded
-                // unchanged between events WITHOUT flushing accumulated motion —
-                // they do not close a frame, so flushing here would split it.
-                if (!uinput_write(uidev, ev.type, ev.code, ev.value))
-                    { dev.disconnected = true; return; }
-                wrote_unsynced_event = true;
+                // Other SYN subtypes (SYN_MT_REPORT, SYN_CONFIG…) do NOT close
+                // a frame, so flushing accumulated motion here would split it.
+                // R8-SYNMT: in accel mode the matching slot data (ABS_MT_*) is
+                // queued for the frame SYN, so writing a SYN_MT_REPORT inline
+                // would emit it BEFORE its slot data — an order inversion that
+                // breaks libinput's touch tracking.  Queue it with the frame
+                // and let the SYN_REPORT flush preserve source order.  Raw
+                // passthrough keeps the 1:1 inline contract.
+                if (dev.settings.prof.raw_passthrough) {
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                        { dev.disconnected = true; return; }
+                    wrote_unsynced_event = true;
+                } else if (queued_count < queued_events.size()) {
+                    queued_events[queued_count++] = ev;
+                } else {
+                    // Pathological >16-event burst: forwarding the subtype now
+                    // (before its queued slot data) beats dropping it.
+                    if (!flush_queued()) return;
+                    if (!out.flush(uidev)) { dev.disconnected = true; return; }
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                        { dev.disconnected = true; return; }
+                    wrote_unsynced_event = true;
+                }
                 continue;
             }
             // ── Genuine SYN_REPORT: real frame boundary ──
@@ -2052,7 +2451,16 @@ for (size_t i = 0; i < read_count; ++i) {
             // SYN's values — setting them again is idempotent.  Silent devices
             // (no frames at all during idle) are covered by the kIdleGapMs
             // re-measurement inside flush_motion instead.
-            if (frame_ev_us != 0) dev.last_frame_ev_us = frame_ev_us;
+            if (frame_ev_us != 0) {
+                // R11-POLL-1: the real polling-rate ring is fed inside
+                // flush_motion (motion path), where the PREVIOUS anchor is
+                // still intact — sampling here, after flush_motion advanced
+                // the anchor, always measured interval 0 for motion frames.
+                // This empty-frame path keeps ONLY the SM-4 anchor re-advance:
+                // idle devices that keep emitting empty SYN_REPORTs must not
+                // measure the whole idle gap on their next motion frame.
+                dev.last_frame_ev_us = frame_ev_us;
+            }
             dev.last_time_ms = now_ms();
             // P93-BATCH: close this frame with ONE write() syscall — the motion
             // REL plus any queued non-motion events and the closing SYN_REPORT
@@ -2076,7 +2484,7 @@ for (size_t i = 0; i < read_count; ++i) {
                 // this caused subtly different cursor feel even in raw mode.
                 // Skip accumulation entirely in this mode.
                 if (dev.settings.prof.raw_passthrough) {
-                    if (!uinput_write(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 } else if (ev.code == REL_X) {
@@ -2087,7 +2495,16 @@ for (size_t i = 0; i < read_count; ++i) {
             } else {
                 // Wheel / tilt / other relative axes — SM-2: buffer and write
                 // at the frame SYN instead of flushing the motion early.
-                if (queued_count < queued_events.size()) {
+                // RAW-FIX: in raw_passthrough mode forward EVERY event
+                // immediately (not just REL_X/REL_Y) so the output stream
+                // order matches the source exactly.  Queuing a wheel/tilt event
+                // until the SYN would reorder it behind a raw REL already
+                // forwarded — violating the 1:1 bit-faithful contract.
+                if (dev.settings.prof.raw_passthrough) {
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                        { dev.disconnected = true; return; }
+                    wrote_unsynced_event = true;
+                } else if (queued_count < queued_events.size()) {
                     queued_events[queued_count++] = ev;
                 } else {
                     // A run of >16 pre-SYN non-motion events is pathological;
@@ -2096,7 +2513,7 @@ for (size_t i = 0; i < read_count; ++i) {
                     // non-motion group early changes no interval).
                     if (!flush_queued()) return;
                     if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                    if (!uinput_write(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 }
@@ -2104,12 +2521,20 @@ for (size_t i = 0; i < read_count; ++i) {
         } else {
             // Buttons / misc — SM-2: buffer and write at the frame SYN instead
             // of flushing the motion early.
-            if (queued_count < queued_events.size()) {
+            // RAW-FIX: same 1:1 forwarding guarantee as the REL branch — buttons
+            // must never wait for the frame SYN while earlier raw REL events are
+            // already written (a press that lags its motion can mis-slot into
+            // libinput's frame classification on some compositors).
+            if (dev.settings.prof.raw_passthrough) {
+                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    { dev.disconnected = true; return; }
+                wrote_unsynced_event = true;
+            } else if (queued_count < queued_events.size()) {
                 queued_events[queued_count++] = ev;
             } else {
                 if (!flush_queued()) return;
                 if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                if (!uinput_write(uidev, ev.type, ev.code, ev.value))
+                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
                     { dev.disconnected = true; return; }
                 wrote_unsynced_event = true;
             }
@@ -2137,9 +2562,14 @@ for (size_t i = 0; i < read_count; ++i) {
     // Close any frame that accumulated WRITTEN events (raw passthrough REL or
     // forwarded SYN subtypes) but never saw a SYN.  This is the only remaining
     // place a synthetic SYN_REPORT is emitted — for non-motion data only, where
-    // no interval semantics are affected.
-    if (wrote_unsynced_event) {
-        if (!uinput_write(uidev, EV_SYN, SYN_REPORT, 0))
+    // no interval semantics are affected.  R7-RAWSYN: in raw passthrough the
+    // written events ARE motion; the real source SYN_REPORT arrives in the next
+    // batch and closes the frame there.  Emitting a synthetic SYN here would
+    // split one kernel frame into [REL][SYN_synth][SYN_real] — a double-SYN /
+    // extra empty frame that violates the T-B1 byte-identical 1:1 contract,
+    // exactly the LOW-1 asymmetry the accel path was rebuilt to avoid.
+    if (wrote_unsynced_event && !dev.settings.prof.raw_passthrough) {
+        if (!uinput_write_retry_ev(uidev, EV_SYN, SYN_REPORT, 0))
             { dev.disconnected = true; return; }
         wrote_unsynced_event = false;
     }
@@ -2179,7 +2609,14 @@ void AccelDaemon::dump_latency_stats() {
             snaps.push_back(std::move(s));
         }
     }
-    // Lock released — all stdout I/O is now lock-free.
+    // R1-04 RACE: the stdout report must be serialised against log() — the
+    // loop/hidpp/ipc threads can be writing log lines (also std::cout) while
+    // this SIGUSR1/IPC dump prints, interleaving and racing iostream's shared
+    // buffers.  log_mu_ is taken ONLY AFTER devices_mutex_ was released so the
+    // lock order matches the rest of the codebase (devices_mutex_ → log_mu_,
+    // as in apply_new_config which logs under devices_mutex_) — never both at
+    // once in the other order.
+    const std::lock_guard<std::mutex> lk(log_mu_);
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "=== RawAccel Processing Latency ===\n";
     if (snaps.empty()) {
@@ -2315,7 +2752,7 @@ std::string AccelDaemon::status_json() const {
 
 struct DevSnap {
         std::string name, path, device_id;
-        int dpi, poll_rate, detected_dpi, detected_polling_rate, detected_battery;
+        int dpi, poll_rate, detected_dpi, detected_polling_rate, real_polling_rate, detected_battery;
         lat_stats::snapshot lat_snap;   // P136: histogram copy (math runs lock-free below)
         bool     has_lat = false;       // lat_snap.count > 0
         uint64_t lat_count = 0;
@@ -2338,6 +2775,7 @@ struct DevSnap {
             s.dpi = dev.dpi; s.poll_rate = dev.poll_rate;
             s.detected_dpi = dev.detected_dpi;
             s.detected_polling_rate = dev.detected_polling_rate;
+            s.real_polling_rate = dev.telemetry->real_polling_rate.load(std::memory_order_relaxed);
             s.detected_battery = dev.detected_battery;
 
             // P136 lock-narrowing: copy histogram counters under lat.mtx only
@@ -2417,6 +2855,8 @@ struct DevSnap {
         o += std::to_string(s.detected_dpi);
         o += ",\"detected_polling_rate\":";
         o += std::to_string(s.detected_polling_rate);
+        o += ",\"real_polling_rate\":";
+        o += std::to_string(s.real_polling_rate);
         o += ",\"detected_battery\":";
         o += std::to_string(s.detected_battery);
         if (s.lat_count > 0) {
@@ -2722,6 +3162,15 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
         if (now_ns() >= deadline_ns) { reply_timeout(); return; } // slow command line
         ssize_t r = recv(client_fd, &ch, 1, 0);
         if (r < 0 && errno == EINTR) continue; // D-9: retry on signal
+        // D-8 + RCVFIX: SO_RCVTIMEO expiry also drops a still-alive peer — it
+        // could be reading a huge status response while we wait for its next
+        // line.  Reply "request timeout" (best-effort) just like the total-
+        // deadline path instead of returning silently, so the client never
+        // blocks forever on a response that will not come.
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            reply_timeout();
+            return;
+        }
         if (r <= 0) return;
         if (ch == '\n') break;
         line.push_back(ch);

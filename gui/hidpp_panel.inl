@@ -277,11 +277,29 @@ static gpointer hw_query_thread(gpointer data) {
                 cur.ok = true;
                 cur.dpi = dpi->dpi_current;
                 cur.supports_lod = dpi->supports_lift_off_distance;
-                if (dpi->supports_lift_off_distance)
-                    cur.lod = dpi->lift_off_distance;
+                // R6-8: capability bit set but the current-LOD byte is
+                // out-of-range (transport's get_lift_off_distance rejects
+                // > 2) — do NOT present the garbage value or write it back.
+                // A byte that isn't a valid 0..2 LOD means the read wasn't
+                // populated; treat the device as LOD-unsupported so the combo
+                // stays disabled and no sentinel "High" is ever written.
+                if (dpi->supports_lift_off_distance) {
+                    if (dpi->lift_off_distance <= 2)
+                        cur.lod = dpi->lift_off_distance;
+                    else
+                        cur.supports_lod = false;
+                }
             }
-            if (auto rate = transport.get_polling_rate(task->device_index))
+            if (auto rate = transport.get_polling_rate(task->device_index)) {
                 cur.rate_hz = (int)*rate;
+                // R5-C: previously cur.ok was only set by the DPI query above —
+                // a rate-only device (no DPI feature supported, e.g. hardware
+                // DPI) reported a *successful* query as "Could not query the
+                // device's current settings."  Report success once any query
+                // landed so the rate control populates and the status line
+                // reflects what was actually read.
+                cur.ok = true;
+            }
             // P169 — read-only battery for the capability/source display.
             cur.bsrc = preferred_battery_source(task->features, task->hidpp10);
             if (auto b = transport.get_battery_status(task->device_index))

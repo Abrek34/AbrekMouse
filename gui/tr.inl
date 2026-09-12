@@ -103,6 +103,7 @@ static const char* tr(const char* key) {
             {"Import failed: file too large.", "İçe aktarma hatası: dosya çok büyük."},
             {"Import failed: profile \"%s\" already exists.", "İçe aktarma hatası: \"%s\" profili zaten var."},
             {"Import failed: %s",               "İçe aktarma hatası: %s"},
+            {"Import failed: %s. Fix the file and try again.", "İçe aktarma hatası: %s. Dosyayı düzeltip tekrar deneyin."},
             {"Imported profile: %s",            "Profil içe aktarıldı: %s"},
             {"Raw Passthrough (bypass all acceleration)", "Ham Geçiş (tüm ivmeyi atla)"},
             {"Gain mode (recommended)",   "Kazanım modu (önerilir)"},
@@ -342,6 +343,8 @@ static const char* tr(const char* key) {
              "İmleç kilidi yok — bu Wayland oturumu imleci yakalayamıyor.\nİmleç bu pencerenin içine kilitlenmiş DEĞİL (yalnızca tam ekran kapsamı).\nFareyi hareket ettirin, ardından kapatmak için ESC'ye basın."},
             {"Awaiting motion…",
              "Hareket bekleniyor…"},
+            {"Raw 1:1 passthrough — no telemetry is produced (accelerated mode only).",
+             "Ham 1:1 geçiş — telemetri üretilmez (yalnızca hızlandırılmış mod)."},
             {"Mouse test: pointer released (ESC).",
              "Fare testi: imleç serbest bırakıldı (ESC)."},
             {"Mouse test: pointer lock released (window unfocused).",
@@ -423,6 +426,8 @@ static const char* tr(const char* key) {
              "Uyarı: \"%s\" için kaydedilmemiş değişiklikler atıldı."},
             {"A profile with that name already exists.",
              "Bu ada sahip bir profil zaten var."},
+            {"Maximum number of profiles (%d) reached.",
+             "Maksimum profil sayısına (%d) ulaşıldı."},
             {"At least one profile is required.",
              "En az bir profil gerekli."},
             {"Profile reset to defaults — press Save to keep.",
@@ -518,6 +523,8 @@ static const char* tr(const char* key) {
                                              "Yerel olarak kaydedildi ve daemon sinyallendi (yalnızca yeniden yükleme): %s"},
              {"Saved locally, but the daemon was not updated: %s",
                                              "Yerel olarak kaydedildi, ancak daemon güncellenemedi: %s"},
+             {"Saved locally, but the daemon REJECTED the new config (old config kept): %s",
+                                             "Yerel olarak kaydedildi, ancak daemon yeni yapılandırmayı REDDETTİ (eski yapılandırma korundu): %s"},
              {"Saved locally, but the daemon is not running: %s",
                                              "Yerel olarak kaydedildi, ancak daemon çalışmıyor: %s"},
              {"Save error: %s",             "Kaydetme hatası: %s"},
@@ -681,6 +688,14 @@ static void refresh_language(AppState* S) {
         }
         gtk_drop_down_set_model(GTK_DROP_DOWN(S->device_id_combo), G_LIST_MODEL(sl));
         g_object_unref(sl);
+        // R7-LANGDM: the rebuilt model has no "(unplugged)" placeholder (that is
+        // appended by device_combo_select() from devices.inl, called after this
+        // refresh via rebuild_profile_combo).  If the saved selection pointed at
+        // the old placeholder, sel is now out of range — clamp instead of passing
+        // an invalid index to gtk_drop_down_set_selected (GLib critical on stderr
+        // + transient blank binding; self-corrected on the next line anyway).
+        guint n = g_list_model_get_n_items(G_LIST_MODEL(sl));
+        if (sel >= n) sel = n - 1;
         gtk_drop_down_set_selected(GTK_DROP_DOWN(S->device_id_combo), sel);
     }
 
@@ -703,11 +718,15 @@ static void refresh_language(AppState* S) {
     update_daemon_status(S);    // daemon status + battery markup are dynamic
     mouse_test_refresh_language(S); // open test window stays in sync (BUG-09)
 
-    // Translate the idle status if it still shows the untranslated default.
+    // Translate the idle status if it still shows a ready-state in either
+    // language.  The old check only matched the English default, so switching
+    // Turkish → English left a stale "Hazır." on the bar indefinitely.
     if (S->status_bar) {
         const char* cur = gtk_label_get_text(GTK_LABEL(S->status_bar));
-        if (cur && strcmp(cur, "Ready.") == 0)
-            gtk_label_set_text(GTK_LABEL(S->status_bar), tr("Ready."));
+        const char* ready = tr("Ready.");
+        if (cur && (strcmp(cur, "Ready.") == 0 ||
+                    (ready && strcmp(cur, ready) == 0)))
+            gtk_label_set_text(GTK_LABEL(S->status_bar), ready);
     }
 }
 

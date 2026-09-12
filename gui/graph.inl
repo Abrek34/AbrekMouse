@@ -296,7 +296,12 @@ void on_graph_drag_update(GtkGestureDrag*, double dx, double /*dy*/, gpointer us
 
     // On-screen pixel movement → pan delta in ips
     double delta_ips = -(dx / PW) * max_speed_at_start;
-    S->graph_pan_x = std::max(0.0, S->drag_pan_start + delta_ips);
+    // PAN-CAP: the old std::max(0.0, ...) had no upper bound, so repeated
+    // rightward drags grew max_speed (50/zoom + pan_x) without limit —
+    // effectively zooming out to infinity and making points unclickable.
+    // Cap pan at 500 ips (~10× default max speed) which covers every real
+    // config while leaving the graph usable.
+    S->graph_pan_x = std::clamp(S->drag_pan_start + delta_ips, 0.0, 500.0);
     gtk_widget_queue_draw(S->graph_area);
 }
 
@@ -334,7 +339,8 @@ void on_graph_motion(GtkEventControllerMotion*, double cx, double cy, gpointer u
     bool vel  = ax.gain;
     for (auto& [spd, stored] : pts) {
         double gain = lut_stored_to_gain(spd, stored, vel);
-        double px = GRAPH_ML + (spd / max_speed) * PW;
+        double px = std::clamp(GRAPH_ML + (spd / max_speed) * PW,
+                                      GRAPH_ML, GRAPH_ML + PW);
         // BUG-NEW-52: hit-test must clamp like draw's to_cy (graph.inl:89), or
         // gain/max_gain > 1 (float ULP) pushes the target off-dot and the
         // crosshair never appears.

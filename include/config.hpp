@@ -69,6 +69,12 @@ app_config app_config_from_json(const std::string& json_str);
 /// Sanitize a device_profile in-place (clamp DPI, polling_rate, rotation, etc.).
 void sanitize_device_profile(device_profile& dp);
 
+/// R12-IMPLUT: pre-parse an imported profile JSON and report over-capacity or
+/// odd-element LUT tables that profile_from_json() would silently clamp/floor.
+/// Returns "" when the curve is acceptable, else a human-readable description.
+/// Shared by the GUI import (CLI keeps its own copy).
+std::string check_import_lut_size(const std::string& json_str);
+
 /// Find or create config path (user home or /etc).
 std::string find_config_path();
 

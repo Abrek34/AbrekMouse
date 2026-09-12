@@ -147,6 +147,18 @@ struct lat_stats {
         }
     };
 
+    /// Zero the counters without producing a snapshot.  Used on the transition
+    /// into raw 1:1 passthrough (R12-LATRAW): flush_motion() — the only
+    /// lat.record() caller — never runs in raw mode, so without a reset the
+    /// status JSON keeps publishing stale accel-era lat_* fields long after raw
+    /// mode took over.  Caller must NOT hold mtx (we take it).
+    void reset() {
+        std::lock_guard<std::mutex> lk(mtx);
+        count = 0; sum_us = 0; min_us = 1e9; max_us = 0;
+        std::fill(hist, hist + BUCKETS, 0ULL);
+        over = 0;
+    }
+
     /// Non-resetting copy for lock-narrowing readers (P136: status_json).
     /// Copies counters+histogram under mtx; avg/percentile math runs on the
     /// returned copy with NO locks held. Caller must NOT hold mtx (we take it).
