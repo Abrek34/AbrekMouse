@@ -2,7 +2,7 @@
 
 Kaynak: `Bug Hata Raporları.md` TUR 20-24 (satır 1023-1390). Amaç: her loglanan maddenin durumunu tek yerde tutmak; aynı dosyada aynı anda çalışmayın.
 
-Son güncelleme: 2026-09-12
+Son güncelleme: 2026-09-13
 
 ---
 
@@ -478,3 +478,21 @@ SKIP/KARAR: **real_polling_rate yüzeye çıkarma (GUI boyutu)** — CLI `live:`
 Doğrulama: BUILD CLEAN (warning:0) + unit 33832/33832 + ASan/UBSan clean (EXIT=0) + tr_coverage PASS (yeni tr anahtarı YOK — round-13 CLI/daemon yüzeyi) + oracle OK (1071 satır / 67 known deviation — accel headers değişmedi) + `bash -n` scripts ✓.
 
 **Bu turda değişen dosyalar (kilit, round-14'te aynı dosyalara eşzamanlı edit YAPMAYIN):** `daemon/daemon.cpp`, `cli/main.cpp`, `gui/kwin_focus.inl`, `AGENTS.md`, `tests/test_accel.cpp`, `FIX_LOG.md`. (Round-12 kilitleri — daemon/daemon.cpp, daemon/lat_stats.hpp, src/config.cpp, include/config.hpp, gui/daemon_comm.inl, gui/kwin_focus.inl, gui/mouse_test.inl, gui/profile_mgr.inl, gui/tr.inl — serbest; daemon.cpp, kwin_focus.inl round-13 listesinde devam ediyor.)
+
+---
+
+## round-14 (big-pickle — 13.09.2026) — CANLI SİSTEM: IPC tamamen kilitli (ECONNRESET), staleness, e2e PID regresyonu
+
+Kullanıcı raporu: "ayar yapılamıyor, çıkış DPI 400'de kilitli, program çalışmıyor". Canlı sisteme bakıldı (daemon v0.6.6 idi; repo HEAD 1.1.0'dı — sistem 11.09 kurulumundan beri bayattı, `ca163631`/`170c5e14` sistemde yoktu). Yüklü eski sürümün IPC'si her istemciye ECONNRESET verdiği için önce build-manual (1.1.0) yeniden kuruldu; sonra AYNI hata yeni daemon'da tekrar üredi → kodda gerçek bug.
+
+| ID | Dosya | Konu | Durum |
+|---|---|---|---|
+| R14-IPCGRL (BUG-CRIT) | daemon/daemon.cpp:3095 | SEC-1 SO_PEERCRED ek grup denetimi `getgrouplist(...) == 0` diyordu; glibc başarıda **grup sayısını** döndürür (0 ASLA), -1 = yalnız hata. Bu yüzden `input` grubunun tam üyesi olan normal kullanıcılar **her zaman reddediliyor**, bağlantı okunmadan kapatılıyordu → GUI/CLI tüm IPC çağrıları ECONNRESET/"daemon unreachable". Root (`uid==0` dalı) hep geçtiği için E2E/root testlerinde görünmüyordu | `✅ big-pickle — `>= 0` başarı denetimi (yorumlu). Doğrulama: user `ping`→`pong`, `status` canlı cihaz detayları, `set-param output_dpi 1200` daemon'a ulaştı (/etc'e kaydedildi)` |
+| R14-E2EPID (BUG-LOW, tests) | tests/run_e2e.sh + tests/e2e_harness.cpp | ca163631 PID-1/3 canlılık kilidi, SIGSTOP'lu sistem daemonunun /run/rawaccel.pid'ini "canlı" sayıyor → clean-room test daemonu "Another instance may already be running" ile başlamıyor → e2e 2/2 FAIL (regresyon; ci'de root+uinput olmadığı için yakalanmadı) | `✅ big-pickle — run_e2e.sh duraklatılan daemonun kendi PID dosyalarını (eşleşen PID) test boyunca kaldırıp EXIT trap'inde geri yazıyor (3. daemonun kilidine dokunmaz); harness alt sürece özel XDG_RUNTIME_DIR (pid+soket ayrışır). e2e accel 5/5 + raw 2/2 PASS` |
+| R14-STALE (ops) | /usr/bin/* | Sistemde v0.6.6 (11.09 kurulumu) çalışıyordu — `170c5e14` audit-sweep dahil tüm yeni IPC/davranış zaten sistemde yoktu; bayat ikili bu hataların görünümünü maskelemekteydi | `✅ big-pickle — build-manual (HEAD 1.1.0, warning:0) sistem ikililerine kopyalandı, servis yeniden başlatıldı; /etc config'e vm-gaming (classic, DPI 800, output_dpi 1200, raw_passthrough false) push edildi → kullanıcının "çıkış DPI 400 kilitli" durumu bitti` |
+
+SKIP/KARAR: **config iki yerde** (daemon `/etc/rawaccel/settings.json`, GUI/CLI `~/.config/rawaccel/settings.json`) — tasarım gereği CLI/GUI kaydedince daemon'a push edilir, daemon kendi yoluna kalıcılar; push IPC'si artık çalıştığı için iki dosya push sırasında yakınsar, ayrı mekanizmaya gerek yok. Daemon, yeni save_config'in izin-koruma yoluyla /etc dosyasını 0600 yaptı (geçici; chmod 0644 ile geri alındı). E2E child'ı XDG_RUNTIME_DIR taşıdığından /run kilidine hiç dokunmadı.
+
+Doğrulama: BUILD CLEAN (warning:0) + unit 33832/33832 + tr_coverage PASS + oracle OK (1071 / 67 known deviation) + e2e accel 5/5, raw 2/2 PASS + canlı sistem IPC uçtan uca (user ping/status/set-param).
+
+**Değişen dosyalar:** `daemon/daemon.cpp`, `tests/run_e2e.sh`, `tests/e2e_harness.cpp`, `FIX_LOG.md`. (Round-13 kilitleri — daemon.cpp, cli/main.cpp, kwin_focus.inl, AGENTS.md, test_accel.cpp — serbest; daemon.cpp round-14'e girişiyle yeniden kilitli, round-15'te aynı dosyaya edit GEREKİRSE önce haberleşin.)

@@ -3091,8 +3091,15 @@ void AccelDaemon::ipc_serve_loop() {
                                              nullptr, &ngroups);
                                 if (ngroups > 0) {
                                     std::vector<gid_t> groups(ngroups);
+                                    // SEC-1-BUG: getgrouplist() returns the
+                                    // NUMBER OF GROUPS on success (>=0), not 0;
+                                    // -1 is the only failure signal.  The old
+                                    // `== 0` check never matched, so every
+                                    // non-root client (even an 'input' group
+                                    // member) was rejected and its connection
+                                    // closed unread -> client saw ECONNRESET.
                                     if (getgrouplist(pw->pw_name, grp->gr_gid,
-                                                     groups.data(), &ngroups) == 0) {
+                                                     groups.data(), &ngroups) >= 0) {
                                         for (int i = 0; i < ngroups; i++) {
                                             if (groups[i] == grp->gr_gid) {
                                                 allowed = true;

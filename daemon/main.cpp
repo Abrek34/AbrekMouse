@@ -35,7 +35,7 @@ static std::string g_pid_file;
 /// K1: Atomically write PID file using O_CREAT|O_EXCL.
 /// Returns false if the file already exists (another daemon instance is running).
 static bool write_pid(const std::string& path) {
-    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return false; // EEXIST → daemon already running
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
@@ -58,7 +58,10 @@ static bool write_pid(const std::string& path) {
         unlink(path.c_str());
         return false;
     }
-    if (fsync(fd) != 0) // L-BUG-3: a failed fsync = PID may not survive a crash
+    if (fchmod(fd, 0644) != 0) // L-BUG-3: keep the "running" probe readable —
+        std::cerr << "[rawaccel] warning: fchmod PID file failed: "
+                  << strerror(errno) << "\n";
+    if (fsync(fd) != 0) // a failed fsync = PID may not survive a crash
         std::cerr << "[rawaccel] warning: fsync PID file failed: "
                   << strerror(errno) << "\n";
     close(fd);

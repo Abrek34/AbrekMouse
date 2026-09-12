@@ -43,10 +43,22 @@ fi
 
 # ── Pause the running system daemon so it can't steal our synthetic source ──
 SYS_PID="$(pgrep -x rawaccel-daemon 2>/dev/null | head -n1 || true)"
+PRESERVED_PIDFILES=""
 if [[ -n "$SYS_PID" ]]; then
     if kill -STOP "$SYS_PID" 2>/dev/null; then
         echo "[INFO] system daemon (pid $SYS_PID) paused for isolation"
-        trap '[ -n "${SYS_PID:-}" ] && kill -CONT "$SYS_PID" 2>/dev/null || true' EXIT
+        # E2E-PID: the PID liveness gate scans EVERY candidate path, so a merely
+        # stopped system daemon still counts as "another running instance" and
+        # the clean-room test daemon could never start.  Remove the pid file(s)
+        # owned by the paused daemon and restore them on exit.  Only steal files
+        # whose stored PID matches $SYS_PID (never clobber a third daemon's lock).
+        for p in "${XDG_RUNTIME_DIR:-/run/user/0}/rawaccel.pid" /run/rawaccel.pid /tmp/rawaccel.pid; do
+            if [[ -f "$p" ]] && [[ "$(cat "$p" 2>/dev/null)" == "$SYS_PID" ]]; then
+                rm -f "$p"
+                PRESERVED_PIDFILES="$PRESERVED_PIDFILES $p"
+            fi
+        done
+        trap '[ -n "${SYS_PID:-}" ] && { for p in $PRESERVED_PIDFILES; do [ -f "$p" ] || echo "$SYS_PID" > "$p"; done; kill -CONT "$SYS_PID" 2>/dev/null || true; }' EXIT
     else
         echo "[WARN] could not pause system daemon — hot-plug may interfere"
     fi

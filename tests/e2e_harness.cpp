@@ -95,6 +95,15 @@ static pid_t spawn_daemon(const char* daemon_path, const std::string& config_pat
     if (pid == 0) {
         int fd = open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        // E2E-PID: run with a private runtime dir so the test daemon's PID file
+        // and IPC socket land in the harness workdir instead of /run.  The PID
+        // liveness gate (PID-1/PID-3) would otherwise refuse to start while the
+        // paused system daemon still owns /run/rawaccel.pid — and the private
+        // socket keeps the two daemons' IPC from colliding.
+        std::string rd = config_path; // <workdir>/cfg.json → strip basename
+        const size_t slash = rd.find_last_of('/');
+        if (slash != std::string::npos) rd.resize(slash);
+        setenv("XDG_RUNTIME_DIR", rd.c_str(), 1);
         execl(daemon_path, daemon_path, "-v", "-c", config_path.c_str(), (char*)nullptr);
         _exit(127);
     }

@@ -10,6 +10,13 @@ After=systemd-udevd.service
 Wants=plasma-kwin_wayland.service
 After=plasma-kwin_wayland.service
 Documentation=https://github.com/rawaccel-linux/rawaccel-linux
+# SVC-1: make the restart burst limit explicit (systemd defaults are
+# StartLimitIntervalSec=10s / StartLimitBurst=5 — an invisible surprise if
+# RestartSec is ever tuned).  60s window / 10 attempts.  These directives
+# belong in [Unit], not [Service] (a misplaced StartLimitIntervalSec is
+# silently ignored with a journal warning).
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -21,11 +28,6 @@ ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
-# SVC-1: make the restart burst limit explicit (systemd defaults are
-# StartLimitIntervalSec=10s / StartLimitBurst=5 — an invisible surprise if
-# RestartSec is ever tuned).  60s window / 10 attempts.
-StartLimitIntervalSec=60
-StartLimitBurst=10
 # BS-11: no PIDFile= — that directive is only honoured for Type=forking and
 # would be dead (systemd warns).  The daemon writes /run/rawaccel.pid for the
 # CLI/GUI's PID discovery, which must not be confused with systemd's notion.
@@ -73,14 +75,20 @@ CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
 AmbientCapabilities=
 
 # Network: this is a 100% local mouse driver — no network access ever.
-# PrivateNetwork=true gives the daemon its own empty network namespace
-# (no loopback, no interfaces, nothing).  Combined with the address-family
-# restriction below, it is impossible for the daemon to make a network
-# connection even if compromised.
+# IPC-FIX: PrivateNetwork=true is DELIBERATELY NOT used.  AF_UNIX sockets
+# are scoped to their network namespace on Linux (unix_find_socket_byname
+# resolves within the connecting socket's netns).  A daemon started in its
+# own netns (PrivateNetwork=true) binds /run/rawaccel.sock inside that
+# namespace, so the GUI/CLI in the host netns can never reach the accept
+# loop — every set_config/status ping silently fails and the daemon keeps
+# running the stale config (settings appear frozen / "DPI stuck").  The
+# network-blocking posture below (AF_UNIX-only + no IP traffic) is preserved
+# without namespacing: with RestrictAddressFamilies=AF_UNIX the process
+# cannot create a single AF_INET/AF_INET6/AF_PACKET socket, and
+# IPAddressDeny=any denies all IP traffic on top of that.
 #   - AF_UNIX is needed for the IPC socket (local file, not network).
 #   - AF_NETLINK is dropped: the daemon uses inotify, not udev/netlink.
 #   - IP families (AF_INET/AF_INET6/AF_PACKET/...) are explicitly forbidden.
-PrivateNetwork=true
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
 
