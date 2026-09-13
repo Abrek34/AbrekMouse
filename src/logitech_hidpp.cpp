@@ -1887,8 +1887,14 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
     if (!index) return false;
 
     if (info->extended) {
-        const uint16_t y = info->supports_y && info->dpi_current_y
-            ? info->dpi_current_y : dpi;
+        // DPIFIX-1: a single-value set_dpi is symmetric — write the SAME DPI
+        // to both axes.  The previous code PRESERVED the current Y byte
+        // (y = dpi_current_y) whenever the device supports Y, so a profile
+        // apply (daemon/GUI always pass one value) left a stale asymmetric
+        // hardware DPI behind: e.g. X=400 / Y=1600 → vertical cursor motion
+        // 4× faster than horizontal.  There is no X-only caller; Solaar's
+        // dpi_extended semantics set X and Y together.
+        const uint16_t y = dpi;
         const uint8_t params[6] = {
             0, static_cast<uint8_t>(dpi >> 8), static_cast<uint8_t>(dpi),
             static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),

@@ -6,6 +6,29 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.3] — 2026-09-13
+
+### Fixed: asymmetric hardware DPI (X ≠ Y) after profile apply
+
+**Bug (DPIFIX-1):** `set_dpi()` wrote the requested DPI to the **X** axis and
+PRESERVED whatever Y was currently set to whenever the device supports a
+separate Y DPI (`supports_y`). Every profile apply — daemon start and the GUI
+hardware panel — passes a single DPI value, so on dual-axis devices a stale
+Y left the cursor anisotropic. On the PRO X 2 this produced **X=400 /
+Y=1600**: vertically moving the physical mouse the same distance moved the
+cursor four times farther than horizontally, in every mode including Raw
+Passthrough ("Ham Geçiş") because the hardware already reported different
+counts per centimetre per axis.
+
+- `src/logitech_hidpp.cpp` — `set_dpi()` now writes the same DPI to both axes
+  (symmetric single-value set, matching Solaar's `dpi_extended` semantics).
+  There is no X-only caller in the app; the previous "keep Y" behaviour had no
+  UI purpose and only generated the asymmetry.
+
+**Reported:** Abrek34 — "mouse ham geçiş tıklı ama sağa/sola ile aşağı/yukarı
+hareketler eşit değil". Diagnosed live on the PRO X 2 (`GetDpi` read)
+before/after the fix; hardware verified back to symmetric X=Y=400.
+
 ## [1.2.2] — 2026-09-13
 
 ### Fixed

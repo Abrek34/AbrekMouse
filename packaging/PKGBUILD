@@ -11,7 +11,7 @@
 # and drop the parent-tree copy in prepare().
 
 pkgname=rawaccel-linux
-pkgver=1.2.2
+pkgver=1.2.3
 pkgrel=1
 pkgdesc="Raw Accel mouse acceleration daemon (Linux port): kernel-level uinput grab + GTK4 GUI + CLI"
 arch=('x86_64' 'aarch64')
