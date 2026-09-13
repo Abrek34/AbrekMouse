@@ -6,6 +6,22 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.1] — 2026-09-13
+
+### Added
+- **HID++ ayarları etkinleştirildi.** Onboard-profile modunda çalışan gaming
+  farelerde (PRO X 2 / G Pro X vb.) DPI / polling-rate / LOD yazmaları HID++
+  tarafından reddediliyordu; yazmadan önce onboard modu kapatılıyor
+  (`disable_onboard_profiles_for_write`).
+- `setup.sh` artık `hidraw` alt sistemini de tetikliyor; HID++ hidraw
+  düğümlerine udev kuralları paket kurulumunda anında uygulanıyor.
+
+### Fixed
+- **MATH-1:** negatif ivmelenme + aktif cap (`cap.y > 0`) dejenere eğri
+  üretiyordu (cap.x negatife dönüyor, gain eğrisi geriye gidiyordu). Bu
+  kombinasyon artık identity eğrisine düşürülüyor.
+- Test corpus (`tests/corpus_accel`, `tests/corpus_config`) haznelere eklendi.
+
 ## [1.2.0] — 2026-09-13
 
 ### Fixed
