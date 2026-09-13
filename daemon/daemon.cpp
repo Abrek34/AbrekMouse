@@ -2160,27 +2160,41 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
             if (dev.frame_ev_us_count < mouse_device::POLL_RATE_SAMPLES)
                 dev.frame_ev_us_count++;
             // Compute median polling rate from samples
+            // PERF (P0): the median is recomputed at most once per ring fill
+            // (POLL_RATE_SAMPLES frames) instead of on every motion frame; the
+            // first 4 samples still produce an estimate immediately so SM-4 /
+            // the status JSON converge during the first ~50 ms.
             if (dev.frame_ev_us_count >= 4) {
-                uint64_t sorted[mouse_device::POLL_RATE_SAMPLES];
-                int n = dev.frame_ev_us_count;
-                for (int k = 0; k < n; ++k)
-                    sorted[k] = dev.frame_ev_us_samples[k];
-                // Simple insertion sort for small array
-                for (int k = 1; k < n; ++k) {
-                    uint64_t key = sorted[k];
-                    int j = k - 1;
-                    while (j >= 0 && sorted[j] > key) {
-                        sorted[j + 1] = sorted[j];
-                        j--;
+                // Throttle: while the ring is still filling (first 16 frames)
+                // compute every frame so SM-4 converges in ~50 ms; once full,
+                // recompute at most once per POLL_RATE_SAMPLES frames (the true
+                // rate only changes on replug/config switch).
+                // NOTE: the pre-increment form matters — the old post-increment
+                // (++ after compare) + reset-to-0 recomputed on EVERY frame.
+                if (dev.frame_ev_us_count < mouse_device::POLL_RATE_SAMPLES ||
+                    ++dev.poll_median_tick >= mouse_device::POLL_RATE_SAMPLES) {
+                    dev.poll_median_tick = 0;
+                    uint64_t sorted[mouse_device::POLL_RATE_SAMPLES];
+                    int n = dev.frame_ev_us_count;
+                    for (int k = 0; k < n; ++k)
+                        sorted[k] = dev.frame_ev_us_samples[k];
+                    // Simple insertion sort for small array
+                    for (int k = 1; k < n; ++k) {
+                        uint64_t key = sorted[k];
+                        int j = k - 1;
+                        while (j >= 0 && sorted[j] > key) {
+                            sorted[j + 1] = sorted[j];
+                            j--;
+                        }
+                        sorted[j + 1] = key;
                     }
-                    sorted[j + 1] = key;
-                }
-                uint64_t median_us = sorted[n / 2];
-                if (median_us > 0) {
-                    int rate_hz = static_cast<int>(1000000.0 / median_us + 0.5);
-                    if (rate_hz >= 100 && rate_hz <= 10000)
-                        dev.telemetry->real_polling_rate.store(
-                            rate_hz, std::memory_order_relaxed);
+                    uint64_t median_us = sorted[n / 2];
+                    if (median_us > 0) {
+                        int rate_hz = static_cast<int>(1000000.0 / median_us + 0.5);
+                        if (rate_hz >= 100 && rate_hz <= 10000)
+                            dev.telemetry->real_polling_rate.store(
+                                rate_hz, std::memory_order_relaxed);
+                    }
                 }
             }
         }

@@ -95,6 +95,13 @@ struct mouse_device {
     uint64_t frame_ev_us_samples[POLL_RATE_SAMPLES] = {};
     int      frame_ev_us_count = 0;
     int      frame_ev_us_next = 0;
+    // PERF (P0): the median interpolates over POLL_RATE_SAMPLES intervals and
+    // ran on EVERY motion frame (copy + insertion sort + divide ≈ 40–80 ns,
+    // i.e. 1–2× the classic no-smoothing cost).  The true poll rate changes
+    // only when the device is replugged or its config is switched, so
+    // recompute the estimate at most once every POLL_RATE_SAMPLES frames the
+    // moment POLL_RATE_SAMPLES accepted samples pass.  Loop thread only.
+    int      poll_median_tick = 0;
 
     // BUG-18: SYN_DROPPED state must persist across process_device() calls.
     // The Linux input protocol says all events between a SYN_DROPPED and the

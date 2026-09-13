@@ -1,28 +1,28 @@
 === RawAccel Hot-Path Benchmark ===
-Date: Cts 12 Eyl 2026 19:38:04 +03
+Date: Paz 13 Eyl 2026 03:48:05 +03
 Host: cachyos-x8664
 CPU: Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz
 Kernel: 7.2.4-3-cachyos
-Iterations per run: 100000
+Iterations per run: 1000000
 Perf runs per config: 1
 Binary: /home/a/Masaüstü/AbrekMouse-main/build-manual/bench_hotpath
 Compiler: g++ (GCC) 16.2.1 20260810
 
 === Timing Results (nanoseconds per event) ===
-noaccel: 7.84081 ns/event (100000 iterations)
-power-whole: 10.5579 ns/event (100000 iterations)
-classic: 27.6452 ns/event (100000 iterations)
-power+rot45+snap15+clamp: 30.7388 ns/event (100000 iterations)
-power-dual+4ema: 527.873 ns/event (100000 iterations)
-apply_motion_math(full): 22.5252 ns/event (100000 iterations)
+noaccel: 10.0253 ns/event (1000000 iterations)
+power-whole: 13.3921 ns/event (1000000 iterations)
+classic: 30.7554 ns/event (1000000 iterations)
+power+rot45+snap15+clamp: 33.2843 ns/event (1000000 iterations)
+power-dual+4ema: 388.761 ns/event (1000000 iterations)
+apply_motion_math(full): 56.6233 ns/event (1000000 iterations)
 
 === SUMMARY ===
-noaccel: 7.84081 ns/event
-power-whole: 10.5579 ns/event
-classic: 27.6452 ns/event
-power+rot45+snap15+clamp: 30.7388 ns/event
-power-dual+4ema: 527.873 ns/event
-apply_motion_math(full): 22.5252 ns/event
+noaccel: 10.0253 ns/event
+power-whole: 13.3921 ns/event
+classic: 30.7554 ns/event
+power+rot45+snap15+clamp: 33.2843 ns/event
+power-dual+4ema: 388.761 ns/event
+apply_motion_math(full): 56.6233 ns/event
 
 === Hardware Counters ===
 perf not available. Install 'perf' package for cycles/instructions/syscalls measurements.
@@ -30,15 +30,15 @@ perf not available. Install 'perf' package for cycles/instructions/syscalls meas
 === Baseline Summary ===
 Configuration                    | ns/event
 --------------------------------|----------
-noaccel | 8.60415 ns
-power-whole | 14.6472 ns
-classic | 28.9678 ns
-power+rot45+snap15+clamp | 32.8049 ns
-power-dual+4ema | 575.663 ns
-apply_motion_math(full) | 24.9816 ns
-noaccel | 8.60415 ns
-power-whole | 14.6472 ns
-classic | 28.9678 ns
-power+rot45+snap15+clamp | 32.8049 ns
-power-dual+4ema | 575.663 ns
-apply_motion_math(full) | 24.9816 ns
+noaccel | 8.99061 ns
+power-whole | 11.0957 ns
+classic | 30.6346 ns
+power+rot45+snap15+clamp | 33.3105 ns
+power-dual+4ema | 386.588 ns
+apply_motion_math(full) | 54.8505 ns
+noaccel | 8.99061 ns
+power-whole | 11.0957 ns
+classic | 30.6346 ns
+power+rot45+snap15+clamp | 33.3105 ns
+power-dual+4ema | 386.588 ns
+apply_motion_math(full) | 54.8505 ns

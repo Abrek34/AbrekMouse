@@ -197,8 +197,9 @@ static void mouse_test_set_hint(AppState* S, int state) {
 /// window is closed.
 void mouse_test_refresh_language(AppState* S) {
     if (!S->mouse_test_win) return;
-    const char* names[3] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):") };
-    for (int i = 0; i < 3 && S->test_name_lbls[i]; i++)
+    const char* names[5] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):"),
+                             tr("Latency p50/p95 (µs):"), tr("Poll rate (Hz):") };
+    for (int i = 0; i < 5 && S->test_name_lbls[i]; i++)
         gtk_label_set_text(GTK_LABEL(S->test_name_lbls[i]), names[i]);
     if (S->test_title_lbl)
         gtk_label_set_markup(GTK_LABEL(S->test_title_lbl),
@@ -215,6 +216,17 @@ static void mouse_test_stop_poll(AppState* S) {
         g_source_remove(S->test_poll_id);
         S->test_poll_id = 0;
     }
+}
+
+/// Blank every live value label — shared by all "no fresh sample" poll paths
+/// (daemon down / awaiting motion / raw passthrough) so a stale readout can
+/// never linger next to an updated status line (R2-07 pattern, extended).
+static void mouse_test_blank_values(AppState* S) {
+    if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
+    if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
+    if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+    if (S->test_lat_lbl)   gtk_label_set_text(GTK_LABEL(S->test_lat_lbl),   "—");
+    if (S->test_poll_lbl)  gtk_label_set_text(GTK_LABEL(S->test_poll_lbl),  "—");
 }
 
 /// 250 ms poll: refresh live speed/gain readouts from the daemon status JSON.
@@ -238,18 +250,14 @@ static gboolean mouse_test_poll(gpointer user_data) {
 
     // Skip the IPC entirely when no socket exists (cheap stat) — BUG-10 gate.
     if (!daemon_socket_exists()) {
-        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
-        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
-        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+        mouse_test_blank_values(S);
         mouse_test_set_status(S, 2); // daemon not running
         return G_SOURCE_CONTINUE;
     }
     std::string resp = daemon_ipc_query("status");
     if (resp.empty()) {
         // No complete response within the timeout — treat as daemon down.
-        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
-        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
-        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+        mouse_test_blank_values(S);
         mouse_test_set_status(S, 2);
         return G_SOURCE_CONTINUE;
     }
@@ -267,9 +275,7 @@ static gboolean mouse_test_poll(gpointer user_data) {
     bool fresh = wall >= 0 && (now_mono_raw_ms() - wall) < 2000.0;
     if (cur_prof(S).prof.raw_passthrough) {
         // Raw 1:1 passthrough — readouts are guaranteed empty, show loss markers.
-        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
-        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
-        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+        mouse_test_blank_values(S);
         mouse_test_set_status(S, 4); // raw passthrough — no telemetry
         return G_SOURCE_CONTINUE;
     }
@@ -278,15 +284,27 @@ static gboolean mouse_test_poll(gpointer user_data) {
         // sample it has is stale — >2 s old).
         // R2-07: zero out the readouts too — otherwise the in/out/gain labels
         // keep showing the LAST sample (stale) while the status says "awaiting".
-        if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
-        if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
-        if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
+        mouse_test_blank_values(S);
         mouse_test_set_status(S, 1); // awaiting motion
         return G_SOURCE_CONTINUE;
     }
     if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), fmt_us(in).c_str());
     if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   fmt_us(out).c_str());
     if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  fmt_us(gain).c_str());
+
+    // EXT: live per-event processor latency (p50/p95 µs) + real poll rate from
+    // the same status slice.  lat_* only appear once the daemon recorded ≥ 1
+    // sample (histogram), real_polling_rate only once it estimated a median.
+    double lat_p50 = daemon_device_field(resp, S, "lat_p50_us");
+    double lat_p95 = daemon_device_field(resp, S, "lat_p95_us");
+    double lat_n   = daemon_device_field(resp, S, "lat_samples");
+    double poll    = daemon_device_field(resp, S, "real_polling_rate");
+    if (S->test_lat_lbl)
+        gtk_label_set_text(GTK_LABEL(S->test_lat_lbl),
+            (lat_n > 0 ? fmt_us(lat_p50) + " / " + fmt_us(lat_p95) : "—").c_str());
+    if (S->test_poll_lbl)
+        gtk_label_set_text(GTK_LABEL(S->test_poll_lbl),
+            (poll > 0 ? std::to_string((long)poll) : "—").c_str());
     mouse_test_set_status(S, 0); // live
     return G_SOURCE_CONTINUE;
 }
@@ -381,10 +399,12 @@ static void mouse_test_teardown(GtkWidget* widget, gpointer user_data) {
     S->test_speed_lbl   = nullptr;
     S->test_out_lbl     = nullptr;
     S->test_gain_lbl    = nullptr;
+    S->test_lat_lbl     = nullptr;
+    S->test_poll_lbl    = nullptr;
     S->test_status_lbl  = nullptr;
     S->test_hint_lbl    = nullptr;
     S->test_title_lbl   = nullptr;
-    for (int i = 0; i < 3; i++) S->test_name_lbls[i] = nullptr;
+    for (int i = 0; i < 5; i++) S->test_name_lbls[i] = nullptr;
     S->test_hint_state   = 0;
     S->test_status_state = -1;
     mouse_test_stop_poll(S);
@@ -507,6 +527,18 @@ void on_mouse_test_clicked(GtkButton*, gpointer user_data) {
     gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[2], 0, 2, 1, 1);
     S->test_gain_lbl = value_lbl();
     gtk_grid_attach(GTK_GRID(grid), S->test_gain_lbl, 1, 2, 1, 1);
+
+    // Two extra telemetry rows: per-event processor latency (p50/p95) and the
+    // real poll rate, both from the daemon status slice (lat_*/real_polling_rate).
+    S->test_name_lbls[3] = name_lbl(tr("Latency p50/p95 (µs):"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[3], 0, 3, 1, 1);
+    S->test_lat_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_lat_lbl, 1, 3, 1, 1);
+
+    S->test_name_lbls[4] = name_lbl(tr("Poll rate (Hz):"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[4], 0, 4, 1, 1);
+    S->test_poll_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_poll_lbl, 1, 4, 1, 1);
 
     S->test_status_lbl = gtk_label_new(tr("Awaiting motion…"));
     gtk_label_set_xalign(GTK_LABEL(S->test_status_lbl), 0.5);

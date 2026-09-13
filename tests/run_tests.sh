@@ -232,4 +232,92 @@ PY
     rm -f "$TMPLUT"
     echo "CLI O31-L1 kapısı: odd-lut import reddi ✓"
     rm -f "$TMPP" "$TMPP.bak"
+
+    # ── diff: farklı profiller işaretlenir, özdeş olan temiz çıkar ──────────
+    # diff `<a> <b>` profile adı ya da JSON dosyası alır; çıktı yalnızca farklı
+    # alanları gösterir; rc 0 = özdeş, 1 = en az bir fark.  Sessiz
+    # dönüşüm-farkları (1e-9 epsilon) sahte fark üretmemeli.
+    TMPD1=$(mktemp --suffix=.json)
+    TMP_FILES+=( "$TMPD1" "$TMPD1.bak" )
+    rm -f "$TMPD1" "$TMPD1.bak"
+    "$CLI" -c "$TMPD1" --no-daemon create d1 >/dev/null 2>&1
+    rm -f "$TMPD1.bak"
+    "$CLI" -c "$TMPD1" --no-daemon create d2 >/dev/null 2>&1
+    # özdeş profiller önce: rc 0 + "no differences" (isimler farklı ise isim farkı sayılır)
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 d1 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "no differences"; then
+        echo "FAIL: diff of identical profiles (rc=$RC): $OUT"
+        exit 1
+    fi
+    # tek bir alanı değiştir: tam o alan + rc 1
+    "$CLI" -c "$TMPD1" --no-daemon set-param d1 cap_x 77 >/dev/null 2>&1
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 d2 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ]; then
+        echo "FAIL: diff of differing profiles rc=$RC (want 1): $OUT"
+        exit 1
+    fi
+    if ! echo "$OUT" | grep -q "cap_x" || ! echo "$OUT" | grep -q "77"; then
+        echo "FAIL: diff missing the changed field (cap_x 77): $OUT"
+        exit 1
+    fi
+    # geri al → özdeş; dosya-karşılaştırma formu da aynı sonucu vermeli
+    "$CLI" -c "$TMPD1" --no-daemon set-param d2 cap_x 77 >/dev/null 2>&1
+    TMPDF=$(mktemp --suffix=.json)
+    TMP_FILES+=( "$TMPDF" )
+    "$CLI" -c "$TMPD1" --no-daemon export d2 > "$TMPDF"
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d2 "$TMPDF" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "no differences"; then
+        echo "FAIL: diff profile vs its own export (rc=$RC): $OUT"
+        exit 1
+    fi
+    # hatalı kaynak: yok + dosya değil → rc 1, config'e dokunulmaz
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 "no-such-name-zzz" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ] || echo "$OUT" | grep -q "no differences"; then
+        echo "FAIL: diff with nonexistent source (rc=$RC): $OUT"
+        exit 1
+    fi
+    echo "CLI diff kapısı: özdeş/dosya-gidiş-geliş/eksik-kaynak ✓"
+    rm -f "$TMPD1" "$TMPD1.bak" "$TMPDF"
+
+    # ── monitor: arity + aralık kapıları (daemon yoksa çalışmaz — kapı değil) ─
+    # Monitor, daemon gerektirir; testte sadece argüman doğrulama + (daemon
+    # varsa) tek örnek akışı kontrol edilir.  Süresiz döngü test sürücünü
+    # kilitlememeli: yalnızca aşağıdaki geçersiz çağrılar sinyalsiz döner.
+    set +e
+    OUT=$("$CLI" -c "$(mktemp --suffix=.json)" --no-daemon monitor abc 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "interval"; then
+        echo "FAIL: monitor non-numeric interval accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    set +e
+    OUT=$("$CLI" monitor 0 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "interval"; then
+        echo "FAIL: monitor 0 interval accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    set +e
+    OUT=$("$CLI" monitor 60001 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -eq 0 ] || ! echo "$OUT" | grep -q "interval"; then
+        echo "FAIL: monitor 60001 interval accepted (rc=$RC): $OUT"
+        exit 1
+    fi
+    echo "CLI monitor kapısı: aralık doğrulama ✓"
 fi

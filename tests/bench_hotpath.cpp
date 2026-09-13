@@ -214,6 +214,12 @@ int main(int argc, char** argv) {
             dy = -dy;
         }
         auto end = std::chrono::high_resolution_clock::now();
+        // Consume the outputs so GCC cannot dead-code-eliminate loop-carried
+        // work (remainder/sp are otherwise unused after the loop, which let the
+        // compiler collapse this benchmark into a partial pass-through — a DCE
+        // artifact that understated the true per-event cost).
+        volatile int sink = out_x + out_y;
+        (void)sink;
 
         double total_ns = std::chrono::duration<double, std::nano>(end - start).count();
         double ns_per_event = total_ns / iterations;

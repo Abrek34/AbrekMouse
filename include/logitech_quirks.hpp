@@ -124,11 +124,12 @@ inline const logitech_quirks* find_logitech_quirks(
 /// Which battery facility the device advertises.  Priority ordering matches
 /// Solaar: unified → status → voltage → HID++ 1.0 register fallback.
 enum class logitech_battery_source : uint8_t {
-    none,             // no battery feature advertised
-    legacy10,         // HID++ 1.0 register 0x07 fallback
-    battery_voltage,  // 0x1001 — percent is approximated from millivolts
-    battery_status,   // 0x1000
-    unified_battery,  // 0x1004
+    none,                 // no battery feature advertised
+    legacy10,             // HID++ 1.0 register 0x07 fallback
+    battery_voltage,      // 0x1001 — percent is approximated from millivolts
+    battery_status,       // 0x1000
+    unified_battery,      // 0x1004
+    centurion_battery,    // 0x0104 — PRO X 2 LIGHTSPEED, G515 LS TKL, etc.
 };
 
 inline bool logitech_has_feature(
@@ -144,6 +145,9 @@ inline logitech_battery_source preferred_battery_source(
     if (logitech_has_feature(features,
             static_cast<uint16_t>(hidpp_feature_index::unified_battery)))
         return logitech_battery_source::unified_battery;
+    if (logitech_has_feature(features,
+            static_cast<uint16_t>(hidpp_feature_index::centurion_battery_soc)))
+        return logitech_battery_source::centurion_battery;
     if (logitech_has_feature(features,
             static_cast<uint16_t>(hidpp_feature_index::battery_status)))
         return logitech_battery_source::battery_status;

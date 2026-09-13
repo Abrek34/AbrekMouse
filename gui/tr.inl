@@ -83,8 +83,8 @@ static const char* tr(const char* key) {
             {"Reload",                    "Yeniden Yükle"},
             {"Stop",                      "Durdur"},
             {"Start",                     "Başlat"},
-            {"Apply & Reload",            "Uygula ve Yeniden Yükle"},
-            {"Save",                      "Kaydet"},
+            {"Apply",                   "Uygula"},
+            {"Save As",                 "Farklı Kaydet"},
             {"New profile",               "Yeni profil"},
             {"Duplicate profile",         "Profili çoğalt"},
             {"Could not duplicate profile: no free name.",
@@ -138,6 +138,8 @@ static const char* tr(const char* key) {
             {"Snap (°):",         "Açı Yapıştırma (°):"},
             {"LR Ratio:",         "Sağ/Sol Oranı:"},
             {"UD Ratio:",         "Aşa/Yuk Oranı:"},
+            {"Y/X Ratio:",        "Y/X Oranı:"},
+            {"Raw Input (intercept mice)", "Ham Giriş (fareleri yakala)"},
             {"Min (ips):",        "Min (ips):"},
             {"Max (ips):",        "Maks (ips):"},
             {"DPI:",              "DPI:"},
@@ -187,10 +189,10 @@ static const char* tr(const char* key) {
              "Açıkken tüm ivme hattı atlanır.\n"
              "Döndürme, açı yapıştırma, hız sınırı, ağırlıklar veya alt-piksel biriktirme yok —\n"
              "ham çekirdek sayacı doğrudan uinput'a yazılır (1:1 geçiş)."},
-            {"Classic/Jump/Natural/Synchronous: use the integral (output-speed) form of the curve.\n"
-             "Lookup: gain points are treated as output speeds (gain = y / speed).",
-             "Klasik/Zıplama/Doğal/Senkron: eğrinin integral (çıkış hızı) formunu kullanır.\n"
-             "Arama tablosu: kazanım noktaları çıkış hızı olarak yorumlanır (kazanım = y / hız)."},
+{"Classic/Jump/Natural/Synchronous/Power: use the integral (output-speed) form of the curve.\n"
+              "Lookup: gain points are treated as output speeds (gain = y / speed).",
+              "Klasik/Zıplama/Doğal/Senkron/Güç: eğrinin integral (çıkış hızı) formunu kullanır.\n"
+              "Arama tablosu: kazanım noktaları çıkış hızı olarak yorumlanır (kazanım = y / hız)."},
             {"Classic: acceleration coefficient of the power curve.",
              "Klasik: güç eğrisinin ivme katsayısı."},
             {"Classic: exponent of the power curve.",
@@ -229,6 +231,14 @@ static const char* tr(const char* key) {
              "Sol/sağ çıkış DPI oranı (1.0 = kapalı). >1 değerler sağa hareketi güçlendirir."},
             {"Up/down output DPI ratio (1.0 = off). Values >1 amplify downward movement.",
              "Yukarı/aşağı çıkış DPI oranı (1.0 = kapalı). >1 değerler aşağı hareketi güçlendirir."},
+            {"Y-axis output DPI ratio, relative to X (1.0 = off). Scales all Y motion.",
+             "Y ekseni çıkış DPI oranı, X'e göre (1.0 = kapalı). Tüm Y hareketini ölçekler."},
+            {"Master switch for mouse interception (default: on).\n"
+             "When off, the daemon grabs no mouse and every profile is inert —\n"
+             "the desktop owns the devices (OS-level raw passthrough).",
+             "Fare yakalama ana şalteri (varsayılan: açık).\n"
+             "Kapalıyken daemon hiçbir fareyi yakalamaz ve tüm profiller etkisizdir —\n"
+             "cihazlar masaüstünde kalır (işletim sistemi düzeyinde ham geçiş)."},
             {"Minimum speed clamp (ips). 0 = disabled.",
              "Minimum hız sınırı (ips). 0 = kapalı."},
             {"Maximum speed clamp (ips). Set to 0 to disable clamping.",
@@ -290,8 +300,8 @@ static const char* tr(const char* key) {
              "1:1 çıkış — eğri parametresi yok."},
             {"Uses: Accel, Exp (cls), Input Offset, Cap X/Y, Cap Mode.",
              "Kullanır: İvme, Üs (kls), Giriş Kayması, Cap X/Y, Cap Modu."},
-            {"Uses: Scale, Exp (pwr), Output Offset, Cap X/Y, Cap Mode.",
-             "Kullanır: Ölçek, Üs (güç), Çıkış Kayması, Cap X/Y, Cap Modu."},
+            {"Uses: Scale, Exp (pwr), Output Offset, Cap X/Y, Cap Mode, Gain.",
+             "Kullanır: Ölçek, Üs (güç), Çıkış Kayması, Cap X/Y, Cap Modu, Kazanım."},
             {"Uses: Limit, Decay Rate, Input Offset, Gain.",
              "Kullanır: Limit, Sönüm Oranı, Giriş Kayması, Kazanım."},
             {"Uses: Cap X (step position), Cap Y (step amount), Smooth.",
@@ -335,6 +345,10 @@ static const char* tr(const char* key) {
              "Çıkış (ips):"},
             {"Gain (×):",
              "Kazanç (×):"},
+            {"Latency p50/p95 (µs):",
+             "Gecikme p50/p95 (µs):"},
+            {"Poll rate (Hz):",
+             "Yoklama hızı (Hz):"},
             {"Pointer is locked inside this fullscreen test window.\nMove the mouse to see live speed/gain.\nPress ESC to release.",
              "İmleç bu tam ekran test penceresinin içine kilitli.\nCanlı hız/kazanç için fareyi hareket ettirin.\nKilit ESC ile bırakılır."},
             {"Pointer grab failed — the cursor is confined as best effort (no pointer lock).\nMove the mouse to see live speed/gain.\nPress ESC to release.",
@@ -355,8 +369,20 @@ static const char* tr(const char* key) {
             {"Scanning HID++ devices…",   "HID++ cihazları taranıyor…"},
             {"No Logitech HID++ devices found.",
                                          "Logitech HID++ cihazı bulunamadı."},
+            {"The connected mouse is not a Logitech HID++ device, so the\n"
+             "hardware controls below (DPI / polling rate / lift-off) stay disabled.",
+             "Bağlı fare bir Logitech HID++ cihazı değil; bu yüzden alttaki donanım\n"
+             "kontrolleri (DPI / yoklama hızı / kaldırma mesafesi) kapalı kalır."},
+            {"These need a physical Logitech HID++ mouse (wired, receiver or Bluetooth).",
+             "Bunlar fiziksel bir Logitech HID++ fare (kablolu, alıcı veya Bluetooth) gerektirir."},
+            {"Change sensitivity on any mouse with the software settings instead:\n"
+             "Device section → DPI, Polling Rate, Output DPI — always active.",
+             "Hassasiyeti herhangi bir farede yazılım ayarlarıyla değiştirin:\n"
+             "Cihaz bölümü → DPI, Yoklama Hızı, Çıktı DPI — her zaman aktif."},
             {"Select a Logitech HID++ device first.",
                                          "Önce bir Logitech HID++ cihazı seçin."},
+            {"This device does not support DPI changes.",
+                                         "Bu cihaz DPI değişikliklerini desteklemiyor."},
             {"unknown",                   "bilinmiyor"},
             {"unsupported",               "desteklenmez"},
             {"—",                         "—"},
@@ -383,6 +409,7 @@ static const char* tr(const char* key) {
             {"Charging",                  "Şarj oluyor"},
             {"Discharging",               "Şarj olmuyor"},
             {"Unified Battery",           "Birleşik Pil"},
+            {"Centurion Battery",          "Centurion Pili"},
             {"Battery Status",            "Pil Durumu"},
             {"Battery Voltage",           "Pil Gerilimi"},
             {"HID++ 1.0 register",        "HID++ 1.0 kaydı"},

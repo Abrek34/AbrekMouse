@@ -70,6 +70,8 @@ enum class hidpp_feature_index : uint16_t {
     // request) or data[2] == 1 (powered on); the handler treats any
     // WIRELESS_DEVICE_STATUS notification as a signed-on device.
     wireless_device_status = 0x1D4B,
+    // Centurion battery (PRO X 2 LIGHTSPEED, G515 LS TKL, etc.)
+    centurion_battery_soc  = 0x0104,
     // ── Aşama 1: Easy-Switch / LED / Button / Superstrike ─────────────────
     change_host              = 0x1814, // multi-host switching (1=host, fn=write)
     reprog_controls_v4       = 0x1B04, // reprogrammable keys + divert

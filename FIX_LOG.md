@@ -28,6 +28,7 @@ Son güncelleme: 2026-09-13
 | `.github/workflows/ci.yml` | CI-1, CI-2 |
 | `AGENTS.md` | DOC-1 |
 | `tests/test_accel.cpp` | MATH-2 P107 güncellemesi (scale 0→0.01) |
+| `src/logitech_hidpp.cpp`, `gui/hidpp_panel.inl` | **P-HIDPP-1 (big-pickle, gerçek donanım doğrulandı):** G502 HERO SE'de HID++ ayarları düzeltildi — `ROOT.GetFeature`/`FEATURE_SET.GetCount`/`resolve_feature_index` `send_short` yerine `send_feature_request` (cihaz kısa isteğe uzun `0x11` cevap veriyor); `0x2201` SetDPI fn `0x01`(list okuyucu)→`0x03`(OpenLogi `set_sensor_dpi`) düzeltildi; `gui/hidpp_panel.inl` lambda kapanış derleme hatası onarıldı. Canlı: 2400→400→2400 DPI, 1000→500→125→1000 Hz yaz-oku teyitli. CHANGELOG 1.2.0'ya işlendi |
 
 Önceki oturumun GUI-D4 derleme hatası (duplicate `GError* err`) bu oturumda düzeltildi; build + birim testleri (33792/33792) yeşil. Bu oturumda tamamlananlar: PRE-2, PRE-3 (+oracle mirror, known_deviations 68→67), CFG-2, CFG-3, CFG-5, CLI-2, CLI-3, GUI-O4, GUI-Y3, DOC-1 + önceki seansın MATH-2'siyle P107 tutarlılığı (CLI `scale` domain 0.01 floor, test_accel güncellendi). MATH-1 → KASITLI; CFG-1 → ertelendi (gerekçe yukarıda). Guards: build(warning:0) + unit(33792/33792) + oracle(67 deviation, OK) koşuldu.
 

@@ -6,6 +6,34 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.0] — 2026-09-13
+
+### Fixed
+- **HID++ ayarları (donanım paneli düzeltildi).** Wired G502 HERO SE gibi
+  HID++ 2.0 cihazlarda DPI / polling-rate / LOD ayarları cihaza yazılamıyordu:
+  - `ROOT.GetFeature`, `FEATURE_SET.GetCount` ve `resolve_feature_index`
+    artık `send_short` yerine `send_feature_request` kullanıyor. Bu cihazlar
+    kısa `0x10` isteklerine **uzun `0x11`** raporuyla cevap veriyor;
+    `send_short` yalnızca kısa yanıtı çözebildiği için özellik keşfi boş
+    dönüyor, yazma yolları (`set_dpi` / `set_polling_rate`) reddediliyordu.
+    Artık özellik keşfi (feature yağı), DPI listesi, mevcut DPI, polling rate
+    ve HID++ panel kontrolleri tam çalışıyor.
+  - `0x2201` (non-extended) `AdjustableDpi` **SetDPI fonksiyon kodu `0x03`'e
+    düzeltildi** (OpenLogi `set_sensor_dpi`, `[sensor_index, dpi_hi, dpi_lo]`).
+    Önceki `0x01` aslında DPI *listesini* (GetSensorDpiList) okuyan fonksiyondu;
+    değer gönderse de hızı değiştirmiyordu. Doğrulama (G502 HERO SE,
+    `046d:c08b`): 2400 → 400 → 2400 DPI ve 1000 → 500 → 125 → 1000 Hz yazımları
+    yazıldıktan hemen sonra okunarak teyit edildi.
+  - `gui/hidpp_panel.inl` `hw_query_thread` içindeki `g_idle_add` lambda'sının
+    eksik `});` kapanışı onarıldı (derleme hatası).
+  - **Centurion batarya `/0x0104` desteği:** PRO X 2 LIGHTSPEED, G515 LS TKL
+    gibi cihazların [soc, soc_duplicate, charging_status] dizilimli 3-bayt pil
+    yükü artık `UNIFIED_BATTERY`'den önce deneniyor.
+- GUI HID++ uygulama sonucu artık yazıldıktan sonra cihazdan yeniden okunarak
+  durum satırına yansıtılıyor; "kabul edildi ama uygulanmadı" görüntüsü kalmadı.
+  Eski açık GUI process'i bellekteki eski binary'yi kullandığı için "(reddedildi)"
+  gösterebilir — kapatıp yeniden açın.
+
 ## [1.1.0] — 2026-09-11
 
 ### Added

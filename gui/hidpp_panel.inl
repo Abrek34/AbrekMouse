@@ -49,6 +49,7 @@ static void hw_set_status(AppState* S, const std::string& text) {
 static const char* battery_source_name(logitech_battery_source s) {
     switch (s) {
     case logitech_battery_source::unified_battery: return tr("Unified Battery");
+    case logitech_battery_source::centurion_battery: return tr("Centurion Battery");
     case logitech_battery_source::battery_status:  return tr("Battery Status");
     case logitech_battery_source::battery_voltage: return tr("Battery Voltage");
     case logitech_battery_source::legacy10:        return tr("HID++ 1.0 register");
@@ -84,6 +85,21 @@ void hw_set_battery(AppState* S, int idx,
 /// (the matching widgets stay disabled in hw_update_ui_state).
 void hw_render_caps(AppState* S, int idx) {
     if (!S->hw_caps_lbl) return;
+    // No HID++ hardware found at all (e.g. a non-Logitech or virtual mouse):
+    // never leave the panel silently greyed — spell out WHY the onboard
+    // controls are disabled and point at the always-active software settings.
+    if (S->hidpp_devs.empty()) {
+        gtk_label_set_text(GTK_LABEL(S->hw_caps_lbl),
+            (std::string(tr("The connected mouse is not a Logitech HID++ device, so the\n"
+                            "hardware controls below (DPI / polling rate / lift-off) stay disabled.")) +
+             "\n\n" +
+             tr("These need a physical Logitech HID++ mouse (wired, receiver or Bluetooth).") +
+             "\n\n" +
+             tr("Change sensitivity on any mouse with the software settings instead:\n"
+                "Device section → DPI, Polling Rate, Output DPI — always active."))
+            .c_str());
+        return;
+    }
     if (idx < 0 || idx >= (int)S->hidpp_devs.size()) {
         gtk_label_set_text(GTK_LABEL(S->hw_caps_lbl), tr("Capabilities: —"));
         return;
@@ -161,6 +177,11 @@ struct HwQueryTask {
     // callback drops the result when the vector was rebuilt in the meantime
     // (same index may now name a different physical device).
     int devs_version = 0;
+    // Device capability data for per-device widget ranges
+    std::vector<uint16_t> dpi_levels;
+    bool dpi_xy = false;
+    std::vector<uint32_t> rate_codes_hz;
+    bool supports_lod = false;
 };
 
 struct HwApplyTask {
@@ -172,6 +193,10 @@ struct HwApplyTask {
     uint32_t rate_hz;
     int lod; // hidpp_lift_off_distance value
     int devs_version = 0;
+    // Capability data for validation before write
+    std::vector<uint16_t> dpi_levels;
+    std::vector<uint32_t> rate_codes_hz;
+    bool supports_lod = false;
 };
 
 struct HwNotificationTask {
@@ -244,10 +269,12 @@ static gpointer hw_scan_thread(gpointer data) {
                 gtk_drop_down_set_selected(dd, 0);
         }
         hw_update_ui_state(S);
-        if (S->hidpp_devs.empty())
+        if (S->hidpp_devs.empty()) {
             hw_set_status(S, tr("No Logitech HID++ devices found."));
-        else
+            hw_render_caps(S, -1); // explain why the controls are disabled
+        } else {
             hw_query_current(S); // trigger a query (no-op if notify already did)
+        }
         delete r;
         return G_SOURCE_REMOVE;
     }, res);
@@ -289,6 +316,9 @@ static gpointer hw_query_thread(gpointer data) {
                     else
                         cur.supports_lod = false;
                 }
+                // Capture device-specific DPI levels for the UI
+                task->dpi_levels = dpi->dpi_levels;
+                task->dpi_xy = dpi->supports_y;
             }
             if (auto rate = transport.get_polling_rate(task->device_index)) {
                 cur.rate_hz = (int)*rate;
@@ -300,19 +330,65 @@ static gpointer hw_query_thread(gpointer data) {
                 // reflects what was actually read.
                 cur.ok = true;
             }
+            // Get supported rate codes from the device
+            task->rate_codes_hz.clear();
+            if (auto rate_info = transport.get_polling_rate(task->device_index)) {
+                // We already have the current rate; now try to get the list of supported rates
+                // via the extended report rate feature if available
+                if (auto ext_rate = transport.feature_request(
+                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x00,
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
+                    // Parse rate codes from the extended report rate feature
+                    // Payload format: [count, code1, code2, ...]
+                    if (ext_rate->size() > 1) {
+                        for (size_t i = 1; i < ext_rate->size(); ++i) {
+                            if (auto hz = hidpp_rate_code_to_hz(true, (*ext_rate)[i]))
+                                task->rate_codes_hz.push_back(*hz);
+                        }
+                    }
+                }
+            }
+            // If extended rate not available, fall back to legacy rate feature
+            if (task->rate_codes_hz.empty()) {
+                if (auto legacy_rate = transport.feature_request(
+                        static_cast<uint16_t>(hidpp_feature_index::report_rate), 0x00,
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
+                    if (legacy_rate->size() > 1) {
+                        for (size_t i = 1; i < legacy_rate->size(); ++i) {
+                            if (auto hz = hidpp_rate_code_to_hz(false, (*legacy_rate)[i]))
+                                task->rate_codes_hz.push_back(*hz);
+                        }
+                    }
+                }
+            }
             // P169 — read-only battery for the capability/source display.
             cur.bsrc = preferred_battery_source(task->features, task->hidpp10);
             if (auto b = transport.get_battery_status(task->device_index))
                 cur.battery = b;
+            task->supports_lod = cur.supports_lod;
         }
     }
 
-    struct Result { AppState* S; int idx; Current cur; int devs_version = 0; };
+    struct Result {
+        AppState* S;
+        int idx;
+        Current cur;
+        int devs_version = 0;
+        // Device capability data for UI ranges
+        std::vector<uint16_t> dpi_levels;
+        bool dpi_xy = false;
+        std::vector<uint32_t> rate_codes_hz;
+        bool supports_lod = false;
+    };
     auto* res = new Result();
     res->S = S;
     res->idx = task->idx;
     res->cur = cur;
     res->devs_version = task->devs_version;
+    res->dpi_levels = task->dpi_levels;
+    res->dpi_xy = task->dpi_xy;
+    res->rate_codes_hz = task->rate_codes_hz;
+    res->supports_lod = task->supports_lod;
     delete task;
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
@@ -334,48 +410,71 @@ static gpointer hw_query_thread(gpointer data) {
         hw_set_battery(S, r->idx, r->cur.battery, r->cur.bsrc);
         if (r->idx == selected) {
             hw_update_ui_state(S);
-            if (r->cur.ok) {
-                if (S->hw_dpi_spin && r->cur.dpi > 0)
+            // Update DPI spin with device-specific range
+            if (S->hw_dpi_spin && !r->dpi_levels.empty()) {
+                uint16_t dpi_min = r->dpi_levels.front();
+                uint16_t dpi_max = r->dpi_levels.back();
+                uint16_t dpi_step = 50; // default step
+                if (r->dpi_levels.size() >= 2)
+                    dpi_step = std::max<uint16_t>(50, r->dpi_levels[1] - r->dpi_levels[0]);
+                gtk_spin_button_set_range(GTK_SPIN_BUTTON(S->hw_dpi_spin),
+                                          dpi_min, dpi_max);
+                gtk_spin_button_set_increments(GTK_SPIN_BUTTON(S->hw_dpi_spin),
+                                               dpi_step, dpi_step * 5);
+                if (r->cur.dpi > 0)
                     gtk_spin_button_set_value(GTK_SPIN_BUTTON(S->hw_dpi_spin),
                                               (double)r->cur.dpi);
-                if (S->hw_rate_combo && r->cur.rate_hz > 0) {
+            }
+            // Update rate combo with device-specific supported rates
+            if (S->hw_rate_combo && !r->rate_codes_hz.empty()) {
+                GtkStringList* sl = gtk_string_list_new(nullptr);
+                for (uint32_t hz : r->rate_codes_hz) {
+                    gtk_string_list_append(sl, (std::to_string(hz) + " Hz").c_str());
+                }
+                GtkDropDown* dd = GTK_DROP_DOWN(S->hw_rate_combo);
+                gtk_drop_down_set_model(dd, G_LIST_MODEL(sl));
+                g_object_unref(sl);
+                // Select the current rate
+                if (r->cur.rate_hz > 0) {
                     int best = 0, bd = INT_MAX;
-                    for (int i = 0; i < HW_NRATES; ++i) {
-                        int d = std::abs((int)HW_RATES[i] - r->cur.rate_hz);
-                        if (d < bd) { bd = d; best = i; }
+                    for (size_t i = 0; i < r->rate_codes_hz.size(); ++i) {
+                        int d = std::abs((int)r->rate_codes_hz[i] - r->cur.rate_hz);
+                        if (d < bd) { bd = d; best = (int)i; }
                     }
-                    gtk_drop_down_set_selected(GTK_DROP_DOWN(S->hw_rate_combo),
-                                               (guint)best);
+                    gtk_drop_down_set_selected(dd, (guint)best);
+                } else {
+                    gtk_drop_down_set_selected(dd, 0);
                 }
-                if (S->hw_lod_combo) {
-                    gtk_widget_set_sensitive(S->hw_lod_combo,
-                                             r->cur.supports_lod);
-                    if (r->cur.supports_lod)
-                        gtk_drop_down_set_selected(
-                            GTK_DROP_DOWN(S->hw_lod_combo),
-                            (guint)std::clamp(r->cur.lod, 0, 2));
-                }
+            }
+            if (S->hw_lod_combo) {
+                gtk_widget_set_sensitive(S->hw_lod_combo, r->supports_lod);
+                if (r->supports_lod)
+                    gtk_drop_down_set_selected(
+                        GTK_DROP_DOWN(S->hw_lod_combo),
+                        (guint)std::clamp(r->cur.lod, 0, 2));
+            }
+            if (r->cur.ok) {
                 hw_set_status(S, trf("Current: DPI %s · %d Hz · LOD %s",
                                      cur_dpi_text(r->cur.dpi).c_str(),
                                      r->cur.rate_hz,
-                                     lod_text(r->cur.lod, r->cur.supports_lod).c_str()));
+                                     lod_text(r->cur.lod, r->supports_lod).c_str()));
             } else {
                 hw_set_status(S, tr("Could not query the device's current settings."));
             }
         } else {
             hw_update_ui_state(S);
         }
-        // GUI-Y3: user selected another device while this query was in flight
-        // — re-issue the query now that we are free (stale pending cleared by
-        // the fresh hw_query_current()).
-        if (S->hw_pending_query >= 0) {
-            int pq = S->hw_pending_query;
-            S->hw_pending_query = -1;
-            if (pq < (int)S->hidpp_devs.size())
-                hw_query_current(S);
-        }
-        delete r;
-        return G_SOURCE_REMOVE;
+    // GUI-Y3: user selected another device while this query was in flight
+    // — re-issue the query now that we are free (stale pending cleared by
+    // the fresh hw_query_current()).
+    if (S->hw_pending_query >= 0) {
+        int pq = S->hw_pending_query;
+        S->hw_pending_query = -1;
+        if (pq < (int)S->hidpp_devs.size())
+            hw_query_current(S);
+    }
+    delete r;
+    return G_SOURCE_REMOVE;
     }, res);
     return nullptr;
 }
@@ -411,10 +510,74 @@ static gpointer hw_apply_thread(gpointer data) {
         } else {
             transport.set_device_index(task->device_index);
             out.opened = true;
-            out.ok_dpi  = transport.set_dpi(task->dpi, task->device_index);
-            out.ok_rate = transport.set_polling_rate(task->rate_hz, task->device_index);
-            out.ok_lod  = transport.set_lift_off_distance(
-                (hidpp_lift_off_distance)task->lod, task->device_index);
+            // Validate DPI against device levels before sending
+            std::vector<uint16_t> dpi_levels = task->dpi_levels;
+            if (dpi_levels.empty()) {
+                // Query the device for DPI levels if not provided
+                if (auto dpi = transport.get_dpi_info(task->device_index)) {
+                    dpi_levels = dpi->dpi_levels;
+                }
+            }
+            bool dpi_valid = true;
+            if (!dpi_levels.empty()) {
+                auto it = std::find(dpi_levels.begin(), dpi_levels.end(), task->dpi);
+                if (it == dpi_levels.end()) {
+                    dpi_valid = false;
+                }
+            }
+            if (dpi_valid) {
+                out.ok_dpi = transport.set_dpi(task->dpi, task->device_index);
+            } else {
+                out.ok_dpi = false;
+            }
+            // Validate rate against device-supported rates
+            std::vector<uint32_t> rate_codes_hz = task->rate_codes_hz;
+            if (rate_codes_hz.empty() && task->rate_hz != 0) {
+                // Query the device for supported rates if not provided
+                if (auto ext_rate = transport.feature_request(
+                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x00,
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
+                    if (ext_rate->size() > 1) {
+                        for (size_t i = 1; i < ext_rate->size(); ++i) {
+                            if (auto hz = hidpp_rate_code_to_hz(true, (*ext_rate)[i]))
+                                rate_codes_hz.push_back(*hz);
+                        }
+                    }
+                }
+                if (rate_codes_hz.empty()) {
+                    if (auto legacy_rate = transport.feature_request(
+                            static_cast<uint16_t>(hidpp_feature_index::report_rate), 0x00,
+                            nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
+                        if (legacy_rate->size() > 1) {
+                            for (size_t i = 1; i < legacy_rate->size(); ++i) {
+                                if (auto hz = hidpp_rate_code_to_hz(false, (*legacy_rate)[i]))
+                                    rate_codes_hz.push_back(*hz);
+                            }
+                        }
+                    }
+                }
+            }
+            bool rate_valid = true;
+            if (task->rate_hz != 0 && !rate_codes_hz.empty()) {
+                auto it = std::find(rate_codes_hz.begin(), rate_codes_hz.end(), task->rate_hz);
+                if (it == rate_codes_hz.end()) {
+                    rate_valid = false;
+                }
+            }
+            if (rate_valid && task->rate_hz != 0) {
+                out.ok_rate = transport.set_polling_rate(task->rate_hz, task->device_index);
+            } else if (task->rate_hz == 0) {
+                out.ok_rate = true; // no change requested
+            } else {
+                out.ok_rate = false;
+            }
+            // LOD only if supported
+            if (task->supports_lod) {
+                out.ok_lod = transport.set_lift_off_distance(
+                    (hidpp_lift_off_distance)task->lod, task->device_index);
+            } else {
+                out.ok_lod = true; // no change requested
+            }
         }
 
     }
@@ -643,19 +806,38 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
     if (idx < 0 || idx >= (int)S->hidpp_devs.size())
         return hw_set_status(S, tr("Select a Logitech HID++ device first."));
+    // Validate against device capabilities before sending
+    const auto& dev = S->hidpp_devs[idx];
+    const logitech_controls c = logitech_controls_for(dev.features);
+    if (!c.dpi) {
+        hw_set_status(S, tr("This device does not support DPI changes."));
+        return;
+    }
     S->hw_busy = true;
     hw_update_ui_state(S);
     auto* task = new HwApplyTask();
     task->S = S;
     task->idx = idx;
-    task->hidraw_path = S->hidpp_devs[idx].hidraw_path;   // main-thread snapshot
-    task->device_index = S->hidpp_devs[idx].device_index; // main-thread snapshot
+    task->hidraw_path = dev.hidraw_path;
+    task->device_index = dev.device_index;
     task->dpi  = static_cast<uint16_t>(std::clamp((int)gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->hw_dpi_spin)), HW_DPI_MIN, HW_DPI_MAX));
-    task->rate_hz = HW_RATES[(guint)std::clamp(
-        (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_rate_combo)),
-        0, HW_NRATES - 1)];
+    task->rate_hz = 0;
+    if (c.report_rate || c.report_rate_extended) {
+        int rate_sel = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_rate_combo));
+        GtkDropDown* dd = GTK_DROP_DOWN(S->hw_rate_combo);
+        GListModel* model = gtk_drop_down_get_model(dd);
+        if (model && rate_sel >= 0 && rate_sel < (int)g_list_model_get_n_items(model)) {
+            gpointer item = g_list_model_get_item(model, rate_sel);
+            if (item) {
+                const char* str = gtk_string_object_get_string(GTK_STRING_OBJECT(item));
+                task->rate_hz = std::stoul(str);
+                g_object_unref(item);
+            }
+        }
+    }
     task->lod = std::clamp(
         (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo)), 0, 2);
     task->devs_version = S->hw_devs_version;
+    task->supports_lod = c.lod;
     hw_thread("rawaccel-hw-apply", hw_apply_thread, task);
 }

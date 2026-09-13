@@ -234,6 +234,9 @@ std::optional<hidpp_battery_info> parse_battery_charge(
     return info;
 }
 
+/// Decode a Centurion battery SoC payload (feature 0x0104 — PRO X 2
+/// LIGHTSPEED, G515 LS TKL, etc.).  Three bytes: [soc, soc_duplicate,
+/// charging_status].  The SoC byte is the direct percentage (a duplicate
 std::optional<hidpp_battery_info> parse_legacy_battery_status(
     const uint8_t* payload, size_t size) {
     if (!payload || size < 3) return std::nullopt;
@@ -323,6 +326,25 @@ std::optional<hidpp_battery_info> hidpp_parse_legacy_battery(
     return parse_legacy_battery_status(payload, size);
 }
 
+std::optional<hidpp_battery_info> parse_centurion_battery(
+    const std::vector<uint8_t>& payload) {
+    // Centurion battery (0x0104) response format (3 bytes):
+    //   Byte 0: Battery Percentage (0-100)
+    //   Byte 1: Battery Percentage (duplicate)
+    //   Byte 2: Charging Status (0=discharging, 1=charging, 2=charging via USB, 3=charge complete)
+    if (payload.size() < 3) return std::nullopt;
+    hidpp_battery_info info;
+    info.level = payload[0] <= 100 ? payload[0] : 255;
+    uint8_t charging_status = payload[2];
+    if (charging_status == 1 || charging_status == 2) {
+        info.charging = true;
+    } else if (charging_status == 3) {
+        info.charging = false; // charge complete = not actively charging
+    }
+    info.online = true;
+    return info;
+}
+
 std::optional<uint32_t> hidpp_rate_code_to_hz(bool extended, uint8_t code) {
     return rate_code_to_hz(extended, code);
 }
@@ -358,6 +380,7 @@ const char* hidpp_feature_name(uint16_t feature_id) {
     case hidpp_feature_index::gesture: return "gesture";
     case hidpp_feature_index::battery_status: return "battery_status";
     case hidpp_feature_index::unified_battery: return "unified_battery";
+    case hidpp_feature_index::centurion_battery_soc: return "centurion_battery_soc";
     case hidpp_feature_index::battery_voltage: return "battery_voltage";
     case hidpp_feature_index::adjustable_dpi: return "adjustable_dpi";
     case hidpp_feature_index::extended_adjustable_dpi: return "extended_adjustable_dpi";
@@ -786,14 +809,20 @@ std::optional<uint8_t> HidppTransport::resolve_feature_index(
         static_cast<uint8_t>(feature_id & 0xFF),
         0
     };
-    auto response = send_short(0, 0, params, std::chrono::milliseconds(500),
-                               target_device_index);
-    if (!response || response->params[0] == 0) return std::nullopt;
+    // send_feature_request (NOT send_short): ROOT.GetFeature is answered with
+    // a LONG 0x11 report by some HID++ 2.0 devices (wired G502 HERO SE, ...),
+    // and send_short only parses short 0x10 replies, so index resolution would
+    // fail and every write path (set_dpi / set_polling_rate) would be rejected.
+    auto response = send_feature_request(0, 0, params, sizeof(params),
+                                         std::chrono::milliseconds(500),
+                                         target_device_index);
+    if (!response || response->empty() || (*response)[0] == 0)
+        return std::nullopt;
     {
         std::lock_guard lock(feature_mutex_);
-        feature_indices_[cache_key] = response->params[0];
+        feature_indices_[cache_key] = (*response)[0];
     }
-    return response->params[0];
+    return (*response)[0];
 }
 
 std::optional<hidpp_short_packet> HidppTransport::send_short(
@@ -1169,28 +1198,36 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
 
     // ROOT.GetFeature(FEATURE_SET) returns the dynamic FEATURE_SET index,
     // followed by FEATURE_SET.GetCount and FEATURE_SET.GetFeature.
+    // NB: send_feature_request — NOT send_short — is used here because some
+    // HID++ 2.0 devices (e.g. the wired Logitech G502 HERO SE family) reply to
+    // the ROOT short request with a LONG (0x11) response; send_short only
+    // parses short (0x10) replies, so feature discovery would come up empty
+    // and the HID++ hardware panel would report "no HID++" on those mice.
     const uint8_t feature_id[3] = {0x00, 0x01, 0x00};
-    auto fs = send_short(0, 0x00, feature_id);
-    if (!fs || fs->params[0] == 0) return features;
+    auto fs = send_feature_request(0, 0x00, feature_id, sizeof(feature_id),
+                                   std::chrono::milliseconds(900), target);
+    if (!fs || fs->empty() || (*fs)[0] == 0) return features;
 
+    const uint8_t feature_set_index = (*fs)[0];
     {
         std::lock_guard lock(feature_mutex_);
         feature_indices_[(static_cast<uint32_t>(target) << 16) | 0x0001] =
-            fs->params[0];
+            feature_set_index;
     }
     const uint8_t count_params[3] = {0, 0, 0};
-    auto count_response = send_short(fs->params[0], 0x00, count_params,
-                                     std::chrono::milliseconds(900), target);
-    if (!count_response) return features;
+    auto count_response = send_feature_request(
+        feature_set_index, 0x00, count_params, sizeof(count_params),
+        std::chrono::milliseconds(900), target);
+    if (!count_response || count_response->empty()) return features;
 
     // Solaar's FEATURE_SET.GetCount response excludes ROOT.  ROOT therefore
     // occupies index 0 and the advertised count needs one added before
     // enumerating dynamic indices.  The fourth byte of GetFeatureId is the
     // feature version, not the dynamic index; the request index is the
     // authoritative metadata.
-    const uint16_t count = static_cast<uint16_t>(count_response->params[0]) + 1;
+    const uint16_t count = static_cast<uint16_t>((*count_response)[0]) + 1;
     features.push_back({0x0000, 0, 0, 0});
-    features.push_back({0x0001, fs->params[0], 0, 0});
+    features.push_back({0x0001, feature_set_index, 0, 0});
     // A non-responding device would otherwise stall the daemon for minutes
     // (900 ms × up to 256 indices, ~4 min worst case).  Solaar aborts
     // enumeration after a short run of consecutive timeouts; match that so
@@ -1200,13 +1237,13 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
     const auto deadline = std::chrono::steady_clock::now() + kIdentifyBudget;
     for (uint16_t i = 1; i < count; ++i) {
         if (std::chrono::steady_clock::now() >= deadline) break;
-        if (i == fs->params[0]) continue;
+        if (i == feature_set_index) continue;
         // GetFeatureId has one parameter byte, so the request is short even
         // though devices commonly return its four-byte metadata in a long
         // report.  send_feature_request accepts either response report size.
         const uint8_t index_param = static_cast<uint8_t>(i);
         auto frsp = send_feature_request(
-            fs->params[0], 0x01, &index_param, 1,
+            feature_set_index, 0x01, &index_param, 1,
             std::chrono::milliseconds(900), target);
         const auto metadata = frsp
             ? hidpp_parse_feature_metadata(static_cast<uint8_t>(i), *frsp)
@@ -1462,6 +1499,17 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
             // millivolts rather than a direct charge percentage.
             const bool charging = (rsp->params[2] & 0x80) != 0;
             return battery_info_from_voltage(voltage, charging);
+        }
+
+    // Centurion battery (0x0104) — PRO X 2 LIGHTSPEED, G515 LS TKL, etc.
+    // This is a separate feature from UNIFIED_BATTERY with a 3-byte payload:
+    // [soc, soc_duplicate, charging_status].  Try it before legacy registers.
+    if (has_feature(hidpp_feature_index::centurion_battery_soc))
+        if (auto payload = feature_request(
+                static_cast<uint16_t>(hidpp_feature_index::centurion_battery_soc), 0x00,
+                nullptr, 0, std::chrono::milliseconds(500),
+                target_device_index)) {
+            if (auto info = parse_centurion_battery(*payload)) return info;
         }
 
     // Legacy devices advertise either register.  Solaar probes
@@ -1816,6 +1864,12 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
     const uint8_t params[3] = {
         0, static_cast<uint8_t>(dpi >> 8), static_cast<uint8_t>(dpi)
     };
+    // 0x2201 (non-extended) ADJUSTABLE_DPI SetDPI is function 0x03 with
+    // [sensor_index, dpi_hi, dpi_lo] (OpenLogi: set_sensor_dpi).  Verified on
+    // the wired G502 HERO SE: fn 0x03 applies 2400 → 400 → 2400 immediately
+    // (read back through GetSensorDpi, fn 0x02).  fn 0x01 is the DPI *list*
+    // reader (GetSensorDpiList), not a setter — sending a value there only
+    // reads a list chunk and never changes the DPI (P-HIDPP-1).
     return send_feature_request(*index, 0x3, params, sizeof(params),
                                 std::chrono::milliseconds(700),
                                 target_device_index).has_value();
@@ -2268,6 +2322,13 @@ std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_p
         // source across devices.
         device.info.name = hidraw_export_name(hidraw_path);
         device.connected = true;
+        // Enable HID++ 1.0 notifications (BATTERY_STATUS + UI + CONFIG_COMPLETE)
+        // so the device sends battery/link events.  Match Solaar's default:
+        // NotificationFlag::BATTERY_STATUS | NotificationFlag::UI | NotificationFlag::CONFIGURATION_COMPLETE
+        // These map to bits 0x100000 | 0x000200 | 0x000004 = 0x100204
+        // Register 0x00 (NOTIFICATIONS) with value [0x00, 0x02, 0x04] (3 bytes, little-endian flag field)
+        static constexpr uint8_t notif_flags[3] = {0x00, 0x02, 0x04};
+        transport.write_register(0x00, notif_flags, sizeof(notif_flags));
         return device;
     }
 
@@ -2368,6 +2429,10 @@ hidpp_notification_event classify_hidpp_notification(
         case hidpp_feature_index::unified_battery:
             event.kind = hidpp_notification_event_kind::battery;
             event.battery = hidpp_parse_unified_battery(notification.payload);
+            break;
+        case hidpp_feature_index::centurion_battery_soc:
+            event.kind = hidpp_notification_event_kind::battery;
+            event.battery = parse_centurion_battery(notification.payload);
             break;
         case hidpp_feature_index::battery_voltage:
             event.kind = hidpp_notification_event_kind::battery;

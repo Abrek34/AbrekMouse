@@ -16,6 +16,7 @@ static void update_raw_sensitivity(AppState* S, bool raw) {
     if (S->speed_max_spin)     gtk_widget_set_sensitive(S->speed_max_spin, !raw);
     if (S->lr_ratio_spin)      gtk_widget_set_sensitive(S->lr_ratio_spin, !raw);
     if (S->ud_ratio_spin)      gtk_widget_set_sensitive(S->ud_ratio_spin, !raw);
+    if (S->yx_ratio_spin)      gtk_widget_set_sensitive(S->yx_ratio_spin, !raw);
     if (S->dist_mode_combo)    gtk_widget_set_sensitive(S->dist_mode_combo, !raw);
     if (S->lp_norm_spin)       gtk_widget_set_sensitive(S->lp_norm_spin, !raw);
     if (S->input_hl_spin)      gtk_widget_set_sensitive(S->input_hl_spin, !raw);
@@ -76,9 +77,9 @@ static void update_mode_sensitivity(AppState* S) {
     row_set_visible(S->accel_row_label[14], S->scale_spin,         mode_uses(mode, {accel_mode::power}));
 
     // The Gain toggle switches between the LEGACY multiplier form and the
-    // integral (output-speed) GAIN form. Power is not gain-capable yet, so it
-    // stays disabled there; noaccel has no curve at all.
-    bool gain_capable = !mode_uses(mode, {accel_mode::noaccel, accel_mode::power});
+    // integral (output-speed) GAIN form.  noaccel has no curve at all.
+    // Power GAIN is supported by the engine (integral form with cap handling).
+    bool gain_capable = !mode_uses(mode, {accel_mode::noaccel});
     if (S->gain_check)
         gtk_widget_set_sensitive(S->gain_check, !raw && gain_capable);
 
@@ -102,7 +103,7 @@ static void update_mode_sensitivity(AppState* S) {
         switch (mode) {
         case accel_mode::noaccel:     hint = "1:1 output — no curve parameters."; break;
         case accel_mode::classic:     hint = "Uses: Accel, Exp (cls), Input Offset, Cap X/Y, Cap Mode."; break;
-        case accel_mode::power:       hint = "Uses: Scale, Exp (pwr), Output Offset, Cap X/Y, Cap Mode."; break;
+        case accel_mode::power:       hint = "Uses: Scale, Exp (pwr), Output Offset, Cap X/Y, Cap Mode, Gain."; break;
         case accel_mode::natural:     hint = "Uses: Limit, Decay Rate, Input Offset, Gain."; break;
         case accel_mode::jump:        hint = "Uses: Cap X (step position), Cap Y (step amount), Smooth."; break;
         case accel_mode::synchronous: hint = "Uses: Sync Speed, Motivity, Gamma, Smooth."; break;
@@ -230,6 +231,7 @@ void widgets_to_profile(AppState* S) {
     dp.prof.output_dpi          = SPIN(output_dpi_spin);
     dp.prof.lr_output_dpi_ratio = SPIN(lr_ratio_spin);
     dp.prof.ud_output_dpi_ratio = SPIN(ud_ratio_spin);
+    dp.prof.yx_output_dpi_ratio = SPIN(yx_ratio_spin);
     dp.dev_cfg.dpi              = (int)SPIN(dpi_spin);
     dp.dev_cfg.polling_rate     = (int)SPIN(polling_spin);
 
@@ -360,8 +362,14 @@ void profile_to_widgets(AppState* S) {
     SET_SPIN(output_dpi_spin, dp.prof.output_dpi);
     SET_SPIN(lr_ratio_spin,   dp.prof.lr_output_dpi_ratio);
     SET_SPIN(ud_ratio_spin,   dp.prof.ud_output_dpi_ratio);
+    SET_SPIN(yx_ratio_spin,   dp.prof.yx_output_dpi_ratio);
     SET_SPIN(dpi_spin,        dp.dev_cfg.dpi);
     SET_SPIN(polling_spin,    dp.dev_cfg.polling_rate);
+    // PAS-1: the master switch lives outside the profile.  S->updating is true
+    // here, so on_raw_input_toggled() ignores this programmatic set.
+    if (S->raw_input_check)
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(S->raw_input_check),
+                                    S->config.use_raw_input);
 
     // Speed processor
     {
@@ -595,6 +603,19 @@ void on_xy_link_toggled(GtkCheckButton* btn, gpointer user_data) {
     widgets_to_profile(S);
 }
 
+// PAS-1: top-level use_raw_input master switch.  Unlike every other control
+// on this panel it is NOT per-profile: it flips AppState::config.use_raw_input
+// and persists immediately (the daemon picks it up live via the set_config
+// push, same as any other save).  S->updating guards the programmatic set in
+// profile_to_widgets().
+void on_raw_input_toggled(GtkCheckButton* btn, gpointer user_data) {
+    auto* S = static_cast<AppState*>(user_data);
+    if (S->updating) return;
+    S->config.use_raw_input = gtk_check_button_get_active(btn) != FALSE;
+    S->unsaved = true;
+    save_config_now(S);
+}
+
 // L-BUG-30: on_save_clicked / on_apply_clicked were ~30 identical lines.
 // Shared "Save As" flow: asks for a name, upserts the profile, persists it.
 // save_config_now() auto-sends SIGHUP when the daemon is running, so both
@@ -695,9 +716,10 @@ void on_save_clicked(GtkButton*, gpointer user_data) {
 }
 
 void on_apply_clicked(GtkButton*, gpointer user_data) {
-    // Apply & Reload: same Save As logic, then reload the daemon.
-    // save_config_now() auto-sends SIGHUP when daemon is running.
-    save_profile_as_dialog(static_cast<AppState*>(user_data));
+    auto* S = static_cast<AppState*>(user_data);
+    // Apply: save current profile changes to config and push to daemon (no dialog)
+    widgets_to_profile(S);
+    save_config_now(S);
 }
 
 void on_daemon_start(GtkButton*, gpointer user_data) {

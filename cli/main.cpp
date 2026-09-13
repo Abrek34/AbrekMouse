@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <ctime>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -1334,6 +1335,204 @@ static int cmd_export(const app_config& cfg, const std::string& name) {
     return 1;
 }
 
+/// Compare two profiles (either by profile name in the config, or by JSON file
+/// path) and print ONLY the fields that differ, using the same epsilon the
+/// accel_args operator== uses so legitimate round-trip precision differences
+/// never show up as bogus diffs.  Read-only: never touches the config file,
+/// the daemon, or the LUT data.
+static int cmd_diff(const app_config& cfg, const std::string& a, const std::string& b) {
+    auto resolve = [&](const std::string& ref, device_profile& out) -> bool {
+        for (const auto& dp : cfg.profiles) {
+            if (dp.name == ref) { out = dp; return true; }
+        }
+        // Not a profile name — try it as a JSON file (the `export` format).
+        // Same bounded chunked read as import (stat() can fail on FUSE/pipes).
+        std::ifstream f(ref, std::ios::in | std::ios::binary);
+        if (!f.is_open()) {
+            std::cerr << "Diff source is neither a profile name nor a readable "
+                      << "file: " << ref << "\n";
+            return false;
+        }
+        std::string content;
+        char chunk[1 << 16];
+        constexpr size_t kDiffMax = 1024 * 1024;
+        while (f && content.size() <= kDiffMax) {
+            f.read(chunk, sizeof(chunk));
+            content.append(chunk, (size_t)f.gcount());
+        }
+        if (content.size() > kDiffMax) {
+            std::cerr << "Refusing to diff: " << ref << " is larger than 1MB\n";
+            return false;
+        }
+        try {
+            out = profile_from_json(content);
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid profile JSON in " << ref << ": " << e.what() << "\n";
+            return false;
+        }
+        return true;
+    };
+
+    device_profile A, B;
+    if (!resolve(a, A) || !resolve(b, B)) return 1;
+
+    std::cout << "diff '" << A.name << "' vs '" << B.name << "'\n";
+    if (A.name == B.name && (A.name == a || A.name == b))
+        std::cout << "note: both sides share the name '" << A.name
+                  << "' but the values differ (one side is a file).\n";
+
+    int diffs = 0;
+    auto dnum = [](double v) -> std::string {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%.10g", v);
+        return buf;
+    };
+    auto dbl = [&](const char* key, double x, double y) {
+        if (std::fabs(x - y) > accel_args::DBL_EPSILON_CMP) {
+            std::cout << "  " << std::left << std::setw(26) << key
+                      << dnum(x) << "  vs  " << dnum(y) << "\n";
+            ++diffs;
+        }
+    };
+    auto bval = [&](const char* key, bool x, bool y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key
+                      << (x ? "true" : "false") << "  vs  "
+                      << (y ? "true" : "false") << "\n";
+            ++diffs;
+        }
+    };
+    auto sval = [&](const char* key, const std::string& x, const std::string& y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key << "'"
+                      << x << "'  vs  '" << y << "'\n";
+            ++diffs;
+        }
+    };
+    auto ival = [&](const char* key, int x, int y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key << x
+                      << "  vs  " << y << "\n";
+            ++diffs;
+        }
+    };
+    auto mode_name = [](accel_mode m) -> const char* {
+        switch (m) {
+        case accel_mode::noaccel:    return "noaccel";
+        case accel_mode::classic:    return "classic";
+        case accel_mode::power:      return "power";
+        case accel_mode::natural:    return "natural";
+        case accel_mode::jump:       return "jump";
+        case accel_mode::synchronous:return "synchronous";
+        case accel_mode::lookup:     return "lookup";
+        }
+        return "?";
+    };
+    auto cap_name = [](cap_mode m) -> const char* {
+        switch (m) {
+        case cap_mode::io:  return "io";
+        case cap_mode::in:  return "in";
+        case cap_mode::out: return "out";
+        }
+        return "?";
+    };
+
+    sval("name", A.name, B.name);
+    sval("device_id", A.device_id, B.device_id);
+    sval("match_app", A.match_app, B.match_app);
+    bval("disable", A.dev_cfg.disable, B.dev_cfg.disable);
+    ival("dpi", A.dev_cfg.dpi, B.dev_cfg.dpi);
+    ival("polling_rate", A.dev_cfg.polling_rate, B.dev_cfg.polling_rate);
+    bval("raw_passthrough", A.prof.raw_passthrough, B.prof.raw_passthrough);
+
+    // X and Y accel args (the X-only view; Y is reported separately only when
+    // it differs from X on EITHER side, to keep identical rows out of the diff).
+    auto cmp_args = [&](const char* axis, const accel_args& x, const accel_args& y) {
+        if (x.mode != y.mode) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".mode")
+                      << mode_name(x.mode) << "  vs  " << mode_name(y.mode) << "\n";
+            ++diffs;
+        }
+        if (x.gain != y.gain) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".gain")
+                      << (x.gain ? "true" : "false") << "  vs  "
+                      << (y.gain ? "true" : "false") << "\n";
+            ++diffs;
+        }
+        if (x.cap_mode_val != y.cap_mode_val) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".cap_mode")
+                      << cap_name(x.cap_mode_val) << "  vs  " << cap_name(y.cap_mode_val) << "\n";
+            ++diffs;
+        }
+        dbl((std::string(axis) + ".input_offset").c_str(),  x.input_offset, y.input_offset);
+        dbl((std::string(axis) + ".output_offset").c_str(), x.output_offset, y.output_offset);
+        dbl((std::string(axis) + ".acceleration").c_str(),  x.acceleration, y.acceleration);
+        dbl((std::string(axis) + ".decay_rate").c_str(),    x.decay_rate, y.decay_rate);
+        dbl((std::string(axis) + ".gamma").c_str(),         x.gamma, y.gamma);
+        dbl((std::string(axis) + ".motivity").c_str(),      x.motivity, y.motivity);
+        dbl((std::string(axis) + ".exponent_classic").c_str(), x.exponent_classic, y.exponent_classic);
+        dbl((std::string(axis) + ".scale").c_str(),         x.scale, y.scale);
+        dbl((std::string(axis) + ".exponent_power").c_str(),x.exponent_power, y.exponent_power);
+        dbl((std::string(axis) + ".limit").c_str(),         x.limit, y.limit);
+        dbl((std::string(axis) + ".sync_speed").c_str(),    x.sync_speed, y.sync_speed);
+        dbl((std::string(axis) + ".smooth").c_str(),        x.smooth, y.smooth);
+        dbl((std::string(axis) + ".cap_x").c_str(),         x.cap.x, y.cap.x);
+        dbl((std::string(axis) + ".cap_y").c_str(),         x.cap.y, y.cap.y);
+        if (x.length != y.length) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".lut.length") << x.length
+                      << "  vs  " << y.length << "\n";
+            ++diffs;
+        }
+        if (x.length == y.length) {
+            bool lut_eq = true;
+            for (int i = 0; i < x.length && i < (int)LUT_RAW_DATA_CAPACITY; ++i)
+                if (std::fabs(x.data[i] - y.data[i]) > accel_args::LUT_EPSILON) { lut_eq = false; break; }
+            if (!lut_eq) {
+                std::cout << "  " << std::left << std::setw(26)
+                          << (std::string(axis) + ".lut.data") << "[different]"
+                          << "\n";
+                ++diffs;
+            }
+        } else if (x.length > 0 || y.length > 0) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".lut.data") << "[different]" << "\n";
+            ++diffs;
+        }
+    };
+    sval("domain_weights", dnum(A.prof.domain_weights.x) + "," + dnum(A.prof.domain_weights.y),
+                            dnum(B.prof.domain_weights.x) + "," + dnum(B.prof.domain_weights.y));
+    sval("range_weights", dnum(A.prof.range_weights.x) + "," + dnum(A.prof.range_weights.y),
+                           dnum(B.prof.range_weights.x) + "," + dnum(B.prof.range_weights.y));
+    bval("speed.whole", A.prof.speed_processor_args.whole, B.prof.speed_processor_args.whole);
+    dbl("speed.lp_norm", A.prof.speed_processor_args.lp_norm, B.prof.speed_processor_args.lp_norm);
+    dbl("speed.input_smooth_halflife", A.prof.speed_processor_args.input_speed_smooth_halflife,
+                                       B.prof.speed_processor_args.input_speed_smooth_halflife);
+    dbl("speed.scale_smooth_halflife", A.prof.speed_processor_args.scale_smooth_halflife,
+                                       B.prof.speed_processor_args.scale_smooth_halflife);
+    dbl("speed.output_smooth_halflife", A.prof.speed_processor_args.output_speed_smooth_halflife,
+                                        B.prof.speed_processor_args.output_speed_smooth_halflife);
+    dbl("output_dpi", A.prof.output_dpi, B.prof.output_dpi);
+    dbl("yx_output_dpi_ratio", A.prof.yx_output_dpi_ratio, B.prof.yx_output_dpi_ratio);
+    dbl("lr_output_dpi_ratio", A.prof.lr_output_dpi_ratio, B.prof.lr_output_dpi_ratio);
+    dbl("ud_output_dpi_ratio", A.prof.ud_output_dpi_ratio, B.prof.ud_output_dpi_ratio);
+    dbl("degrees_rotation", A.prof.degrees_rotation, B.prof.degrees_rotation);
+    dbl("degrees_snap", A.prof.degrees_snap, B.prof.degrees_snap);
+    dbl("speed_min", A.prof.speed_min, B.prof.speed_min);
+    dbl("speed_max", A.prof.speed_max, B.prof.speed_max);
+
+    cmp_args("accel_x", A.prof.accel_x, B.prof.accel_x);
+    if (A.prof.accel_y != A.prof.accel_x || B.prof.accel_y != B.prof.accel_x)
+        cmp_args("accel_y", A.prof.accel_y, B.prof.accel_y);
+
+    std::cout << (diffs == 0 ? "no differences" : std::to_string(diffs) + " difference(s)")
+              << "\n";
+    return diffs == 0 ? 0 : 1;
+}
+
 static int cmd_import(app_config& cfg, const std::string& config_path, const std::string& json_file) {
     std::ifstream f(json_file, std::ios::in | std::ios::binary);
     if (!f.is_open()) { std::cerr << "Cannot open: " << json_file << "\n"; return 1; }
@@ -1543,6 +1742,10 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
             cfg.active_profile.clear();
         }
     }
+    // CFG-1: import bypassed migrate_config() — old profiles (pre-0.4.0
+    // lookup+gain semantics) would be loaded without the y*x scaling migration.
+    // Run migration on the merged config so imported profiles get upgraded.
+    migrate_config(cfg);
     if (!safe_save(cfg, config_path)) return 1;
     return daemon_apply_if_enabled(cfg);
 }
@@ -1625,6 +1828,165 @@ static bool daemon_running() {
         if (pid_is_rawaccel_daemon(pid)) return true;
     }
     return false;
+}
+
+// ── monitor: live per-device telemetry (reads the IPC status JSON) ───────────
+
+static volatile sig_atomic_t g_monitor_stop = 0;
+static void monitor_sigint_handler(int) { g_monitor_stop = 1; }
+
+static double monitor_monotonic_ms() {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static std::string monitor_time_stamp() {
+    std::time_t t = std::time(nullptr);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+    return buf;
+}
+
+/// Poll the daemon's `status` JSON and render a live per-device table
+/// (input/output IPS, gain, latency percentiles, real poll rate, battery,
+/// staleness).  Interactive on a TTY (re-drawn in place); line-stream mode
+/// (one sample per line, first line = header) when piped/redirected so it is
+/// script-friendly.  Never touches the config file.
+/// @param interval_ms  poll period; must be within [20, 60000].
+static int cmd_monitor(int interval_ms) {
+    if (!daemon_running()) {
+        std::cerr << "Daemon is not running.  Start it with: sudo systemctl start rawaccel\n";
+        return 1;
+    }
+    struct sigaction sa {};
+    sa.sa_handler = monitor_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+
+    const bool tty = isatty(STDOUT_FILENO);
+    auto num = [](const nlohmann::json& j, const char* key, double fallback = 0.0) {
+        return j.contains(key) && j[key].is_number() ? j[key].get<double>() : fallback;
+    };
+    auto it  = [](const nlohmann::json& j, const char* key, int fallback = -1) {
+        return j.contains(key) && j[key].is_number() ? j[key].get<int>() : fallback;
+    };
+    // name column width — cap at 28 so device names can't wreck the layout
+    auto trimmed = [](std::string s, size_t w) {
+        if (s.size() > w) { s.resize(w > 1 ? w - 1 : w); s += "\u2026"; }
+        return s;
+    };
+
+    bool header_shown = false;
+    while (!g_monitor_stop) {
+        std::string resp = daemon_ipc_query("status");
+        if (resp.empty()) {
+            // Daemon stopped (or IPC socket vanished) mid-poll: report it
+            // instead of failing with a confusing JSON-parse error.  Give the
+            // PID file one quick re-check to distinguish "stopped" from a
+            // transient connect snag.
+            usleep(50000);
+            if (!daemon_running()) {
+                std::cerr << "Daemon stopped — monitor exiting.\n"
+                          << "Start it with: sudo systemctl start rawaccel\n";
+                return 1;
+            }
+            continue;
+        }
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(resp);
+        } catch (const std::exception& e) {
+            std::cerr << "Daemon returned unparseable status: " << e.what() << "\n";
+            return 1;
+        }
+        const double now_ms = monitor_monotonic_ms();
+        const std::string stamp = monitor_time_stamp();
+
+        const nlohmann::json devs = (j.contains("devices") && j["devices"].is_array())
+                                        ? j["devices"] : nlohmann::json::array();
+        if (!tty && !header_shown) {
+            std::cout << "   TIME  DEVICE                      IN_IPS  OUT_IPS    GAIN   "
+                      << "LATp50(m) LATp95(m)  HHZ  BAT  PROFILE"
+                      << (devs.empty() ? "  (no devices)" : "") << "\n";
+            header_shown = true;
+        }
+        if (tty) {
+            std::cout << "\033[2J\033[H";
+            std::cout << "rawaccel monitor [" << stamp << "]  active_profile="
+                      << (j.contains("active_profile") && j["active_profile"].is_string()
+                              ? j["active_profile"].get<std::string>() : "?")
+                      << "  poll=" << interval_ms << "ms  (Ctrl-C to quit)\n";
+        }
+        std::string rows;
+        for (const auto& d : devs) {
+            std::string name = d.contains("name") && d["name"].is_string()
+                                   ? d["name"].get<std::string>() : "(unnamed)";
+            const double t_in  = num(d, "telem_in_ips");
+            const double t_out = num(d, "telem_out_ips");
+            const double t_gain = num(d, "telem_gain");
+            const double t_wall = num(d, "telem_wall_ms");
+            const bool has_telem = d.contains("telem_in_ips");
+            const bool stale = has_telem && (now_ms - t_wall) > 2000.0;
+            const int has_lat = it(d, "lat_samples");
+            const double p50 = has_lat > 0 ? num(d, "lat_p50_us") : 0.0;
+            const double p95 = has_lat > 0 ? num(d, "lat_p95_us") : 0.0;
+            const int rpr = it(d, "real_polling_rate", it(d, "detected_polling_rate"));
+            const int batt = it(d, "detected_battery");
+            const std::string dev_id = d.contains("device_id") && d["device_id"].is_string()
+                                           ? d["device_id"].get<std::string>() : "";
+
+            std::ostringstream r;
+            if (!tty) r << stamp << "  ";
+            r << std::left << std::setw(28) << trimmed(name, 28);
+            if (has_telem) {
+                r << std::fixed << std::setprecision(1)
+                  << std::setw(7) << t_in << std::setw(8) << t_out
+                  << std::setprecision(3) << std::setw(8) << t_gain;
+            } else {
+                r << std::setw(23) << "-";
+            }
+            if (has_lat > 0)
+                r << std::fixed << std::setprecision(1)
+                  << std::setw(8) << p50 << std::setw(9) << p95;
+            else
+                r << std::setw(17) << "-";
+            r << std::setw(6) << (rpr > 0 ? std::to_string(rpr) : "-")
+              << std::setw(5) << (batt > 0 ? (std::to_string(batt) + "%") : "-")
+              << "  ";
+            if (has_telem) {
+                r << (tty ? (stale ? dev_id + " [stale]" : dev_id)
+                          : (stale ? "(stale)" : "(live)")) << "\n";
+            } else {
+                r << (tty ? dev_id : "(none)") << "\n";
+            }
+            rows += r.str();
+        }
+        std::cout << rows;
+        std::cout.flush();
+        // Downstream closed the pipe (e.g. `monitor | head`).  Default SIGPIPE
+        // already terminates us, but a parent that ignores SIGPIPE turns EPIPE
+        // into a badbit — exit cleanly instead of throwing on the next write.
+        if (!std::cout) { std::cout.clear(); return 0; }
+
+        if (g_monitor_stop) break;
+        // Sleep until deadline in ~50 ms slices (nanosleep, EINTR-retried) so a
+        // stray signal can never truncate the poll interval and Ctrl-C stays
+        // responsive for intervals up to 60 s.
+        double wake = monitor_monotonic_ms() + interval_ms;
+        while (!g_monitor_stop) {
+            const double remain = wake - monitor_monotonic_ms();
+            if (remain <= 0) break;
+            struct timespec ts {};
+            ts.tv_sec = (time_t)(remain / 1000.0);
+            ts.tv_nsec = (long)((remain - ts.tv_sec * 1000.0) * 1e6);
+            if (ts.tv_nsec > 49999999L) { ts.tv_nsec = 49999999L; }
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR && !g_monitor_stop) {}
+        }
+    }
+    std::cout << "\n";
+    return 0;
 }
 
 static int cmd_status_json(const std::string& config_path) {
@@ -2347,6 +2709,13 @@ Commands:
                                  Set a parameter in a profile
   export [profile]              Export profile as JSON to stdout
   import <file.json>            Import profile from JSON file
+  diff <a> <b>                  Diff two profiles (name in the config or JSON
+                                 file — e.g. an `export`) and print the fields
+                                 that differ; exit 0 = identical, 1 = differ
+  monitor [interval-ms]         Live per-device telemetry (IPS, gain, latency,
+                                 poll rate, battery) from the running daemon.
+                                 Default 500 ms; interactive on a TTY,
+                                 line-stream when piped. Ctrl-C to quit.
   status                        Show daemon status, profiles, and device assignments
   receivers                     List detected Logitech receivers and HID++ capability
   hidpp                         List detected Logitech HID++ devices and query info
@@ -2544,6 +2913,8 @@ int main(int argc, char* argv[]) {
         { "set-param",     3, 3 },
         { "import",        1, 1 },
         { "export",        0, 1 },
+        { "diff",          2, 2 },
+        { "monitor",       0, 1 },
         { "list",          0, 0 },
         { "validate",      0, 0 },
         { "status",        0, 0 },
@@ -2579,6 +2950,8 @@ int main(int argc, char* argv[]) {
             else if (args[0] == "set-param")       std::cerr << " <profile> <key> <value>";
             else if (args[0] == "import")          std::cerr << " <file.json>";
             else if (args[0] == "export")          std::cerr << " [profile]";
+            else if (args[0] == "diff")            std::cerr << " <profile-or-file> <profile-or-file>";
+            else if (args[0] == "monitor")         std::cerr << " [interval-ms]";
             else if (args[0] == "hidpp-set-dpi")   std::cerr << " <hidraw> <dpi> [device-index]";
             else if (args[0] == "hidpp-set-rate" ||
                      args[0] == "hidpp-set-polling-rate" ||
@@ -2598,6 +2971,8 @@ int main(int argc, char* argv[]) {
             else if (args[0] == "create-preset")   std::cerr << " <preset> <name>";
             else if (args[0] == "import")          std::cerr << " <file.json>";
             else if (args[0] == "export")          std::cerr << " [profile]";
+            else if (args[0] == "diff")            std::cerr << " <profile-or-file> <profile-or-file>";
+            else if (args[0] == "monitor")         std::cerr << " [interval-ms]";
             else if (args[0] == "hidpp-set-dpi")   std::cerr << " <hidraw> <dpi> [device-index]";
             else if (args[0] == "hidpp-set-rate" ||
                      args[0] == "hidpp-set-polling-rate" ||
@@ -2638,6 +3013,20 @@ int main(int argc, char* argv[]) {
     if (args[0] == "reload") return cmd_reload();
     if (args[0] == "stop")   return cmd_stop();
     if (args[0] == "status") return cmd_status(config_path);
+    if (args[0] == "monitor") {
+        int interval_ms = 500;
+        if (args.size() >= 2) {
+            char* end = nullptr;
+            long v = std::strtol(args[1].c_str(), &end, 10);
+            if (!args[1].empty() && *end == '\0' && v > 0 && v <= 60000)
+                interval_ms = (int)v;
+            else {
+                std::cerr << "Monitor interval must be 1-60000 ms: " << args[1] << "\n";
+                return 1;
+            }
+        }
+        return cmd_monitor(interval_ms);
+    }
     if (args[0] == "receivers") return cmd_receivers();
     if (args[0] == "hidpp") return cmd_hidpp();
     if (args[0] == "hidpp-set-dpi") return cmd_hidpp_set_dpi(args);
@@ -2755,6 +3144,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "create-preset") return cmd_create_preset(cfg, config_path, args[1], args[2]);
     if (cmd == "set-param") return cmd_set_param(cfg, config_path, args[1], args[2], args[3]);
     if (cmd == "export") return cmd_export(cfg, args.size() >= 2 ? args[1] : "");
+    if (cmd == "diff")   return cmd_diff(cfg, args[1], args[2]);
     if (cmd == "import") return cmd_import(cfg, config_path, args[1]);
 
     std::cerr << "Unknown command: " << cmd << "\n";

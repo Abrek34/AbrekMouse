@@ -156,12 +156,12 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     g_signal_connect(S->daemon_start_btn, "clicked", G_CALLBACK(on_daemon_start), S);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), S->daemon_start_btn);
 
-    S->apply_btn = trbtn("Apply & Reload");
+    S->apply_btn = trbtn("Apply");
     gtk_widget_add_css_class(S->apply_btn, "suggested-action");
     g_signal_connect(S->apply_btn, "clicked", G_CALLBACK(on_apply_clicked), S);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), S->apply_btn);
 
-    GtkWidget* save_btn = trbtn("Save");
+    GtkWidget* save_btn = trbtn("Save As");
     g_signal_connect(save_btn, "clicked", G_CALLBACK(on_save_clicked), S);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(hbar), save_btn);
 
@@ -225,7 +225,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     g_signal_connect(S->gain_check, "toggled", G_CALLBACK(on_param_changed), S);
     gtk_grid_attach(GTK_GRID(ag), S->gain_check, 0, 1, 2, 1);
     trtip(S->gain_check,
-        "Classic/Jump/Natural/Synchronous: use the integral (output-speed) form of the curve.\n"
+        "Classic/Jump/Natural/Synchronous/Power: use the integral (output-speed) form of the curve.\n"
         "Lookup: gain points are treated as output speeds (gain = y / speed).");
 
     // Mode hint — a one-line note on which params the selected mode actually uses
@@ -429,18 +429,23 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     S->snap_spin      = make_spin(0, 45, 0.5, 0, 1);
     S->lr_ratio_spin  = make_spin(0.01, 100, 0.01, 1.0);
     S->ud_ratio_spin  = make_spin(0.01, 100, 0.01, 1.0);
+    S->yx_ratio_spin  = make_spin(0.01, 100, 0.01, 1.0);
     connect_spin(S->rotation_spin, S);
     connect_spin(S->snap_spin, S);
     connect_spin(S->lr_ratio_spin, S);
     connect_spin(S->ud_ratio_spin, S);
+    connect_spin(S->yx_ratio_spin, S);
     grid_row(rg, 0, "Rotation (°):", S->rotation_spin);
     grid_row(rg, 1, "Snap (°):",     S->snap_spin);
     grid_row(rg, 2, "LR Ratio:",     S->lr_ratio_spin);
     grid_row(rg, 3, "UD Ratio:",     S->ud_ratio_spin);
+    grid_row(rg, 4, "Y/X Ratio:",    S->yx_ratio_spin);
     trtip(S->lr_ratio_spin,
         "Left/right output DPI ratio (1.0 = off). Values >1 amplify rightward movement.");
     trtip(S->ud_ratio_spin,
         "Up/down output DPI ratio (1.0 = off). Values >1 amplify downward movement.");
+    trtip(S->yx_ratio_spin,
+        "Y-axis output DPI ratio, relative to X (1.0 = off). Scales all Y motion.");
 
     // ── Speed Limit ───────────────────────────────────────────────────────────
     append_section("<b>Speed Limit</b>");
@@ -521,6 +526,18 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
     // ── Device ────────────────────────────────────────────────────────────────
     append_section("<b>Device</b>");
+    // PAS-1: the top-level use_raw_input master switch.  When off, the daemon
+    // grabs NO mouse (devices stay owned by the desktop).  This is a global
+    // setting, not a per-profile one — it is stored in AppState::config and
+    // synced by on_raw_input_toggled()/profile_to_widgets().
+    S->raw_input_check = trchk("Raw Input (intercept mice)");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(S->raw_input_check), TRUE);
+    trtip(S->raw_input_check,
+        "Master switch for mouse interception (default: on).\n"
+        "When off, the daemon grabs no mouse and every profile is inert —\n"
+        "the desktop owns the devices (OS-level raw passthrough).");
+    g_signal_connect(S->raw_input_check, "toggled", G_CALLBACK(on_raw_input_toggled), S);
+    gtk_box_append(GTK_BOX(lvbox), S->raw_input_check);
     GtkWidget* dg = append_grid();
     S->dpi_spin        = make_spin(1, 32000, 50, 800, 0);
     S->polling_spin    = make_spin(125, 8000, 125, 1000, 0);

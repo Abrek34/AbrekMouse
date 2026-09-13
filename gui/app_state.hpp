@@ -150,8 +150,10 @@ struct AppState {
     GtkWidget* test_out_lbl      = nullptr; // live "Out (ips)" value
     GtkWidget* test_gain_lbl     = nullptr; // live "Gain (×)" value
     GtkWidget* test_status_lbl   = nullptr; // daemon-down / awaiting-motion note
+    GtkWidget* test_lat_lbl      = nullptr; // live "Latency p50/p95 (µs)" value
+    GtkWidget* test_poll_lbl     = nullptr; // live "Poll rate (Hz)" value
     GtkWidget* test_hint_lbl     = nullptr; // lock-tier explanation (persistent)
-    GtkWidget* test_name_lbls[3] = {};      // "In/Out/Gain (×):" name labels (Bug-09)
+    GtkWidget* test_name_lbls[5] = {};      // "In/Out/Gain/Latency/Poll:" name labels (Bug-09)
     GtkWidget* test_title_lbl    = nullptr; // "Mouse Lock Test" heading (Bug-09)
     int        test_hint_state   = 0;       // hint: 0=Tier-1 locked, 1=Tier-2 confine, 2=Tier-3 n/a
     int        test_status_state = -1;      // status: -1=unset, 0=live, 1=awaiting, 2=daemon down, 3=unfocused
@@ -214,6 +216,7 @@ struct AppState {
     GtkWidget* output_dpi_spin = nullptr;
     GtkWidget* lr_ratio_spin   = nullptr;
     GtkWidget* ud_ratio_spin   = nullptr;
+    GtkWidget* yx_ratio_spin   = nullptr;
 
     // ── Logitech HID++ hardware panel (onboard DPI / report rate / LOD) ──
     // Implementation in gui/hidpp_panel.inl.  These widgets write directly
@@ -258,6 +261,9 @@ struct AppState {
 
     // Raw passthrough
     GtkWidget* raw_check      = nullptr;
+    // PAS-1: top-level use_raw_input master switch (daemon grabs no mouse
+    // when off).  Bound to AppState::config.use_raw_input, not to a profile.
+    GtkWidget* raw_input_check = nullptr;
 
     // Motion
     GtkWidget* rotation_spin  = nullptr;
@@ -343,3 +349,5 @@ void mouse_test_refresh_language(AppState* S);
 
 // GTK callbacks — forward declarations (implementations in .inl files)
 void on_activate(GtkApplication* gapp, gpointer user_data); // user_data = AppState*
+// Toggles the top-level use_raw_input master switch (widgets_sync.inl).
+void on_raw_input_toggled(GtkCheckButton* btn, gpointer user_data);
