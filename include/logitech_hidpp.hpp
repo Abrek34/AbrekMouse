@@ -223,7 +223,7 @@ struct hidpp_dpi_info {
     bool extended = false;
     bool supports_y = false;
     bool supports_lift_off_distance = false;
-    uint8_t lift_off_distance = 0; // 0=low, 1=medium, 2=high
+    uint8_t lift_off_distance = 0; // HID++ 0x2202 LOD byte: 1=low, 2=medium, 3=high; 0 = none/unsupported
 };
 
 struct hidpp_onboard_profile_info {
@@ -244,10 +244,14 @@ struct hidpp_onboard_profile_header {
     uint8_t enabled = 0;
 };
 
+// HID++ 0x2202 (and the 0x8100 profile DPI stage) encode lift-off distance
+// count-from-one: 1=low, 2=medium, 3=high.  Value 0 means "not supported /
+// stage unused" and is REJECTED by firmware when written (the legacy Solaar
+// 0/1/2 mapping could never set Low: it sent 0, which the device refuses).
 enum class hidpp_lift_off_distance : uint8_t {
-    low = 0,
-    medium = 1,
-    high = 2,
+    low = 1,
+    medium = 2,
+    high = 3,
 };
 
 struct hidpp_device {

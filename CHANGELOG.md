@@ -6,6 +6,30 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.2] — 2026-09-13
+
+### Fixed
+- **LOD off-by-one (PRO X 2 / Hidpp 0x2202).** HID++ 0x2202 ve 0x8100 profil
+  DPI satırı, kalkış mesafesini **1=Low, 2=Medium, 3=High** olarak kodluyor
+  (OpenLogi `Lod` ve donanımda doğrulanmış G HUB/Onboard Memory Manager
+  dökümleri: "Medium→Low" `02→01`, "Low→High" `01→03`). Değer **0 bir seviye
+  değil** — "destek yok / satır boş" sentinel'idir ve firmware yazımı
+  reddeder. Eski Solaar-mirası `{0=Low,1=Medium,2=High}` eşlemesi:
+  - `hidpp-set-lod low` byte `0` gönderiyordu → cihaz "not supported"
+    döndürüyordu, düşük LOD asla ayarlanamıyordu;
+  - okuma da bir basamak kayık gösteriyordu (gerçek "High"(3) hiç
+    gösterilemiyor, orta değerde yanlış etiket basılıyordu).
+  - `hidpp_lift_off_distance` enum'ı `{low=1, medium=2, high=3}`'e çekildi;
+    `set_dpi` LOD baytını 1..3'e clamp'liyor, `get/set_lift_off_distance`
+    yalnız 1..3'ü geçerli sayıyor (0/0xFF çöpü "desteklenmiyor" olarak
+    gösteriliyor); CLI dump ve GUI paneli (combo seçimi, durum satırı,
+    apply) senkron düzeltildi.
+  - Doğrulama (PRO X 2, `40A9`, Unifying `046d:c54d`): low/medium/high
+    yazımı + okuması artık çalışıyor; yalnız byte 0 reddediliyor.
+- `set_dpi` artık geçersiz LOD baytı varken tüm DPI yazımını düşürmüyor:
+  bayt 1..3'e clamp'lenerek cihazın DPI değişimini de kabul etmesi
+  sağlanıyor (PRO X 2'ye LOD=0'lı bir yazım bütün yazımı reddettiriyordu).
+
 ## [1.2.1] — 2026-09-13
 
 ### Added

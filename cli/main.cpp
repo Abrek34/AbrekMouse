@@ -2469,10 +2469,11 @@ static int cmd_hidpp() {
                         std::cout << "\n";
                     }
                     if (dpi->supports_lift_off_distance) {
-                        static constexpr const char* lod_names[] = {"low", "medium", "high"};
-                        const auto lod = dpi->lift_off_distance < 3
+                        static constexpr const char* lod_names[] = {"", "low", "medium", "high"};
+                        const auto lod = dpi->lift_off_distance <= 3
                             ? lod_names[dpi->lift_off_distance] : "unknown";
-                        std::cout << "  Lift-off distance: " << lod << "\n";
+                        if (!std::string_view(lod).empty())
+                            std::cout << "  Lift-off distance: " << lod << "\n";
                     }
                 }
                 if (auto rate = transport.get_polling_rate(dev.device_index))

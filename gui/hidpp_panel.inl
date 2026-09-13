@@ -35,8 +35,9 @@ static std::string cur_dpi_text(int dpi) {
 
 static std::string lod_text(int lod, bool supported) {
     if (!supported) return tr("unsupported");
-    const char* en[] = {"Low", "Medium", "High"};
-    return tr(en[std::clamp(lod, 0, 2)]);
+    static const char* en[] = {"", "Low", "Medium", "High"};
+    if (lod < 1 || lod > 3) return tr("unknown");
+    return tr(en[lod]);
 }
 
 static void hw_set_status(AppState* S, const std::string& text) {
@@ -306,12 +307,13 @@ static gpointer hw_query_thread(gpointer data) {
                 cur.supports_lod = dpi->supports_lift_off_distance;
                 // R6-8: capability bit set but the current-LOD byte is
                 // out-of-range (transport's get_lift_off_distance rejects
-                // > 2) — do NOT present the garbage value or write it back.
-                // A byte that isn't a valid 0..2 LOD means the read wasn't
-                // populated; treat the device as LOD-unsupported so the combo
-                // stays disabled and no sentinel "High" is ever written.
+                // values outside 1..3) — do NOT present the garbage value or
+                // write it back.  A byte that isn't a valid 1..3 LOD means the
+                // read wasn't populated (or the device reports the not-supported
+                // sentinel 0); treat the device as LOD-unsupported so the combo
+                // stays disabled and no stale LOD is ever written.
                 if (dpi->supports_lift_off_distance) {
-                    if (dpi->lift_off_distance <= 2)
+                    if (dpi->lift_off_distance >= 1 && dpi->lift_off_distance <= 3)
                         cur.lod = dpi->lift_off_distance;
                     else
                         cur.supports_lod = false;
@@ -451,10 +453,10 @@ static gpointer hw_query_thread(gpointer data) {
             }
             if (S->hw_lod_combo) {
                 gtk_widget_set_sensitive(S->hw_lod_combo, r->supports_lod);
-                if (r->supports_lod)
+                if (r->supports_lod && r->cur.lod >= 1 && r->cur.lod <= 3)
                     gtk_drop_down_set_selected(
                         GTK_DROP_DOWN(S->hw_lod_combo),
-                        (guint)std::clamp(r->cur.lod, 0, 2));
+                        (guint)(r->cur.lod - 1));
             }
             if (r->cur.ok) {
                 hw_set_status(S, trf("Current: DPI %s · %d Hz · LOD %s",
@@ -610,13 +612,13 @@ static gpointer hw_apply_thread(gpointer data) {
                         "the udev rule.",
                         r->out.hidraw_path.c_str());
         } else {
-            const char* lod_en[] = {"Low", "Medium", "High"};
+            const char* lod_en[] = {"", "Low", "Medium", "High"};
             parts = trf("DPI→%d%s", r->out.dpi,
                         r->out.ok_dpi ? "" : tr("(rejected)"));
             parts += " · " + trf("Rate→%d Hz%s", r->out.rate_hz,
                                  r->out.ok_rate ? "" : tr("(rejected)"));
             parts += " · " + std::string(tr("LOD→"))
-                          + tr(lod_en[std::clamp(r->out.lod, 0, 2)])
+                          + tr(lod_en[std::clamp(r->out.lod, 1, 3)])
                           + (r->out.ok_lod ? "" : tr("(rejected)"));
         }
         hw_set_status(S, parts);
@@ -844,7 +846,7 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
         }
     }
     task->lod = std::clamp(
-        (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo)), 0, 2);
+        (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo)) + 1, 1, 3);
     task->devs_version = S->hw_devs_version;
     task->supports_lod = c.lod;
     hw_thread("rawaccel-hw-apply", hw_apply_thread, task);

@@ -1876,8 +1876,10 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
             info->dpi_levels.end())
         return false;
     // P-BUG-1: do not refuse the whole DPI change just because the advertised
-    // LOD byte is out of the valid range (low=0, medium=1, high=2).  Clamp it
-    // to the highest valid value instead, matching set_lift_off_distance().
+    // LOD byte is not a valid level (1=low, 2=medium, 3=high; 0 is the
+    // "not supported" sentinel and is rejected by firmware when written).
+    // Clamp into 1..3 so writing DPI also carries a writable LOD byte,
+    // matching set_lift_off_distance().
     const auto index = resolve_feature_index(
         info->extended ? hidpp_feature_index::extended_adjustable_dpi
                        : hidpp_feature_index::adjustable_dpi,
@@ -1891,7 +1893,7 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
             0, static_cast<uint8_t>(dpi >> 8), static_cast<uint8_t>(dpi),
             static_cast<uint8_t>(y >> 8), static_cast<uint8_t>(y),
             static_cast<uint8_t>(info->supports_lift_off_distance
-                ? std::min<uint16_t>(info->lift_off_distance, 2) : 0)
+                ? std::clamp<uint16_t>(info->lift_off_distance, 1, 3) : 0)
         };
         return send_feature_request(*index, 0x6, params, sizeof(params),
                                     std::chrono::milliseconds(700),
@@ -2022,6 +2024,7 @@ std::optional<hidpp_lift_off_distance>
 HidppTransport::get_lift_off_distance(uint8_t target_device_index) {
     const auto info = get_dpi_info(target_device_index);
     if (!info || !info->supports_lift_off_distance ||
+        info->lift_off_distance < static_cast<uint8_t>(hidpp_lift_off_distance::low) ||
         info->lift_off_distance > static_cast<uint8_t>(hidpp_lift_off_distance::high))
         return std::nullopt;
     return static_cast<hidpp_lift_off_distance>(info->lift_off_distance);
@@ -2032,6 +2035,7 @@ bool HidppTransport::set_lift_off_distance(hidpp_lift_off_distance distance,
     disable_onboard_profiles_for_write(target_device_index);
     const auto info = get_dpi_info(target_device_index);
     if (!info || !info->extended || !info->supports_lift_off_distance ||
+        static_cast<uint8_t>(distance) < static_cast<uint8_t>(hidpp_lift_off_distance::low) ||
         distance > hidpp_lift_off_distance::high)
         return false;
     const auto index = resolve_feature_index(hidpp_feature_index::extended_adjustable_dpi,
