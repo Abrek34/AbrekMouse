@@ -461,6 +461,15 @@ private:
         const uint8_t* params, size_t param_len,
         std::chrono::milliseconds timeout, uint8_t target_device_index);
 
+    /// 0x8100 OnboardProfiles — gaming mice run "On-Board" (an onboard
+    /// profile is active) and REJECT host DPI/rate/LOD writes with a HID++
+    /// error while that mode is on (PRO X 2 / G Pro X, etc. — Solaar: "when
+    /// an onboard profile is active it may not be possible to change the
+    /// aspects that the profile controls").  Turn onboard mode OFF first
+    /// (Solaar fn 0x10 param 0x02; read fn 0x20 to skip a redundant write
+    /// when already off).  No-op when the device lacks 0x8100.
+    bool disable_onboard_profiles_for_write(uint8_t target_device_index);
+
     // BUG-22 (aj4): notifications that arrive inside a feature-request wait
     // window are parsed and stashed here instead of being discarded by
     // send_feature_request(); drain_notifications() flushes the stash first so

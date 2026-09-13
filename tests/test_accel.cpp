@@ -3244,21 +3244,7 @@ static void test_accel_args_sanitize() {
         std::remove(tmp);
     }
 
-    // 14. Negative acceleration + integer exponent → referans GAIN formu yine de sonlu
-    {
-        accel_args args;
-        args.mode = accel_mode::classic;
-        args.acceleration = -0.01;
-        args.exponent_classic = 2.0; // integer — pow(-0.01, 1) = -0.01, valid
-        classic c(args);
-        double gain = c(10.0, args);
-        EXPECT(std::isfinite(gain));
-        // Referans GAIN out: accel_raised=-0.01, cap.y=0.5, cap.x=-25,
-        // c(10) = 1 + (constant/x + cap.y) = 1 + (6.25/10 + 0.5) = 2.125
-        EXPECT_NEAR(gain, 2.125, 1e-9);
-    }
-
-    // 15. Negative acceleration + non-integer exponent → NaN guarded to 0 in constructor
+    // 14. Negative acceleration + non-integer exponent → NaN guarded to 0 in constructor
     {
         accel_args args;
         args.mode = accel_mode::classic;

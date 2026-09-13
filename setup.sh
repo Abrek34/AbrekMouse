@@ -337,9 +337,12 @@ do_install() {
         warn "udevadm control başarısız (container/CI?). 264u kuralı reboot'ta uygulanır."
     # SH-4: selectorless `udevadm trigger` replays the full system device
     # inventory (thousands of events, pointless churn).  The rules installed
-    # here only concern input devices — scope the trigger to them.
+    # here concern input devices AND the Logitech HID++ hidraw nodes (GUI/CLI
+    # onboard DPI/rate control) — scope the trigger to both subsystems.
     udevadm trigger --subsystem-match=input --action=change 2>/dev/null || \
         warn "udevadm trigger başarısız (container/CI?). Mekanik cihazlar ulaşılabilir olmayabilir."
+    udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || \
+        warn "udevadm trigger (hidraw) başarısız (container/CI?). HID++ erişimi reboot'ta uygulanır."
 
     # libinput quirk: RawAccel sanal cihazını "trackball" olarak işaretle.
     # Use a dedicated vendor-style file so existing local overrides are never

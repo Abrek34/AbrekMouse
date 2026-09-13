@@ -1933,3 +1933,1484 @@ Doğrulama sonrası ZATEN DÜZELMİŞ (bu turda dokunulmadı): H2 sw_id wrap (N-
 Bu turda değişen dosyaların kilidi FIX_LOG.md round-4 bölümündedir.
 
 Denetim kapsamı (DONUK): engine (include/*.hpp, src/config.cpp) — yeni bulgu yok (INF yalnız); daemon (daemon/*.cpp) — yeni bulgu yok; GUI — yukarıdaki 2 düşük; CLI — yukarıdaki set. Başlıca yeni bulgu seti daemon'da D26-N2/N3'ün doğrulanmış deliberate durumu.
+
+---
+
+# TUR 34 — Taze Denetim (2026-09-13, güncel ağaç — anlık loglama turu)
+
+Analiz tarihi: 2026-09-13
+Kapsam: Tüm ağaç (`daemon/`, `gui/`, `include/`, `src/`, `cli/`, `scripts/`, `packaging/`, `.github/`, docs)
+Yöntem: Satır-satır kaynak taraması + sürüm/parite çapraz kontrolü. Yönerge gereği her bulgu bulunduğu anda bu dosyaya loglanıp analize devam edilmiştir.
+Durum: AÇIK (aşağıdaki maddeler bu turda bulundu, fix bekliyor)
+
+**T34-VERS1 · ORTA · `.SRCINFO` bayat — pkgver 1.1.0, kod 1.2.0 + arch eksik**
+- Konum: `packaging/.SRCINFO:3` (`pkgver = 1.1.0`, `arch = x86_64` tek) vs `packaging/PKGBUILD:14-17` (`pkgver=1.2.0`, `arch=('x86_64' 'aarch64')`), `include/rawaccel-base.hpp:9` (`1.2.0`), `CMakeLists.txt:2` (`1.2.0`), `CHANGELOG.md:9` (`[1.2.0]`)
+- Kategori: Paketleme / tutarlılık
+- Açıklama: PKG-1 daha önce "ağaçta teyit (pkgver 1.1.0)" diye kapatılmıştı ama 1.2.0 bump'ında PKGBUILD güncellenmiş, `.SRCINFO` yeniden üretilmemiş. AUR meta verisi eski sürümü ilan eder; aarch64 kullanıcısı yanlış arch ile karşılaşır. `.SRCINFO` içinde `optdepends qt6-tools` satırı da eksik (PKGBUILD:23'te var).
+- Öneri: `cd packaging && makepkg --printsrcinfo > .SRCINFO` ile yeniden üret (PKG-1'in kendi önerisi).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T34-VERS2 · DÜŞÜK · `README.md` bayat sürüm iddiaları (1.1.0 → 1.2.0 drift)**
+- Konum: `README.md:5` (`Current state: v1.1.0`), `README.md:90` (`rawaccel-linux-1.1.0-1-x86_64.pkg.tar.zst`), `README.md:76` (`RawAccel 1.1.0+ relies on...`) vs `include/rawaccel-base.hpp:9` (`1.2.0`)
+- Kategori: Dokümantasyon
+- Açıklama: T30-N8 daha önce README'yi v1.1.0'a güncellemişti; 1.2.0 bump'ında CHANGELOG/PKGBUILD/CMake/base.hpp güncellenmiş ama README satırları 1.1.0'da kalmış. Kullanıcı "son sürüm 1.1.0" sanır, paket dosya adını yanlış arar.
+- Öneri: Versiyon bump politikasına README.md:5 + :90 satırlarını ekle (T30-N8 zinciri); `1.1.0` → `1.2.0`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 35 — Daemon Derin Analiz (2026-09-13, anlık log)
+
+Odak: `daemon/daemon.cpp`, `daemon.hpp`, `main.cpp`, `motion_math.hpp`, `lat_stats.hpp`
+Yöntem: Paralel daemon agent + satır doğrulama. HP-1/HP-2/HP-3, R10-EIO/REGRB/PUSHG/PUSHTC, N-SAVEQ/UVIRT/HPSCAN/POLL1/RAWSYN/PRATE/TELSR, SM-1..8, LOW-1/BUG-CRIT-1, RAC-1/4/5, TH-1..7, PID-1/2/3, SEC-1/R14-IPCGRL tekrar raporlanmadı.
+
+**T35-DMN01 · YÜKSEK · Renumber + removal sıralaması: replug cihaz tek scan'de kaybolur**
+- Konum: `daemon/daemon.cpp:1372-1378` + `1439-1480` + `1480` (`do_hotplug_scan` add-önce/remove-sonra + `missed_any=false`)
+- Kategori: Hot-plug / lifecycle
+- Açıklama: Kernel renumber'da (`eventN→eventM`, aynı `usb:VID:PID:serial`) add-döngüsü yeni yolu `opened_device_ids_` dolu diye `close+continue` eder (missed_any koymaz), aynı scan'in removal-fazı eskiyi siler. Sonuç `rescan_needed_=false` — yeni yol bir daha denenmez. Tek farede 2sn empty-rescan kurtarır; çok farede cihaz replug/restart'a kadar ölü.
+- Öneri: Removal-fazını add'den önce çalıştır veya duplicate-skip dalında `missed_any=true` koy.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN02 · ORTA · `release_device()` bloklayan syscall'ları `devices_mutex_` altında yapıyor**
+- Konum: `daemon/daemon.cpp:1167-1190` (tanım) ← `1202-1215` (`apply_new_config`) + `1065-1071` (`apply_active_app`)
+- Kategori: Thread safety / kilit süresi
+- Açıklama: `epoll_ctl(DEL)` + `libevdev_uinput_destroy` (ioctl+close) + `ioctl(EVIOCGRAB,0)+close` kilit altında. `teardown_devices` ve `do_hotplug_scan` removal aynı işi kilit dışında (`to_destroy` vektörü) yapar — kod kendi kuralını ihlal eder. Disable'lı reload/app-switch anında `status_json()` ve loop dispatch aynı mutex'te bekler.
+- Öneri: Kilit altında yalnız `epoll_del+map erase`, destroy/ungrab/close'u kilit dışında `to_destroy` ile yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN03 · DÜŞÜK · Motion frame başına 3. `clock_gettime` (doküman 2 diyor)**
+- Konum: `daemon/daemon.cpp:2253` (`lat_anchor=now_ns`) + `2055` (`t_now=now_ns`) + `2144/2478` (`last_time_ms=now_ms()` üzerine yazma)
+- Kategori: Performans / doküman drift
+- Açıklama: `flush_motion` `t_now`-türevi `now` yazar, SYN handler aynı frame için `now_ms()` ile üzerine yazar ("idempotent" yorumu). Her motion SYN: 2x `now_ns` + 1x `now_ms` = 3x `CLOCK_MONOTONIC_RAW`. AGENTS.md "canonical 2xclock+1 write" iddiası bayat; iki timestamp arası µs drift var.
+- Öneri: `2478`'i yalnız flush çalışmadıysa yaz veya `t_now`-türevi `now`'u handler'a geçir; AGENTS.md sayacını güncelle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN04 · DÜŞÜK · `status_json()` `snaps` vektörüne `reserve` yok (8KB x N kopya)**
+- Konum: `daemon/daemon.cpp:2781` (`vector<DevSnap> snaps;` reservesiz) vs `2608-2610` (`dump_latency_stats: snaps.reserve(...)`)
+- Kategori: Performans / kilit altında allocation
+- Açıklama: `DevSnap` içinde `lat_stats::snapshot` = `hist[1000]` ~8KB. Kilit altında `push_back` ile 8KB kopyalar; `reserve` yoksa büyürken aynı 8KB bloklar kilit altında tekrar taşınır (O(N²) memcpy). `dump` aynı deseni `reserve` ile çözmüş, `status` (GUI 250ms poll) kaçırmış.
+- Öneri: Kilit bloğunda `snaps.reserve(devices_.size())` (dump ile aynı).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN05 · DÜŞÜK · `handle_ipc_client` `setsockopt(SO_RCVTIMEO/SNDTIMEO)` dönüşü kontrolsüz**
+- Konum: `daemon/daemon.cpp:3162-3163`
+- Kategori: IPC / timeout
+- Açıklama: İki `setsockopt` yok sayılıyor. Başarısız olursa `recv`/`send` sonsuz bloklanır; deadline kontrolleri `recv` içinde takılı kaldığı için çalışmaz — seri accept-loop tek yavaş peer'a kilitlenir. GUI tarafı aynı hata için düzeltilmişti (N-GUI3), daemon tarafı kaçmış.
+- Öneri: `if (setsockopt(...)<0) { log; close; return; }`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN06 · DÜŞÜK · Buton-only tail `has_pending_motion=true` → sahte sıfır-motion `flush_motion`**
+- Konum: `daemon/daemon.cpp:2568-2571` (park) + `2319-2322` (merge `has_motion=true`) + `2222-2242` (telemetri+`lat.record`)
+- Kategori: Telemetri kirliliği
+- Açıklama: `[BTN_PRESS, <SYN yok>]` EAGAIN ile biterse motion yok ama `queued_count>0` diye `has_pending_motion=true` kurulur. Sonraki merge koşulsuz `has_motion=true` yapar; motion'suz SYN bile `flush_motion(0,0)` çalıştırır: `in_ips=0,gain=0` telemetri + `lat.record`. Buton "last-motion" telemetrisini sıfır-hız örneğiyle ezer.
+- Öneri: `2568`'i `if (has_motion)` / `if (queued)` diye ayır veya merge'de `has_motion |= (pending_dx!=0||pending_dy!=0)`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T35-DMN07 · DÜŞÜK · `set_active_app` log-satır enjeksiyonu (128 cap var, sanitize yok)**
+- Konum: `daemon/daemon.cpp:3213-3215` (kayıt) → `1055-1058` (`log("Focus: application ...")`)
+- Kategori: Log bütünlüğü
+- Açıklama: `app` 128'e kesilir ama `\n\r` dahil kontrol karakterleri korunur. `input` grubu üyesi sahte satırı text-log/journal'a düşürebilir. `main.cpp:505-528 json_escape` ve `daemon.cpp:2698 json_str` diğer yolları korur, bu focus yolu kaçmış.
+- Öneri: `app.erase(remove_if(iscntrl),end)` veya allowlist (GUI N-DIGIT ile simetrik).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 36 — GUI / CLI / Config Derin Analiz (2026-09-13, anlık log)
+
+Odak: `gui/*.inl`, `gui/app_state.hpp`, `cli/main.cpp`, `src/config.cpp`, `include/presets.hpp`, `include/rawaccel.hpp`
+Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/PUSHOK/FOCR, R12-*, R13-*, N-YLUT, N-HLMAX, R9-DPI/LPNRM/CAP0, CLI-4/5/6/B, O31-L1/L2/L3, CFG-*, GUI-Y3/O3/O4/D1-D4, G2 tekrar raporlanmadı. `run_tr_coverage.sh` PASS (kayıp anahtar yok).
+
+**T36-GUI01 · ORTA · CRUD diyaloglarında `window_destroyed` kapısı yok (UAF)**
+- Konum: `gui/profile_mgr.inl:183-203` (new), `:297-304` (input do_ok), `:628-711` (save-as + overwrite), `:378-388` (delete), `:481-495` (reset)
+- Kategori: GTK lifecycle / UAF
+- Açıklama: `export/import_done` ve `update_daemon_status` ve `kde_fix_finish` `window_destroyed` bakıyor; 5 CRUD diyaloğu bakmıyor. Hepsi heap ctx içinde çiğ `AppState* S` tutup yıkılmış `status_bar`/`profile_combo`'ya yazıyor. Tetik: diyalog açıkken ana pencere WM ile kapat → diyalog yaşar, OK'ye bas → yıkılmış widget'a yazım.
+- Öneri: Her 5 cb girişine `if (S->window_destroyed) { gtk_window_destroy(...); return; }` veya destroy'da açık diyalogları takip edip yık.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-GUI02 · INFO · Ölü `AppState` üyeleri (hiç inşa edilmiyor)**
+- Konum: `gui/app_state.hpp:137-140` (`dpi_detected_lbl`, `polling_detected_lbl`, `dpi_autofill_btn`, `polling_autofill_btn` = `nullptr`)
+- Kategori: Dead code
+- Açıklama: `ui_builder.inl` yalnız `battery_detected_lbl` + `latency_lbl` kuruyor; 4 üye hiçbir yerde atanmıyor/okunmuyor. Gelecekte biri "canlı" sanıp dokunursa null-deref.
+- Öneri: Sil veya kur.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-GUI03 · ORTA · `input_offset` spin max'ı sanitize/CLI'nin 5x altında (sessiz clamp)**
+- Konum: `gui/ui_builder.inl:242` (`offset_spin 0..100`), `:412` (`offset_spin_y 0..100`) vs `src/config.cpp:485` (`>500→500`), `cli/main.cpp:1125` (`range_ok 0..500`)
+- Kategori: Spin ↔ sanitize parity
+- Açıklama: `scale/cap/cap_y/output_offset/power_exp` GUI max'ları sanitize ile birebir; yalnız `input_offset` `100` vs `500`. CLI/JSON `input_offset 400` yüklenir → spin `100` gösterir → kaydet `100` yazar (classic/natural eğri kayması). O31-G4 yalnız min'leri hizalamıştı. R9-DPI/N-HLMAX ile aynı sınıf.
+- Öneri: `make_spin(0,500,…)` (X+Y).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-GUI04 · ORTA · Unlinked-Y `lookup`'ın editörü yok (LUT yalnız X)**
+- Konum: `gui/graph.inl:595-601` (`is_lut` yalnız X `mode_combo`), `:238-240`, `:451-453`, `:513`,`:568`, `ui_builder.inl:828-872,878-925` (click handler'lar yalnız `ax`)
+- Kategori: LUT / Y-axis
+- Açıklama: X=`classic`, Y=`lookup` (unlinked) iken `lut_frame` gizli, Y eğrisi çizilir ama noktası çizilmez/düzenlenemez. CLI'da `lut-data` anahtarı yok, Y-LUT fiilen import-only. G2 + N-YLUT veriyi korur ama editörü eklemez.
+- Öneri: `update_lut_visibility`'yi `X||Y lookup` yap + editörü eksen-seçici yap; kısa vadede Y-lookup iken uyarı bas.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-GUI05 · DÜŞÜK · Unlinked-Y skaler alanlar koşulsuz X→Y eziyor (N-YLUT tutarsızlığı)**
+- Konum: `gui/widgets_sync.inl:184-194` (11 alan koşulsuz) vs `:205-208` (LUT `if (ay.length==0)` koşullu)
+- Kategori: Y-axis simetrisi
+- Açıklama: N-YLUT LUT için "mevcut Y'yi koru"ya geçti; `gain/cap_mode/cap.x/exponent_power/decay_rate/scale/output_offset/motivity/gamma/smooth/sync_speed` hâlâ koşulsuz `ay=ax`. JSON/import ile gelmiş belirgin-Y ilk GUI edit+save'de sessizce silinir.
+- Öneri: LUT deseni gibi koru veya Y widget'ı ekle; en azından belgele.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-GUI06 · DÜŞÜK · Açık transient diyaloglar dil değişiminde eski dilde kalır**
+- Konum: `gui/profile_mgr.inl:109-224,257-314,644-693,348-391,448-498`, `gui/widgets_sync.inl:628-711` vs `gui/tr.inl:681-758` (`refresh_language`)
+- Kategori: Yerelleştirme
+- Açıklama: `refresh_language` açık New/Rename/Delete/Reset/Save-As/Unsaved pencerelerine dokunmaz (başlık/placeholder/buton `tr()` ile yaratıldı, kayıtlı değil). Header-bar `lang_combo` ile diyalog açıkken dil değiştirilirse diyalog eski dilde çakılı.
+- Öneri: Kabul (transient) veya diyalog label'larını `tr_register` + destroy'da unregister.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI01 · ORTA · `set-param`'da `disable`/`match_app`/`use_raw_input` anahtarı yok**
+- Konum: `cli/main.cpp:977-987` (`all_keys` 38 anahtar, 3'ü yok) vs `include/config.hpp:25` (`disable`), `:41` (`match_app`), `:47` (`use_raw_input`); GUI'de `match_app_entry`, `raw_input_check` var
+- Kategori: CLI parity / eksik özellik
+- Açıklama: `disable` (PAS-2) hiçbir UI'dan ayarlanamaz (yalnız hand-JSON); `match_app` yalnız GUI; `use_raw_input` yalnız GUI. P107 "bilinmeyen anahtar → Unknown key" der, bu üçü bilinen-ama-reddedilen değil bilinmeyen.
+- Öneri: `disable` (strict-bool), `match_app` (trim+128 cap) ekle; `use_raw_input` için profil-dışı komut veya "CLI'dan yönetilemez" notu.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI02 · DÜŞÜK · `diff` domain/range weight'te epsilon'u baypas ediyor (sahte fark)**
+- Konum: `cli/main.cpp:1506-1509` (`sval(dnum(x)+","+dnum(y))`) vs `:1390-1396` (`dbl` `>DBL_EPSILON_CMP`), `include/rawaccel-base.hpp:72-73`
+- Kategori: `diff` doğruluğu
+- Açıklama: Diğer 20+ double `dbl` (1e-9) ile; yalnız bu ikisi `%.10g` string eşitliğiyle. `%.10g` ~1e-10 çözünürlük → 5e-11 fark "farklı" görünür. `diff` kontratı "round-trip gürültüsü asla sahte fark göstermez" ihlali.
+- Öneri: `dbl("domain_weights.x",…)`/`dbl(….y)` (4 satır).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI03 · DÜŞÜK · `diff` dosya çözümü tek format, `import` 4 format**
+- Konum: `cli/main.cpp:1344-1374` (`profile_from_json` tek obje) vs `:1555-1602` (obje/wrapper/array/satır-akışı)
+- Kategori: round-trip
+- Açıklama: `export` satır-akışı yazar, `import` hepsini okur (R3-NEW-1); `diff` aynı dosyayı "Invalid profile JSON" diye reddeder. Help "e.g. an `export`" vaat eder.
+- Öneri: `resolve`'u import'un frag ayrıştırmasını paylaşır yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI04 · DÜŞÜK · `status --json` `match_app`'i düşürüyor**
+- Konum: `cli/main.cpp:2003-2028` (JSON şeması) vs `:2171-2173` (human app-scoped notu, CLI-1)
+- Kategori: `status` parity
+- Açıklama: CLI-1 human'a not ekledi; JSON şeması eklenmedi → `status --json` tüketen script app-scoping'i göremez.
+- Öneri: `po["match_app"]=p.match_app`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI05 · DÜŞÜK · `show`/`list` domain/range weight'i hiç göstermiyor**
+- Konum: `cli/main.cpp:432-484` (`print_profile` yok) vs `:929-934` (`stored_value_str` var), `:1506-1509` (`diff` karşılaştırır)
+- Kategori: CLI görüntü parity
+- Açıklama: `set-param … domain_weight_x 2` "Set … = 2" basar ama `show`/`list` değişikliği doğrulayamaz.
+- Öneri: `print_profile`'a 2 satır ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CLI06 · DÜŞÜK · Help preset tablosu bayat (apex 0.9 + gaming/precision capsız)**
+- Konum: `cli/main.cpp:2751,2753,2757` vs `include/presets.hpp:42-43` (`gaming {15,1.8}` C-5), `:79-80` (`precision {24,1.2}` PRE-2), `:145-146` (`apex 1.0` PRE-3)
+- Kategori: Help parity
+- Açıklama: C-5/PRE-2/PRE-3 değerleri değiştirdi, tablo kalmış. CLI-B domain metinlerini hizalamıştı, preset tablosu unutulmuş.
+- Öneri: `gaming [15.0,1.8]`, `precision [24.0,1.2]`, `apex 1.0` yaz.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CFG01 · DÜŞÜK · `match_app` trim parity (GUI kırpar, load kırpmaz)**
+- Konum: `gui/widgets_sync.inl:293-295` (trim) vs `src/config.cpp:634` (`json_get_string_limited` cap, trim yok)
+- Kategori: `device_id`/`match_app` handling
+- Açıklama: GUI'den kaydedilen asla baş/son boşluklu olamaz; hand-JSON `" firefox "` yüklenir, daemon `icontains`'te eşleşemez (ölü binding).
+- Öneri: `device_profile_from_json`'da aynı trim'i uygula.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CFG02 · DÜŞÜK · Export `write_text_file` sabit `.tmp` + parent-fsync yok**
+- Konum: `gui/profile_mgr.inl:24-57` (`tmp=path+".tmp"`, pid-suffix yok, parent-fsync yok) vs `src/config.cpp:762` (pid-suffix), `:870-878` (parent-fsync)
+- Kategori: Atomicity
+- Açıklama: `save_config` iki-yazar yarışını pid-suffix ile, dayanıklılığı parent-fsync ile kapatır; export aynı disiplini uygulamaz. Çift-hızlı export `.tmp`'yi çakıştırır; güç kaybında rename dayanıksız.
+- Öneri: pid-suffix + parent-fsync (save_config deseni).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T36-CFG03 · DÜŞÜK · `kde_atomic_write` bayat `.tmp`'de kalıcı başarısız**
+- Konum: `gui/ui_builder.inl:1303-1307` (`O_EXCL`, `if (fd<0) return false`, retry yok) vs `gui/tr.inl:650-654` (GUI-D2 retry), `gui/profile_mgr.inl:30-34` (retry)
+- Kategori: Atomicity / güvenilirlik
+- Açıklama: Crash'ten kalan `kwinrc.tmp` tüm gelecek KDE fix'lerini `false` yapar → "Could not write to kwinrc" kalıcı. Diğer iki yazar aynı dersi almış.
+- Öneri: Aynı `unlink+retry-once`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 37 — HID++ / Build / Paketleme / CI / Test (2026-09-13, anlık log)
+
+Odak: `src/logitech_hidpp.cpp`, `src/logitech_receiver.cpp`, `include/logitech_hidpp.hpp`, `include/logitech_quirks.hpp`, `setup.sh`, `scripts/*`, `packaging/*`, `.github/workflows/ci.yml`, `CMakeLists.txt`, `tests/*`
+Yöntem: Paralel HID++/scripts agent + satır doğrulama. N-SWID2/N-FDERR/N-EAGAIN, B1-B8, O31-H1/H2/H4/H5, R4 L-3/L-10, S1/S2/S3/S4/S7, N-CMAKEUDEV/N-PKGARCH/N-UNMLU/R10-UNMLL, R10-CITRC/R10-LDREG, T30-N2/N7, PKG-1/T34-VERS1/VERS2, L-6/L-7, SH-2/SH-3/SH-4/BS-7 tekrar raporlanmadı.
+
+**T37-HID01 · ORTA · `write_packet` EAGAIN/POLLOUT sonsuz döngü — deadline yok**
+- Konum: `src/logitech_hidpp.cpp:677-693` (`while(left>0)` içinde EAGAIN → `poll(POLLOUT,100ms)` → sayaçsız `continue`)
+- Kategori: Bloklama / DoS
+- Açıklama: POLLOUT hazır görünüp `write` sürekli EAGAIN veren takoz hidraw kuyruğunda sonsuz döner. Dış `send_feature_request` deadline'ı (500ms) `write_packet`'tan sonra başlıyor, bu beklemeyi sınırlamıyor. `uinput_write_retry` için D26-N2/N3 bütçe tartışıldı, HID++ yazma yolu için yok.
+- Öneri: Deneme sayacı veya `steady_clock` deadline (örn. 500ms) ile sınırla, aşımda `false` + throttled log.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID02 · ORTA · Pil prob sırası centurion'ı atlıyor — GUI ile daemon ayrışır**
+- Konum: `src/logitech_hidpp.cpp:1492-1513` (kod: `unified→status→voltage→centurion`) vs `include/logitech_quirks.hpp:142-159` (`preferred_battery_source`: `unified→centurion→status→voltage`); `:1470-1471` yorumu "sıra eşleşti" diyor
+- Kategori: Tutarlılık / yanlış pil
+- Açıklama: Her iki feature'ı ilan eden cihazda daemon `status/voltage`, GUI capability `centurion` çözer — N-BATTORD'un centurion kardeşi.
+- Öneri: `centurion` probunu `voltage`'dan önceye al (quirks sırasıyla birebir).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID03 · ORTA · 8-hedef identify süpürmesinde global bütçe yok — yorum yanlış**
+- Konum: `src/logitech_hidpp.cpp:2211-2221` + `:29` + `:2209-2210` (`candidates={0xFF,0x00,0x01..0x06}`, her hedef kendi `kIdentifyBudget(20s)` + streak-3)
+- Kategori: Gecikme / hang
+- Açıklama: `:2209` "kIdentifyBudget bounds the whole sweep" diyor ama kod hedef-başına bütçe — ölü node'da ~8x20s ≈ dakikalar. Çağıranlar `cli/main.cpp:2249,2404,2556` ve `gui/hidpp_panel.inl:229` — panel/CLI dakikalarca takılır.
+- Öneri: Süpürme başına tek `deadline=now+kIdentifyBudget`, her hedefte kontrol; yorumu düzelt.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID04 · DÜŞÜK (latent) · Onboard write son-chunk sıfır dolduruyor + boyutsuz**
+- Konum: `src/logitech_hidpp.cpp:2111-2121` (`params(2+chunk,0)` sabit 16 bayt; `n=min(14,kalan)` kopyalanıp `size()=16` gönderiliyor)
+- Kategori: Veri bütünlüğü (flash)
+- Açıklama: Son parça <14 ise kuyruk sıfırlarla yazılır. `read_..._sector`'daki `sector/size/4096` kapısı (`:1806-1808`) yazmada yok — sınırsız döngü/flash aşınması. O31-H1 yalnız `chunk 16→14`'ü düzeltti. Bugün üretim çağıranı yok (latent).
+- Öneri: `params.resize(2+n)`; `get_onboard_profile_info()` ile sector/size doğrula.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID05 · DÜŞÜK · `hidraw_export_name` blocking open**
+- Konum: `src/logitech_hidpp.cpp:2156` (`open(path,O_RDONLY|O_CLOEXEC)`) vs `:615`,`:2140` (`O_NONBLOCK` var)
+- Kategori: Güvenilirlik
+- Açıklama: Takoz hidraw'da `identify_*` (4 çağrı noktası) bloklanır.
+- Öneri: `O_NONBLOCK` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID06 · DÜŞÜK · `set_polling_rate` legacy-önce / `get` extended-önce asimetrisi**
+- Konum: `src/logitech_hidpp.cpp:1910-1927` (set legacy-önce) vs `:1883-1896` (get extended-önce, BUG-23)
+- Kategori: Tutarlılık
+- Açıklama: Çift-feature cihazda 1000Hz legacy yoldan yazılırken okuma extended'dan gelir; 8000Hz'de boşa legacy turu.
+- Öneri: `set`'te de extended-önce dene (Solaar parity).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID07 · DÜŞÜK · `decode_dpi_levels` 2048 tavanı mutlak değil**
+- Konum: `src/logitech_hidpp.cpp:98` (`if(size>=2048) break` yalnız iç döngü) vs `:107` (dış döngü eklemeye devam)
+- Kategori: Savunma / yorum-doğruluk
+- Açıklama: N-DPICAP "2048 tavan" iddiası sentetik genişletme için doğru, toplam için değil (pratikte 256 chunk ile sınırlı).
+- Öneri: Dış döngüye de `size>=2048` kapısı veya yorumu "sentetik genişletme tavanı" diye düzelt.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-HID08 · DÜŞÜK · Alıcı ürün tablosu iki yerde — senkron riski**
+- Konum: `src/logitech_receiver.cpp:24-52` (`RECEIVERS` 25 ürün) vs `src/logitech_hidpp.cpp:1538-1554` (`get_pairing_info` slot zinciri, c542 hariç tutma dahil)
+- Kategori: Bakım / drift
+- Açıklama: Aynı bilgi iki yerde tekrarlanır. Yeni alıcı birine eklenip diğerine unutulursa keşif/pairing ayrışır.
+- Öneri: Tek kaynak (örn. `receiver_spec` ortak) veya `static_assert` çapraz kontrol.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD01 · ORTA · CMake `install(CODE)` DESTDIR'i yok sayıyor — paket tanımsız + host kirlenmesi**
+- Konum: `CMakeLists.txt:171-180` (`file(MAKE_DIRECTORY "/etc/rawaccel")`, `if(NOT EXISTS "/etc/rawaccel/settings.json")`, `file(COPY ... DESTINATION "/etc/rawaccel")`)
+- Kategori: Paketleme / doğruluk
+- Açıklama: Mutlak host yoluna bakıyor; `DESTDIR="$pkgdir" cmake --install` bunu öne eklemez. Host'ta `/etc/rawaccel/settings.json` varsa paket configsiz çıkar; yoksa pakete girer (tanımsız). Üstelik `package()` sırasında host `/etc`'ye yazmaya çalışır. N-CMOME yalnız üzerine-yazmayı düzeltti, DESTDIR'i değil.
+- Öneri: `$ENV{DESTDIR}` öne ekle veya config kurulumunu `install(FILES...)` + `backup=()`'a bırak.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD02 · DÜŞÜK · `rawaccel-linux.install` trigger kapsamı SH-4 gerisinde**
+- Konum: `packaging/rawaccel-linux.install:26` (`udevadm trigger` seçicisiz) vs `setup.sh:341` (`--subsystem-match=input --action=change`)
+- Kategori: Kurulum
+- Açıklama: Paket yolu SH-4 öncesi fırtınayı yapıyor.
+- Öneri: Aynı seçiciyi ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD03 · DÜŞÜK · `build.sh` USE_CMAKE yolu `CXX`/`PORTABLE`'ı düşürüyor**
+- Konum: `scripts/build.sh:89-96` (`cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_...`, `$CXX`/`RAWACCEL_PORTABLE` iletilmiyor)
+- Kategori: Build parity
+- Açıklama: `CXX=clang++ RAWACCEL_USE_CMAKE=1` veya portable CMake build sessizce default toolchain/native ile yapılır.
+- Öneri: `CXX` ve `RAWACCEL_PORTABLE`'ı cmake argümanlarına geçir; `make` yerine `cmake --build`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD04 · DÜŞÜK · CMake Debug'da FORTIFY uyarısı**
+- Konum: `CMakeLists.txt:65-67` (`-D_FORTIFY_SOURCE=2` koşulsuz) + `:96` (Debug `-O0 -g`)
+- Kategori: Hardening parity
+- Açıklama: `_FORTIFY_SOURCE` optimizasyonsuzda uyarı üretir. CI CMake kullanmıyor, gizli.
+- Öneri: FORTIFY'ı `$<$<CONFIG:Release>:...>` ile sınırla.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD05 · DÜŞÜK · Bilinmeyen-distro prompt'unda TTY guard yok (L-6 kardeşi)**
+- Konum: `setup.sh:150-154` (çıplak `read -r _ || true`) vs `:63-71` (pacman dalı TTY guard'lı)
+- Kategori: UX / CI
+- Açıklama: CI/script'te sormadan devam eder, uyarı yok. Farklı satır, aynı sınıf.
+- Öneri: Aynı `[[ -t 0 ]]` + warn deseni.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD06 · DÜŞÜK · Root-build artifaktları root'a kalıyor**
+- Konum: `setup.sh:266-272` (`:270-271` root fallback, `chown` yok)
+- Kategori: İzinler
+- Açıklama: Sonraki `sudo -u $REAL_USER build.sh` / temizlik EACCES alır.
+- Öneri: Root fallback sonrası `chown -R $REAL_USER:$REAL_USER build-manual` (başarısızsa warn).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-BLD07 · DÜŞÜK · `setup.sh --uninstall` tek-kullanıcı kwinrc temizliyor**
+- Konum: `setup.sh:563-567` (yalnız `$REAL_USER`) vs `scripts/uninstall.sh:108-127` (`/home/*` döner)
+- Kategori: Uninstall paritesi
+- Açıklama: Çok kullanıcılı makinede setup ile kaldırınca diğer kullanıcıların `(RawAccel)` override'ları kalır.
+- Öneri: Setup uninstall'u da `/home/*` döngüsüne genişlet veya uninstall.sh'ye devret.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T37-TST01 · DÜŞÜK · `run_tests.sh` monitor kapısında mktemp sızıntısı**
+- Konum: `tests/run_tests.sh:299` (`"$(mktemp --suffix=.json)"` komut-içi, `TMP_FILES`'a eklenmiyor, `trap cleanup_tmp` kapsamıyor)
+- Kategori: Test hijyeni
+- Açıklama: Her koşuda bir `/tmp/tmp.*.json` kalır. P114 trap'i diğer tmpleri kapsıyor, bu satır dışarıda.
+- Öneri: Değişkene al + `TMP_FILES+=`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 34-37 ÖZET — ÖNCELİK SIRASI (2026-09-13 taze tur)
+
+**YÜKSEK:** T35-DMN01 (renumber kaybolma)
+**ORTA:** T34-VERS1 (.SRCINFO), T35-DMN02 (release kilit), T36-GUI01 (CRUD UAF), T36-GUI03 (input_offset spin), T36-GUI04 (Y-LUT editör yok), T36-CLI01 (disable/match_app/use_raw_input CLI yok), T37-HID01 (write deadline yok), T37-HID02 (pil sırası), T37-HID03 (identify global bütçe yok), T37-BLD01 (CMake DESTDIR)
+**DÜŞÜK/INFO:** T34-VERS2, T35-DMN03..07, T36-GUI02/GUI05/GUI06, T36-CLI02..06, T36-CFG01..03, T37-HID04..08, T37-BLD02..07, T37-TST01
+**Not:** TUR 34-37 maddelerinin hiçbiri önceki TURLAR/FIX_LOG'da yok (çapraz kontrol edildi). Satır numaraları 2026-09-13 ağacı.
+
+---
+
+# TUR 38 — Daemon Hot-Path / Timing (2026-09-13, anlık log)
+
+Odak: `daemon/daemon.cpp` flush/process/SYN, `motion_math.hpp`, `lat_stats.hpp`, `rawaccel.hpp`
+
+**T38-HOT01 · ORTA · Latency histogram uinput `write()` süresini ölçmüyor (iyimser p99)**
+- Konum: `daemon/daemon.cpp:2240-2242` (`lat.record(t_now-anchor)`) vs `:2213` (yalnız `memcpy` batch) vs `:2483-2484` (gerçek `write()` SYN handler'da) vs `:2596-2597` (yorum "math + write" diyor)
+- Kategori: Ölçüm yanlılığı
+- Açıklama: `out.add_rel()` yalnız batche kopyalar; final SYN `write` sonradan olur. Sonraki `process_device` `lat_anchor`ı yeniden kurar (`:2253`) → final write süresi hiçbir örneğe girmez. Compositor stall'da p99/max sistematik düşük görünür. MED-4'ten farklı (o batch-içi ikinci flush; bu batch-sonu write'ın tamamen kaybolması).
+- Öneri: `out.flush()` çevresini `now_ns()` ile ölçüp ekle veya anchor'ı flush sonrasına kaydır; yorumu düzelt.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T38-HOT02 · YÜKSEK · SYN_DROPPED parkı batch-sonu defer tarafından eziliyor (BTN kaybı)**
+- Konum: `daemon/daemon.cpp:2383-2384` (park append, count korunur) vs `:2572-2574` (defer `pending_ev_count=0` reset + yalnız güncel queued kopyası) vs `:2324-2325` (merge)
+- Kategori: Event-loss
+- Açıklama: `pending_dx/dy +=` korunurken `pending_events` sıfırlanır. İz: `[BTN(queued=1), REL(5), SYN_DROPPED→park pending=[BTN], SYN clear, REL(3), EAGAIN]` → `pending_dx=8` doğru ama `pending=[BTN]` silinip `queued=0` kopyalanır → BTN kaybolur. RAC-4 parkın kendisi değil, ikinci deferin ezmesidir.
+- Öneri: `=0` yerine append yap veya doluysa erken-flush + throttled log; `dx` için yapılan `+=` korumanın olay simetriğini kur.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T38-HOT03 · ORTA · `pending_events(16)` taşması sessiz truncasyon (logsuz)**
+- Konum: `daemon/daemon.cpp:2383-2384` + `:2324-2325` + `:2573-2574` (`< size(16)` ile sessiz kesme) vs `:2528/:2549` (queued taşması erken-yazılır, düşürme yok)
+- Kategori: Tanılanabilirlik
+- Açıklama: `pending(16)` taşması log/sayaçsız düşer. Buton/wheel kaybı "ara-sıra tutmayan tık" olur, journal iz bırakmaz.
+- Öneri: Truncasyon dalına throttled `log()` + sayaç; 16 sabitini `daemon.hpp:80-81` ile tek `constexpr` yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T38-HOT04 · DÜŞÜK · `EVIOCSCLOCKID` yok — ev.time REALTIME varsayımı NTP sıçramasına dayanıksız**
+- Konum: `daemon/daemon.cpp:48-56` + `:2105-2113` (`ev_now_us()` REALTIME, `EVIOCSCLOCKID` hiç çağrılmıyor — grep ile doğrulandı)
+- Kategori: Clock-robustness
+- Açıklama: SM-1 deltası REALTIME farkıdır. NTP/step ileri → sahte `>=100ms idle` → nominal ölçüme düşer; geri → wall-fallback'a düşer. Clamp ile maskelenir ama bir frame yanlış ölçülür.
+- Öneri: `open_input_device` sonrası `EVIOCSCLOCKID(CLOCK_MONOTONIC)` dene (başarısızsa log + REALTIME'da kal) veya `gap_ms`ı wall-delta ile çapraz-doğrula.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T38-HOT05 · ORTA · `status_json()` uzun kritik-seksiyonu 8kHz lookup'u jitter'a sokuyor**
+- Konum: `daemon/daemon.cpp:2783-2831` (kilit altında `lat.copy()` 8KB + 64-spin seqlock) vs `:1820-1825` (loop her epoll olayında aynı mutex ile `fd_to_dev_` lookup, 8000Hz'de 8000/s)
+- Kategori: Contention/jitter
+- Açıklama: T35-DMN02/04'ten farklı; okuyucunun uzun kritik-seksiyonu yazıcının per-event lookup'unu geciktirir. GUI 250ms poll + monitor ile periyodik ~10µs stall 8kHz'de ~80 frame penceresine denk gelir.
+- Öneri: `fd_to_dev_` lookup'u lock-free yap veya status kritik-seksiyonunu cihaz-başına böl (kopyala-bırak-işle).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T38-HOT06 · DÜŞÜK · Raw dalı kısmi telemetri örneği (yeni dx + eski gain) + okuyucu ayrışması**
+- Konum: `daemon/daemon.cpp:2060-2091` (raw dalı `dx/dy/wall` yazar + çift-bump, `speed/out/gain` yazmaz) vs `:2617-2618` (dump raw'ı `has_data=false` sayar) vs `:2876-2885` (status `count>0` ise `lat_*` basar)
+- Kategori: Telemetri tutarlılığı (latent)
+- Açıklama: Okuyucu `s1==s2` görüp `telem_ok=true` ile yeni `dx` + eski `gain`i eşleştirir (`gain != out/in`). Yorum dalı "unreachable harmless" sayar; batched raw ile ulaşır hale gelirse torn örnek yayınlar. TEL-1/R12-LATRAW reset disiplininden farklı, dalın kendi kısmi-örneğidir.
+- Öneri: Dalı sil veya tamamla (`speed/out/gain=0` + `lat.record` kaldır), `status_json`a raw-gate ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 39 — Daemon IPC / Socket / Threading (2026-09-13, anlık log)
+
+Odak: `start/stop_ipc_server`, `ipc_serve_loop`, `handle_ipc_client`, `push_config`, `save_q_`, SO_PEERCRED/timeout/deadline
+
+**T39-IPC01 · ORTA · `push_config` no-op guard `save_q_`'yu baypas ediyor (revert kaybı, queued varyant)**
+- Konum: `daemon/daemon.cpp:629-637` (erken `return true`) vs `:648-653` (coalesce+enqueue) vs `:609-627` (R10-PUSHG yalnız pending slotu danışır)
+- Kategori: Config tutarlılığı
+- Açıklama: `save_q_`'da bekleyen (henüz armed olmamış) `Y` varken `X==applied` push'lanırsa guard `true` dönüp çıkar — `:649-650` `clear()` hiç çalışmaz. İstemci `X` için başarı alır ama `Y` kuyrukta kalıp uygulanır. R10-PUSHG'nin pending varyantından farklı; bu queued-but-not-armed varyantıdır.
+- Öneri: No-op dalında dönmeden önce `save_q_mu_` altında kuyruğu danış/temizle veya front JSON'unu dedup'a dahil et.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T39-IPC02 · DÜŞÜK · `stop_ipc_server` kör `unlink` — ardıl daemon'ın socket'ini silebilir**
+- Konum: `daemon/daemon.cpp:3046` (`close`) + `:3050-3057` (yol kopyala+clear+koşulsuz `unlink`)
+- Kategori: IPC lifecycle
+- Açıklama: D26-N1 başlangıç claim'ini düzeltti ama duruşta doğrulama yok. `close`–`unlink` arası ikinci daemon aynı yolu `bind→listen` ile sahiplenirse eski `unlink` yeninin canlı socket dosyasını siler. Yenisi accept'e devam eder ama yeni connect edemez → GUI/CLI SIGHUP fallback'e düşer.
+- Öneri: `close` öncesi `fstat` dev/ino al, `unlink` öncesi `stat(path)` ile karşılaştır; eşleşmiyorsa unlink yapma.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T39-IPC03 · DÜŞÜK · Komut-satırı `EOF` sessiz düşüyor (D-8 ihlali, body ile tutarsız)**
+- Konum: `daemon/daemon.cpp:3195` (`r<=0 → return`) vs `:3191-3193` (EAGAIN→`reply_timeout()`) ve `:3252-3256` (body EOF → "incomplete")
+- Kategori: Robustness
+- Açıklama: Satır tamamlanmadan `recv==0` (yarı-kapatma + yanıt bekleme) sessiz return → istemci sonsuza dek bekler. Body yolu yanıt verir, satır yolu vermez.
+- Öneri: `r==0 && !line.empty()` dalında `{"ok":false,"error":"incomplete command"}` gönderip dön.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T39-IPC04 · DÜŞÜK · Her bağlantıda bloklayan NSS (`getgrnam/pwuid/grouplist`, önbelleksiz)**
+- Konum: `daemon/daemon.cpp:3095` (`getgrnam`), `:3101` (`getpwuid`), `:3104-3115` (`getgrouplist` x2) — seri loop `:3060-3152` içinde
+- Kategori: Availability
+- Açıklama: Root-dışı her istemci 3 NSS çağrısı tetikler. SSSD/LDAP yavaşlığında seri worker saniyelerce takılır. İki `getgrouplist` arası grup büyümesi ikincide `-1` → meşru `input` üyesi sahte ret yer. SEC-1/R14 doğruluk içindi; bu bloklama+önbelleksizliktir.
+- Öneri: `input` gid'yi `start`'ta bir kez çözüp sakla; `uid→üyelik` için kısa TTL önbellek veya `-1 → resize → retry` döngüsü.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T39-IPC05 · DÜŞÜK · Kapanışta `ack true` ama kayıp (enqueue vs worker-çıkış yarışı)**
+- Konum: `daemon/daemon.cpp:601` (`running_` ön-kontrol) + `:648-653` (enqueue) vs `:663-700` (worker `:697` `break`) + `:570-576` (`stop()`)
+- Kategori: Shutdown persistence
+- Açıklama: SAVE-1 sırası pencereyi daraltır ama kapatmaz: `push` `true` görüp `save_q_mu_`'da bloklanırken worker boş + `running_==false` görüp `break→join` girerse arkadan gelen `emplace_back` drenaj görmez. İstemci `true` aldı, veri diskte yok.
+- Öneri: `stop()`'ta `join` sonrası `save_q_`'yu senkron drenaj et veya `push`'ta `running_` çift-kontrollü yap veya worker çıkışında kuyruğu bir kez daha pop edip çık.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T39-IPC06 · DÜŞÜK · `set_active_app` debouncesiz — alterne spam re-apply+rescan churn'ü**
+- Konum: `daemon/daemon.cpp:3208-3219` (yalnız 128 cap) + `:1042-1086` (`apply_active_app`, `:1053` aynıysa ucuz, farklıysa her cihazda `apply_profile` + `:1086` `rescan_needed_=true`)
+- Kategori: Churn
+- Açıklama: Aynı değer ucuz ama `A/B/A/B…` alterne her tur telemetri sıfırlama + `lat.reset` + re-anchor + ~2s tarama tetikler. Hız sınırı/kota yok. T35-DMN07 log-enjeksiyon içindi; bu flap/churn içindir.
+- Öneri: IPC tarafında kaba debounce (aynı `uid`'den 200ms altı değişimi birleştir) veya loop tarafında değişim sıklığı kapağı + throttled log.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 40 — Hot-Plug / Lifecycle / PID / Signal (2026-09-13, anlık log)
+
+Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_reopen`, `find_mice`, `main.cpp` PID/signal
+
+**T40-HP01 · YÜKSEK · Seri-nosu boş aynı-model iki fare tek `device_id`de çakışır (ikinci fare hiç grab'lenmez)**
+- Konum: `daemon/daemon.cpp:735-740` (`EVIOCGUNIQ` boş → `usb:VID:PID:` aynı) vs `:898-899` + `:1372-1373` (`opened_device_ids_.count(id)` → duplicate-skip)
+- Kategori: Device-identity
+- Açıklama: `uniq` boşsa iki farklı fiziksel fare aynı id'yi üretir, ikincisi duplicate diye atlanır. HP-3'ün tersi (o tek fizikselin çift noduydu; bu iki fizikselin tek id'sidir).
+- Öneri: `uniq[0]=='\0'` ise id'ye `resolve_stable_id(path)`/`phys`/by-id-hash ekleyerek ayır veya boş-seride by-id fallback'una düş.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-PID01 · ORTA · Bozuk (non-numeric) PID içeriği boot'u brick eder**
+- Konum: `daemon/main.cpp:439-463` (`try_clear_stale` yalnız `n<=0` siler; `pid==0` yolu hep `false`) vs `:374-404` (`pid_file_is_live==false`)
+- Kategori: PID/lifecycle
+- Açıklama: `"abc\n"` gibi parse-edilemez içerik `pid==0` olur → hep `false` döner. İlk `write_pid` EEXIST ile düşer, `cleared/retry_ok=false` → her açılış "Another instance..." reddi, manuel silme gerekir. PID-2 yalnız 0-byte'ı kapsar.
+- Öneri: `pid==0` dosyayı da `unlink` ile stale say (kill ile canlı olamayacağı sabit).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-PID02 · DÜŞÜK-ORTA · Fallback başarısında stale dosya leak olur**
+- Konum: `daemon/main.cpp:414-416,467-470` (`pid_written=write(xdg)||write(/run)||write(/tmp)`; `try_clear` yalnız `!pid_written` dalında)
+- Kategori: PID/lifecycle
+- Açıklama: XDG stale iken `/run` yazımı başarırsa `pid_written=true` olur, stale XDG hiç temizlenmez. Sonraki boot yine EEXIST → yine fallback; `stop` yanlış dosyaya bakar.
+- Öneri: Başarılı fallback sonrası doğrulanmış-stale adayları proaktif temizle veya write öncesi tüm adaylara `is_live==false → try_clear` budaması yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-PID03 · DÜŞÜK · PID dosyasında dir `fsync` yok**
+- Konum: `daemon/main.cpp:61-67` (`write+fchmod+fsync(fd)+close`, parent fsync yok)
+- Kategori: Durability
+- Açıklama: Crash/power-loss'ta directory entry kaybolursa daemon çalışırken PID dosyası yoktur → `stop` bulamaz, ikinci instance çift-grab yapar.
+- Öneri: `close()` sonrası parent `open(O_DIRECTORY)+fsync()` (best-effort).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-DEV01 · DÜŞÜK · `EVIOCGUNIQ` NUL-guard yok (stack OOB okuma)**
+- Konum: `daemon/daemon.cpp:727-728,738-739` (`char uniq[256]={}; ioctl(...,sizeof(uniq),uniq)` + `snprintf(...%s,uniq)`) vs `:714-716` (EVIOCGNAME için `sizeof-1` + guard var)
+- Kategori: Identity
+- Açıklama: Sürücü tam 256 byte NUL'suz dönerse `std::string(uniq)` stack OOB okur, `device_id` zehirlenir.
+- Öneri: `sizeof(uniq)-1` + `uniq[sizeof-1]='\0'` + dönüş kontrolü.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-SIG01 · DÜŞÜK · `SIGHUP` startup penceresinde kaybolur**
+- Konum: `daemon/main.cpp:116-134,492-497,610-611` (`SIGTERM/INT` latch var, `SIGHUP` `if(d) d->reload()` latch'siz; `g_daemon==nullptr` iken veya `start()` içi config/epoll sırasında gelen HUP sessizce düşer; `SIGUSR1` latch'li)
+- Kategori: Signal
+- Açıklama: Tekrarı yoktur.
+- Öneri: `g_reload_requested` atom latch ekle, `store()` sonrası ve `run_loop` ilk iterasyonunda tüket.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T40-HP02 · ORTA · By-id string eşitliği replug'ı maskeler, sağlıklı düğüme 5sn ceza verir**
+- Konum: `daemon/daemon.cpp:1446-1448` (`p==it->path` by-id string) vs `:1850-1858` (`read→ENODEV` → `deny_reopen` 5sn) — by-id'li fare `event5→event6` renumber olsa string aynı kalır → eski ölü fd tutulur, yeni atlanır; kurtarma disconnect yoluyla olur ve sağlıklı yeni düğüm de 5sn deny yer.
+- Kategori: Hot-plug
+- Açıklama: Temiz unplug (deny yok) ile hatalı disconnect (deny var) ayrımı by-id alias yüzünden yapılamaz.
+- Öneri: Kopuşu string değil `realpath`/`stat(st_rdev)`/fd geçerliliği ile karşılaştır veya replug (aynı id farklı rdev) için deny muafiyeti.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 41 — Classic / Power / Jump (2026-09-13, anlık log)
+
+**T41-01 · ORTA · Sanitize evrensel `cap.x>=input_offset` clamp'i jump/power/out'u sessizce mutasyona uğratıyor**
+- Konum: `src/config.cpp:471` (`if (a.cap.x < a.input_offset) a.cap.x = a.input_offset;`) — gerekçe classic GAIN/io içindi
+- Kategori: Validasyon / yanlış genelleme
+- Açıklama: `input_offset` power (`accel-power.hpp:30-115` hiç kullanmıyor) ve jump (`accel-jump.hpp:24-30,42-83` hiç bakmıyor) için tanımsız; classic out için `cap.x` kullanılmıyor (`accel-classic.hpp:102-113,173-199`). `jump cap.x=5 + input_offset=10` save/load'da `5→10` olur, step sessizce kayar.
+- Öneri: Gate'le: `if (mode==classic && (cap_mode==io||in) && cap.x < input_offset)`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T41-02 · ORTA · `acceleration` üst sınırı yok (P120 yarım)**
+- Konum: `src/config.cpp:433-436` (üst yok), `include/config.hpp:18-22` (`ACCEL_MAX` yok) vs GUI `ui_builder.inl:238,409` `0..20`, R15 boundary `20.0`
+- Kategori: Sanitize eksikliği
+- Açıklama: JSON `accel=1e6..1e300` sağ kalır. `accel-classic.hpp:88-89,105-106` `pow(acc,exp-1)` Inf→0 sessiz identity veya ~1e105 astronomik gain üretir.
+- Öneri: `ACCEL_MAX=20.0` ekle + sanitize üst clamp.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T41-03 · DÜŞÜK · `smooth` üst sınırı yok (`[0,1]` referans ihlali)**
+- Konum: `src/config.cpp:459-460` (yalnız `<0` →0) vs ref `accel-jump.hpp:13` `[0,1]`, GUI `ui_builder.inl:247` `0..1`
+- Kategori: Validasyon
+- Açıklama: `10,1e9` geçer; `rate=2π/(smooth*step.x)` tiny rate, spec-dışı ama stabil. JSON ile ulaşılabilir.
+- Öneri: `if (smooth > 1.0) smooth=1.0;`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T41-04 · DÜŞÜK · Oracle grid kritik dalları hiç çalıştırmıyor**
+- Konum: `tests/oracle/oracle_cases.hpp:65-73,86-90,158-220` — `classic legacy io/in` yok, `power in` yok, `jump_gain_hard` yok, `cap.y=1.0` yok (`accel-classic.hpp:74-101`, `accel-power.hpp:72-104`, `accel-jump.hpp:54-56`, `accel-classic.hpp:181-182`)
+- Kategori: Test-kapsama
+- Açıklama: Bu dallarda drift `run_oracle.sh` 1071/67 OK ile yakalanamaz.
+- Öneri: `classic_legacy_io/in`, `power_gain_in/legacy_in`, `jump_gain_hard`, `classic_gain_out_capy1` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T41-05 · DÜŞÜK · Classic legacy `in` eşitlikte referanstan sapıyor (guard fazla katı)**
+- Konum: `include/accel-classic.hpp:97` (`if (cap.x>0 && cap.x>offset)`) — `exp=2,acc=0.005,offset=10,cap={10,1.5} in legacy`: ref `gain 1`, local `1.066` (%6.6)
+- Kategori: Parity
+- Açıklama: `>offset` integer/eşitlik finite cap'leri de öldürüyor; `!isfinite` kontrolü (`:99`) NaN'ı zaten yakalar. Gain `in` eşitlikte ref ile eşleşirken legacy tersi veriyor.
+- Öneri: `if (cap.x>0){cap=base_fn(...); if(!finite) cap=DBL_MAX;}`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 42 — Natural / Sync / Lookup / EMA (2026-09-13, anlık log)
+
+**T42-EMA01 · ORTA · `whole` modda Y-smoother'lar bayatlıyor, `separate`'e dönüşte transient**
+- Konum: `include/rawaccel.hpp:260-273` (`calc_speed_whole` yalnız `smoother_x`), `:430-473` (whole dalı `:457-459,:469`), `:241-258` (`reconfigure` `dist_mode` izlemez)
+- Kategori: State tutarlılığı
+- Açıklama: `whole` modda Y-input/scale/output hiç ilerlemez; `separate→whole→separate` sonrası Y eski/0 değerde kalır, sonraki frame'lerde Y-gain yanlış noktadan değerlendirilir (~halflife asimetrik sönüm). SM-5'ten farklı (o resetle/koru politikası; bu Y kanalının hiç ilerlememesi).
+- Öneri: Whole'da iki kanalı da aynı `speed` ile ilerlet veya `reconfigure`'da `dist_mode` değişiminde Y-smoother'ları resetle/kopyala.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T42-SMO01 · DÜŞÜK · EMA `NaN speed` / `time=Inf+coeff==1` kalıcı state zehirlenmesi**
+- Konum: `include/rawaccel.hpp:50-58,108-150` (guard yalnız `!(time>0)`; `twc=1-exp2(log2*time)`)
+- Kategori: Robustness
+- Açıklama: `smooth(NaN,finite)` → `windowTotal=NaN`, sonraki tüm çağrılar NaN (reset olmadan kurtulamaz). `halflife=Inf` + `time=Inf` → `0*Inf=NaN→poison`. `modify` üstte `!isfinite(time)` eler ama direkt/fuzz API zehirlenir.
+- Öneri: `if (!(time>0) || !isfinite(time) || !isfinite(speed)) return ...;`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T42-LUT01 · DÜŞÜK · `lookup(NaN)` rastgele orta LUT değerini döndürür**
+- Konum: `include/accel-lookup.hpp:73,82-95` (`if (x<=0)` NaN için false; `x<px`/`x>px` ikisi false → `else` ilk `mid`'de döner)
+- Kategori: Robustness
+- Açıklama: Synchronous'ta `!isfinite→1.0` guard var (`accel-synchronous.hpp:47,149`), lookup'ta yok.
+- Öneri: `if (!isfinite(x) || x<=0) return 0.0;`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T42-NAT01 · DÜŞÜK · `natural`da `NaN/Inf` guard yok, gain-modda `Inf→NaN`**
+- Konum: `include/accel-natural.hpp:28-29,50-57` (`x<=offset`/`x<1e-9` NaN/Inf'i yakalamaz; `x=Inf` gain-mod `Inf/Inf=NaN`, legacy sonlu — tutarsız)
+- Kategori: Numerik robustness
+- Açıklama: Direkt `apply(NaN/Inf)` NaN sızdırır (synchronous sertleşti, natural unutuldu).
+- Öneri: Başa `if (!isfinite(x)) return 1.0;`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T42-SPD01 · DÜŞÜK · `NaN lp_norm` sessizce `euclidean`'a düşer**
+- Konum: `include/rawaccel.hpp:194-203` (`NaN>=16`/`<=0`/`fabs(NaN)>` hepsi false → euclidean) — `Inf` doğru `max`'a gider
+- Kategori: Robustness
+- Açıklama: Config yolu `finite_or` ile kapalı (`config.cpp:506`); direkt/fuzz yanlış metrikle değerlendirir.
+- Öneri: `else if (!isfinite(lp_norm) || lp_norm>=MAX_NORM || lp_norm<=0) max;`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T42-UNI01 · DÜŞÜK · `accel_union::apply` index-`switch` variant sırasına kırılgan**
+- Konum: `include/accel-union.hpp:14-22` (variant) + `:52-62` (`switch(index)` + `get<N>`, `default` 6'yı yutar)
+- Kategori: Bakım trap
+- Açıklama: Ortaya mod eklenip variant sırası değişirse kod derlenir ama yanlış tipe dispatch eder (sessiz yanlış gain). Derleyici uyarmaz.
+- Öneri: 7 `static_assert(variant_alternative_t<N>==...)` ile sırayı kilitle (sıfır maliyet).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 43 — Config Sanitize / JSON / Atomic-Save (2026-09-13, anlık log)
+
+**T43-01 · ORTA · `lut_data` var + `lut_length` yoksa eğri sessizce düşer**
+- Konum: `src/config.cpp:189-190` (`contains(lut_data) && is_array && contains(lut_length)` üçü şart → `length=0` kalır) vs yazar `:96` (`if(length>0)`)
+- Kategori: Veri-kaybı
+- Açıklama: El-ile dosyada `lut_data` dolu ama `lut_length` yoksa eğri yüklenmez; sonraki `save` hiç yazmaz — kalıcı silinme.
+- Öneri: `lut_length` yoksa `pts.size()`'dan türet (`min(CAP,size)`, çift'e floor).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-02 · ORTA · `sanitize_*` LUT payload'unu temizlemiyor (JSON yolu temizliyor)**
+- Konum: `src/config.cpp:400-489,585-589` vs `:212-219` (JSON `NaN/Inf→0`, `±FLT_MAX` clamp; sanitize yalnız `length` clamp `:406-407`)
+- Kategori: Sanitize eksikliği
+- Açıklama: Programatik/IPC `data[i]=NaN/Inf/1e308` `sanitize:944-946`'dan aynen geçer. `sort:380` `NaN>kx==false` sıralamayı bozar, `lookup` yanlış sonuç, `save` ile diske yazılır.
+- Öneri: `sanitize_accel_args` içinde `for i<length: finite_or+FLT clamp` + sonra `sort`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-03 · DÜŞÜK-ORTA · Tek `length` normalize edilmiyor (load→save→load kayıplı)**
+- Konum: `src/config.cpp:406-407,227,96-102` (`length=513` kabul; `sort:372` 256 nokta kullanır; yazar 513 yazar, okuyucu 512'ye floorlar → her tur 1 float kaybı; `check_import:921` reddederken load sessiz budar)
+- Kategori: Round-trip
+- Açıklama: Tutarsız politika.
+- Öneri: `sanitize`'da `if(length%2) length--`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-04 · ORTA · Bool alanlarda `0/1` + `1.0/0.0` tutarsızlığı**
+- Konum: `src/config.cpp:132-137,283-288` (`gain/raw` int 0/1 kabul) vs `:327-328,637-638,670-671` (`whole/disable/use_raw_input` katı `is_boolean`; `gain` float `1.0` reddedilir → `"gain":0.0` `true` default'ta kalır)
+- Kategori: Type-guard tutarsızlığı
+- Açıklama: `"whole":1` sessizce default'a düşer; `"gain":0.0` yanlış `true` kalır.
+- Öneri: Tüm bool'larda `is_boolean || (is_number && v==0/1)` birleştir.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-05 · ORTA · `MAX_PROFILES` aşımı + non-object sessiz budama, save ile kalıcı silinme**
+- Konum: `src/config.cpp:678-682,687-705` (`if(!is_object) continue; if(size>=256) break;` — hata/sayaç yok) + `rawaccel-base.hpp:28`
+- Kategori: Veri-kaybı
+- Açıklama: 257+ profil load'da düşer, sonraki `save` yalnız 256 yazar — kalıcı silinir.
+- Öneri: `stderr`/dönüş ile bildir veya kirli-budama bayrağı ile üzerine-yazmayı engelle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-06 · ORTA · Save yolu sanitize etmiyor (`NaN→null→throw` zinciri)**
+- Konum: `src/config.cpp:727,687-706` (`save` aynen dump; programatik NaN nlohmann'da `null`; sonraki load `require_number:148-150` throw → tüm config açılmaz)
+- Kategori: Atomic-save
+- Açıklama: Out-of-range de clampsız yazılır.
+- Öneri: `save` içinde copy+sanitize+migrate sonra dump.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-07 · ORTA · Atomic-replace `uid/gid`'yi korumuyor (mode korunuyor)**
+- Konum: `src/config.cpp:776-784,854-864` (mode `&0777` kopyalanır, `fchown` yok → root daemon user-owned dosyayı `root:root` yapar, kullanıcı sudo'suz yazamaz)
+- Kategori: Sahiplik
+- Açıklama: `.bak` eski sahibi tutar ama live yol değişir.
+- Öneri: `fstat` `st_uid/gid` + `fchown(fd,...)` best-effort.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-08 · DÜŞÜK · `pid`-sonekli tmp aynı proses içi thread'leri ayırmıyor + prosesler arası kilitsiz**
+- Konum: `src/config.cpp:762,832-843,785-791` (`tmp=path.pid.tmp`; iki thread aynı pid → ikinci `O_EXCL→EEXIST→unlink→retry` kardeş tmp'yi ezer; prosesler arası `flock` yok → last-writer-wins)
+- Kategori: Yarış
+- Açıklama: Tek-yazıcı varsayımında düşük, thread'li GUI'de orta.
+- Öneri: `pid.tid` veya `mkstemp`/`O_TMPFILE+linkat`; prosesler arası `flock` veya not.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-09 · DÜŞÜK · Dangling symlink save'de linkin kendisi değişir**
+- Konum: `src/config.cpp:735-740,854-864` (O31-C5 resolvable link'i `canonical` çözer; dangling'de `canonical` başarısız → `rename(tmp,arg_path)` link'i regular file yapar)
+- Kategori: Symlink
+- Açıklama: Kullanıcı link niyeti yok olur.
+- Öneri: `readlink` ile dangling hedefi çözüp hedefe yaz; çözülemiyorsa hata ver.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-10 · DÜŞÜK · `active_profile=""` / dangling isim normalize edilmiyor**
+- Konum: `src/config.cpp:668-669` (`json_get_string_limited(...,"default")` yalnız non-string'de; `""` veya listede-yok isim aynen kalır → daemon fallback belirsiz)
+- Kategori: JSON
+- Açıklama: Her açılışta aynı boşluk.
+- Öneri: Load sonunda active empty/listede-yoksa `default`/ilk profile düş.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-11 · ORTA · Üst-sınır seti eksik (P120-FAZ2 yalnız 5 alan)**
+- Konum: `src/config.cpp:481-488`, `include/config.hpp:18-22` (yalnız scale/exp/cap/output_offset; `acceleration` GUI `0..20`, `decay 0..10`, `limit 0..100`, `sync 0.0001..100`, `smooth 0..1`, `motivity/gamma 0.01..10` üstten açık → `1e308` geçer, `pow` Inf üretir)
+- Kategori: Sanitize / GUI-parite
+- Açıklama: P120 gerekçesi burada uygulanmamış. CLI de aynı alanlarda `min_ok(0)` / unconstrained.
+- Öneri: GUI `make_spin` max'larını sabite taşı, sanitize+CLI domain'e ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-12 · ORTA · `migrate_lookup_gain` double-finite ama float-Inf üretebilir + re-sanitize yok**
+- Konum: `src/config.cpp:1000-1024,712-724` (`product=y*x` double-finite ise float cast; `1e39` double-finite ama `FLT_MAX` üstü → Inf LUT; migrate sanitize'den sonra çalışır, re-sanitize yok → dump `null` → sonraki tur 0)
+- Kategori: Migration
+- Açıklama: Mevcut double-`isfinite` kontrolünün float-aralık boşluğu.
+- Öneri: `if(!isfinite(product)||fabs(product)>FLT_MAX) skip;` + migrate sonunda `sanitize` tekrarı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-13 · DÜŞÜK · Non-kanonik eşdeğer versiyon hiç normalize olmuyor**
+- Konum: `src/config.cpp:1083-1116,1028-1077` (`version==RAWACCEL_VERSION` exact-match; `"01.02.00"` semantik `1.2.0` ama `migrated=false` → dosya hiç kanonikleşmez)
+- Kategori: Migration
+- Açıklama: Her load aynı karşılaştırmayı tekrarlar.
+- Öneri: Eşdeğer/eski-kanonik ise `version=RAWACCEL_VERSION` damgala.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-14 · DÜŞÜK · `json_get_string_limited` UTF-8 ortasından kesebilir**
+- Konum: `src/config.cpp:611-618` (`s.resize(maxlen)` byte sayar; Türkçe çok-baytlı sınırda bölünürse geçersiz UTF-8 kalıcı yazılır)
+- Kategori: Helper
+- Açıklama: Kalıcı dosya bozulması.
+- Öneri: Continuation-byte geri-sarma (`while((s[n]&0xC0)==0x80) n--`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T43-15 · DÜŞÜK-ORTA · Aynı `Inf`'e iki politika (accel throw, profil sessiz-default)**
+- Konum: `src/config.cpp:145-156` (12 accel alanı throw → tüm config açılmaz) vs `:307-322,329-336` (profil output_dpi/rotation/snap/speed_*/cap sessiz default)
+- Kategori: Politika tutarsızlığı
+- Açıklama: Aynı el-düzenleme sınıfı (`1e999→Inf`) alana göre abort veya degrade olur.
+- Öneri: Politika birleştir veya belgele.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 44 — CLI Parsing / Set-Param / Status / Monitor (2026-09-13, anlık log)
+
+**T44-01 · DÜŞÜK · `scale` alt-sınır parity bozuk (`(0,0.01)` JSON kalır, CLI reddeder)**
+- Konum: `cli/main.cpp:1113-1117` (`range_ok(0.01,SCALE_MAX)`) vs `src/config.cpp:443` (`if(scale<=0) scale=0.01` — `(0,0.01)` geçer)
+- Kategori: Parity
+- Açıklama: MATH-2/P107 "floor 0.01" der ama kod yalnız `<=0` floor'lar. Üstte parity tamam (`100`).
+- Öneri: Sanitize'ı `if(scale<0.01)` yap veya CLI domain'i `(0,100]` + uyarıya çevir + help güncelle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-02 · DÜŞÜK · Global flag'ler değerleri yutuyor (`--json/--dry-run/--help`) + `--` belgesiz**
+- Konum: `cli/main.cpp:2870-2885,2864-2866` vs `:2693-2828` (`print_help`); `set-param p device_id --json`, `create --help` değer verilemez; kurtarıcı `--` (`:2880-2882`) help'te yok
+- Kategori: Parsing
+- Açıklama: Kullanıcı keşfedemez.
+- Öneri: Help `Options` altına `--` satırı + `set-param` örneklerine not.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-03 · DÜŞÜK · `validate_config_path` non-existent dalı `..` normalize etmiyor**
+- Konum: `cli/main.cpp:79-104` (yok-dalda ham `rfind("/proc/",0)` + `stat` parent; `/tmp/../proc/foo.json` prefix'i tutmaz, `S_ISDIR` geçer → `true`; mevcut-dal `realpath` kanonikleştirir — asimetri)
+- Kategori: Hardening
+- Açıklama: Validasyon yalan söyler (pratikte `save` zaten `/proc`'a yazamaz).
+- Öneri: Yok-dalda da parent'ı `realpath` dene, çözülemezse `..` içeriyorsa reddet.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-04 · DÜŞÜK-ORTA · Son profil silinince local vs daemon ıraksar (boş config push)**
+- Konum: `cli/main.cpp:595-607` (`{active:"",profiles:[]}` `safe_save` + `daemon_apply_if_enabled` push) vs `daemon/daemon.cpp:590-656` (boş profili reddetmez) vs `validate` (`ERROR: No profiles`)
+- Kategori: Tutarlılık
+- Açıklama: Local sonraki run'da `default` recreate edecek, daemon `[]` kalacak.
+- Öneri: Boş-sonrası push'u atla (local-only mesaj) veya `default` recreate edip öyle push'la.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-05 · DÜŞÜK · `monitor` aralığı kod-doküman uyumsuz (`1..60000` vs `[20,60000]`)**
+- Konum: `cli/main.cpp:1856` (`[20,60000]` der) vs `:3018-3022` (`v>0 && v<=60000` kabul) + help `:2715-2718` domainsiz; `1ms` sürekli `status` IPC + `devices_mutex_` yorar
+- Kategori: Domain
+- Açıklama: `1-19ms` dokümana aykırı kabul.
+- Öneri: Kodu `20..60000`'e çek + help'e `Default 500, 20-60000` yaz.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-06 · DÜŞÜK · `monitor` `lat_samples` `int` overflow (`get<int>` terminate)**
+- Konum: `cli/main.cpp:1869-1873,1932` (`it` `get<int>()`) vs daemon `uint64_t lat_count` (`:2877-2878`) vs `status` `value(uint64_t)` (`:2178`)
+- Kategori: Dayanıklılık
+- Açıklama: Uzun uptime'da `>INT_MAX` sayım `out_of_range` atar; cihaz-döngüsünü saran `try` yok → `monitor` terminate olur.
+- Öneri: `it`'yi `long long`/`uint64_t` + `is_number_unsigned/integer` ayrımıyla yaz, `status` ile eşitle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-07 · DÜŞÜK · `monitor` truncate JSON'da anında ölür (transient olmalı)**
+- Konum: `cli/main.cpp:1883-1903` (boş `resp` → `continue`, non-empty bozuk/truncate → `return 1` öldürür; yavaş/kilitli IPC aynı durumu üretir)
+- Kategori: Dayanıklılık
+- Açıklama: Bir poll'luk gecikme tüm `monitor`'u bitirmemeli.
+- Öneri: Parse-fail yolunu da `cerr` + `continue` yap (üst üste N fail'de çık opsiyonel).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T44-08 · BİLGİ/DÜŞÜK · `set-param` hex parse + arity `Usage` + `status rc=2` belgesizliği**
+- Konum: `cli/main.cpp:1005-1007` (`stod` `0x10`→`16` sessizce; hidpp yolu `base10` guard'lı — iki disiplin) + zero-arg arity (`list/status/...` `Usage` basmaz) + `status rc=2` help'te yok
+- Kategori: Parsing / exit-code
+- Açıklama: Aynı CLI'da iki integer disiplini.
+- Öneri: `set-param`'da hex reddet (ondalık-only); zero-arg hatalara `Usage` ekle; help'e `Exit codes: 0/1/2` satırı ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 45 — CLI Import / Export / Validate / Preset / Diff (2026-09-13, anlık log)
+
+**T45-IMP01 · ORTA · Import isim-uzunluk kapısı ölü (sessiz kırpma)**
+- Konum: `cli/main.cpp:1668-1673` (`size()>MAX` kontrol) vs `src/config.cpp:627` (`json_get_string_limited(...,256)` zaten kırpmış) — 300-char hiç reddedilmez; `device_id>256`, `match_app>128`, iç `profile.name` de denetlenmez; `create/duplicate/rename` reddederken `import` mutasyona uğratır
+- Kategori: Validasyon
+- Açıklama: P82-MED-1 simetrisi bozuk.
+- Öneri: Ham JSON re-parse ile `raw["name"/"device_id"/"match_app"/"profile"."name"]` >cap ise `rc=1` reddet.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-IMP02 · YÜKSEK · Import migrate etkisiz / çift-çalışır (veri-bozulması)**
+- Konum: `cli/main.cpp:1745-1749` + `:1708-1723` vs `src/config.cpp:1083-1084,1106-1108,1000-1023` (tekil/array importta `version==1.2.0` → `return false` no-op → pre-0.4 `lookup+gain` hiç ölçeklenmez; wrapper importta `version` koşulsuz ezilir → mevcut 256 profil dahil tümü tekrar `y*x` → çift-migrasyon; `migrate_lookup_gain` idempotent değil)
+- Kategori: Migration
+- Açıklama: CFG-1'in migrate-semantiği hatası (C29-N2 restore değil).
+- Öneri: `version`'u wrapper ile ezme; batch'i wrapper-versiyon bağlamında migre et (mevcut profillere dokunma).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-IMP03 · DÜŞÜK · Bare-array/wrapper elem-tip denetimsiz + `lut_length` yalanı**
+- Konum: `cli/main.cpp:1566-1572` + `:1626-1654` (yalnız `all[0].is_object()` bakılır, sonra körü körüne `dump()`; `[{},123,null]` `dp.name==""` ile yanlış hata) + `lut_length` hiç bakılmaz (`lut_length:514 + data:[2]` `length=2` sessiz düzelir)
+- Kategori: Robustness
+- Açıklama: R3-NEW-1 format-varlığı değil, elem-tip/`lut_length` tutarlılığı boşluğu.
+- Öneri: Frag push öncesi `if(!is_object()) Invalid profile JSON return 1`; LUT kontrolüne `lut_length != (n/2)*2` reddi/uyarısı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-VAL01 · ORTA · Validate cross-check 15+ sanitize boyutunu görmüyor (false-PASS)**
+- Konum: `cli/main.cpp:808-836` (yalnız dpi/poll/output_dpi/rotation/snap + isim) vs `src/config.cpp:420-421,446-488,534-546,557-583` (`scale>100, exp>5, cap.x>500, cap.y>100, output_offset>100, input_offset>500, ratios>100, weights>1e6, halflife>10000, lp_norm, speed_min/max, exponent_classic, decay/motivity/gamma/sync` kırpılınca `All checks OK`)
+- Kategori: False-PASS
+- Açıklama: Örn. `scale:1e9` → `100` uyarısız. CFG-2 dpi-kapsamı değil, kalan-alan boşluğu.
+- Öneri: `clamp_warn`'u sanitize üst/alt-sınır tablosuyla genişlet.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-VAL02 · DÜŞÜK-ORTA · Validate LUT-tek uyarısı ölü + id/match_app kırpması uyarısız**
+- Konum: `cli/main.cpp:782-791` (`length%2` sanitize-sonrası bakılır ama loader daima çift yapar `:227` → 515 uyarısız 514'e iner) + `:829-836` (isim uyarılır, `device_id>256`, `match_app>128` uyarısız)
+- Kategori: Dead-code
+- Açıklama: Import R12-IMPLUT reddeder, validate susar — farklı komut tutarsızlığı.
+- Öneri: Ham `lut_data.size()%2` / `>514` uyarı/hata + `device_id/match_app` `truncated to N` uyarısı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-SHOW01 · ORTA · `show/list` `match_app` + LUT eğrisini gizliyor (işletim-körlüğü)**
+- Konum: `cli/main.cpp:432-484` (`print_profile` `match_app` ve `lut_data/length` basmaz; app-scoped globalsan ayırt edilemez, lookup eğrili iki profil aynı görünür)
+- Kategori: Parity
+- Açıklama: `status` human-notu ayrı (CLI-1).
+- Öneri: `match_app` boş-değilse `app: "<v>"` + `lut.length>0` ise `lut: <n> points` satırı ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-DUP01 · DÜŞÜK-ORTA · `duplicate` `match_app`'i koruyor (app-çakışması)**
+- Konum: `cli/main.cpp:649-655` (`dst=*src; dst.name=...; device_id.clear();` — `match_app` kopyalanır → aynı app'li iki profil first-match-wins ile ikincisi gölgelenir)
+- Kategori: Duplicate
+- Açıklama: R12-DUPNM isim değil, app-scope çakışması.
+- Öneri: `dst.match_app.clear()` veya `WARNING: match_app kopyalandı` bas.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-DIFF01 · DÜŞÜK · `diff` exit-kodu + isim-dosya gölgeleme + iç-isim eksik**
+- Konum: `cli/main.cpp:1344-1354,1377,1440,1531-1533` (resolve-fail `1` + fark `1` ayrışmaz; `backup.json` isimli profil dosyayı gölgeler; `sval(name)` dış isim, iç `prof.name` karşılaştırılmaz)
+- Kategori: Kontrat
+- Açıklama: Script `farklı` ile `hata`'yı ayıramaz (`status` 0/1/2 kullanırken).
+- Öneri: Hata için `return 2`; çakışırsa `note` uyar; `profile.name` karşılaştırması ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T45-HELP01 · BİLGİ/DÜŞÜK · Help alias/başlık/eşik + `create-preset` sıra-maskesi**
+- Konum: `cli/main.cpp:2704,2750,2807-2808` vs `presets.hpp:82` (`disable/none/off` help'te yok; tablo başlığı `cap [in,out]` vs değer `[x,y]`; `≳ MAX_NORM` vs kod `16`) + `:673-686` (dolu-isimle `create-preset typo` `already exists` basıp `unknown preset` maskeler)
+- Kategori: UX
+- Açıklama: T36-CLI06 değerleri hariç.
+- Öneri: Help'e alias + `cap [x,y]` + `≥16` yaz; önce `make_preset` bilinmez-kontrolü yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 46 — GUI Widgets / UI Builder / AppState (2026-09-13, anlık log)
+
+**T46-01 · ORTA · `kwinrc` yabancı anahtarları sessiz silme**
+- Konum: `gui/ui_builder.inl:1255-1291` (`kde_upsert_section`, `:1278-1290` yalnız `kv` + yorum/boş satır korunur)
+- Kategori: Veri-kaybı
+- Açıklama: `[Libinput]` içindeki `PointerAccelerationSpeed, LeftHanded, NaturalScroll, ClickMethod` vb. fix sonrası kalıcı silinir. R2-01 yalnız yorum/boş satırı kurtarmıştı.
+- Öneri: `body` dışındaki `is_key` satırları da korunmalı veya merge edilmeli.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-02 · DÜŞÜK · `on_daemon_reload` gevşek `"ok"` eşleşmesi**
+- Konum: `gui/widgets_sync.inl:824-825` (`find("ok")`) vs `daemon_comm.inl:256-257,236-238` (strict `"ok":true/false`)
+- Kategori: Yanlış-başarı
+- Açıklama: `{"ok":false}` ve `broken` içeren hata metni başarı sayılır. Bugün daemon hep `{"ok":true}` (`daemon.cpp:3205-3207`) döndüğü için latent.
+- Öneri: `find("\"ok\":true")` yap, push deseniyle hizala.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-03 · ORTA · `XY Link` açma sessiz Y-verisi eziyor**
+- Konum: `gui/widgets_sync.inl:598-604` + `:179-180` (`xy_linked=true` → doğrudan `widgets_to_profile()`, `if(xy_linked) ay=ax` koşulsuz)
+- Kategori: Veri-kaybı
+- Açıklama: Unlinked ayrışmış `ay.mode/accel/limit/offset/cap.y/LUT` onaysız X ile ezilir, undo yok.
+- Öneri: Link açarken `ay!=ax` ise confirm dialog veya yedek + status uyarısı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-04 · DÜŞÜK-ORTA · `Raw Input` toggle bekleyen editi düşürüyor**
+- Konum: `gui/widgets_sync.inl:611-617` (`widgets_to_profile()` çağırmadan `save_config_now()`; `main.cpp:44-106` aynen yazar → `unsaved=true` edit dosyaya yazılmaz)
+- Kategori: Kayıp-güncelleme
+- Açıklama: Spin/combo editi eski profille gömülür.
+- Öneri: Önce `widgets_to_profile(S)` çağır (`updating` guard var).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-05 · ORTA · `Speed Min/Max` spin tavanı `500`, engine/CLI sınırsız (T36-GUI03 sınıfı)**
+- Konum: `gui/ui_builder.inl:453-454` (`make_spin(0,500)`) vs `src/config.cpp:540-544` (üst clamp yok) vs `cli/main.cpp:1118-1121` (`min_ok(0)`)
+- Kategori: Range-parity
+- Açıklama: JSON/CLI `speed_max=2000` → spin `500` gösterir → kaydet `500` yazar.
+- Öneri: Spin max yükselt veya sanitize/CLI'ya üst sınır + P107 reddi; ara çözüm clamp-uyarısı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-06 · DÜŞÜK · `Battery: unknown` markup'sız + registry-dışı**
+- Konum: `gui/ui_builder.inl:954-957` (`gtk_label_new(tr("<b>..."))` markup işlemez → literal `<b>` görünür; `trlbl/trmlbl` kayıtsız → `refresh_language` çevirmez) vs doğru kullanım `daemon_comm.inl:575-579`
+- Kategori: UI/i18n
+- Açıklama: İlk dilde çakılı kalır.
+- Öneri: `trmlbl` veya `set_markup` + registry kaydı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-07 · INFO · `CssProvider` + `GSimpleAction` ref sızıntısı**
+- Konum: `gui/ui_builder.inl:751-759,1620-1637,1143-1198` (`add_provider` sonrası `unref` yok x2; 5x `g_simple_action_new` sonrası `unref` yok; GUI-D1 yalnız dropdown'ları fixlemişti)
+- Kategori: Leak (tek-seferlik küçük)
+- Açıklama: Display/action-map kendi ref'ini tutar, caller ref'i sızar.
+- Öneri: `add_provider`/`add_action` sonrası `g_object_unref`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-08 · DÜŞÜK · KDE yolu `sudo`'da yanlış `HOME`'a yazıyor**
+- Konum: `gui/ui_builder.inl:1348-1354` + `daemon_comm.inl:35-45` (yalnız `getenv(XDG/HOME)`) vs `main.cpp:163-173` (`SUDO_USER` → `pw_dir`)
+- Kategori: Env-parity
+- Açıklama: `sudo gui` altında `/root/.config/kwinrc`'ye yazılır, kullanıcı `~/.config/kwinrc` etkisiz kalır.
+- Öneri: KDE yardımcıları da `SUDO_USER` home'una düşsün veya `config_path` parent'ından türet.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T46-09 · DÜŞÜK · `config_load_warn` locale öncesi çevriliyor**
+- Konum: `gui/main.cpp:196-200` (`trf()` corrupt uyarısı) vs `ui_builder.inl:1614-1617` (`setlocale+load_lang+resolve` sonra) — o noktada `g_lang=0` English sabit
+- Kategori: i18n-ordering
+- Açıklama: TR kullanıcısı İngilizce uyarı görür.
+- Öneri: Ham `e.what()/backup` saklayıp `build_ui` sonrası render et.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 47 — GUI Graph / Devices / DaemonComm / MouseTest (2026-09-13, anlık log)
+
+**T47-B1 · ORTA · IPC failover kırık (recv-timeout ilk sokette `return`, aday denenmiyor)**
+- Konum: `gui/daemon_comm.inl:191-202` (connect/send fail `continue`, recv sonrası `close; return complete?resp:""` koşulsuz `return` → XDG ölü-ama-dinleyen ise `/run` hiç denenmez)
+- Kategori: Dayanıklılık
+- Açıklama: XDG gölgelemesi sistem daemon'unu gizler; `daemon_running()` + `status` yanlış-negatif.
+- Öneri: `if (!complete) { close; continue; }` (connect/send ile simetrik).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B2 · ORTA · `pid_probe` exe tam-eşleşme upgrade sonrası `(deleted)` daemon'u stale sayar**
+- Konum: `gui/daemon_comm.inl:288-294` (`strcmp(base,"rawaccel-daemon")==0`) + `:355` (`probe==0 → unlink`) — upgrade sonrası `/proc/.../exe` `"... (deleted)"` → `return 0` → canlı PID dosyası silinir, daemon "stopped" gösterilir (R12-PIDUNL `-1` koruması işlemez çünkü bu dal `0` üretir)
+- Kategori: Identity
+- Açıklama: Yanlış-negatif.
+- Öneri: `" (deleted)"` sonekini soyup prefix-karşılaştır (`strncmp(...,15)`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B3 · ORTA-DÜŞÜK · LUT gain tabanı `0.01` (gain=0 sessizce 0.01'e bozulur)**
+- Konum: `gui/graph.inl:478-481` + `ui_builder.inl:852` (`gain spin 0.01..10000`, `max(0.01,gain)`) vs sanitize `config.cpp:210-219` (0 yasaklamaz — gain=0 geçerli)
+- Kategori: Veri-bütünlüğü
+- Açıklama: Gain=0 nokta `rebuild`'de 0.01 gösterilir, sonraki tick'te kalıcı 0.01 yazılır. G-BUG-1'in gain-side ikizi.
+- Öneri: Gain spin `0.0..10000`, click-path `max(0.0,...)`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B4 · DÜŞÜK-ORTA · Velocity-modda speed=0 noktası gösterim/düzenleme tutarsız**
+- Konum: `gui/graph.inl:9-15` (`stored_to_gain(spd<=0,vel)=1.0`) + `:472` (spin `0.0` izin) — speed=0 noktası her stored'da gain `1.0` görünür, gain kaç yapılırsa stored hep `0` yazılır (`gain_to_stored=gain*0`)
+- Kategori: LUT / velocity
+- Açıklama: Graph+liste+click üçü tutarlı-şekilde-yanlış.
+- Öneri: Velocity-modda speed spin min epsilon (örn. `0.01`) veya speed=0 satırını düzenlenemez işaretle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B5 · DÜŞÜK-ORTA · Legacy `/dev/input/eventN` binding sonsuz "(unplugged)" kalır**
+- Konum: `gui/devices.inl:177-184` (yalnız `stable_id`/`event_node`) + `:121-122` (liste hep resolved) — by-id öncesi `"/dev/input/event5"` artık ne stable ne event_node ile eşleşir (N-IDT0/R mevcut-mantık; bu persist-eski-değer migrasyonu)
+- Kategori: Migrasyon
+- Açıklama: Cihaz bağlıyken bile placeholder.
+- Öneri: `device_id` `/dev/input/event` ile başlıyorsa `resolve_stable_id(device_id)` sonucunu da adaylarla karşılaştır.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B6 · DÜŞÜK · `daemon_send_signal` EPERM mesajı yanlış reçete (input-grubu kill yetkisi vermez)**
+- Konum: `gui/daemon_comm.inl:622-633` (EPERM aynı-uid/CAP_KILL eksikliği; `input` grubu `/dev/input` açma hakkı verir, sinyal hakkı vermez → gruba girse de EPERM devam eder)
+- Kategori: UX
+- Açıklama: Yanlış yönlendirme.
+- Öneri: EPERM metninden input-grubu satırını çıkar; tek reçete pkexec-restart + aynı oturum.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B7 · DÜŞÜK · `read_daemon_pid` çift `pid_probe` (TOCTOU) + trailing-çöp kabulü**
+- Konum: `gui/daemon_comm.inl:335-355` (`:344` + `:355` iki kez probe → 2x readlink + recycle penceresi; `strtol` trailing doğrulanmaz → `"1234abc"` geçerli sayılır)
+- Kategori: Sağlamlık
+- Açıklama: Boşa maliyet + pencere.
+- Öneri: Sonucu cache'le + `*end` yalnız `[ \t\r\n\0]` şartı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B8 · DÜŞÜK · `update_daemon_status` her tick'te 2 IPC (tek `status` yeter)**
+- Konum: `gui/daemon_comm.inl:392-401` (`ping`) + `:566-568` (`status`) — 3sn tick 2 round-trip; `mouse_test_poll` (`mouse_test.inl:232-263`) tek-`status`'u up-check yapar
+- Kategori: Perf
+- Açıklama: 2x socket-open/connect + 2x timeout penceresi israf.
+- Öneri: `status` boş-dönerse down say, ping turunu kaldır.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B9 · DÜŞÜK · `on_graph_motion` yarım-ölçek (`max_speed` canlı, `max_gain` bir-frame-eski)**
+- Konum: `gui/graph.inl:79-86` (draw yalnız `max_gain` cache'ler) + `:328-333` (motion `max_speed` yeniden hesaplar) — zoom/pan `queue_draw` beklerken motion yeni speed + eski gain karıştırır → crosshair bir frame kayık; ilk-draw-öncesi hard-coded `2.0`
+- Kategori: Hit-test skew
+- Açıklama: L-BUG-17 invariyantı `queue_draw` penceresinde yanlış.
+- Öneri: Draw'da `max_speed`'i de cache'le, motion ikisini cache'ten okusun.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T47-B10 · INFO · Lejant taşması + "point added" kesmesi**
+- Konum: `gui/graph.inl:213-215` (lejant `ML+PW-100`, `PW<130` plot dışına/Y-etiket üstüne taşar) + `ui_builder.inl:870-871` (`"speed=%d"` ondalık atar, `substr(0,5)` tutarsız keser)
+- Kategori: Kozmetik
+- Açıklama: Erken-dönüş yalnız `PW<10`.
+- Öneri: Lejant x `max(ML+4,...)` veya `PW<130` gizle; `%.2f/%.3f` formatla.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 48 — GUI HID++ Panel / KWin Focus / TR / ProfileMgr (2026-09-13, anlık log)
+
+**T48-01 · ORTA · Query+Apply eşzamanlı koşuyor + `devs_version` düşürülüyor (bayat sonuç)**
+- Konum: `gui/hidpp_panel.inl:816,585-619,840` (`on_hw_apply` `hw_busy` kontrolsüz ikinci worker; `HwApplyTask:195` `devs_version` taşır `:840` ama `Result:585-586` düşürür; idle `:590-619` versiyon kontrolü yapmaz → rescan sonrası eski cihaz metni yeni seçimdeymiş gibi basılır + koşulsuz `hw_query_current:616`)
+- Kategori: Concurrency
+- Açıklama: Scan/query + apply aynı hidraw'da eşzamanlı; ilk biten `busy=false` yapınca üçüncü iş araya girer.
+- Öneri: Apply da `pending` kuyruğuna girsin; `Result` içine `devs_version+idx` taşınıp idle'da drop edilsin.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-02 · ORTA · Dokunulmayan kontrol için yazılmış gibi status**
+- Konum: `gui/hidpp_panel.inl:606-612,824-841,569-580` (`rate_hz==0` "değişiklik yok" sentinel ama idle her durumda `Rate→%d Hz`/`LOD→...` basar; desteklemeyen cihazda `Rate→0 Hz`/`LOD→Low` yazılmamış değeri yazılmış gibi raporlar)
+- Kategori: Misleading-feedback
+- Açıklama: `lod` destekten bağımsız combo'dan alınır (`:838-839`).
+- Öneri: `rate_hz==0` / `!supports_lod` dallarını atla (`n/a` veya yalnız yazılanları listele).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-03 · ORTA · Bilinmeyen rate `0` seçimine zorlanıyor (istenmeyen yazma)**
+- Konum: `gui/hidpp_panel.inl:438-447` (`cur.rate_hz==0` → `set_selected(dd,0)`; DPI tarafı `:424-426` `cur.dpi>0` korur, rate korumaz → dokunmadan Apply en düşük rate'e düşürür)
+- Kategori: Correctness
+- Açıklama: İstenmeyen yazma.
+- Öneri: Bilinmeyende seçim yapma (önceki seçimi koru veya `INVALID` + Apply'da `rate_hz==0` → yazma).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-04 · ORTA · `GError` yaşam-döngüsü ihlali**
+- Konum: `gui/kwin_focus.inl:184,191-207,218` (`if(!result) g_error_free(err)` guardsız (`err==NULL` kritik); `free` sonrası `err=NULL` yokken aynı `&err` ile `loadScript` → GLib `*err==NULL` ihlali; `:204` sızıntı; `:218` dangling `err`)
+- Kategori: GLib-contract
+- Açıklama: Reload hiç denenmeden `NULL` dönebilir.
+- Öneri: Her `free` sonrası `err=nullptr`, her `call_sync` öncesi `nullptr` garantile; `:184`/`:204` `if(err)` guard.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-05 · ORTA · Focus yolunda bloklayan senkron I/O (Alt-Tab 2sn blok)**
+- Konum: `gui/kwin_focus.inl:87-91,120-127` + `daemon_comm.inl:236-238` (her `windowActivated`'da `GetConnectionUnixProcessID(2000ms)` + `set_active_app(150ms IPC)` ana thread'de — obje `session_conn` ana context'te kayıtlı)
+- Kategori: UI-jank
+- Açıklama: Worker'a alınsa `last_app:120` (`std::string` atomsuz) yarışı doğar.
+- Öneri: PID→comm cache'le veya `*_async` + idle'a taşı; `last_app` mutex/atomik.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-06 · DÜŞÜK · Öngörülebilir script dosyası `fopen("w")` ile**
+- Konum: `gui/kwin_focus.inl:168-175` (`$RUNTIME/rawaccel/kwin_focus_relay.js` `fopen("w")` — `O_EXCL|O_NOFOLLOW` yok; repo `tr.inl:644`, `profile_mgr.inl:28-33` `O_NOFOLLOW|O_EXCL` kullanır; `dir 0700` düşük sömürü ama politika tutarsız + uninstall'da silinmiyor)
+- Kategori: Hardening
+- Açıklama: Tutarsızlık.
+- Öneri: `open(O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC,0600)+fdopen+fsync`, uninstall'da `unlink`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-07 · ORTA · Uninstall pencere-kapanışı ana thread'de ~9sn bloklayabilir**
+- Konum: `gui/kwin_focus.inl:312,182,192,200,212` (worker `loadScript 2000+unload 2000+reload 2000+run 3000` ~7-9sn bloklanabilir; `uninstall:312` `worker.join()` destroy handler'dan `ui_builder.inl:1050` ana thread'de; KWin yavaş/ölüyken kapanış donar)
+- Kategori: Responsiveness
+- Açıklama: Join doğruluğu hariç yeni açı (bloklama süresi).
+- Öneri: Join'i `g_timeout_add` ile asenkronlaştır veya timeout'ları kısalt/`g_cancellable` ile iptal.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-08 · ORTA · Import boy kontrolü load'dan sonra (GB allocate)**
+- Konum: `gui/profile_mgr.inl:577-592` (`g_file_get_contents:580` tüm dosyayı heap'e alır, `MAX_IMPORT_BYTES:586` `:587`'de → GB yanlışlıkla seçilse kontrol öncesi allocate)
+- Kategori: Resource-exhaustion
+- Açıklama: LUT-boy kapısı ayrı (R12-IMPLUT), bu dosya-boyutu.
+- Öneri: Önce `g_file_query_info(STANDARD_SIZE)` ile bak, `>4MiB` ise okumadan reddet.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-09 · DÜŞÜK · Export salt-okunur değil, `unsaved` kirletir**
+- Konum: `gui/profile_mgr.inl:527-535` + `widgets_sync.inl:150-152` (`export_done:528` `widgets_to_profile` → `:152` `unsaved=true`; save yok, flag temizlenmez → hiç edit yapmadan export alan çıkışta "Unsaved Changes" görür)
+- Kategori: State-tracking
+- Açıklama: Widget değerleri sessizce in-memory profile işlenir.
+- Öneri: Kopya üzerine uygulayan saf serializer veya `prev_unsaved` saklayıp restore et.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-10 · DÜŞÜK · Hata yolu dialogu yok edip yazımı kaybettirir**
+- Konum: `gui/profile_mgr.inl:207-216,183-188/297-304,322-330` (New/generic `do_ok` `destroy` koşulsuz; duplicate/MAX_PROFILES hatasında dialog kapanır → düzeltilmiş isim yeniden yazılmalı)
+- Kategori: UX
+- Açıklama: Kullanıcı status'u görür ama yazım kaybolur.
+- Öneri: `cb` bool dönsün; `false` ise dialog açık kalsın + entry seçili kalsın.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T48-11 · DÜŞÜK · `unref` edilmiş `GtkStringList*` üzerinden sayım**
+- Konum: `gui/tr.inl:716-724` (`:716` `set_model`, `:717` `unref(sl)`, `:724` `get_n_items(sl)` — bugün dropdown ref tuttuğu için tesadüfi yaşama; dangling okuma)
+- Kategori: Lifetime-fragility
+- Açıklama: Diğer `tr_combo_fill` kullanımları unref sonrası dokunmaz.
+- Öneri: `n`'i unref'ten önce al veya `get_model()` üzerinden sorgula.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 49 — HID++ Transport / Feature Discovery (2026-09-13, anlık log)
+
+**T49-01 · ORTA · Hata paketi cihaz-korelasyonsuz — bayat hata doğru isteği öldürür**
+- Konum: `src/logitech_hidpp.cpp:775,872,920,967,1015` (`is_hidpp_error` yalnız `data[0]==0x10/11/12 && data[2]==0xFF/8F`, `buf[1]==request_device` bakılmaz) vs başarı yolu `:777-779,:874-877` sıkı eşleşir
+- Kategori: Yanıt-eşleştirme
+- Açıklama: Tek hidraw `0xFF/0x00/0x01..0x06` paylaşırken başka hedefe ait bayat hata mevcut isteği anında öldürür; doğru cevap deadline'a kadar beklemek yerine kaybolur.
+- Öneri: Önce `buf[1]!=request_device` ise `continue` (+ hata-echo feature/function/sw_id eşleşmiyorsa stash/continue); yalnız eşleşen hata `nullopt` dönsün.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T49-02 · ORTA · `get_feature_set()` hedefsiz — cross-target capability-gate yanlış**
+- Konum: `src/logitech_hidpp.cpp:1298,1462,1288` + `:1269-1270,:1191` (hep `device_index_` kullanır) vs `feature_request:1070-1077` N-09 düzeltmesi burada yok — current=`0xFF` iken `get_device_info(0x01)` receiver-shell setine bakar (false-negative `nullopt` veya sahte `protocol_version=2`)
+- Kategori: Capability-gate
+- Açıklama: `get_dpi_info` hedef-duyarlı (`target<<16|id`), battery/device_info kapısı hedefsiz.
+- Öneri: `get_feature_set(target)/get_feature_metadata(target)` overload + `resolve_feature_index(feature,target)` kapısına indirgeme.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T49-03 · DÜŞÜK-ORTA · `resolve_feature_index` cache-key vs request-device ayrışması**
+- Konum: `src/logitech_hidpp.cpp:798-800` vs `:816-818` (`target` çözülüp `cache_key=(target<<16)|id` ama `send_feature_request(...,target_device_index)` orijinal sentinel (`0xFF`) iletilir; arada `set_device_index()` girerse yanlış hedeften gelen index yanlış key'e yazılır)
+- Kategori: Concurrency
+- Açıklama: Clear sonrası bile sağ kalır (yazma clear'dan sonra olur).
+- Öneri: `:816-818`'e çözümlenmiş `target` geç.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T49-04 · ORTA · Ölü fd'de `read_packet false` sonrası hot-spin (fast-fail yok)**
+- Konum: `src/logitech_hidpp.cpp:774,871,919,966,1014,1049-1055` + `:712-718,:705` (`read_packet` `dead()`'de `fd_=-1` + `false`, çağrıcı `continue` ile deadline'a kadar döner → kalan 500-900ms hot-spin; N-FDERR tespiti fast-fail eklemedi)
+- Kategori: CPU spin
+- Açıklama: Her `get_feature_metadata` indeksi başına tekrarlanır.
+- Öneri: `!read_packet` sonrası `if(!is_open()) break/return nullopt` ekle (tüm `send_*`, `read_register`, `probe_hidpp10`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T49-05 · DÜŞÜK-ORTA · `set_device_index/clear_feature_cache` `pending_notifications_`'u temizlemiyor**
+- Konum: `src/logitech_hidpp.cpp:645-660` + `logitech_hidpp.hpp:464-470,445-451` (3 feature map temizlenir, `pending_notifications_` max 16 korunur → `drain:1147-1158` eski cihaz stash'i iade eder; replug'da eski index yeni cihazla çakışırsa yanlış map ile sınıflandırılır)
+- Kategori: Notification
+- Açıklama: Hedef değişimi/replug sonrası eski stash yaşar.
+- Öneri: Her iki fonksiyonda L-BUG-40 sırasıyla `pending_notifications_.clear()` da yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T49-06 · DÜŞÜK · `discover_logitech_receivers` `++it` ham artırma (`filesystem_error` fırlatır)**
+- Konum: `src/logitech_receiver.cpp:93-96` (`directory_iterator(it,ec)` + döngüde ham `++it`; hotplug sökülme/IO hatası daemon taramasını çökertir, `while(!ec)` yakalayamaz)
+- Kategori: Robustness
+- Açıklama: Daemon taraması çökebilir.
+- Öneri: `it.increment(ec2); if(ec2) break;` + `try/catch` veya `increment(ec)`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 50 — HID++ Battery / DPI / Rate / LOD / Quirks (2026-09-13, anlık log)
+
+**T50-01 · DÜŞÜK-ORTA · Pil `0x1001` `charging` baytı `Full/Fault`'u `Charging` sanıyor**
+- Konum: `src/logitech_hidpp.cpp:1500` + `:2439-2442` (`charging=(flags&0x80)!=0`; `0x80` yalnız `extPower`; `0x80|0x01` `Full`, `0x80|0x02` `Fault` de `Charging` rozeti alır)
+- Kategori: Pil durumu
+- Açıklama: Bildirim yolu aynı testi tekrarlar, iki yer birlikte bozuk.
+- Öneri: `if(!(f&0x80)) discharging; else if((f&0x03)==0x01) full(false); else if==0x02 not-charging(false); else charging=true`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-02 · ORTA · `get_battery_status` yetenek kapısı transport indexini kullanıyor (hedef karışması)**
+- Konum: `src/logitech_hidpp.cpp:1462` (hedefsiz `get_feature_set()`) vs `get_dpi_info` hedef-duyarlı (`target<<16|id`); çağıran `daemon.cpp:1613-1616` `set_device_index` çağırmaz (CLI/GUI çağırır) — tek hidraw'da `0x01` unified'lı + `0x02` voltajlı iki farede `0x02` sorgusu `unified` dener → `nullopt` → gereksiz legacy timeout
+- Kategori: Hedef karışması
+- Açıklama: Önbellek `0x01`'de kalmışken `0x02` yanlış kapıdan girer.
+- Öneri: Kapıyı hedef-duyarlı yap (`resolve_feature_index` dene) veya `get_feature_set(target)` overload; en azından daemon sorgudan önce `set_device_index` yapsın.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-03 · DÜŞÜK-ORTA · `decode_dpi_levels` ızgara-dışı `last`'ı düşürüyor**
+- Konum: `src/logitech_hidpp.cpp:91-99` (`for(;next<=last;next+=step)` → `400,400,1500` örneğinde `[400,800,1200]`, `1500` yok; OpenLogi `while next<last push + push(last)` → `[400,800,1200,1500]`)
+- Kategori: DPI
+- Açıklama: Desteklenen DPI `dpi_levels`'te yok → `set_dpi` `rejected` sayar.
+- Öneri: Döngüden sonra `if(empty||back()!=last) push(last)` (2048 muhafazasıyla).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-04 · ORTA · GUI oran listesi bitmask'i kod-listesi sanıyor**
+- Konum: `gui/hidpp_panel.inl:338-350` + `:352-363` + `:537-558` (`for(i=1;i<size;i++) code_to_hz(payload[i])` her baytı kod sanır) vs doğrusu `logitech_hidpp.cpp:1915-1939` (2-bayt BE / 1-bayt bitmask); örnek `0x007F` → `125Hz` kopyalar veya bomboş combo + `get_polling_rate` iki kez çağrılır (`:323` + `:335`, 4 sorgu/refresh)
+- Kategori: Oran ayrıştırma
+- Açıklama: Combo dolar veya boş kalır.
+- Öneri: GUI ayrıştırıcıyı transport maskesine çek (ortak `hidpp_parse_report_rates()` helper) + çift çağrıyı tekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-05 · DÜŞÜK-ORTA · GUI Apply DPI'sız cihazda oran/LOD değişimini engelliyor**
+- Konum: `gui/hidpp_panel.inl:812-815` vs `:750-751` (`update_ui` `dpi_ok||rate_ok||lod_ok` ile açar, `on_apply` `if(!c.dpi) reject` ile çıkar → oran-sadece cihazda buton açık ama her tıklama red)
+- Kategori: Yetenek kapısı
+- Açıklama: Oran/LOD yalnız değişim imkânsız.
+- Öneri: Alan-bazlı kapı (`dpi` yalnız `dpi_ok`, `rate` yalnız `rate_ok`, `lod` yalnız `lod_ok`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-06 · DÜŞÜK · `0x1001` voltaj sorgusu `send_short` ile uzun yanıtı düşürür**
+- Konum: `src/logitech_hidpp.cpp:1492-1495` (`send_short`) vs `:812-818` (ROOT uzun-yanıt dersi `send_feature_request` ile çözüldü) + `:465-476` (`from_bytes` yalnız `len==7`)
+- Kategori: Taşıma tutarsızlığı
+- Açıklama: Uzun `0x11` yanıt elenir → sessiz timeout → yanlışlıkla centurion/legacy dallarına inilir.
+- Öneri: Voltaj dalını `feature_request/send_feature_request`'e çevir.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-07 · DÜŞÜK · CLI `pairing_slots` aynı alıcı taramasını her cihazda tekrarlıyor**
+- Konum: `cli/main.cpp:2377` + `:2497` (`get_pairing_info(0xFF)` cihaz-döngüsü içinde; `logitech_hidpp.cpp:1532-1568` hep `0xFF` alıcı-seviyesi → aynı path'te 3 farede aynı `6x` sorgu 3 kez, her biri 900ms → onlarca sn gecikme)
+- Kategori: Perf
+- Açıklama: Doğrudan fare PID'lerinde `count==0` ucuz dönmesi israfı gizler.
+- Öneri: Sorguyu döngüden çıkar, `path` başına bir kez yapıp her entry'ye aynı JSON'u koy.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T50-08 · DÜŞÜK/INFO · `logitech_controls`: LOD fazla-iyimser, LED eksik**
+- Konum: `include/logitech_quirks.hpp:187` + `:197-201` vs `logitech_hidpp.cpp:1636` + `logitech_hidpp.hpp:66-68` (`c.lod=c.dpi_xy` her `0x2202`'yi LOD'lu sayar, transport `caps[2]&0x02` şart koşar → GUI combo açılır, transport reject; `led_brightness` `0x8040/1982/1981` kapsar, `0x1983/0x1990` kapsamaz → LED'siz görünür)
+- Kategori: Quirks
+- Açıklama: Tutarsızlık.
+- Öneri: `lod_maybe` notu veya `GetCaps` sonrası düzeltme + `update_ui` `supports_lod` ezmesi; `led`'e `backlight3||illumination` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 51 — Scripts / Build / Bench / KDE / Virtmouse / Service (2026-09-13, anlık log)
+
+**T51-01 · ORTA · `build.sh` cmake + direkt yolu aynı `build-manual` dizinini paylaşıyor (kirlenme)**
+- Konum: `scripts/build.sh:7,91-92,100` (`BUILD="$ROOT/build-manual"` hem `mkdir -p; cd; cmake ..` hem direkt binary yolu)
+- Kategori: Build
+- Açıklama: CMake `Cache/Makefile/CMakeFiles` artıkları ile manuel binaryler karışır; yoldan yola geçişte bayat cache ile kirli derleme.
+- Öneri: CMake yolu için ayrı dizin (`build-cmake`) veya `cmake -S .. -B`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-02 · ORTA · CMake yolu GTK4 yoksa hard-fail (direkt yol zarif geçer)**
+- Konum: `scripts/build.sh:93-94` vs `:123-134` + `CMakeLists.txt:82-84` (direkt `HAVE_GTK4=1` ise derler yoksa `rm -f gui` geçer; cmake koşulsuz `-DBUILD_GUI=ON` → `pkg_check_modules(GTK4 REQUIRED)` hard-fail)
+- Kategori: Tutarsızlık
+- Açıklama: GTK4sız makinede manuel başarılı, `USE_CMAKE=1` başarısız.
+- Öneri: `HAVE_GTK4` kontrol edip `-DBUILD_GUI=OFF` geç veya aynı `Skipping GUI` davranışı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-03 · ORTA · `bench_hotpath.sh` bayat-binary ile koşar**
+- Konum: `scripts/bench_hotpath.sh:17-38` (`if [[ ! -f $BENCH_BIN ]]; then build; fi` — `bench_hotpath.cpp` değişince rebuild yok → perf-gate bayat sayılar)
+- Kategori: Bench
+- Açıklama: Yanlış perf kararı.
+- Öneri: `[[ cpp -nt BIN ]]` ise rebuild veya her zaman rebuild.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-04 · DÜŞÜK · `bench_hotpath.sh` aynı binary 3 kez koşuyor (israf)**
+- Konum: `scripts/bench_hotpath.sh:65,77,90` (timing + `perf stat` + özet üçü aynı `$BENCH_BIN $ITERATIONS`)
+- Kategori: Perf
+- Açıklama: 1M iterasyon x3 maliyet.
+- Öneri: `:65` çıktısını değişkende tut, özeti onun üstünde yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-05 · DÜŞÜK · `bench_hotpath.sh` girdi-doğrulamasız (`foo/0/bad-path` kriptik hata)**
+- Konum: `scripts/bench_hotpath.sh:12-14,65` (`ITERATIONS=${1:-...}`, `PERF_RUNS`, `OUTPUT_FILE` doğrulanmaz → pahalı derleme sonrası kriptik hata)
+- Kategori: Validasyon
+- Açıklama: Erken fail yok.
+- Öneri: Başta numeric/aralık/dizin-yazılabilirlik kontrolü.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-06 · YÜKSEK · `kde-fix-accel.sh` python yolu yabancı anahtarları siliyor (veri-kaybı)**
+- Konum: `scripts/kde-fix-accel.sh:95-109,111-114,311-318` (`new_block=header+body` + `re.sub` eski gövdeyi komple değiştirir, yalnız 2 anahtar bırakır; `PointerAccelerationSpeed` vb. `--fix` ve `--remove`'da silinir; `sed` fallback `:157-168` korur — iki yol farklı)
+- Kategori: Veri-kaybı
+- Açıklama: Kullanıcı ayarları kalıcı silinir.
+- Öneri: Gövdeyi parse edip yalnız 2 anahtarı upsert et, diğer satır/yorum aynen tut.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-07 · ORTA · KDE yedek-rotasyonu çakışır + boşluklu yolda yanlış silme**
+- Konum: `scripts/kde-fix-accel.sh:47-49` (`ts=date+%S-$$` aynı sn+PID çakışır → ilk yedek ezilir; `ls -1t ... | tail +6 | xargs -r rm -f` boşluk/newline'da kelime-bölünmesi)
+- Kategori: Robustness
+- Açıklama: Yedek kaybı / yanlış silme.
+- Öneri: `date +%S-%N` + `$RANDOM`/`mktemp`; rotasyonu `find -printf '%T@ %p\n'|sort` + `xargs -0/-d` ile yap.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-08 · ORTA · `--remove` kurulum-öncesi Flat tercihini adaptive'e zorlar**
+- Konum: `scripts/kde-fix-accel.sh:310-321,351` (global `[Libinput]` koşulsuz `profile=2,accel=-0.5`; öncesi Flat olanın tercihi geri gelmez)
+- Kategori: Kullanıcı-tercihi
+- Açıklama: Dayatma.
+- Öneri: Yedekteki önceki değerleri restore et, yoksa adaptive'e düş.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-09 · ORTA · `KWINRC` hedefi `sudo -u` altında `/root`'a kayar (yanlış-dosya)**
+- Konum: `scripts/kde-fix-accel.sh:17` + `scripts/uninstall.sh:117` (`KWINRC=${XDG:-$HOME/.config}/kwinrc`; `uninstall:117` `preserve-env` listede `HOME/XDG` yok; `HOME=/root` kalırsa `--remove` `/root/.config/kwinrc` düzeltip `for user` raporlar)
+- Kategori: Env
+- Açıklama: Yanlış dosya + yanlış rapor.
+- Öneri: `HOME=$(getent passwd $user|cut -d: -f6)` türet veya `preserve-env=HOME,XDG_CONFIG_HOME`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-10 · ORTA · `virtmouse-game.c` `EAGAIN` sessiz yutulur (geçersiz ölçüm)**
+- Konum: `scripts/virtmouse-game.c:57,90` (`open(O_NONBLOCK)` + `emit(): if(write<0){/*ignore*/}`; daemon sink `uinput_write_retry` absorbe ederken kaynak etmez → histogram boşluklu, latans geçersiz)
+- Kategori: Reliability
+- Açıklama: Sessiz kayıp.
+- Öneri: Kaynak fd blocking aç veya EAGAIN sınırlı retry + sayaç.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-11 · ORTA · `virtmouse-game.c` `SET_EVBIT` kontrolsüz + yırtık-write + `DESTROY` kontrolsüz**
+- Konum: `scripts/virtmouse-game.c:71-78,90,204` (`UI_SET_*` dönüş kontrolsüz; `0<ret<sizeof` yırtık ` <0` testinden kaçar; `UI_DEV_DESTROY` kontrolsüz → hayalet düğüm, `P121/BUG-10` iddiası boşa çıkar)
+- Kategori: Error-handling
+- Açıklama: Hayalet düğüm riski.
+- Öneri: Her `ioctl(SET_*)` kontrol + fail-fast; `write != sizeof` hata; `DESTROY` `perror` + nonzero exit.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-12 · DÜŞÜK · `virtmouse-game.c` yalnız `REL_X` (diagonal yollar uyarılmaz)**
+- Konum: `scripts/virtmouse-game.c:93-96` (`emit_rel` yalnız `REL_X+SYN`; `REL_Y` yok → öklid/rotasyon/Y-smoothing/diagonal hiç uyarılmaz)
+- Kategori: Coverage
+- Açıklama: Eksik uyarım.
+- Öneri: `emit_rel(fd,dx,dy)` + `pan` diagonal varyant / `mix`e `REL_Y`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-13 · DÜŞÜK · `virtmouse-game.c` süre-validasyonsuz (`0/negatif→5sn`, `INT_MAX` kesilmesi)**
+- Konum: `scripts/virtmouse-game.c:106-111,127` (`dur<=0?5:(int)dur`; `INT_MAX` üstü kesilip negatife dönüp boş koşu)
+- Kategori: Validasyon
+- Açıklama: Sessiz yanlış koşu.
+- Öneri: `dur<=0||dur>86400` → error+usage, `ERANGE` kontrolü.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-14 · ORTA · `rawaccel.service` `Wants/After` user-unit'i system-manager'da no-op**
+- Konum: `scripts/rawaccel.service:10-11,109` (`WantedBy=multi-user.target` system unit + `Wants/After=plasma-kwin_wayland.service` user-session unit → system manager'da isim yok → sıralama çalışmaz)
+- Kategori: Systemd
+- Açıklama: No-op ordering.
+- Öneri: System unit'ten kaldır; gerekiyorsa user unit veya udev tetiklemesi, yorumu düzelt.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-15 · ORTA · `rawaccel.service` `uinput` sırası yok + `ExecStartPre` yorumu kodsuz**
+- Konum: `scripts/rawaccel.service:9,26-27` (`After=systemd-udevd` var, `systemd-modules-load/modprobe` sırası yok → ilk boot `/dev/uinput` hazır değilse `Restart` döngüsü; yorum `:23-26` “`ExecStartPre` below” der ama dosyada yok)
+- Kategori: Systemd
+- Açıklama: İlk-boot yarışı.
+- Öneri: `After=systemd-modules-load.service` veya `ExecStartPre=/sbin/modprobe uinput` (`-`/`|| true`); yorumu hizala.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-16 · DÜŞÜK · `rawaccel.service` `ReadWritePaths=/run` aşırı-geniş**
+- Konum: `scripts/rawaccel.service:61` (tüm `/run` yazılabilir; daemon yalnız `/run/rawaccel.pid/.sock` yazar)
+- Kategori: Hardening
+- Açıklama: Gereksiz genişlik.
+- Öneri: Dar yol (`/run/rawaccel.sock|pid`) veya `RuntimeDirectory=rawaccel`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-17 · ORTA · `99-rawaccel.rules` `uinput` `uaccess` aşırı-yetki (her aktif kullanıcı enjekte edebilir)**
+- Konum: `scripts/99-rawaccel.rules:19` (`KERNEL=="uinput" TAG+="uaccess"`; `input` grubu zaten ekleniyor; ayrıca `SUBSYSTEM` yok)
+- Kategori: Udev
+- Açıklama: Aktif her kullanıcı tuş enjekte edebilir.
+- Öneri: `uinput` satırından `uaccess`'i kaldır (grup-yeter), `SUBSYSTEM=="misc"` ekle; `event*/hidraw*`'da tut.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-18 · BİLGİ · Quirk `MatchName` koşulsuz + `desktop` `TryExec` yok**
+- Konum: `scripts/rawaccel.quirks:16-18` (`MatchName=*(RawAccel)` tip koşulsuz → non-mouse düğüme `ModelTrackball` bulaşır) + `rawaccel.desktop` (`TryExec` yok → manuel kurulum GUI derlenmemişken ölü menü; `setup.sh:360-362` korumalı, manuel değil `README:129-132`)
+- Kategori: Desktop/quirk
+- Açıklama: Kozmetik/yanlış-eşleşme.
+- Öneri: `MatchUdevType=mouse` ekle; `desktop`a `TryExec=rawaccel-gui` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-19 · ORTA · `uninstall.sh:55` `daemon-reload` korumasız (container abort)**
+- Konum: `scripts/uninstall.sh:55` (`set -e` altında çıplak `systemctl daemon-reload`; `setup.sh` `|| warn` korur; `uninstall:22,26,30,34,36,37,91` guard'lı, `:55` değil → systemd-less chroot'ta abort, binary/udev temizliğine ulaşamaz)
+- Kategori: Taşınabilirlik
+- Açıklama: Yarım-temizlik.
+- Öneri: `2>/dev/null || true`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-20 · ORTA · `uninstall.sh:106` exec-bit ister (zip/tar'da atlanan temizlik)**
+- Konum: `scripts/uninstall.sh:106` (`if [[ -x $KDE_FIX ]]` ama çağrı `bash $KDE_FIX --remove` → exec gereksiz; bit düşerse kwinrc temizliği sessizce atlanır; `install.sh:12` doğru desen `[[ -f ... ]]`)
+- Kategori: Uninstall
+- Açıklama: Sessiz atlama.
+- Öneri: `[[ -f $KDE_FIX ]]`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-21 · ORTA · `uninstall.sh` `/root` + LDAP `HOME`'ları atlar**
+- Konum: `scripts/uninstall.sh:68-70,111-112` (binary süpürme `/home/*/.local/bin` + kwinrc `for home in /home/*` → `/root`, `getent` dışı HOME'lar atlanır)
+- Kategori: Kapsam-deliği
+- Açıklama: Kalıntı bırakır.
+- Öneri: `getent passwd|cut -d: -f6` üzerinden dön, `/root` dahil.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-22 · DÜŞÜK · `uninstall.sh` `pkill TERM→0.3s→KILL` grab'ı yarıda kesebilir**
+- Konum: `scripts/uninstall.sh:35-37` (yükte 300ms yetmezse `KILL` grab/uinput destroy'u yarıda kesip hayalet düğüm bırakır)
+- Kategori: Yarış
+- Açıklama: Hayalet düğüm.
+- Öneri: `timeout 5s while pgrep` poll, sonra `KILL`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T51-23 · DÜŞÜK · `uninstall.sh:91` `trigger` yok (kural takılı kalır)**
+- Konum: `scripts/uninstall.sh:91` (`reload-rules` var, `trigger` yok; SH-4 aşırı-geniş trigger'dan farklı — burada hiç yok → kaldırılan kural replug/reboot'a kadar uygulanır)
+- Kategori: Uninstall
+- Açıklama: Bayat kural.
+- Öneri: `udevadm trigger --subsystem-match=input --action=change 2>/dev/null || true` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 52 — Setup / Packaging / CMake / CI (2026-09-13, anlık log)
+
+**T52-01 · ORTA · PKGBUILD taşınabilir-olmayan AUR paketi (`-march=native` gömülü)**
+- Konum: `packaging/PKGBUILD:47-51` (`cmake ... -DCMAKE_INSTALL_PREFIX=/usr`, `-DRAWACCEL_PORTABLE` yok) + `CMakeLists.txt:68-70` (default `OFF` → `-march=native` aktif → builder CPU'suna gömülü `znver4` ikili, eski x86_64'te `SIGILL`; T37-BLD03 `build.sh` tarafı, bu PKGBUILD tarafı)
+- Kategori: Tekrarüretilebilirlik
+- Açıklama: Arch kılavuzu `native` yasaklar.
+- Öneri: `cmake -B build ... -DRAWACCEL_PORTABLE=ON` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-02 · ORTA · PKGBUILD `makedepends` `make` eksik**
+- Konum: `packaging/PKGBUILD:21` vs `:51` (`cmake --build` default `Unix Makefiles` → `make` ister; `makedepends=(cmake pkgconf gcc)` içinde `make` yok → `base-devel`'siz chroot'ta `CMAKE_MAKE_PROGRAM not found`)
+- Kategori: Derleme
+- Açıklama: `setup.sh` Arch dalı `base-devel` kurduğu için orada görünmez.
+- Öneri: `make` ekle (veya `base-devel` varsayımını yoruma yaz).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-03 · DÜŞÜK-ORTA · `kde-fix-accel.sh` hiçbir paket yoluna kurulmuyor (`optdepends` ölü)**
+- Konum: `packaging/PKGBUILD:22-23,62-79`, `CMakeLists.txt:158-191` (kurulum yok; `optdepends` `python/kde-fix` + `qt6-tools/qdbus6` vaat eder; `setup.sh:443` repo-içi yol kullanır)
+- Kategori: Özellik eksikliği
+- Açıklama: Paket kullanıcısında dosya yoktur.
+- Öneri: `/usr/bin/rawaccel-kde-fix` (755) olarak kur + açıklamayı yola bağla veya optdepends'tan düşür.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-04 · DÜŞÜK · `setup.sh` GUI'ye `KILL` atmıyor (inatçı GUI upgrade'i gölgeler)**
+- Konum: `setup.sh:196-201` (daemon `TERM→0.3→KILL`, GUI yalnız `TERM`; `uninstall.sh:30-37` her ikisine `TERM+KILL` (R4-L-8) → `TERM` yoksayan GUI eski inode altında yaşar, "güncelledim değişmedi" sanılır)
+- Kategori: Lifecycle
+- Açıklama: Gölgeleme.
+- Öneri: `sleep 0.3` sonrası `pkill -KILL -x rawaccel-gui || true` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-05 · DÜŞÜK · `clean_old_install` XDG pid/sock bırakır (reinstall bayat kilit)**
+- Konum: `setup.sh:204` (yalnız `/run`+`/tmp`) vs `:556-560` (`do_uninstall` `/run/user/*` döner; reinstall `install_deps→build→clean→install` `/run/user/$UID` artığıyla başlar)
+- Kategori: Stale-state
+- Açıklama: Bayat kilit.
+- Öneri: `for d in /run/user/*` bloğunu `clean_old_install`'a taşı (ortak fonksiyon).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-06 · DÜŞÜK · `~/.config/systemd/user` gölge unit hiç temizlenmiyor**
+- Konum: `setup.sh:208-225,376-380`, `packaging/rawaccel-linux.install:8-9` (SH-3 uyarısı iki yeri kontrol eder ama `files=()` + `pre_install` yalnız `/etc/systemd/user` + sistem yolları siler; `$HOME/.config/...` yok → login'de gölgeleme sürer)
+- Kategori: Kurulum bütünlüğü
+- Açıklama: Uyarı var, temizlik yok (SH-3 uyarının kendisi hariç, bu temizlik boşluğu).
+- Öneri: `clean_old_install` + `pre_install` içine `$REAL_HOME/.config/systemd/user/rawaccel.service` (+ `/home/*` taraması) ekle veya "uyar-only" yorumu.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-07 · DÜŞÜK-ORTA · Container'da abort eden iki korumasız adım**
+- Konum: `setup.sh:326` (`echo uinput > /etc/modules-load.d/...` `mkdir -p`/`|| warn` yok) + `:387` (`usermod -aG input` `|| warn` yok; `input` yoksa/silindiyse abort → yarı-kurulum)
+- Kategori: `set -e` sağlamlığı
+- Açıklama: Diğer adımlar BS-7 deseninde korunur, bu ikisi değil.
+- Öneri: `(a)` `mkdir -p` + `|| warn`; `(b)` `usermod ... || warn`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-08 · DÜŞÜK · `udevadm trigger` `hidraw`/`uinput` kuralını uygulamaz**
+- Konum: `setup.sh:341` (`--subsystem-match=input` yalnız) vs `99-rawaccel.rules:19,22,27` (`uinput` misc/SUBSYSTEM-yok, `event*` input, `hidraw*` hidraw → takılı receiver `hidraw` izni + `uinput` reboot/replug'a kadar eski modda, GUI "izin yok" verir; T37-BLD02 seçicisiz `.install` içindir, bu daraltmanın eksik yarısı)
+- Kategori: İzin zamanlaması
+- Açıklama: Eksik tetikleme.
+- Öneri: `... --subsystem-match=hidraw ...` (+ misc/uinput) ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-09 · DÜŞÜK · `.install` `daemon-reload` korumasız + fresh kurulum başlamaz**
+- Konum: `packaging/rawaccel-linux.install:20-22,30` (`pre_install:15` korumalı, `post_install:20` + `post_upgrade:30` çıplak → container'da hata; `post_install` `enable+try-restart` fresh'te no-op → reboot'a kadar başlamaz; `setup.sh:404` `enable --now` ile çelişir)
+- Kategori: Lifecycle
+- Açıklama: Tutarsızlık.
+- Öneri: İki satıra `&>/dev/null || true`; fresh'te `enable --now` (upgrade'de `try-restart`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-10 · DÜŞÜK · CMake prefix uyarısı `/usr/local` dışını yakalamaz + sahiplik fail-open**
+- Konum: `CMakeLists.txt:19-23` (yalnız `==/usr/local` bakar; `/opt/...` dışı her prefix bölünmüş kurulum → `ExecStart=/usr/bin` boşa düşer; BS-12 mutlak `/usr/...` ile birleşir) + `setup.sh:305-308,286-288` (`stat/id` başarısızsa `""` → `[[ -n ... ]]` false → fail-open devam; `mkdir/cp` umask-bağımlı, `install -Dm644` ile tutarsız)
+- Kategori: Build/güvenlik-kenarı
+- Açıklama: Bölünmüş kurulum + fail-open.
+- Öneri: `if(NOT PREFIX STREQUAL "/usr") WARNING`; sahiplikte boşlukta `warn+skip` (fail-closed), fresh config/dizinde `install -Dm...`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T52-11 · ORTA (süreç) · CI paketleme/CMake'i hiç gate'lemez**
+- Konum: `.github/workflows/ci.yml:15-213` (paket adımı yok → `bash -n setup/packaging`, `printsrcinfo` diff (PKG-1/T34), `DESTDIR` smoke (T37-BLD01), `USE_CMAKE=1` build (T37-BLD03) hiç koşmaz → bu TUR driftleri CI'dan sessiz geçer)
+- Kategori: CI kapsamı
+- Açıklama: Sessiz drift.
+- Öneri: `build-and-test` sonuna `bash -n` + `cmake -B /tmp/cm -DCMAKE_INSTALL_PREFIX=/usr && DESTDIR=/tmp/pkg cmake --install` smoke + `printsrcinfo` diff (+ `namcap -i`).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+---
+
+# TUR 53 — Tests Harness (2026-09-13, anlık log)
+
+**T53-01 · ORTA · `run_tests.sh` `build-manual/` oluşturmuyor (temiz checkout patlar)**
+- Konum: `tests/run_tests.sh:8,17-22` (`$ROOT/build-manual/test_accel` yazar ama `mkdir -p` yok) vs `run_tests_asan.sh:19` (var; `rg mkdir tests/` yalnız asan+fuzz'da var)
+- Kategori: Robustness
+- Açıklama: Temiz klonda `g++ ... -o "$BIN"` "No such file" ile ölür.
+- Öneri: Derlemeden önce `mkdir -p "$ROOT/build-manual"` ekle.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-02 · DÜŞÜK · `run_tests.sh` + `run_tests_asan.sh` `-lpthread` link sırası (`--as-needed` riski)**
+- Konum: `tests/run_tests.sh:17`, `run_tests_asan.sh:23` (`$CXX $CXXFLAGS -lpthread <src> -o` → `--as-needed` soldan-sağa lib'i düşürebilir, sonraki nesneler çözümsüz kalır)
+- Kategori: Portability
+- Açıklama: Bugün çoğu toolchain'de örtülü çalıştığı için gizli.
+- Öneri: `-lpthread`'i kaynaklardan sonraya taşı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-03 · ORTA · `run_tests.sh` kurulum adımları çıplak (`set -e` susarak çıkar, teşhis kaybı)**
+- Konum: `tests/run_tests.sh:95-96,132-140,180-188,243-245,256,270-273` (`OUT=$(create ... >/dev/null; set ...)` birinci rc atılır; geçerli-yol kurulumlar çıplak → reddedilirse `FAIL` basmadan `set -e` ile susarak çıkar; `export` sonrası boşluk doğrulanmaz)
+- Kategori: Diagnosability
+- Açıklama: Hangi kapı/kirdi kırıldığı logda görünmez.
+- Öneri: Kurulumları da `set +e … RC … set -e; [RC] && FAIL` kalıbına al; 95. satırı böl + her rc denetle; `export` sonrası boşluk doğrula.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-04 · ORTA · `run_e2e.sh` daemon bayatlığı denetlenmiyor (yalnız harness tazeliği)**
+- Konum: `tests/run_e2e.sh:25-42` (yalnız `CPP_HARNESS -nt HARNESS`; `daemon/**`/`include/**` değişip `rawaccel-daemon` derlenmemişse varlığa bakıp eski daemonla koşar → sonucu yeni kodmuş gibi raporlar; R10-E2EBIN harness tarafı, bu daemon tarafı)
+- Kategori: Staleness
+- Açıklama: Yanlış rapor.
+- Öneri: Daemon kaynak en-yenisi binary'den yeniyse `WARN + 77/1` dur veya `--rebuild` bayrağı.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-05 · ORTA · `run_e2e.sh` faz çağrılarında `timeout` yok (asılı CI sonsuza kilitlenir)**
+- Konum: `tests/run_e2e.sh:67-82` (`"$HARNESS" --daemon ... --phase` çıplak; 5sn `wait_for_output` dışında üst sınır yok; `timeout/timelimit` referansı yok)
+- Kategori: Hang-safety
+- Açıklama: Grab'da takılma / `waitpid`/poll asılması hiç dönmez.
+- Öneri: `command -v timeout` varsa `timeout 120 ...` sar; 124'ü FAIL say.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-06 · ORTA · `e2e_harness.cpp` workdir yaşam-döngüsü bozuk (`/tmp/rawe2e-*` sızıntısı + bayat kirlenme)**
+- Konum: `tests/e2e_harness.cpp:382,388` (`mkdir` dönüş yok; final yalnız `rmdir` → içi `cfg.json+daemon.log+pid+sock` (`:236-240,:103-106`) dolu dizinde her zaman `ENOTEMPTY` → her faz `/tmp/rawe2e-<pid>/` bırakır; pid-reuse'da bayat `cfg/pid/sock` yeni koşuyu kirletir → yalancı FAIL)
+- Kategori: Tmp-hygiene
+- Açıklama: Sızıntı + kirlenme.
+- Öneri: `mkdir` denetle (`EEXIST` temizle/doğrula); finalde `remove_all` veya 4 dosyayı `unlink` + `rmdir`; `run_e2e.sh` EXIT tuzağıyla süpür.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-07 · ORTA · `e2e_harness.cpp` `read_output_events` zaman-muhasebesi sahte (`+=20`)**
+- Konum: `tests/e2e_harness.cpp:134-168` (`:146,:165` `poll(deadline-waited)` ama gerçek süre ölçülmez, her tur `+=20`; sürekli akışta gerçek 10ms iken sayaç 400ms'e ulaşıp erken keser (T-A4 ikinci kare kaçabilir → yalancı FAIL); deadline sonrası `poll(...,0)` meşgul-döngü)
+- Kategori: Timing-correctness
+- Açıklama: Yalancı FAIL + meşgul-döngü.
+- Öneri: `clock_gettime(MONOTONIC)` ile gerçek `elapsed` hesapla; deadline sonrası tek pas drenaj + çık.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-08 · DÜŞÜK-ORTA · `e2e_harness.cpp` `send_events` yazım hatalarını yutuyor (yanlış sınıflandırma)**
+- Konum: `tests/e2e_harness.cpp:170-174` (çağrılar `:264,282,302,318-323,336`; `write_event` dönüş hiç denetlenmez → `ENODEV` altyapı sorunu (77) "gain/frame uyuşmazlığı" FAIL'u olur)
+- Kategori: Error-handling
+- Açıklama: Arıza sınıflandırması bozulur.
+- Öneri: `send_events` bool/int dönsün, hatada hangi olayda takıldığını basıp `77` dönsün.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-09 · DÜŞÜK · `e2e_harness.cpp` `cleanup()` `SIGTERM` + sınırsız `waitpid` (tırmanma yok)**
+- Konum: `tests/e2e_harness.cpp:215-221` (`kill(TERM); waitpid(...,0)` bloklayıcı; `TERM` yutan daemon sonsuza asar; `g_sys_daemon` hiç atanmaz (`-1` sabit) → `:217-220` SIGCONT dalı ölü kod, sahiplik `run_e2e.sh` tuzağında)
+- Kategori: Hang-safety
+- Açıklama: Sonsuz asılma + yanıltıcı sahiplik.
+- Öneri: Süreli bekle (3sn anket) + aşımda `KILL` + `waitpid`; ölü alanı/yorumu kaldırıp sahipliği başlıkta belgele.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-10 · DÜŞÜK-ORTA · `tr_coverage.cpp` çağrı-ayraç tanıma yalnız `' '` atlıyor (`\t`/`\n` kaçar → yalancı PASS)**
+- Konum: `tests/tr_coverage.cpp:239-241,:270-272` (yalnız uzay atlanır) vs `:43-44,:258-259` (tüm boşluk atlanır — tutarsız; `tr\n(`/`tr\t(` `used`'e girmez → eksik çeviri varken PASS)
+- Kategori: Scanner false-negative
+- Açıklama: Gizli kapsama deliği.
+- Öneri: `isspace`-eşdeğeri atlama (`skip_ws()` yardımcısı).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-11 · DÜŞÜK · `tr_coverage.cpp` yorum-içi `tr("…")` `used`'e katılır (yalancı MISSING)**
+- Konum: `tests/tr_coverage.cpp:248-267`, `in_comment:105-141` (literal dalı `used.insert` `in_comment` bakmaz; koruma yalnız değişken/boş-string dalında → `// tr("eski")` MISSING üretir; bugün tetikleyen yorum yok → ilk denemede patlayacak mayın)
+- Kategori: Scanner false-positive
+- Açıklama: Gizli mayın.
+- Öneri: Başarılı dalda da `if (!in_comment(src,start)) used.insert`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-12 · DÜŞÜK · `tr_coverage.cpp` sözlük/combo sınırlayıcılar kırılgan + iç-içe virgül araması**
+- Konum: `tests/tr_coverage.cpp:343` (`"D = {"` sabit), `:353` (ilk `" };"`), `:367-369` (`find('}')` dize-içini atlamaz), `:275-287` (`find(',',arg)` iç-içe/dize gözetmez → `f(a,b)` widget ifadesi `combo_def_missing` FAIL'u; bugün ilk arg hep `S->…` olduğu için gizli)
+- Kategori: Fragility
+- Açıklama: Tek boşluk/`};` içeren çeviri sözlüğü keser.
+- Öneri: `D` simgesini regex/sembol-tabanlı bul + dize-farkındalıklı tarama + derinlik-sayaçlı virgül/brace eşleme.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-13 · ORTA · `fuzz_accel.cpp` girdiyi pipeline'a değmeden törpülüyor (koruma kolları hedef-dışı)**
+- Konum: `tests/fuzz_accel.cpp:93-103` (`time<=0||!finite→1.0`, `>100→100`; `dx/dy` NaN→0, ±10000 kelepçe → daemon `0.0625ms` altı, subnormal/0/Inf (`IPS_FACTOR_MAX`), `1e300` (`hypot`), NaN-yayılım kolları elenir; "NaN kaçamaz" tuzağı kapıda sıfırlanır → erişilemez)
+- Kategori: Coverage-hole
+- Açıklama: Kendi tuzağını erişilemez kılar.
+- Öneri: Ham bitleri iki yola ayır (kelepçesiz gerçek-yol + hijyenik-yol) + `time_edge`/`vec_edge` tohumu.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-14 · DÜŞÜK-ORTA · `fuzz_accel.cpp` oracle yalnız `isnan` (Inf kaçışı sessiz)**
+- Konum: `tests/fuzz_accel.cpp:112,:129` (`if(isnan(...)) trap`; `isinf/isfinite` yok → `+Inf/-Inf` regresyon tuzağa düşmez; `modify` koruması `isfinite` düzeyinde)
+- Kategori: Oracle-gap
+- Açıklama: Sessiz kaçış.
+- Öneri: `if(!isfinite(...)) trap` yap (NaN+Inf).
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-15 · DÜŞÜK · `run_fuzz.sh` `DURATION` doğrulanmadan bayrağa geçirilir**
+- Konum: `tests/run_fuzz.sh:16,:35,:45` (`DURATION="${1:-60}"` regex/aritmetik yok → `foo/-5/""` libFuzzer argüman hatası; `set -e` altında Uniform mesaj yok; BS-5 alıntılama değil, bu argüman-doğrulama)
+- Kategori: Validasyon
+- Açıklama: Kriptik düşme.
+- Öneri: `[[ "$DURATION" =~ ^(0|[1-9][0-9]*)$ ]] || { echo usage; exit 2; }`.
+- Durum: AÇIK (2026-09-13 bulundu)
+
+**T53-16 · BİLGİ/DÜŞÜK · `run_tr_coverage.sh` liste elle-kodlu (yeni `.inl` sessizce denetim-dışı)**
+- Konum: `tests/run_tr_coverage.sh:7-19` (`SRC=(…)` 11 yol sabit; dizinde listede-olmayan `app_state.hpp` bugün anahtarsız (doğru sonuç) ama yarın yeni `.inl` liste güncellenene dek sessizce kaçar; T30-N4 `kwin_focus` tek-dosya fix'i, mekanizma hâlâ elle)
+- Kategori: Maintenance
+- Açıklama: Yapısal tekrar riski.
+- Öneri: `SRC=(gui/main.cpp gui/*.inl)` glob (+ `nullglob`) veya listeyi dizinle çapraz-doğrulayan bekçi.
+- Durum: AÇIK (2026-09-13 bulundu)

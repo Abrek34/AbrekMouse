@@ -332,33 +332,36 @@ static gpointer hw_query_thread(gpointer data) {
             }
             // Get supported rate codes from the device
             task->rate_codes_hz.clear();
-            if (auto rate_info = transport.get_polling_rate(task->device_index)) {
-                // We already have the current rate; now try to get the list of supported rates
-                // via the extended report rate feature if available
-                if (auto ext_rate = transport.feature_request(
-                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x00,
-                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
-                    // Parse rate codes from the extended report rate feature
-                    // Payload format: [count, code1, code2, ...]
-                    if (ext_rate->size() > 1) {
-                        for (size_t i = 1; i < ext_rate->size(); ++i) {
-                            if (auto hz = hidpp_rate_code_to_hz(true, (*ext_rate)[i]))
+            {
+                // EXTENDED_ADJUSTABLE_REPORT_RATE (0x8061): GetSupportedRates is
+                // fn 0x01 and returns a big-endian support mask, one bit per code
+                // (code 0..6 = 125..8000 Hz) — NOT the fn 0x00 "count+list" payload
+                // some devices use.  PRO X 2 replies `00 7f` (all seven rates).
+                if (auto ext_mask = transport.feature_request(
+                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x01,
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index);
+                    ext_mask && ext_mask->size() >= 1) {
+                    const uint16_t bits = ext_mask->size() >= 2
+                        ? (static_cast<uint16_t>((*ext_mask)[0]) << 8) | (*ext_mask)[1]
+                        : (*ext_mask)[0];
+                    for (uint8_t c = 0; c < 7; ++c)
+                        if ((bits & (static_cast<uint16_t>(1) << c)) != 0)
+                            if (auto hz = hidpp_rate_code_to_hz(true, c))
                                 task->rate_codes_hz.push_back(*hz);
-                        }
-                    }
                 }
             }
-            // If extended rate not available, fall back to legacy rate feature
+            // If extended rate not available, fall back to legacy report-rate
+            // feature (0x8060, fn 0x00): a bit mask over 1..8 ms periods.
             if (task->rate_codes_hz.empty()) {
-                if (auto legacy_rate = transport.feature_request(
+                if (auto legacy_mask = transport.feature_request(
                         static_cast<uint16_t>(hidpp_feature_index::report_rate), 0x00,
-                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
-                    if (legacy_rate->size() > 1) {
-                        for (size_t i = 1; i < legacy_rate->size(); ++i) {
-                            if (auto hz = hidpp_rate_code_to_hz(false, (*legacy_rate)[i]))
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index);
+                    legacy_mask && !legacy_mask->empty()) {
+                    const uint8_t bits = (*legacy_mask)[0];
+                    for (uint8_t i = 0; i < 8; ++i)
+                        if ((bits & (static_cast<uint8_t>(1) << i)) != 0)
+                            if (auto hz = hidpp_rate_code_to_hz(false, i + 1))
                                 task->rate_codes_hz.push_back(*hz);
-                        }
-                    }
                 }
             }
             // P169 — read-only battery for the capability/source display.
@@ -533,27 +536,32 @@ static gpointer hw_apply_thread(gpointer data) {
             // Validate rate against device-supported rates
             std::vector<uint32_t> rate_codes_hz = task->rate_codes_hz;
             if (rate_codes_hz.empty() && task->rate_hz != 0) {
-                // Query the device for supported rates if not provided
-                if (auto ext_rate = transport.feature_request(
-                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x00,
-                        nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
-                    if (ext_rate->size() > 1) {
-                        for (size_t i = 1; i < ext_rate->size(); ++i) {
-                            if (auto hz = hidpp_rate_code_to_hz(true, (*ext_rate)[i]))
+                // Query the device for supported rates if not provided —
+                // EXTENDED_ADJUSTABLE_REPORT_RATE.GetSupportedRates is fn 0x01
+                // and returns a big-endian bitmask (code 0..6 = 125..8000 Hz).
+                if (auto ext_mask = transport.feature_request(
+                        static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_report_rate), 0x01,
+                        nullptr, 0, std::chrono::milliseconds(500), task->device_index);
+                    ext_mask && ext_mask->size() >= 1) {
+                    const uint16_t bits = ext_mask->size() >= 2
+                        ? (static_cast<uint16_t>((*ext_mask)[0]) << 8) | (*ext_mask)[1]
+                        : (*ext_mask)[0];
+                    for (uint8_t c = 0; c < 7; ++c)
+                        if ((bits & (static_cast<uint16_t>(1) << c)) != 0)
+                            if (auto hz = hidpp_rate_code_to_hz(true, c))
                                 rate_codes_hz.push_back(*hz);
-                        }
-                    }
                 }
                 if (rate_codes_hz.empty()) {
+                    // Legacy REPORT_RATE fn 0x00: bit mask over 1..8 ms periods.
                     if (auto legacy_rate = transport.feature_request(
                             static_cast<uint16_t>(hidpp_feature_index::report_rate), 0x00,
-                            nullptr, 0, std::chrono::milliseconds(500), task->device_index)) {
-                        if (legacy_rate->size() > 1) {
-                            for (size_t i = 1; i < legacy_rate->size(); ++i) {
-                                if (auto hz = hidpp_rate_code_to_hz(false, (*legacy_rate)[i]))
+                            nullptr, 0, std::chrono::milliseconds(500), task->device_index);
+                        legacy_rate && !legacy_rate->empty()) {
+                        const uint8_t bits = (*legacy_rate)[0];
+                        for (uint8_t i = 0; i < 8; ++i)
+                            if ((bits & (static_cast<uint8_t>(1) << i)) != 0)
+                                if (auto hz = hidpp_rate_code_to_hz(false, i + 1))
                                     rate_codes_hz.push_back(*hz);
-                            }
-                        }
                     }
                 }
             }

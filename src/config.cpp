@@ -434,6 +434,12 @@ static void sanitize_accel_args(accel_args& a) {
     //   Negative acceleration with integer exponent is a legitimate deceleration feature.
     //   Negative + non-integer exponent produces NaN, but the classic constructor and
     //   motion_math NaN guard handle this downstream — don't clamp here.
+    // MATH-1: negative acceleration with active cap (cap.y > 0) produces a degenerate
+    // curve (cap.x becomes negative, gain curve goes backward). Forbid this combo.
+    if (a.acceleration < 0 && a.cap.y > 0) {
+        a.acceleration = 0;
+        a.cap.y = 0; // disable cap to match the identity curve
+    }
     // scale: used as pow(scale * x, exp) in power mode.
     //   Negative scale * positive x → negative base → NaN with non-integer exp.
     //   Zero → pow(0,x)=0 → gain≡0 (dead cursor) with no cap, or a silent

@@ -750,7 +750,13 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
     std::lock_guard lock(request_mutex_);
     const uint8_t request_device = target_device_index != 0xFF
         ? target_device_index : device_index_.load(std::memory_order_relaxed);
-    const uint8_t report_id = param_len > 3 ? 0x11 : 0x10;
+    // Solaar (device.py `request()`) sends HID++ 2.0 feature calls ALWAYS as
+    // LONG 0x11 frames (protocol >= 2.0 → long_message=True), even when the
+    // payload is 0..3 bytes.  The PRO X 2 on a Lightspeed receiver replies to
+    // SHORT (0x10, 7-byte) feature frames with HID++ error UNKNOWN_DEVICE
+    // (0x08) regardless of the addressed feature, so every write (and some
+    // reads) silently failed.  Always use the LONG frame here.
+    const uint8_t report_id = 0x11;
     std::array<uint8_t, 20> request{};
     request[0] = report_id;
     request[1] = request_device;
@@ -760,7 +766,7 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
     if (params && param_len != 0)
         std::memcpy(request.data() + 4, params, param_len);
 
-    const size_t request_len = report_id == 0x11 ? 20 : 7;
+    const size_t request_len = 20;
     if (!write_packet(request.data(), request_len)) return std::nullopt;
 
     const uint8_t request_sw_id = request[3] & 0x0F;
@@ -1830,7 +1836,37 @@ HidppTransport::read_onboard_profile_sector(
     return result;
 }
 
+bool HidppTransport::disable_onboard_profiles_for_write(uint8_t target_device_index) {
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index : device_index_.load(std::memory_order_relaxed);
+    // No 0x8100 feature → plain desktop mice, nothing to disable.
+    const auto index = resolve_feature_index(
+        hidpp_feature_index::onboard_profiles, target);
+    if (!index) return true;
+    // ONBOARD_PROFILES fn 0x20 = read "enabled" state; 0x01 means an onboard
+    // profile is active.  PRO X 2 runs "On-Board" mode by default, in which
+    // the device REJECTS host DPI/rate/LOD writes with a HID++ error.  When
+    // the mode is provably off there is nothing to do (Solaar
+    // OnboardProfiles.read).  Note: on PRO X 2 the fn 0x20 read itself does
+    // NOT reply (observed null), so absence of a reply must NOT be treated
+    // as "off" — fall through and send the disable write, which is
+    // idempotent and harmless when already disabled.
+    bool onboard_active = true;
+    if (auto reply = send_feature_request(*index, 0x20, nullptr, 0,
+                                          std::chrono::milliseconds(500), target);
+        reply && !reply->empty())
+        onboard_active = ((*reply)[0] == 0x01);
+    if (!onboard_active) return true;
+    // fn 0x10 param 0x02 = set onboard profiles OFF (Solaar write path /
+    // NT-slug PRO X 2 tool).  The write then applies to the host mode and is
+    // no longer blocked by the active profile.
+    const uint8_t param = 0x02;
+    return send_feature_request(*index, 0x10, &param, 1,
+                                std::chrono::milliseconds(700), target).has_value();
+}
+
 bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
+    disable_onboard_profiles_for_write(target_device_index);
     const auto info = get_dpi_info(target_device_index);
     if (!info || dpi == 0) return false;
     // Solaar only exposes this setting after GetDpiList succeeds.  Do the
@@ -1883,17 +1919,51 @@ std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_i
     if (auto index = resolve_feature_index(
             hidpp_feature_index::extended_adjustable_report_rate,
             target_device_index)) {
-        if (auto reply = send_feature_request(*index, 0x2, nullptr, 0,
-                                              std::chrono::milliseconds(500),
-                                              target_device_index);
-            reply && !reply->empty()) {
-            // B3: a reply whose code decodes to no known Hz (out-of-range /
-            // garbage byte) must NOT be treated as a negative answer — fall
-            // through to the legacy 0x8060 report-rate path instead of
-            // giving up.  A device that advertised 0x8061 may still only
-            // honour the legacy feature.
-            if (auto hz = rate_code_to_hz(true, (*reply)[0])) return hz;
+        // EXTENDED_ADJUSTABLE_REPORT_RATE.get_report_rate (fn 0x02) takes a
+        // connection_type parameter (0=wired, 1=gaming wireless).  A WIRELESS
+        // mouse attached through its receiver reports the LIVE rate only for
+        // conn=1; the un-parameterised read returns the wired slot, which
+        // silently caps at 1000 Hz even though the wireless link is running
+        // 2000/4000/8000.  Determine the ACTIVE connection type first, then
+        // query that slot:
+        //   fn 0x01 = get_actual_report_rate_list — the mask of the device's
+        //             current/host connection
+        //   fn 0x00 = get_device_capabilities(conn) — per-connection mask
+        // The active conn is the one whose capabilities match fn 0x01.
+        std::optional<uint8_t> active_conn;
+        if (auto actual = send_feature_request(*index, 0x1, nullptr, 0,
+                                               std::chrono::milliseconds(500),
+                                               target_device_index);
+            actual && actual->size() >= 2) {
+            const uint16_t actual_mask = read_be16(actual->data());
+            for (uint8_t ct = 0; ct <= 1; ++ct) {
+                const uint8_t p = ct;
+                if (auto caps = send_feature_request(*index, 0x0, &p, 1,
+                                                     std::chrono::milliseconds(500),
+                                                     target_device_index);
+                    caps && caps->size() >= 2 &&
+                    read_be16(caps->data()) == actual_mask) {
+                    active_conn = ct;
+                    break;
+                }
+            }
         }
+        if (active_conn) {
+            const uint8_t p = *active_conn;
+            if (auto reply = send_feature_request(*index, 0x2, &p, 1,
+                                                  std::chrono::milliseconds(500),
+                                                  target_device_index);
+                reply && !reply->empty()) {
+                // B3: a reply whose code decodes to no known Hz (out-of-range /
+                // garbage byte) must NOT be treated as a negative answer — fall
+                // through to the legacy 0x8060 report-rate path instead of
+                // giving up.  A device that advertised 0x8061 may still only
+                // honour the legacy feature.
+                if (auto hz = rate_code_to_hz(true, (*reply)[0])) return hz;
+            }
+        }
+        // No active connection resolved (or a non-resolving read) — fall back
+        // to the legacy 0x8060 report-rate path below.
     }
     if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
                                             target_device_index)) {
@@ -1907,6 +1977,7 @@ std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_i
 }
 
 bool HidppTransport::set_polling_rate(uint32_t hz, uint8_t target_device_index) {
+    disable_onboard_profiles_for_write(target_device_index);
     if (auto code = hz_to_rate_code(false, hz)) {
         if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
                                                target_device_index)) {
@@ -1958,6 +2029,7 @@ HidppTransport::get_lift_off_distance(uint8_t target_device_index) {
 
 bool HidppTransport::set_lift_off_distance(hidpp_lift_off_distance distance,
                                            uint8_t target_device_index) {
+    disable_onboard_profiles_for_write(target_device_index);
     const auto info = get_dpi_info(target_device_index);
     if (!info || !info->extended || !info->supports_lift_off_distance ||
         distance > hidpp_lift_off_distance::high)

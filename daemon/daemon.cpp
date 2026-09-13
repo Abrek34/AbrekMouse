@@ -1086,12 +1086,76 @@ void AccelDaemon::apply_active_app() {
     rescan_needed_.store(true);
 }
 
+std::pair<HidppTransport*, uint8_t> AccelDaemon::find_hidpp_transport(const mouse_device& dev) const {
+    std::string needle;
+    // Check if device_id contains a serial number (format: usb:VVVV:PPPP:SERIAL)
+    size_t serial_pos = dev.device_id.find_last_of(':');
+    if (serial_pos != std::string::npos && serial_pos + 1 < dev.device_id.size()) {
+        needle = dev.device_id.substr(serial_pos + 1);
+    } else {
+        // Fallback to vendor:product (format: usb:VVVV:PPPP or usb:VVVV:PPPP:)
+        size_t first_colon = dev.device_id.find(':');
+        if (first_colon != std::string::npos) {
+            size_t second_colon = dev.device_id.find(':', first_colon + 1);
+            if (second_colon != std::string::npos) {
+                size_t third_colon = dev.device_id.find(':', second_colon + 1);
+                if (third_colon != std::string::npos) {
+                    // Format: usb:VVVV:PPPP:SERIAL or usb:VVVV:PPPP:
+                    needle = dev.device_id.substr(first_colon + 1, third_colon - first_colon - 1);
+                } else {
+                    // Format: usb:VVVV:PPPP (no trailing colon)
+                    needle = dev.device_id.substr(first_colon + 1);
+                }
+            }
+        }
+    }
+
+    if (needle.empty()) return {nullptr, 0xFF};
+
+    std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+    for (const auto& hidpp_dev : hidpp_devs_) {
+        bool match = false;
+        if (!hidpp_dev.info.serial.empty()) {
+            match = (hidpp_dev.info.serial == needle);
+        } else {
+            char vp_buf[16];
+            std::snprintf(vp_buf, sizeof(vp_buf), "%04x:%04x", hidpp_dev.vendor_id, hidpp_dev.product_id);
+            match = (std::string(vp_buf) == needle);
+        }
+        if (match) {
+            auto it = hidpp_transports_.find(hidpp_dev.hidraw_path);
+            if (it != hidpp_transports_.end() && it->second && it->second->is_open()) {
+                return {it->second.get(), hidpp_dev.device_index};
+            }
+        }
+    }
+    return {nullptr, 0xFF};
+}
+
 void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     // Defense-in-depth clamp: values are already sanitized in config.cpp,
     // but guard here too in case of programmatic / future IPC paths.
     dev.dpi       = std::clamp(prof.dev_cfg.dpi,          1, 32000);
     dev.poll_rate = std::clamp(prof.dev_cfg.polling_rate,
                                (int)POLL_RATE_MIN, (int)POLL_RATE_MAX);
+
+    // Apply polling rate and DPI to Logitech HID++ hardware if available
+    auto [transport, dev_idx] = find_hidpp_transport(dev);
+    if (transport && dev_idx != 0xFF) {
+        // Set polling rate on hardware
+        if (!transport->set_polling_rate(static_cast<uint32_t>(dev.poll_rate), dev_idx)) {
+            log("Failed to set polling rate " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
+        } else {
+            log("Set polling rate to " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
+        }
+        // Set DPI on hardware (if device supports it)
+        if (!transport->set_dpi(static_cast<uint16_t>(dev.dpi), dev_idx)) {
+            log("Failed to set DPI " + std::to_string(dev.dpi) + " on " + dev.name, true);
+        } else {
+            log("Set DPI to " + std::to_string(dev.dpi) + " on " + dev.name, true);
+        }
+    }
+
     // O6: reference uses input_dpi_normalization_factor = NORMALIZED_DPI / dpi
     // (true inches/s input speed); previously (dpi/NORMALIZED_DPI) was inverted.
     dev.dpi_factor = NORMALIZED_DPI / dev.dpi; // R13-perf: pre-compute
@@ -1561,33 +1625,36 @@ void AccelDaemon::poll_hidpp_notifications() {
         const auto paths = discover_logitech_hidraw_devices();
 
         std::set<std::string> seen(paths.begin(), paths.end());
-        for (auto it = hidpp_devs_.begin(); it != hidpp_devs_.end();) {
-            if (!seen.count(it->hidraw_path)) {
-                log("HID++ device removed: " + it->hidraw_path, true);
-                hidpp_transports_.erase(it->hidraw_path);
-                it = hidpp_devs_.erase(it);
-            } else {
-                ++it;
+        {
+            std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+            for (auto it = hidpp_devs_.begin(); it != hidpp_devs_.end();) {
+                if (!seen.count(it->hidraw_path)) {
+                    log("HID++ device removed: " + it->hidraw_path, true);
+                    hidpp_transports_.erase(it->hidraw_path);
+                    it = hidpp_devs_.erase(it);
+                } else {
+                    ++it;
+                }
             }
-        }
-        for (const auto& path : paths) {
-            const bool known = std::any_of(
-                hidpp_devs_.begin(), hidpp_devs_.end(),
-                [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
-            if (known) continue; // already identified; drain only
-            // Use identify_logitech_devices (plural) to detect all device indices
-            // on this hidraw node (receiver 0xFF, direct 0x00, paired 0x01-0x06).
-            // identify_logitech_device (singular) only tries 0xFF/0x00 and would
-            // miss mice behind a Unifying receiver.
-            for (auto& dev : identify_logitech_devices(path)) {
-                // protocol_version 0 = Logitech hidraw node with no HID++
-                // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
-                // UI/CLI display entry only and has no battery or notification
-                // stream to subscribe to.
-                if (dev.info.protocol_version == 0) continue;
-                log("HID++ device detected: " + path + " (idx=0x" +
-                    std::to_string(static_cast<int>(dev.device_index)) + ")", true);
-                hidpp_devs_.push_back(std::move(dev));
+            for (const auto& path : paths) {
+                const bool known = std::any_of(
+                    hidpp_devs_.begin(), hidpp_devs_.end(),
+                    [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
+                if (known) continue; // already identified; drain only
+                // Use identify_logitech_devices (plural) to detect all device indices
+                // on this hidraw node (receiver 0xFF, direct 0x00, paired 0x01-0x06).
+                // identify_logitech_device (singular) only tries 0xFF/0x00 and would
+                // miss mice behind a Unifying receiver.
+                for (auto& dev : identify_logitech_devices(path)) {
+                    // protocol_version 0 = Logitech hidraw node with no HID++
+                    // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
+                    // UI/CLI display entry only and has no battery or notification
+                    // stream to subscribe to.
+                    if (dev.info.protocol_version == 0) continue;
+                    log("HID++ device detected: " + path + " (idx=0x" +
+                        std::to_string(static_cast<int>(dev.device_index)) + ")", true);
+                    hidpp_devs_.push_back(std::move(dev));
+                }
             }
         }
     }
@@ -1598,94 +1665,97 @@ void AccelDaemon::poll_hidpp_notifications() {
     if (t < hidpp_drain_ms_) return;
     hidpp_drain_ms_ = t + 1000.0;
 
-    for (auto& dev : hidpp_devs_) {
-        auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
-        if (!transport_ptr || !transport_ptr->is_open()) {
-            transport_ptr = std::make_unique<HidppTransport>(dev.hidraw_path);
-            if (!transport_ptr->is_open()) continue;
-            transport_ptr->clear_feature_cache();
-        }
+    {
+        std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+        for (auto& dev : hidpp_devs_) {
+            auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
+            if (!transport_ptr || !transport_ptr->is_open()) {
+                transport_ptr = std::make_unique<HidppTransport>(dev.hidraw_path);
+                if (!transport_ptr->is_open()) continue;
+                transport_ptr->clear_feature_cache();
+            }
 
-        // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.  Wireless
-        // receivers/pairings that advertise neither a sysfs power-supply tree
-        // nor (live) battery notifications would otherwise stay "unknown (-1)"
-        // forever although the device answers a get_battery_status() request.
-        if (now_ms() - static_cast<double>(dev.last_battery_ms) >= 60000.0) {
-            dev.last_battery_ms = static_cast<uint64_t>(now_ms());
-            if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
-                dev.battery_level = b->level;
-                apply_hidpp_battery(dev, *b);
+            // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.  Wireless
+            // receivers/pairings that advertise neither a sysfs power-supply tree
+            // nor (live) battery notifications would otherwise stay "unknown (-1)"
+            // forever although the device answers a get_battery_status() request.
+            if (now_ms() - static_cast<double>(dev.last_battery_ms) >= 60000.0) {
+                dev.last_battery_ms = static_cast<uint64_t>(now_ms());
+                if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
+                    dev.battery_level = b->level;
+                    apply_hidpp_battery(dev, *b);
+                }
             }
         }
-    }
 
-    // R8-HIDN: a Unifying/Nano receiver exposes ONE hidraw node shared by all
-    // paired devices.  The old loop drained that SAME kernel fd once PER device;
-    // the 0xFF "shell" entry (always first in hidpp_devs_) consumed every queued
-    // notification, and the R6-4 filter then dropped the events that named other
-    // device indexes — so paired mice receiver NO live battery/link notifications
-    // (only the 60 s active query, which is why the symptom was "battery only
-    // updates once a minute").  Drain ONCE per unique transport and route every
-    // notification to the device its device_index names, classifying it against
-    // that device's OWN feature map.
-    std::vector<std::string> drained_paths;
-    for (const auto& anchor : hidpp_devs_) {
-        if (std::find(drained_paths.begin(), drained_paths.end(),
-                      anchor.hidraw_path) != drained_paths.end())
-            continue;
-        drained_paths.push_back(anchor.hidraw_path);
-        auto& transport_ptr = hidpp_transports_[anchor.hidraw_path];
-        if (!transport_ptr || !transport_ptr->is_open()) continue;
+        // R8-HIDN: a Unifying/Nano receiver exposes ONE hidraw node shared by all
+        // paired devices.  The old loop drained that SAME kernel fd once PER device;
+        // the 0xFF "shell" entry (always first in hidpp_devs_) consumed every queued
+        // notification, and the R6-4 filter then dropped the events that named other
+        // device indexes — so paired mice receiver NO live battery/link notifications
+        // (only the 60 s active query, which is why the symptom was "battery only
+        // updates once a minute").  Drain ONCE per unique transport and route every
+        // notification to the device its device_index names, classifying it against
+        // that device's OWN feature map.
+        std::vector<std::string> drained_paths;
+        for (const auto& anchor : hidpp_devs_) {
+            if (std::find(drained_paths.begin(), drained_paths.end(),
+                          anchor.hidraw_path) != drained_paths.end())
+                continue;
+            drained_paths.push_back(anchor.hidraw_path);
+            auto& transport_ptr = hidpp_transports_[anchor.hidraw_path];
+            if (!transport_ptr || !transport_ptr->is_open()) continue;
 
-        for (const auto& notification :
-             transport_ptr->drain_notifications(8, std::chrono::milliseconds(0))) {
-            // Route to the OWNING device: notifications are classified against
-            // the target's own feature cache (hidpp_device::notification_feature_id).
-            hidpp_device* target = nullptr;
-            for (auto& d : hidpp_devs_) {
-                if (d.hidraw_path != anchor.hidraw_path) continue;
-                if (d.device_index == notification.device_index) { target = &d; break; }
-            }
-            if (!target) {
-                // 0xFF broadcast, or a device index we have not identified yet:
-                // attach to the first device on this transport (same attribution
-                // the old code produced for whichever device it happened to drain).
+            for (const auto& notification :
+                 transport_ptr->drain_notifications(8, std::chrono::milliseconds(0))) {
+                // Route to the OWNING device: notifications are classified against
+                // the target's own feature cache (hidpp_device::notification_feature_id).
+                hidpp_device* target = nullptr;
                 for (auto& d : hidpp_devs_) {
-                    if (d.hidraw_path == anchor.hidraw_path) { target = &d; break; }
+                    if (d.hidraw_path != anchor.hidraw_path) continue;
+                    if (d.device_index == notification.device_index) { target = &d; break; }
                 }
-            }
-            if (!target) continue;
+                if (!target) {
+                    // 0xFF broadcast, or a device index we have not identified yet:
+                    // attach to the first device on this transport (same attribution
+                    // the old code produced for whichever device it happened to drain).
+                    for (auto& d : hidpp_devs_) {
+                        if (d.hidraw_path == anchor.hidraw_path) { target = &d; break; }
+                    }
+                }
+                if (!target) continue;
 
-            const auto event = classify_hidpp_notification(*target, notification);
-            if (event.kind == hidpp_notification_event_kind::unhandled) continue;
-            switch (event.kind) {
-            case hidpp_notification_event_kind::battery:
-                if (event.battery) {
-                    // BUG-24 (aj2): surface live battery notifications on
-                    // the mouse device, not just the log line.
-                    target->battery_level = event.battery->level;
-                    apply_hidpp_battery(*target, *event.battery);
-                    const std::string level = event.battery->level == 255
-                        ? "unknown" : std::to_string(event.battery->level) + "%";
-                    log("HID++ battery: dev " +
-                            std::to_string(event.device_index) + " " + level +
-                            (event.battery->charging ? " (charging)" : ""),
+                const auto event = classify_hidpp_notification(*target, notification);
+                if (event.kind == hidpp_notification_event_kind::unhandled) continue;
+                switch (event.kind) {
+                case hidpp_notification_event_kind::battery:
+                    if (event.battery) {
+                        // BUG-24 (aj2): surface live battery notifications on
+                        // the mouse device, not just the log line.
+                        target->battery_level = event.battery->level;
+                        apply_hidpp_battery(*target, *event.battery);
+                        const std::string level = event.battery->level == 255
+                            ? "unknown" : std::to_string(event.battery->level) + "%";
+                        log("HID++ battery: dev " +
+                                std::to_string(event.device_index) + " " + level +
+                                (event.battery->charging ? " (charging)" : ""),
+                            true);
+                    }
+                    break;
+                case hidpp_notification_event_kind::connection:
+                    log("HID++ link: dev " + std::to_string(event.device_index) +
+                            (event.connected ? " connected" : " disconnected"),
                         true);
+                    break;
+                case hidpp_notification_event_kind::illumination:
+                    log("HID++ illumination event: dev " +
+                            std::to_string(event.device_index),
+                        true);
+                    break;
+                case hidpp_notification_event_kind::generic:
+                case hidpp_notification_event_kind::unhandled:
+                    break;
                 }
-                break;
-            case hidpp_notification_event_kind::connection:
-                log("HID++ link: dev " + std::to_string(event.device_index) +
-                        (event.connected ? " connected" : " disconnected"),
-                    true);
-                break;
-            case hidpp_notification_event_kind::illumination:
-                log("HID++ illumination event: dev " +
-                        std::to_string(event.device_index),
-                    true);
-                break;
-            case hidpp_notification_event_kind::generic:
-            case hidpp_notification_event_kind::unhandled:
-                break;
             }
         }
     }

@@ -60,7 +60,7 @@ struct accel_args {
     double limit              = 1.5;
     double sync_speed         = 5;
     double smooth             = 0.5;
-    vec2d  cap                = { 15, 1.5 };
+    vec2d  cap                = { 15, 0 };
     cap_mode cap_mode_val     = cap_mode::out;
     int    length             = 0;
     mutable float data[LUT_RAW_DATA_CAPACITY] = {};

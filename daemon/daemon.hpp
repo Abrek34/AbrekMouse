@@ -311,6 +311,15 @@ private:
     // mice behind one receiver) merge nothing — only log.  Hidpp-worker thread.
     void apply_hidpp_battery(const hidpp_device& dev, const hidpp_battery_info& b);
 
+    /// Find the HID++ transport and device index matching the given evdev mouse.
+    /// Matches by serial number (Unifying receiver) or vendor:product (direct).
+    /// Returns {transport_ptr, device_index} or {nullptr, 0xFF} if no match.
+    std::pair<HidppTransport*, uint8_t> find_hidpp_transport(const mouse_device& dev) const;
+
+    // Guards hidpp_devs_ and hidpp_transports_ against concurrent access from
+    // hidpp_thread_ (poll_hidpp_notifications) and loop_thread_ (find_hidpp_transport).
+    mutable std::mutex hidpp_devs_mutex_;
+
     // Config push slot: filled by the IPC thread (push_config), consumed by the
     // loop thread.  push_cfg_ is fully parsed+sanitized before being stored, so
     // the loop thread never throws on it.
