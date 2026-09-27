@@ -9,7 +9,7 @@ thread, and every measurement in this project says the same thing:
 
 This document collects the numbers behind that claim — the hot-path syscall
 model, where time actually goes, the latency measurement workflow, build-time
-choices (native vs portable), and what the *settings you can feel* (polling,
+choices (native vs baseline), and what the *settings you can feel* (polling,
 DPI, smoothing) do to responsiveness. It is the user-facing companion to the
 developer-side contract in `AGENTS.md` ("Low-latency motion contract") and the
 research notes in `docs/research/precision.md` (§8).
@@ -248,14 +248,15 @@ inside the 125 µs budget at 8 kHz.
 | Choice | When | Effect |
 |--------|------|--------|
 | `bash scripts/build.sh` (default) | you build for the machine you're on | `-march=native`: fastest + same hardening; may FMA-contract (accuracy nuance, see precision.md) |
-| `RAWACCEL_PORTABLE=1 bash scripts/build.sh` | you distribute/share the binary across CPUs | disables `-march=native`; generic x86-64 baseline; same hardening; **measurable difference in the hot path is negligible** because math is ns-scale, syscalls dominate |
+| `RAWACCEL_PORTABLE=1 bash scripts/build.sh` | you want a build that does not depend on the builder's CPU (CI, reproducible artefacts) | disables `-march=native` **and** every optional ISA level (AVX2/AVX/FMA), leaving the x86-64 baseline; same hardening. **It is not a "runs on any CPU" guarantee** — it is an x86-64-baseline build, and the packaged release (`packaging/PKGBUILD`) is what ships `-march=native`. Hot-path difference is negligible either way: math is ns-scale, syscalls dominate. Before `cece865a` this row was the whole reason the flag lied — `build.sh` dropped `-march=native` but still added `-mavx2 -mfma`, so this build needed a post-Haswell CPU while `CMakeLists.txt:68` (no ISA flags at all) gave a genuinely baseline one under the same flag |
 | Arch/CachyOS package (`packaging/PKGBUILD`) | you install a packaged release | shipped with native `-march=native`, hardened, PIE; PGO **evaluated and not adopted** — ~0.4% gain, noise level (R50, Aj 4) |
-| CI (`ci.yml`) | automated verification | builds portable + runs tests/oracle — confirms portability never regresses behavior |
+| CI (`ci.yml`) | automated verification | builds with `RAWACCEL_PORTABLE=1` (baseline) + runs tests/oracle — so the build never depends on the runner's CPU, and the baseline path is the one CI exercises |
 
 Because the accel math is 20–50 ns/event (single-axis; worst dual-axis + 4 EMA
-≈ 425 ns), native vs portable is a **~ns-level
-difference per event on a µs-level total** — you cannot feel it. Pick portable
-when you must run on unknown CPUs, native anywhere else (the CI already
+≈ 425 ns), native vs baseline is a **~ns-level
+difference per event on a µs-level total** — you cannot feel it. Pick the
+baseline build when the artefact must not depend on the build machine's CPU;
+native everywhere else (the CI already
 guards both). PGO would target cold/startup code paths, not the hot loop.
 
 PGO was actually tried (R50, Aj 4) with the production flag set
@@ -281,7 +282,7 @@ init/object costs — another sign there is nothing left to squeeze in hot math.
 - *"Should I lower the halflifes?"* → If you're on `synchronous` and feel
   floaty: halflife 100 ms → 10 ms or 0 (§3.3). That is the single biggest
   "latency" setting you control.
-- *"Native or portable build?"* → Native if it's your own machine (default);
+- *"Native or baseline build?"* → Native if it's your own machine (default);
   you won't feel the difference.
 - *"Where's the SIMD?"* → There isn't any and it isn't needed: the entire
   math is 20–50 ns/event in typical single-axis use (425 ns worst dual-axis

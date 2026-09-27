@@ -43,7 +43,8 @@ verifies it — prefer it over manual package setup.
 # Quick build (no cmake required)
 bash scripts/build.sh
 
-# Portable binary (no -march=native, runs on other CPUs)
+# Baseline build — no -march=native, no AVX2/FMA (this is what CI uses, for a
+# build that does not depend on which CPU the builder happens to be)
 RAWACCEL_PORTABLE=1 bash scripts/build.sh
 
 # Custom compiler
@@ -662,7 +663,7 @@ Tips:
 ## Performance
 
 > Deep-dive on the syscall model, polling/DPI/smoothing effect tables, and the
-> native-vs-portable build choice: [docs/performance_tuning.md](docs/performance_tuning.md).
+> native-vs-baseline build choice: [docs/performance_tuning.md](docs/performance_tuning.md).
 
 RawAccel Linux processes mouse events with sub-microsecond latency in the daemon's hot path:
 

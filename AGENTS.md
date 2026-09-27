@@ -49,7 +49,7 @@ sudo bash setup.sh --reinstall # clean the old install, then reinstall (default)
 # Standard build (-march=native, fastest)
 bash scripts/build.sh
 
-# Portable build (works on other CPU architectures)
+# Baseline build (no -march=native, no AVX2/FMA) — this is what CI uses
 RAWACCEL_PORTABLE=1 bash scripts/build.sh
 
 # Custom compiler
@@ -61,7 +61,43 @@ Output binaries: `build-manual/rawaccel-daemon`, `build-manual/rawaccel-cli`, `b
 Both `scripts/build.sh` and the CMake target apply the same hardening flags
 (`-fstack-protector-strong`, `-fstack-clash-protection`, `-D_FORTIFY_SOURCE=2`,
 `-D_GLIBCXX_ASSERTIONS`, `-fPIE`+`-pie`, `-Wl,-z relro,now,noexecstack,separate-code`,
-`-fcf-protection=full` on x86). `RAWACCEL_PORTABLE=1` turns off `-march=native`.
+`-fcf-protection=full` on x86).
+
+**`RAWACCEL_PORTABLE=1` means "no `-march=native`", not "runs on any CPU".**
+It exists so a build does not depend on which CPU the builder happens to be —
+GitHub runners do not guarantee a CPU level, and `-march=native` bakes whatever
+the runner has into the binary. The shipped release is the `-march=native` one
+(`packaging/PKGBUILD`); the flag is a CI/reproducibility knob, **not** a
+distribution-portability promise, and the docs used to claim otherwise in three
+places at once (fixed in `cece865a`'s follow-up: `scripts/build.sh:41`,
+`README.md`, `docs/performance_tuning.md`).
+
+**The flag was two switches, and the two build systems disagreed about it.**
+`scripts/build.sh` controlled `-march=native` via `MARCH` but appended
+`SIMD_FLAGS` unconditionally, so the flag left `-mavx2 -mfma` in. Meanwhile
+`CMakeLists.txt:68` and `scripts/bench_hotpath.sh` add no ISA flags at all, so
+there the same flag honestly produced the x86-64 baseline. That disagreement —
+not the missing `-march` — was the actual defect, and it hit the common path:
+both `setup.sh` and CI build through `build.sh`. `SIMD_FLAGS` now follows the
+flag (`-mfpmath=sse -msse2`), so all three entry points mean the same thing.
+SSE2 is the x86-64 baseline ABI floor, so naming it is a no-op on this target;
+the load-bearing half is **dropping** `-mavx2 -mfma`.
+
+Why that mattered: backend selection is compile-time only
+(`include/simd_math.hpp:48-60` keys off `__AVX2__`/`__SSE2__`; the tree has
+**zero** uses of `__builtin_cpu_supports` / `cpuid` / `xgetbv`, measured, so
+there is no runtime dispatch to fall back on). An AVX2 instruction on a CPU
+without AVX2 is `#UD` → SIGILL. Measured on `RAWACCEL_PORTABLE=1`: VEX `%ymm`
+instructions daemon 20258 → **0**, cli 14668 → **0**, gui → **0**; backend
+actually selected SSE2 / 16-byte `v2d` / no `__FMA__`, versus AVX2 / 32-byte /
+`__FMA__` natively; both builds exit 0 on `--help`. ARM/aarch64 was never
+affected (the `uname` case adds nothing there). CI never caught it because
+ubuntu-24.04 runners are post-Haswell — the flag's one consumer was the CI job
+that could not observe the failure it existed to prevent.
+
+Side effect worth keeping: the baseline build is the one that matches the
+oracle's own `-O2 -mavx2` numbers (0 differing rows at `%.17g`), so it is also
+free of the `-mfma` drift class documented in `tests/run_simd_parity.sh`.
 
 ## Test
 
@@ -173,6 +209,16 @@ scalar fallback, so it is the one to run first while iterating.
 # Exits with code 1 if any FAIL line appears.
 ```
 
+```bash
+# Record↔code bridge: catches "the tracker still says ⏸/AÇIK but the code
+# already carries the fix" — the mechanical form of "there is a signal, nobody
+# measured where it was written".  Only that direction is gated; the reverse
+# measured ~15-17% false positive (23 closed records, 4 with no code marker,
+# 3 of them fixed with the marker in the commit message instead), so it is
+# reported, not failed.  No root, no /dev/uinput, no daemon.
+bash tests/run_tracker_bridge.sh
+```
+
 ## Oracle (reference cross-check)
 
 ```bash
@@ -277,7 +323,7 @@ Seed corpus: `tests/corpus_config/`
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
 Five jobs run on every push/PR (Ubuntu 24.04):
-- **build-and-test** — portable build (`RAWACCEL_PORTABLE=1`), warning-as-failure gate
+- **build-and-test** — baseline build (`RAWACCEL_PORTABLE=1`, so the result never depends on the runner's CPU), warning-as-failure gate
   via `grep -E "warning:|error:"`, then `tests/run_tests.sh`, then `tests/run_tr_coverage.sh`,
   then the differential oracle (`bash tests/oracle/run_oracle.sh`) which fails if any
   gain row drifts outside `tests/oracle/known_deviations.txt`.
@@ -317,6 +363,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `include/rawaccel.hpp` | Modifier + EMA smoother engine |
 | `include/rawaccel-base.hpp` | Core types, structs, RAWACCEL_VERSION |
 | `include/config.hpp` | Config structs |
+| `include/logitech_hidpp.hpp` | HID++ protocol + `HidppTransport` (hidraw I/O) and, beside it, the `hidpp_hw_sync` / `hidpp_hw_job` / `hidpp_hw_enqueue` / `hidpp_hw_take` / `hidpp_hw_plan_job` write-dedup queue. The queue is **owned by the daemon**, not here: `drain_hidpp_writes()` in `daemon/daemon.cpp` is the only consumer and takes **no** daemon mutex (leaf-lock contract), so the 5.8 s worst-case USB round-trip cannot stall the motion loop |
 | `include/presets.hpp` | Built-in game/FPS presets — single source shared by CLI `create-preset` and GUI "New Profile" preset dropdown |
 | `src/config.cpp` | JSON serialization (nlohmann/json) |
 | `daemon/daemon.cpp` | evdev/uinput implementation, hot-plug |

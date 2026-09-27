@@ -38,26 +38,36 @@ fi
 
 CXX="${CXX:-g++}"
 
-# Architecture flags: -march=native optimises for this machine's CPU but breaks portability.
-# Set RAWACCEL_PORTABLE=1 to build a portable binary (runs on other CPU architectures).
+# RAWACCEL_PORTABLE=1 means: DO NOT USE -march=native.  It exists for
+# reproducible/CI builds (GitHub runners do not guarantee a CPU level, and
+# -march=native bakes whatever the runner happens to have into the binary).
+# It is NOT a promise that the result runs anywhere -- see below.
 #
-# PORTABILITY IS TWO SWITCHES, NOT ONE.  MARCH controls -march=native, but the
-# SIMD_FLAGS list below was appended unconditionally, so the "portable" branch
-# only dropped -march=native and still compiled in -mavx2 -mfma.  Backend
-# selection is compile-time only (simd_math.hpp:48-60 keys off __AVX2__ /
-# __SSE2__; measured: zero uses of __builtin_cpu_supports/cpuid/xgetbv in the
-# tree), and an AVX2 instruction on a CPU without AVX2 is #UD -> SIGILL.  So
-# RAWACCEL_PORTABLE=1 produced a binary that died on startup on any x86-64 CPU
-# older than Haswell -- while build.sh's own comment and AGENTS.md promised
-# exactly the opposite.  ARM/aarch64 was never affected: the uname case below
-# adds nothing there, which is why this survived.
+# THIS FLAG WAS TWO SWITCHES, NOT ONE, AND THE TWO DISAGREED.  MARCH controls
+# -march=native, but SIMD_FLAGS below was appended unconditionally, so this
+# branch only dropped -march=native and still compiled in -mavx2 -mfma.  Two
+# consequences, both measured:
+#   1) The flag did not do what its own comment claimed.  Backend selection is
+#      compile-time only (simd_math.hpp:48-60 keys off __AVX2__ / __SSE2__;
+#      measured: zero uses of __builtin_cpu_supports/cpuid/xgetbv in the tree),
+#      so there is no runtime dispatch to fall back on and an AVX2 instruction
+#      on a CPU without AVX2 is #UD -> SIGILL.  A binary whose whole purpose is
+#      to be CPU-independent died at startup on any pre-Haswell x86-64.
+#   2) The same flag meant DIFFERENT THINGS in the two build systems, which is
+#      the real defect.  CMakeLists.txt:68 and scripts/bench_hotpath.sh:20-25
+#      add no ISA flags at all, so there "portable" honestly meant the
+#      x86-64 baseline; only build.sh added -mavx2 -mfma.  setup.sh and CI
+#      both go through build.sh, so the misleading path was also the common
+#      one.  All three now mean the same thing: no -march=native, no optional
+#      ISA level beyond the baseline.
 #
-# The portable branch therefore also drops every optional ISA level.  SSE2 is
-# the floor and is always on: it is part of the x86-64 baseline ABI, so naming
-# it is a no-op on this target and is kept only to document the intent.
+# ARM/aarch64 was never affected: the uname case below adds nothing there,
+# which is why this survived.  SSE2 is the x86-64 baseline ABI floor, so naming
+# it in SIMD_FLAGS is a no-op on this target and is kept only to document intent
+# -- the load-bearing part of the fix is DROPPING -mavx2 -mfma.
 if [ "${RAWACCEL_PORTABLE:-0}" = "1" ]; then
     MARCH=""
-    echo "[INFO] Portable build enabled ( -march=native, AVX2/AVX/FMA disabled )"
+    echo "[INFO] Baseline build ( -march=native and AVX2/AVX/FMA disabled )"
 else
     MARCH="-march=native"
     echo "[INFO] Native architecture build ( -march=native )"
@@ -92,7 +102,7 @@ fi
 #   -fomit-frame-pointer       : omit frame pointer for better register allocation (x86_64)
 
 # -fcf-protection is x86-specific (mirrors CMakeLists.txt) so non-x86
-# portable builds (-march=native disabled) still compile.
+# baseline builds (RAWACCEL_PORTABLE=1) still compile.
 case "$(uname -m)" in
     x86_64|amd64|i[3-6]86) FCF="-fcf-protection=full" ;;
     *) FCF="" ;;

@@ -17,7 +17,9 @@ CXX="${CXX:-g++}"
 if [[ ! -f "$BENCH_BIN" ]]; then
     echo "Building benchmark..."
     cd "$PROJECT_ROOT"
-    # R4-L-4: $CXX onurlandır; RAWACCEL_PORTABLE=1 portable üretir (mirror build.sh).
+    # R4-L-4: $CXX onurlandır.  RAWACCEL_PORTABLE=1 = -march=native off (mirror
+    # build.sh).  Bu yol SIMD bayrağı EKLEMEZ, yani "baseline" burada zaten
+    # derleyicinin varsayılanı; build.sh de artık aynı sonuca varıyor.
     if [[ "${RAWACCEL_PORTABLE:-0}" = "1" ]]; then
         MARCH=""
     else
