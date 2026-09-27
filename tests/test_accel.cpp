@@ -6174,6 +6174,114 @@ static void test_config_missing_active_profile() {
     std::remove(tmp.c_str());
 }
 
+// AJ2 config-presets K1 — a `profiles` key that is present but not an array used
+// to fall through the `is_array()` guard SILENTLY: `cfg.profiles` stayed empty
+// while `active_profile` still pointed at a name that no longer existed.  The
+// next save (the daemon's ordinary reload->mutate->save cycle, or any mutating
+// CLI command) then wrote `"profiles": []` and destroyed every profile in the
+// file with no warning.  Measured pre-fix: a 3-profile / 7814-byte config
+// collapsed to 103 bytes on 5 malformations.
+//
+// The load_config side is AJ2's lane (src/config.cpp); the regression gate is
+// here because tests/test_accel.cpp is AJ1's.  AJ2's standalone 8-case proof
+// (/tmp/opencode/aj2_k1_regression.cpp) was re-run independently by AJ1 against
+// the merged tree: 8/8, exit 0.
+static void test_config_profiles_wrong_type_rejected() {
+    SECTION("K1 — config: malformed `profiles` is rejected and the file is left intact");
+
+    // A healthy 3-profile config.  Used both as the control and as the carrier
+    // the malformations are spliced into, so every case starts from real data.
+    static const char* SAGLAM =
+        R"({"version":"1.2.3","active_profile":"cs2","use_raw_input":true,"profiles":[
+ {"name":"cs2","device_id":"/dev/input/by-id/x","dpi":800,"polling_rate":1000,"disable":false,
+  "profile":{"name":"cs2","raw_passthrough":false,"accel_x":{"mode":"classic","gain":true,"limit":1.6},
+             "accel_y":{"mode":"classic","gain":true,"limit":1.6}}},
+ {"name":"valorant","device_id":"","dpi":1600,"polling_rate":1000,"disable":false,
+  "profile":{"name":"valorant","raw_passthrough":false,"accel_x":{"mode":"natural","gain":true,"limit":1.3},
+             "accel_y":{"mode":"natural","gain":true,"limit":1.3}}},
+ {"name":"apex","device_id":"","dpi":800,"polling_rate":8000,"disable":false,
+  "profile":{"name":"apex","raw_passthrough":false,"accel_x":{"mode":"power","gain":true,"scale":2.2},
+             "accel_y":{"mode":"power","gain":true,"scale":2.2}}}]})";
+
+    const std::string saglam = SAGLAM;
+    const std::string tmp = "/tmp/rawaccel_test_k1_profiles_type.json";
+
+    auto yaz = [&](const std::string& icerik) {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << icerik;
+    };
+    auto oku = [&]() {
+        std::ifstream f(tmp);
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    };
+    // Splice a replacement for the `"profiles": [...]` array into the carrier.
+    auto birlestir = [&](const std::string& degistirme) {
+        const size_t b = saglam.find("\"profiles\":[");
+        const size_t e = saglam.rfind("]}") + 1;
+        if (degistirme.empty())                      // drop the key entirely
+            return saglam.substr(0, b - 1) + saglam.substr(e);
+        return saglam.substr(0, b) + degistirme + saglam.substr(e);
+    };
+
+    // ── KONTROL: saglam config bozulmadan korunmali ──────────────────────────
+    // Without this the section could pass by rejecting everything, including
+    // valid configs — a fix that throws unconditionally would be "green" here.
+    {
+        yaz(saglam);
+        app_config c = load_config(tmp);
+        EXPECT(c.profiles.size() == 3);
+        save_config(c, tmp);
+        app_config c2 = load_config(tmp);
+        EXPECT(c2.profiles.size() == 3);
+        EXPECT(c2.active_profile == "cs2");
+    }
+
+    // ── bozuk varyantlar: load_config REDDETMELI ve dosyaya dokunmamalı ──────
+    // The `dosya` check is the load-bearing half.  It is what turns "this load
+    // failed" into "this file is still rescuable by hand", which is the whole
+    // reason throwing is safe here: both callers (daemon.cpp:470-481 keeps a
+    // synthetic default, daemon.cpp:1866-1870 keeps the running config) return
+    // without writing, so nothing is destroyed on the retry.
+    struct Varyant { const char* ad; std::string degistirme; };
+    const Varyant bozuk[] = {
+        { "\"profiles\" metin",              R"("profiles":"bir-dizi-olmaliydi")" },
+        { "\"profiles\" obje",               R"("profiles":{"cs2":1})"          },
+        { "\"profiles\" sayi",               R"("profiles":42)"                  },
+        { "\"profiles\" icinde obje degil",  R"("profiles":[1,2,3])"             },
+    };
+    for (const auto& v : bozuk) {
+        yaz(birlestir(v.degistirme));
+        const std::string onceki = oku();
+        bool threw = false;
+        try { app_config c = load_config(tmp); (void)c; } catch (...) { threw = true; }
+        EXPECT(threw);                 // must NOT load as an empty profile list
+        EXPECT(oku() == onceki);        // must NOT have touched the file
+    }
+
+    // ── tolere edilen iki varyant: kayip riski yok, reddedilmemeli ──────────
+    // `null` is the common "unset" idiom and an absent key means the file never
+    // held profile data, so neither can destroy anything.  These guard against
+    // the fix over-reaching into a needless hard failure on first run.
+    {
+        yaz(birlestir(R"("profiles":null)"));
+        bool threw = false;
+        try { app_config c = load_config(tmp); EXPECT(c.profiles.empty()); }
+        catch (...) { threw = true; }
+        EXPECT(!threw);
+    }
+    {
+        yaz(birlestir(""));
+        bool threw = false;
+        try { app_config c = load_config(tmp); EXPECT(c.profiles.empty()); }
+        catch (...) { threw = true; }
+        EXPECT(!threw);
+    }
+
+    std::remove(tmp.c_str());
+}
+
 static void test_config_extreme_values() {
     SECTION("R10 — config: extreme values are clamped by sanitize");
 
@@ -9507,6 +9615,7 @@ int main(int argc, char** argv) {
     test_config_profiles_over_max();
     test_config_empty_profiles();
     test_config_missing_active_profile();
+    test_config_profiles_wrong_type_rejected();
     test_config_extreme_values();
     test_config_duplicate_device_id();
     test_check_duplicate_device_ids();
