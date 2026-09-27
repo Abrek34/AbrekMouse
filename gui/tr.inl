@@ -434,8 +434,8 @@ static const char* tr(const char* key) {
             {"Onboard DPI / report rate / LOD are not available on this hardware.",
                                          "Donanım DPI / rapor hızı / kaldırma mesafesi bu donanımda kullanılamaz."},
             {"Model ID: ",                "Model Kimliği: "},
-            {"Model quirks: known (write-protect policy)",
-                                         "Model quirks: biliniyor (yazma-koruma politikası)"},
+            {"Model quirks: known (RGB effects not written)",
+                                         "Model quirks: biliniyor (RGB efektleri yazılmaz)"},
             {"Daemon live battery: %d%%", "Daemon canlı pil: %d%%"},
             {"Cannot open %s — make sure you are in the 'input' group "
              "(sudo usermod -aG input $USER) and reinstall the udev rule.",

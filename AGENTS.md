@@ -341,14 +341,28 @@ compute sample staleness). Design keeps the hot path lock-free:
   16 transport-flag combinations x both response-size cases the composed id is
   only ever `""` or 12 chars. This is a PARKED decision (FIX_LOG.md O31-H2 —
   "gerçek 12-char id doğrulanmadan yazılmaz"), not an oversight: resolving it
-  needs the physical G522. The row is kept (deleting it would silently widen
-  what may be written) and `test_logitech_quirks_model_id_shape()` is the guard
+  needs the physical G522. The row is kept (it is the only record of what was
+  validated on that device) and `test_logitech_quirks_model_id_shape()` is the guard
   rail — it fails if the id parsing ever changes so a short key becomes
   reachable, so the decision is revisited instead of the row quietly mattering.
   A "short-key fallback" loop that used to sit in the lookup was removed as dead
   code: its match condition was a strict subset of the loop above it, proven
   identical over 1,510,738 inputs including an exhaustive sweep of every 1-4
   char string.
+- **`LOGITECH_QUIRKS` is a data registry, NOT an enforced write gate (O31-H6)**:
+  the `nvconfig`/`headset` rows have **zero consumers** — measured project-wide.
+  `rgb_effects` (`0x8071`) appears in exactly one place outside this table (the
+  enum at `include/logitech_hidpp.hpp:81`) and `0x0622` only in comments; no
+  code reads either vector. The only HID++ writes in the tree are `set_dpi`,
+  `set_polling_rate`, `set_lift_off_distance`, `set_led_brightness`,
+  `set_change_host` and `write_onboard_profile_sector`, and none consults the
+  table. The "default-DENY allowlist" the header and the HID++ panel label used
+  to claim is therefore not enforced anywhere — it held only vacuously, because
+  there is no such write to refuse. Both were corrected (O31-H6) because the
+  failure mode is a *maintainer trap*: the rows read as a live gate, so the
+  first person adding an RGB write path could reasonably assume one already
+  exists. **Adding a 0x8071/0x0622 write path means adding the
+  `find_logitech_quirks()` branch in the same change.**
 - **HID++ short-message payload budget is a named constant, not a literal**:
   `HIDPP_SHORT_PAYLOAD_MAX` (16) is the payload room in a 0x8110 request, and
   `send_feature_request()` rejects any `param_len` above it outright — a silent

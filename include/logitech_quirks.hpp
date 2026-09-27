@@ -3,19 +3,31 @@
 // Independent C++ encoding of the protocol behaviour that the Solaar project
 // has validated on real hardware.  Solaar is GPLv2-or-later; this header is
 // NOT a line-by-line translation of Solaar source.  Only the published
-// semantics (feature IDs, validated model entries, default-DENY policy) are
-// re-expressed here in RawAccel's own types, so the accelerated/daemon motion
-// path and RawAccel's licence structure stay untouched.
+// semantics (feature IDs, validated model entries) are re-expressed here in
+// RawAccel's own types, so the accelerated/daemon motion path and RawAccel's
+// licence structure stay untouched.  The "default-DENY policy" Solaar applies
+// to these rows is NOT re-expressed — see the MEASURED note below on why.
 //
 // Keying follows Solaar `device.modelId`: the composited transport PID string
 // (btid+btleid+wpid+usbid) reported by DEVICE_FW_VERSION function 0.  One
 // entry covers the model on any transport.  `logitech_compose_model_id()`
 // rebuilds that key from the decoded transport ids.
 //
-// RawAccel has no RGB write path today, so the NV-config / signature-effect
-// rows are a *read-only policy*: they declare which persistent-light effects
-// are known-good per model, exactly as Solaar gates them.  Any future code
-// that enables such writes must consult this table first (default-DENY).
+// ⚠ MEASURED, NOT ASSUMED (O31-H6): RawAccel has **no write path** for
+// 0x8071 / 0x0622.  The only HID++ writes in the tree are set_dpi,
+// set_polling_rate, set_lift_off_distance, set_led_brightness,
+// set_change_host and write_onboard_profile_sector — measured, and none of
+// them consults this table.  The nvconfig/headset rows are therefore inert
+// DATA: nothing reads them, and the "default-DENY allowlist" they were
+// documented as is not enforced anywhere.  The protection they describe holds
+// today only vacuously — there is no such write to protect, not a gate
+// refusing one.
+//
+// So this is a *registry of device-validated rows*, not an active policy.
+// That distinction is load-bearing for the next person: adding an RGB write
+// path means adding the gate with it, in the same change.  Reading this table
+// as a live allowlist is the specific mistake this paragraph exists to stop —
+// the rows look like an enforced gate, and nothing is enforcing them.
 //
 // The capability normalisation helpers below are feature-derived (truth comes
 // from the device's own FEATURE_SET discovery, never from assumptions), plus
@@ -52,12 +64,14 @@ struct logitech_headset_row {
     std::vector<std::string> fields;
 };
 
-/// Per-model quirk record.  Default construction = fully policy-suppressed
-/// (a model that is not listed must not be written without real-device
-/// validation — the same conservative stance as Solaar).
+/// Per-model quirk record: the device-validated rows for one model.
+/// Default construction = *no validated rows*, which is the correct answer
+/// for an unknown model (Solaar treats unlisted models the same conservative
+/// way).  Note that today no write path reads these vectors, so "empty" is not
+/// yet load-bearing — see the MEASURED note at the top of this header.
 struct logitech_quirks {
-    std::vector<logitech_nvconfig_row> nvconfig;   // 0x8071 — default-DENY allowlist
-    std::vector<logitech_headset_row> headset;     // 0x0622 — default-DENY allowlist
+    std::vector<logitech_nvconfig_row> nvconfig;   // 0x8071 — validated rows
+    std::vector<logitech_headset_row> headset;     // 0x0622 — validated rows
 };
 
 struct logitech_quirks_entry {
@@ -66,8 +80,10 @@ struct logitech_quirks_entry {
 };
 
 /// Solaar-validated rows only (lib/logitech_receiver/device_quirks.py).
-/// Unknown models return nullptr via find_logitech_quirks(), i.e. are treated
-/// as not-yet-validated and are therefore write-protected.
+/// Unknown models return nullptr via find_logitech_quirks() — that means "no
+/// validated rows on record", full stop.  It is NOT a write-protection verdict
+/// today: nothing writes these features, so the nullptr is never consulted to
+/// refuse anything.  A future RGB write path must branch on it explicitly.
 inline const std::vector<logitech_quirks_entry> LOGITECH_QUIRKS = [] {
     std::vector<logitech_quirks_entry> t;
     // G502 X PLUS — 0x8071 cap 0x0001 (startup): the colour bytes are inert,
@@ -98,7 +114,7 @@ inline const std::vector<logitech_quirks_entry> LOGITECH_QUIRKS = [] {
     // obtained without the physical device, and a guessed id would be worse
     // than an honest dead row.  The two ways out, both needing a decision:
     //   (a) read the real 12-char id off a G522 and replace "32" with it, or
-    //   (b) drop this row and let G522 stay default-DENY, which is the
+    //   (b) drop this row and leave the G522 with no validated rows at all,
     //       conservative policy the table already applies to unknown models.
     // Either way this comment goes with the change.  test_logitech_quirks_
     // model_id_shape() pins the invariant that keeps this row dead, so a future

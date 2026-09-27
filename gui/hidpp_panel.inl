@@ -148,7 +148,7 @@ void hw_render_caps(AppState* S, int idx) {
     if (!mid.empty()) {
         m += std::string(tr("Model ID: ")) + mid + "\n";
         if (find_logitech_quirks(dev.info))
-            m += std::string(tr("Model quirks: known (write-protect policy)")) + "\n";
+            m += std::string(tr("Model quirks: known (RGB effects not written)")) + "\n";
     }
     if (S->hw_daemon_battery >= 0 && S->hw_daemon_battery <= 100)
         m += trf("Daemon live battery: %d%%", S->hw_daemon_battery) + "\n";

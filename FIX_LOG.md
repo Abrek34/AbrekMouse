@@ -70,6 +70,7 @@ big-pickle oturumunun kilidindeki dosyalar için eşzamanlı edit YAPILMADI, mad
 | O31-H3 (HIDPP B1) | daemon/main.cpp:293-298 | `-c -v` sonraki bayrağı yutar | `✅ opencode — reject arg starting with '-' for -c and -f` |
 | O31-H4 (HIDPP C4) | scripts/bench_hotpath.sh:58 | geçersiz perf olayı syscalls | `✅ opencode — syscalls→syscalls:sys_enter (tracepoint)` |
 | O31-H5 (HIDPP C3) | scripts/kde-fix-accel.sh:322-325 | --remove symlink yıkıyor + sabit tmp | `✅ opencode — mkstemp+realpath+fsync (--fix deseni)` |
+| O31-H6 (HIDPP A3) | include/logitech_quirks.hpp (beyan satırları) + gui/hidpp_panel.inl:151 + gui/tr.inl:437 | "default-DENY allowlist" / "write-protect policy" uygulanmıyor | `✅ **DOĞRULANDI + DÜZELTİLDİ**` — ölçüm: `0x8071` tablo dışında 1 yerde (enum), `0x0622` yalnız yorumda, vektör okuyan kod **0**; 7 HID++ yazma yolunun hiçbiri tabloya bakmıyor. Yanlış beyan ölçülen gerçekle değiştirildi (veri kaydı ≠ aktif politika), GUI etiketi düzeltildi. `📌 O31-H2'nin parkeli "32" kararı korundu` — bu bulgu onu değiştirmiyor |
 | O31-L1 (CLI F5) | cli/main.cpp:1242-1248 | import 515-lik tek LUT sessiz eleman düşürüyor | `✅ opencode — reject odd n%2!=0, CLI gate added` |
 | O31-L2 (CLI F4-x2) | cli/main.cpp:951-954,919 | input_offset>500 / cap_x<input_offset CLI-domain yok (P107) | `✅ opencode — upper bound + cross-constraint, CLI gate added` |
 | O31-L3 (CLI F7) | cli/main.cpp:2080,575-577,243 | help/çıktı metni davranıştan sapıyor | `✅ opencode — daemon msg/receivers+hidpp/none+off alias` |
