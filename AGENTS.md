@@ -82,6 +82,50 @@ sudo bash tests/run_e2e.sh          # exit 0 = pass, 1 = failed check, 77 = env 
 # Translation coverage: every translatable UI string must have a Turkish entry
 bash tests/run_tr_coverage.sh
 
+# SIMD backend parity: compile tests/simd_parity.cpp once per backend
+# (AVX2 / SSE2 / scalar), assert a Y-only input survives modifier::modify(),
+# then diff the three backends' numeric output against each other.
+# Exit 0 = all pass AND agree; 1 = failure or backend mismatch; 77 = host
+# cannot run the AVX2 binary (skips gracefully).
+bash tests/run_simd_parity.sh
+```
+
+## SIMD backend coverage (READ BEFORE TOUCHING include/simd_math.hpp)
+
+`include/simd_math.hpp` selects one of **three** backends at compile time:
+AVX2 (`__AVX2__`), SSE2 (`__SSE2__`), or a pure-scalar fallback. They are NOT
+interchangeable, and a bug can live in only one of them.
+
+**Lane layout (AVX2 backend).** `v2d_set(x, y)` → `_mm256_set_pd(0, 0, y, x)`,
+so **X is lane 0 and Y is lane 1**; lanes 2,3 are zero padding. Every
+accessor must therefore read/write lanes 0,1 only:
+
+```cpp
+v2d_store: _mm_storeu_pd(ptr, _mm256_castpd256_pd128(v));
+v2d_get_y: _mm_cvtsd_f64(_mm_unpackhi_pd(lo, lo));   // NOT _mm256_extractf128_pd(a,1)
+hmin/hmax : reduce lanes 0,1 only (folding in the padding makes hmin 0.0)
+```
+
+This exact mistake shipped once: `v2d_store`/`v2d_get_y` read lane 2, so every
+AVX2 build wrote `0.0` into the Y component and **vertical mouse movement was
+silently dead in the shipped daemon**. It reached production because
+`tests/run_tests.sh` has no `-march` flag, `tests/oracle/run_oracle.sh`
+deliberately drops `-march`, and CI sets `RAWACCEL_PORTABLE=1` — so all three
+exercised SSE2 only, while `CMakeLists.txt` / `scripts/build.sh` add
+`-march=native` and shipped AVX2. `tests/run_simd_parity.sh` now closes that
+gap and runs in CI.
+
+**Rule:** any change to `include/simd_math.hpp` (or to the SIMD block in
+`include/rawaccel.hpp`) must be validated with all three of:
+
+```bash
+bash tests/run_simd_parity.sh        # per-backend + cross-backend agreement
+bash tests/run_tests.sh              # SSE2-path unit/integration suite
+bash tests/oracle/run_oracle.sh      # differential vs official reference
+```
+
+A green `run_tests.sh` alone does **not** mean the AVX2 path is correct.
+
 # Expected output: "=== Sonuç: N/N geçti ===" (N/N passed)
 # Exits with code 1 if any FAIL line appears.
 ```
@@ -242,6 +286,8 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
 | `tests/run_tr_coverage.sh` | Translation coverage runner (exit 1 on MISSING) |
+| `tests/simd_parity.cpp` | SIMD backend parity + Y-axis survival regression (compiled once per backend) |
+| `tests/run_simd_parity.sh` | Runs `simd_parity.cpp` under AVX2/SSE2/scalar and diffs the three backends against each other |
 | `scripts/build.sh` | Quick build script |
 | `setup.sh` | Canonical one-shot installer (all deps + build + system install + KDE fix) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (build + tests + oracle + sanitizers + fuzz smoke) |

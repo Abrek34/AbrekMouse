@@ -65,6 +65,15 @@ jobs:
         # Fails (exit 1) if any row outside tests/oracle/known_deviations.txt drifts.
         run: bash tests/oracle/run_oracle.sh
 
+      - name: Run SIMD backend parity (AVX2 / SSE2 / scalar)
+        # Every other gate here compiles WITHOUT -march, so they only ever
+        # exercised the SSE2 backend — which is how the AVX2 lane bug (Y read
+        # from the zero padding lane, killing vertical movement) reached
+        # production. This step forces each backend explicitly and diffs the
+        # three against each other. Runs even though RAWACCEL_PORTABLE=1,
+        # because it does not rely on the build's -march.
+        run: bash tests/run_simd_parity.sh
+
       - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4

@@ -1,5 +1,6 @@
 #pragma once
 #include "accel-union.hpp"
+#include "simd_math.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -329,6 +330,118 @@ inline void init_settings(modifier_settings& settings) {
     settings.data.flags         = modifier_flags(settings.prof);
 }
 
+// ── SIMD-optimized separate mode acceleration ─────────────────────────────
+/// Process X and Y axes simultaneously using SIMD (2-wide).
+/// Used when speed_flags.dist_mode == distance_mode::separate.
+static void modify_separate_simd(vec2d& in, speed_processor& sp,
+                                 const modifier_settings& settings,
+                                 double dpi_factor, milliseconds time)
+{
+    using namespace simd;
+    auto& args  = settings.prof;
+    auto& data  = settings.data;
+    auto& flags = settings.data.flags;
+
+    // Early guards (same as modify)
+    if (!std::isfinite(time) || time <= 0) {
+        in.x = 0; in.y = 0; return;
+    }
+
+    double ips_factor = dpi_factor / time;
+    constexpr double IPS_FACTOR_MAX = 1e6;
+    if (!std::isfinite(ips_factor) || ips_factor > IPS_FACTOR_MAX)
+        ips_factor = IPS_FACTOR_MAX;
+
+    // 1. Rotation (scalar - branchy, not worth vectorizing)
+    if (flags.apply_rotate)
+        in = rotate(in, data.rot_direction);
+
+    // 2. Angle snap (scalar - complex branching)
+    double reference_angle = 0;
+    if (flags.compute_ref_angle &&
+        (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
+        if (std::abs(in.x) < 1e-9) reference_angle = M_PI / 2;
+        else if (std::abs(in.y) < 1e-9) reference_angle = 0.0;
+        else reference_angle = std::atan(std::fabs(in.y / in.x));
+        if (flags.apply_snap) {
+            double snap = args.degrees_snap * M_PI / 180.0;
+            if (reference_angle > M_PI / 2 - snap) {
+                reference_angle = M_PI / 2;
+                in = { 0, std::copysign(magnitude(in), in.y) };
+            } else if (reference_angle < snap) {
+                reference_angle = 0;
+                in = { std::copysign(magnitude(in), in.x), 0 };
+            }
+        }
+    }
+
+    // 3. Speed clamp (scalar - magnitude is combined)
+    if (flags.clamp_speed) {
+        double speed = magnitude(in) * ips_factor;
+        if (speed > 0) {
+            double ratio = simd_clamp(speed, args.speed_min, args.speed_max) / speed;
+            in.x *= ratio; in.y *= ratio;
+        }
+    }
+
+    // 4. Domain-weighted speed - THIS IS WHERE SIMD SHINES
+    
+    // abs_vel = |in * ips_factor * domain_weights|
+    v2d v_in = v2d_load(&in.x);
+    v2d v_ips = v2d_set1(ips_factor);
+    v2d v_dw = v2d_set(args.domain_weights.x, args.domain_weights.y);
+    v2d v_abs_vel = v2d_abs(v2d_mul(v2d_mul(v_in, v_ips), v_dw));
+    
+    // Store back for smoother
+    double abs_vel_arr[2];
+    v2d_store(abs_vel_arr, v_abs_vel);
+    
+    // Call speed processor (processes X/Y separately)
+    sp.calc_speed_separate(*reinterpret_cast<vec2d*>(abs_vel_arr), time);
+    
+    // SIMD acceleration evaluation - process X and Y together
+    double scale_x = 1.0 + (data.accel_x.apply(abs_vel_arr[0], args.accel_x) - 1.0) * args.range_weights.x;
+    double scale_y = 1.0 + (data.accel_y.apply(abs_vel_arr[1], args.accel_y) - 1.0) * args.range_weights.y;
+    
+    v2d v_scale = v2d_set(scale_x, scale_y);
+    
+    if (sp.speed_flags.should_smooth_scale) {
+        scale_x = sp.smoother_x.scale_smoother.smooth(scale_x, time);
+        scale_y = sp.smoother_y.scale_smoother.smooth(scale_y, time);
+        v_scale = v2d_set(scale_x, scale_y);
+    }
+    
+    // Apply scale
+    v_in = v2d_mul(v_in, v_scale);
+    
+    if (sp.speed_flags.should_smooth_output) {
+        double ox = std::copysign(sp.smoother_x.output_speed_smoother.smooth(std::fabs(v2d_get_x(v_in)), time), v2d_get_x(v_in));
+        double oy = std::copysign(sp.smoother_y.output_speed_smoother.smooth(std::fabs(v2d_get_y(v_in)), time), v2d_get_y(v_in));
+        v_in = v2d_set(ox, oy);
+    }
+    
+    v2d_store(&in.x, v_in);
+
+    // 5. Output DPI normalization + directional DPI multipliers (vectorized)
+    if (args.output_dpi > 0 && dpi_factor > 0) {
+        double dpi_adj = (args.output_dpi / NORMALIZED_DPI) * dpi_factor;
+        v2d v_dpi = v2d_set(dpi_adj, dpi_adj * args.yx_output_dpi_ratio);
+        v_in = v2d_load(&in.x);
+        v_in = v2d_mul(v_in, v_dpi);
+        v2d_store(&in.x, v_in);
+    }
+    
+    // Directional multipliers (only negative direction)
+    if (flags.apply_dir_mul_x && args.lr_output_dpi_ratio > 0 && in.x < 0)
+        in.x *= args.lr_output_dpi_ratio;
+    if (flags.apply_dir_mul_y && args.ud_output_dpi_ratio > 0 && in.y < 0)
+        in.y *= args.ud_output_dpi_ratio;
+
+    // Defense-in-depth: NaN/Inf guard
+    if (!std::isfinite(in.x)) in.x = 0;
+    if (!std::isfinite(in.y)) in.y = 0;
+}
+
 // ── Core modifier ─────────────────────────────────────────────────────────────
 
 class modifier {
@@ -419,26 +532,9 @@ public:
                           std::fabs(in.y * ips_factor * args.domain_weights.y) };
 
         if (sp.speed_flags.dist_mode == distance_mode::separate) {
-            // Per-axis acceleration.  Reference callback weight convention:
-            //   gain = 1 + (accel_fn - 1) * range_weight
-            // so a 0 weight disables acceleration (returns 1), not the mouse.
-            sp.calc_speed_separate(abs_vel, time);
-
-            double scale_x = 1.0 + (data.accel_x.apply(abs_vel.x, args.accel_x) - 1.0) * args.range_weights.x;
-            double scale_y = 1.0 + (data.accel_y.apply(abs_vel.y, args.accel_y) - 1.0) * args.range_weights.y;
-
-            if (sp.speed_flags.should_smooth_scale) {
-                scale_x = sp.smoother_x.scale_smoother.smooth(scale_x, time);
-                scale_y = sp.smoother_y.scale_smoother.smooth(scale_y, time);
-            }
-
-            in.x *= scale_x;
-            in.y *= scale_y;
-
-            if (sp.speed_flags.should_smooth_output) {
-                in.x = std::copysign(sp.smoother_x.output_speed_smoother.smooth(std::fabs(in.x), time), in.x);
-                in.y = std::copysign(sp.smoother_y.output_speed_smoother.smooth(std::fabs(in.y), time), in.y);
-            }
+            // SIMD-optimized separate mode (processes X/Y simultaneously)
+            modify_separate_simd(in, sp, settings, dpi_factor, time);
+            return; // Early return - SIMD version handles everything
         } else {
             // Whole (combined) acceleration
             double speed = sp.calc_speed_whole(abs_vel, time);

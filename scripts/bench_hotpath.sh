@@ -30,7 +30,19 @@ if [[ ! -f "$BENCH_BIN" ]]; then
     esac
     HARDENING="-fstack-protector-strong -fstack-clash-protection $FCF -D_FORTIFY_SOURCE=2 -D_GLIBCXX_ASSERTIONS -fPIE -Wformat -Wformat-security"
     LDFLAGS_HARDEN="-pie -Wl,-z,relro,-z,now,-z,noexecstack,-z,separate-code"
-    "$CXX" -O3 $MARCH -std=c++20 $HARDENING \
+    
+    # PGO support (mirror build.sh)
+    PGO_FLAGS=""
+    if [[ "${RAWACCEL_PGO:-0}" = "1" ]] && [[ "${RAWACCEL_PGO_GEN:-0}" = "1" ]]; then
+        PGO_FLAGS="-fprofile-generate=$BUILD_DIR/pgo-data"
+        mkdir -p "$BUILD_DIR/pgo-data"
+        echo "[INFO] PGO profile generation enabled for benchmark"
+    elif [[ "${RAWACCEL_PGO:-0}" = "1" ]] && [[ "${RAWACCEL_PGO_USE:-0}" = "1" ]]; then
+        PGO_FLAGS="-fprofile-use=$BUILD_DIR/pgo-data -fprofile-correction"
+        echo "[INFO] PGO profile use enabled for benchmark"
+    fi
+    
+    "$CXX" -O3 $MARCH -std=c++20 $HARDENING $PGO_FLAGS \
         -I"$PROJECT_ROOT/include" \
         -I"$PROJECT_ROOT/include/nlohmann" \
         "$PROJECT_ROOT/tests/bench_hotpath.cpp" \

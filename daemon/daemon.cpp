@@ -3357,4 +3357,12 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     }
 }
 
+// ── io_uring-based event loop ─────────────────────────────────────────────────
+// Provides significantly lower syscall overhead than epoll:
+// - Batched readv/writev (32 events per syscall)
+// - Kernel-side polling (no userspace epoll_wait per device)
+// - Optional SQPOLL for zero-syscall submission (kernel 5.11+)
+
+
+
 } // namespace rawaccel
