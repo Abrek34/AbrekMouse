@@ -1,4 +1,22 @@
 #pragma once
+
+// O31: <cstdlib> DOSYANIN EN TEPESINDE, rawaccel-base.hpp'den ONCE.
+// Bu dosyayi ILK include eden bir TU derlenmiyordu:
+//   printf '#include "simd_math.hpp"\nint main(){return 0;}\n' | g++ -mavx2 -Iinclude
+//   -> 26 hata, hepsi /usr/include/c++/16/cstdlib'ta ("'lldiv_t' has not been
+//      declared in '__gnu_cxx'") — yani hata simd_math.hpp'yi degil 200 satir
+//      otedeki bir sistem basligini isaret ediyor, sebebi gostermiyor.
+// Buraya eklenmesi: 0 hata. Iki kere yanlis yere kondu, ikisi de olculdu:
+//   * <immintrin.h>'in YANINA   -> 26 hata (kalmadi)
+//   * <cmath> dosyadan ONCE     -> 26 hata (yetmiyor)
+//   * <cstdlib> dosyadan ONCE   ->  0 hata
+// Yani sira onemli: bu satiri <rawaccel-base.hpp> tasindigi an, o include
+// zincirinin bozdugu include durumu icinde giriyor ve <cstdlib> artik duzelmiyor.
+// Bugun proje TU'lari buraya rawaccel.hpp uzerinden gectigi icin hicbiri bu
+// yolu denemiyor — yani KORUMA KAZARA. tests/simd_parity.cpp:26-28 std
+// basliklarini once include ediyor ve tuzagi KACANIYOR, kapatmiyor.
+#include <cstdlib>
+
 #include "rawaccel-base.hpp"
 #include <cmath>
 #include <cfloat>
