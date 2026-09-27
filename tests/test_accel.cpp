@@ -17,6 +17,7 @@
 #include "../include/config.hpp"
 #include "../include/logitech_receiver.hpp"
 #include "../include/logitech_hidpp.hpp"
+#include "../include/logitech_quirks.hpp"
 #include "../daemon/lat_stats.hpp"    // latency histogram (no libevdev dependency)
 #include "../daemon/motion_math.hpp"  // apply_motion_math — subpixel accumulation
 
@@ -686,6 +687,109 @@ static void test_logitech_hidpp_hardware_controls() {
         auto hardware = hidpp_parse_firmware_record({0x02, 0x07});
         EXPECT(hardware && hardware->level == 2 && hardware->major == 7);
     }
+}
+
+// ── O31-H2: quirks lookup key shape (pins the "32" row as known-dead) ────────
+//
+// find_logitech_quirks() matches a composed modelId against the table keys.
+// logitech_hidpp.cpp fills model_id with bytes_to_hex(count->data()+7, 6), so
+// it is ALWAYS 12 hex chars whenever the device answered, and every per-
+// transport id is a 2-char slice of that same 12-char string assigned inside
+// the same `if (count->size() >= 13)` block.  logitech_compose_model_id()
+// therefore returns either that 12-char string or "" (short response) — never a
+// shorter key.
+//
+// The table's "32" row (G522) is a single model BYTE, not a model id, so it can
+// never be reached.  That is a PARKED decision, not an oversight: see
+// FIX_LOG.md O31-H2 — the real 12-char G522 id needs hardware.  This test is
+// the guard rail: if the id parsing is ever changed so that a short id becomes
+// reachable, these assertions fail and the parked decision must be revisited
+// instead of the row silently becoming (or silently not becoming) live.
+
+static void test_logitech_quirks_model_id_shape() {
+    SECTION("O31-H2 — composed modelId is only ever \"\" or 12 chars");
+
+    // Replay exactly how logitech_hidpp.cpp populates the fields: a 12-char
+    // model id plus 2-char slices gated on each transport flag; and the
+    // short-response case where nothing is assigned at all.
+    size_t produced_12 = 0, produced_empty = 0, produced_other = 0;
+    for (int flags = 0; flags < 16; ++flags) {
+        for (bool full_response : {true, false}) {
+            hidpp_device_info info{};
+            info.transport_flags = static_cast<uint8_t>(flags);
+            if (full_response) {
+                info.model_id = "000000000000";
+                size_t off = 0;
+                auto take_id = [&](uint8_t bit) {
+                    if ((info.transport_flags & bit) == 0 ||
+                        off + 2 > info.model_id.size())
+                        return std::string{};
+                    const std::string id = info.model_id.substr(off, 2);
+                    off += 2;
+                    return id;
+                };
+                info.bluetooth_id    = take_id(0x01);
+                info.bluetooth_le_id = take_id(0x02);
+                info.wireless_pid    = take_id(0x04);
+                info.usb_id          = take_id(0x08);
+            }
+            const size_t n = logitech_compose_model_id(info).size();
+            if (n == 12) ++produced_12;
+            else if (n == 0) ++produced_empty;
+            else ++produced_other;
+        }
+    }
+    // 16 flag values x 2 response sizes = 32 cases, all of them accounted for.
+    EXPECT(produced_12 + produced_empty + produced_other == 32);
+    EXPECT(produced_other == 0);   // no shape outside {0, 12} is reachable
+    EXPECT(produced_12 == 16);     // every flag value with a full response
+    EXPECT(produced_empty == 16);  // every flag value with a short response
+
+    SECTION("O31-H2 — the \"32\" row is unreachable from any device shape");
+
+    // No 12-char id the parser can produce may resolve to the short key.
+    for (int flags = 0; flags < 16; ++flags) {
+        hidpp_device_info info{};
+        info.transport_flags = static_cast<uint8_t>(flags);
+        // Put 0x32 in every pair position the flags could select.
+        for (size_t off = 0; off <= 10; off += 2) {
+            info.model_id = "000000000000";
+            info.model_id.replace(off, 2, "32");
+            size_t p = 0;
+            auto take_id = [&](uint8_t bit) {
+                if ((info.transport_flags & bit) == 0 ||
+                    p + 2 > info.model_id.size())
+                    return std::string{};
+                const std::string id = info.model_id.substr(p, 2);
+                p += 2;
+                return id;
+            };
+            info.bluetooth_id    = take_id(0x01);
+            info.bluetooth_le_id = take_id(0x02);
+            info.wireless_pid    = take_id(0x04);
+            info.usb_id          = take_id(0x08);
+
+            const logitech_quirks* q = find_logitech_quirks(info);
+            if (q)
+                EXPECT(q != &LOGITECH_QUIRKS[2].quirks);  // never the "32" row
+        }
+    }
+
+    SECTION("O31-H2 — the two real 12-char keys still resolve");
+
+    for (const char* key : {"4099C0950000", "B38940B4C355"}) {
+        hidpp_device_info info{};
+        info.model_id = key;
+        EXPECT(find_logitech_quirks(info) != nullptr);
+        EXPECT(find_logitech_quirks(info) == find_logitech_quirks(std::string(key)));
+    }
+
+    // The "32" key is still a table row (not deleted — the decision is parked,
+    // and removing the G522 policy would silently widen what may be written),
+    // it is simply only matchable by a caller passing that exact string.
+    EXPECT(LOGITECH_QUIRKS.size() == 3);
+    EXPECT(std::string(LOGITECH_QUIRKS[2].model_id) == "32");
+    EXPECT(find_logitech_quirks(std::string("32")) != nullptr);
 }
 
 // ── Test 1: noaccel ──────────────────────────────────────────────────────────
@@ -9269,6 +9373,7 @@ int main(int argc, char** argv) {
     test_logitech_hidpp_notification_classification();
     test_logitech_hidpp_hardware_controls();
     test_logitech_hidraw_discovery();
+    test_logitech_quirks_model_id_shape();
 
     // P114 BUG-A: a --filter that matched nothing silently reported "0/0 geçti"
     // + exit 0 (a typo hid the whole suite behind a green gate). No match is a

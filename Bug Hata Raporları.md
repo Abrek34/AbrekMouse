@@ -1807,10 +1807,10 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Durum: `[ALINDI: opencode]` ⏸ logitech_hidpp.cpp (big-pickle B6/B3 tamamladı; yeniden edit riski) — kilit açılınca.
 
 **O31-H2 · DÜŞÜK · G522 LIGHTSPEED `"32"` quirk kaydı ölü kod (HIDPP A2)**
-- Konum: `include/logitech_quirks.hpp:86`, `:93-106` (short-key fallback), `:214-222`
+- Konum: `include/logitech_quirks.hpp:106` (`"32"` satırı, erişilemezliği `:87-103` yorumunda belgeli), `:113` (string overload arama), `:141` (`hidpp_device_info` overload arama); koruma testi `tests/test_accel.cpp:709` `test_logitech_quirks_model_id_shape()`
 - Açıklama: `model_id` hep 12 hex; kısa-anahtar fabrikaları `model_id.size()==klen` (12≠2) → "32" asla eşleşmez; LED quirk (0x0622) hiç uygulanmıyor.
 - Öneri: Gerçek 12-char model ID doğrulaması gerekir (donanım) veya kayıt kaldırılır.
-- Durum: `[ALINDI: opencode]` 📌 KARAR — kimlik doğrulaması olmadan tahmini id yazılmaz.
+  - Durum: ◑ **KISMEN DÜZELTİLDİ** — ölü kısa-anahtar döngüsü ve ölü `info.model_id` yeniden-sorgusu kaldırıldı (1.510.738 girdi üzerinde eski↔yeni karşılaştırması: 0 fark; 1/2/3/4 karakterlik tüm diziler ayrıntılı tarandı). `test_logitech_quirks_model_id_shape()` değişmezlik testi eklendi ve pozitif kontrollü (kimlik ayrıştırması kısa anahtarı erişilebilir kılarsa kırılıyor). 📌 KARAR **hâlâ geçerli**: tahmini 12-char id yazılmıyor, `"32"` satırı bilinçli olarak ölü bırakıldı — ya gerçek G522 donanımında okunacak, ya satır kaldırılacak. Bkz. AGENTS.md "Logitech quirks keying".
 
 **O31-H3 · DÜŞÜK · `-c`/`--config` sonraki bayrağı config yolu sanıyor (HIDPP B1)**
 - Konum: `daemon/main.cpp:293-298` vs `--config=`/`--log-format` arity hatası

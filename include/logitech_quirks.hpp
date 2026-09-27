@@ -83,6 +83,26 @@ inline const std::vector<logitech_quirks_entry> LOGITECH_QUIRKS = [] {
     // G522 LIGHTSPEED (Centurion model byte 0x32) — 0x0622 startup honours the
     // primary colour only, shutdown honours both; the passive slot's behaviour
     // is not understood, so it is suppressed entirely.
+    //
+    // ⚠ O31-H2 — THIS ROW IS CURRENTLY UNREACHABLE, AND THAT IS KNOWN, NOT
+    // OVERLOOKED.  "32" is a single model *byte* taken from the middle of the
+    // 12-hex-char model id, not a model id.  logitech_compose_model_id() can
+    // only ever return "" or 12 chars (measured over all 16 transport-flag
+    // combinations x both response-size cases), so this key can never be
+    // matched by find_logitech_quirks().  The short-key loop that was supposed
+    // to make it reachable has been removed as dead code (see above).
+    //
+    // Status is deliberately PARKED, matching the recorded project decision
+    // (FIX_LOG.md O31-H2 / "Bug Hata Raporları.md" O31-H2: "gerçek 12-char id
+    // doğrulanmadan yazılmaz").  The real 12-char G522 model id cannot be
+    // obtained without the physical device, and a guessed id would be worse
+    // than an honest dead row.  The two ways out, both needing a decision:
+    //   (a) read the real 12-char id off a G522 and replace "32" with it, or
+    //   (b) drop this row and let G522 stay default-DENY, which is the
+    //       conservative policy the table already applies to unknown models.
+    // Either way this comment goes with the change.  test_logitech_quirks_
+    // model_id_shape() pins the invariant that keeps this row dead, so a future
+    // change to the id parsing surfaces here instead of silently mattering.
     t.push_back({"32",
                  {{},
                   {{0, {"color1"}},
@@ -94,29 +114,33 @@ inline const logitech_quirks* find_logitech_quirks(const std::string& model_id) 
     for (const auto& entry : LOGITECH_QUIRKS)
         if (model_id == entry.model_id)
             return &entry.quirks;
-    // Short-key fallback: quirks table may use abbreviated keys (e.g. "32")
-    // that must match the FULL composed model ID (exact length, not suffix).
-    for (const auto& entry : LOGITECH_QUIRKS) {
-        size_t klen = std::char_traits<char>::length(entry.model_id);
-        if (klen <= 4 && model_id.size() == klen &&
-            model_id == entry.model_id)
-            return &entry.quirks;
-    }
+    // O31-H2: a "short-key fallback" loop used to live here.  It was provably
+    // dead and has been removed — its match condition was
+    //   klen <= 4 && model_id.size() == klen && model_id == entry.model_id
+    // of which the last clause is already tested by the loop above for EVERY
+    // entry, so the loop could never produce a hit the first loop had missed
+    // (measured: 0 new matches over the whole probe set).  Its comment claimed
+    // it let an abbreviated key match "the FULL composed model ID", but
+    // model_id.size() == klen (12 == 2) makes that impossible — the code said
+    // the opposite of what the comment described.  Reachable model_id values
+    // are only "" or 12 hex chars (see logitech_compose_model_id), so no short
+    // key can match by any route.  If a real short key is ever wanted it needs
+    // a verified full 12-char ID from hardware, not a matching heuristic.
     return nullptr;
 }
 
-/// Overload: also try the raw 12-char model_id from the device info, which
-/// logitech_compose_model_id() may abbreviate to ≤8 chars when transport
-/// flags are set (NEW-3 fix).
-inline std::string logitech_compose_model_id(const hidpp_device_info& info);
+/// Overload: look the device up by its composed modelId.
+///
+/// O31-H2: this used to add a second probe of the raw `info.model_id`.  That
+/// probe was provably dead as well and is gone: compose() returns
+/// `info.model_id` verbatim whenever it is non-empty (so the re-probe would
+/// be looking at the very string that had just missed), and when it IS empty
+/// every transport id is empty too, because all five fields are assigned
+/// inside the same `if (count->size() >= 13)` block in logitech_hidpp.cpp —
+/// so the re-probe would look up "" and no key is the empty string.
 inline const logitech_quirks* find_logitech_quirks(
         const hidpp_device_info& info) {
-    const std::string mid = logitech_compose_model_id(info);
-    if (auto q = find_logitech_quirks(mid))
-        return q;
-    if (info.model_id != mid)
-        return find_logitech_quirks(info.model_id);
-    return nullptr;
+    return find_logitech_quirks(logitech_compose_model_id(info));
 }
 
 // ── Capability normalisation (feature-derived) ───────────────────────────────

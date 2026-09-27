@@ -178,7 +178,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 195 test groups, 33851 runtime assertions covering: algorithms, JSON round-trips,
+- 198 test groups, 33862 runtime assertions covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -275,7 +275,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33851 assertions, 195 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (33862 assertions, 198 groups) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -335,6 +335,20 @@ compute sample staleness). Design keeps the hot path lock-free:
   `input_offset`. Covered by `test_classic_legacy_in_cap_boundary()` and the
   `k1_legacy_in_*` oracle cases; the NaN guard for `cap.x < input_offset` (BUG-9)
   and the `cap.x == 0` 0/0 guard are asserted in the same test.
+- **Logitech quirks keying is exact-match on a 12-char modelId**: `find_logitech_quirks()`
+  has NO short-key/prefix/substring matching. The table's `"32"` row (G522) is a
+  single model *byte*, not a model id, so it is unreachable — measured: over all
+  16 transport-flag combinations x both response-size cases the composed id is
+  only ever `""` or 12 chars. This is a PARKED decision (FIX_LOG.md O31-H2 —
+  "gerçek 12-char id doğrulanmadan yazılmaz"), not an oversight: resolving it
+  needs the physical G522. The row is kept (deleting it would silently widen
+  what may be written) and `test_logitech_quirks_model_id_shape()` is the guard
+  rail — it fails if the id parsing ever changes so a short key becomes
+  reachable, so the decision is revisited instead of the row quietly mattering.
+  A "short-key fallback" loop that used to sit in the lookup was removed as dead
+  code: its match condition was a strict subset of the loop above it, proven
+  identical over 1,510,738 inputs including an exhaustive sweep of every 1-4
+  char string.
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment
