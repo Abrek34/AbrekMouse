@@ -1904,6 +1904,37 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
   - "push sonrası 'Daemon reloaded.' (reload değil)" → **yanlış**: `Daemon reloaded.` yalnız `cmd_reload()` içinde, `daemon_reload_via_any_path()` `sent` döndürdüğünde basılıyor (`cli/main.cpp:1806-1813`); push yolu `cmd_reload()`'ı çağırmıyor. Satır 338 ve 382'deki yorumlar eski yalanın **kaldırıldığını** belgeliyor.
   Aynı sınıf, aynı gün: kayıt kodun gerisinde kalmış (O31-G3, O31-L1, O31-L2'den sonra 4.).
 
+**O31-L4 · KRİTİK · CLI-3 kendini-onarma bloğu, okuyamadığı profil verisini **yazarak yok ediyor** (CLI-3, `profiles` anahtarı dışındaki bir anahtarda veri taşıyan config)**
+- Konum: `cli/main.cpp:3163-3176` (CLI-3). `load_config(config_path)` `:3144` → hemen ardından, **komut yönlendirmesinden ÖNCE** `if (cfg.profiles.empty())` bloğu bir `default` profili uydurup `save_config()` çağırıyor.
+- Ölçüm — **gerçek derlenmiş `build-manual/rawaccel-cli` ile, uçtan uca:**
+
+| girdi (81 bayt) | komut | çıkış kodu | dosya sonrası | `profile_list` |
+|---|---|---|---|---|
+| `{"version":"1.2.3","active_profile":"x","profile_list":[{"name":"x","dpi":800}]}` | `list` | **0** | **2679 bayt** | **yok edildi** |
+| aynı | `show x` | 1 (`Profile not found`) | **2679 bayt** | **yok edildi** |
+| aynı | `list --json` | **0** | **2679 bayt** | **yok edildi** |
+
+  `list` **salt okunur** bir komut ve dosyayı yazıyor. 101 baytlık özgün veri, 2679 baytlık varsayılan config ile değiştiriliyor.
+- **Kök neden ölçüldü (pozitif kontrol):** CLI-3 bloğu `if (false)` ile devre dışı bırakılıp **yeniden derlendi** → `list`/`show x` dosyayı **81→81 bayt** bırakıyor, `profile_list` sağlam. Yani suçlu tek başına CLI-3. Aynı PC meşru davranışı da düşürdü (`delete` son profili → `list` → 0 profil, kendini onarmıyor), yani **CLI-3'ü kaldırmak regresyondur** — düzeltme *daraltma* olmalı.
+- Neden bu hata K1'in dışında: K1 yanlış **tipte** `profiles` anahtarını reddediyor. Burada `profiles` **yok**; veri **farklı bir anahtarda** duruyor ve `j.contains("profiles")` `:720`'de false olduğu için hiç okunmuyor. AJ2'nin §2 gerekçesi ("anahtar yoksa silinecek profil zaten yok") **eksik**: parser'ın gözünde profil yok, ama **dosyada veri var**.
+- Gerçekçi tetikleyiciler: şema yeniden adlandırma (bu kod tabanı zaten yeniden adlandırma yapıyor — `migrate_lookup_gain`, "renamed fields"), elle yazılmış yazım hatası, üçüncü bir aracın farklı anahtar yazması. K1'in yorumu da aynı yönü işaret ediyor: "a hostile client can push an arbitrarily large profiles" — düşman istemci `profiles` dışında bir anahtarla da veri gönderebilir.
+- **Ayırıcı ÖLÇÜLDÜ, tahmin değil:** `save_config` tam olarak 4 üst-düzey anahtar yazıyor — `version`, `active_profile`, `use_raw_input`, `profiles` (`src/config.cpp:753-761`) — ve `app_config` (`include/config.hpp:44-49`) tek dizi üyesi `profiles`. Yani **`profiles` dışında nesne dizisi tutan her anahtar tanımıyla yabancı veridir.** Kural: kendini-onarma yalnız `profiles` mevcut ve boş (`[]`) iken, ya da `profiles` yokken **hiçbir yabancı dizi anahtarı yoksa** çalışsın.
+- Not: `safe_save` `.bak` döndürdüğü için özgün veri `.bak`'ta **korunuyor** — bu yüzden "sessiz ve kalıcı" değil, "sessiz ve geri dönüşü zor". Yine de `list` komutunun dosya değiştirmesi kendi başına bir sözleşme ihlali.
+- Öneri: `cli/main.cpp:3163` öncesine ham JSON'u okuyup yukarıdaki ayırıcıyı uygula; yabancı dizi anahtarı varsa onarma yapma, bunun yerine `validate`'a yönlendiren bir uyarı bas. `cmd_validate` (`cli/main.cpp:775`) zaten ham JSON okuyor — aynı yardımcı oradan paylaşılabilir.
+- Durum: ⏸ **AÇIK — doğrulandı, düzeltilmedi.** `cli/main.cpp` hattı AJ2'ye devredildi (config-presets bağlamı, kilidi zaten açık). Kapı: düzeltme AJ2'den gelince `tests/run_tests.sh`'e gerçek binary'ye karşı kapı konacak (AJ1 hattı) — 3 komutun da (`list`/`show`/`list --json`) dosyayı **bayt bayt** değiştirmemesi, artı meşru `delete`→`list` kendini onarmasının çalışmaya devam etmesi.
+  - Beklenen pozitif kontrol: CLI-3 bloğu geri açılırsa kapı kırılmalı; `profile_list` senaryosu yine yazıyor olmalı.
+
+**O31-L5 · DÜŞÜK · "eksik alan → varsayılan" testi `dpi >= 0`a denk düşüyordu; sözleşmeyi ölçmüyordu (test zayıflığı)**
+- Konum: `tests/test_accel.cpp:2164` (kayıtta eski satır; düzeltmeden sonra `:2172-2173`)
+- Bulgu: `EXPECT(cfg.profiles[0].dev_cfg.dpi == 0 || cfg.profiles[0].dev_cfg.dpi >= 0);` — mantıksal olarak tam olarak `dpi >= 0`. 1, 800 ve 99999'u **hepsini** kabul ediyor, yani "varsayılana düştü" sözleşmesini hiç ölçmüyor. `load_config` bir gün varsayılanları uygulamayı bıraksa **sessizce geçer**.
+- İkinci hata: yorum "struct default (**0**)" diyordu. `include/config.hpp:26` → `int dpi = 800;`. Varsayılan 0 **değil**. Yorumu okuyup ifadeyi `dpi == 0`'a "düzelt"en biri **testi kırardı**.
+- Ölçülen ayrım: `dpi=1 / 800 / 99999` → eski ifade **GECER** (hepsi `>= 0`), sıkı ifade **FAIL**.
+- Pozitif kontrol — **ilk PC yanlış tasarlanmıştı, kayda geçti:** `json_get_int_safe(j["dpi"], 800)` → `1600` yaptım, 2 FAIL geldi ama **benim testim değil**, `:3271` ve `:7279`. Sebep: `if (j.contains("dpi"))` **eksik alanda hiç çalışmıyor** — PC yanlış yola bakmış. Doğru PC: eksik alanda `dp.dev_cfg.dpi = 0` yazmak (sanitize `:361` `if (dc.dpi < 1) dc.dpi = 1` → gözlenen 1 olur) → **1 FAIL, tam olarak `:2172`**, doğru bölümde. Eski ifade `dpi=1`'de GECER → kaçırırdı.
+- Düzeltme: sözleşmeyi doğrudan ifade ediyor — `dpi == device_config{}.dpi` ve `polling_rate == device_config{}.polling_rate`. Sabit değere pinlemek varsayılan yeniden ayarlanınca kırılır; aralık kontrolü fallback'i hiç ölçmez.
+- Durum: ✅ **DOĞRULANDI ve DÜZELTİLDİ** (`4d3dbcfb`). `src/config.cpp`'ye dokunulmadı. Kapılar: build 0 uyarı · **34037/34037** · oracle `RESULT: OK` · SIMD PASS · TR PASS.
+  - Aynı commit'te `AGENTS.md`'deki iki bayat sayı düzeltildi ("200 test groups, 33956 assertions" → 147 `test_` fonksiyonu / 210 `SECTION` / 34037 runtime iddiası / 1541 `EXPECT` kaynağı) ve "eksik alan → struct default" sözleşmesi karar listesine eklendi.
+  - AJ2'nin `:2141` referansı **15 satır kaymıştı**; sözleşme yorumu `:2156`'da, fonksiyon `test_config_error_paths()` (`:2135`).
+
 **Negatif teyid — bulgu değil (deneysel):** HIDPP C2 (`kde-fix-accel.sh` ilk çalıştırmada backup rotasyonu abort) ÜRETİLEMEDİ: `cp -a` (satır 48) backup'ı `ls` glob'undan ÖNCE yaratır → glob her zaman en az bir dosya eşleştirir, exit-2 senaryosu oluşmaz. Test: boş backup setinde betik geçti. Loglanmadı/üstlenilmedi.
 
 **Duplike / önceden üstlenilmiş (tekrar alınmadı):** CLI F1 = C-3 + C29-N3 (önceki tur); F2 = CFG-2 ([ALINDI: big-pickle]); F3 = CFG-3 (big-pickle); F4 output_dpi yüzü = CLI-2 (✅ big-pickle); F6 = CFG-4 (big-pickle); Config C2 grep'i "aktif profil" çakışması yok — yeni; HIDPP C1 = R4 L-3 (aj1); C5 = PKG-1 (✅); C6 = BS-12 (rapor:732).
