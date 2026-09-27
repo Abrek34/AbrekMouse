@@ -687,6 +687,36 @@ static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
     if (j.contains("use_raw_input") && j["use_raw_input"].is_boolean())
         cfg.use_raw_input = j["use_raw_input"].get<bool>();
 
+    if (j.contains("profiles")) {
+        // K1 (config-presets denetimi): a `profiles` key that is present but is
+        // not an array used to fall through the `is_array()` guard silently, so
+        // `cfg.profiles` stayed EMPTY while `active_profile` kept pointing at a
+        // name that no longer existed anywhere.  The next save — the daemon's
+        // ordinary reload->mutate->save cycle, or any mutating CLI command —
+        // then wrote `"profiles": []` and destroyed every profile in the file
+        // with no warning.  Measured: 3-profile / 7814-byte config collapsed to
+        // 103 bytes on 5 distinct malformations (string, object, number,
+        // non-object entries, missing key).
+        //
+        // This is the same administrative decision `require_number` already
+        // makes for the 12 accel_args scalars one screen above ("must not load
+        // half-correct acceleration math", P120-FAZ2) — T43-15 recorded that
+        // inconsistency for the scalar fields; the `profiles` array was the
+        // instance with the *destructive* outcome, so it gets the same policy.
+        //
+        // Throwing is safe for both callers: daemon.cpp:470-481 logs the reason
+        // and falls back to a synthetic default WITHOUT touching the file, and
+        // daemon.cpp:1866-1870 keeps the running config ("keeping current").
+        // Neither path writes, so a rejected config stays intact on disk.
+        //
+        // `null` is exempted: it is the common "unset" idiom and carries no
+        // profile data, so tolerating it cannot lose anything (an empty file
+        // saves back as an empty array — nothing to destroy).
+        const json& pj_arr = j["profiles"];
+        if (!pj_arr.is_array() && !pj_arr.is_null())
+            throw std::runtime_error(std::string("config field 'profiles' must be an array, got ")
+                                     + pj_arr.type_name());
+    }
     if (j.contains("profiles") && j["profiles"].is_array()) {
         // SEC-9: a hostile IPC client can push an arbitrarily large "profiles"
         // array (easy to craft, each entry ~1 KB) → unbounded memory growth in
@@ -696,7 +726,14 @@ static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
         // note above: the file path needs a far higher ceiling because dropping
         // there destroys the user's own profiles on the next save.
         for (auto& pj : j["profiles"]) {
-            if (!pj.is_object()) continue;
+            // K1: was `if (!pj.is_object()) continue;` — a silently skipped
+            // entry shifts every later profile's index, so `active_profile` and
+            // any per-device matching would bind to the WRONG profile.  Reject
+            // the whole config instead, naming the offending index.
+            if (!pj.is_object())
+                throw std::runtime_error("config field 'profiles[" +
+                    std::to_string(cfg.profiles.size()) +
+                    "]' must be an object, got " + pj.type_name());
             if (cfg.profiles.size() >= max_profiles) break;
             cfg.profiles.push_back(device_profile_from_json(pj));
         }
