@@ -153,9 +153,17 @@ reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
 because both sides reduce to 1^n with scale=1 exactly.  PRE-3 raised the apex
 `output_offset` to 1.0, which made the power identity row at speed 0 line up
 with the reference — `game_apex_power 0` was removed from the deviation list).
-The `io`-gain cap.y=0 rows are intentionally NOT listed: the reference emits
-NaN there and `NaN > tol` is never true, so they can never appear as a
-deviation — listing them would raise a stale-row error. Run this after
+Of the two `io`-gain `cap.y=0` grid families, only the **`p155_io_cap0_gain`**
+rows are intentionally NOT listed: the reference emits NaN there, `NaN > tol`
+is never true, so they can never appear as a deviation — listing them would
+raise a stale-row error. The sibling `p155_io_cap0_legacy` family is the same
+degenerate input and the same local result, but the reference returns a hard
+**0** instead of NaN, so those **12 rows ARE listed** (measured: ref=0 vs
+local 0.125893 at spd 0.001, 1 at spd 1, 7.94328 at spd 1000). Do not
+generalise the unlisted rule to all `cap.y=0` rows — measured over the grid,
+`known_deviations.txt` holds 67 rows in four classes (23 `classic_gain_exp_le1`
++ 9 `power`/`sync` at speed 0 + 23 `power_tinyexp_floor` + 12
+`p155_io_cap0_legacy`), each documented in that file's header. Run this after
 EVERY change to `include/accel-*.hpp`.
 
 ## Translation Coverage

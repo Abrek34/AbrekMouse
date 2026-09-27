@@ -2,7 +2,13 @@
 # RawAccel reference. Rows here are expected to differ; run_oracle.sh treats
 # only rows NOT in this list as drift. Format: <case-name>\t<spd>
 #
-# Deviation classes (both are documented port conventions with their own tests):
+# Deviation classes (four; all documented port conventions with their own tests).
+# The file currently holds 67 rows and they account for exactly:
+#   23 classic_gain_exp_le1 | 9 power/sync at spd 0 | 23 power_tinyexp_floor
+#   | 12 p155_io_cap0_legacy
+# If a new row is added here, document its class in this header — an
+# unexplained row reads as cruft, and the natural "cleanup" (delete it) turns
+# into a hard gate failure ("UNKNOWN mismatched rows") instead of a fix.
 #  1. classic *exp<=1* → the local port's "linear path" returns the constant
 #     gain 1+acceleration. The official reference keeps x^(exp-1), which
 #     explodes (e.g. gain ≈ 448 at speed 0.001 for exp=0.5) on the physical
@@ -23,6 +29,20 @@
 #     the SAME n), the reference evaluates the raw ep. Every speed in the band is
 #     a documented deviation; `power_tinyexp_floor` pins it (raw*_pX cases use
 #     exponents ≥ 0.3 so they never exercise the band).
+#  4. `p155_io_cap0_legacy` (12 rows) → `io` gain with the degenerate
+#     `cap.y = 0`. The local port returns the ordinary gain curve; the
+#     reference returns **0** for the whole speed range (measured:
+#     ref=0 vs local 0.125893 at spd=0.001, 1 at spd=1, 7.94328 at spd=1000),
+#     i.e. the reference kills all output on this input while the port does
+#     not. P155.
+#     The sibling family `p155_io_cap0_gain` is the SAME cap.y=0 input and the
+#     SAME local result, but the reference emits **NaN** there instead of 0 —
+#     measured, not assumed. Those 12 rows are therefore deliberately NOT
+#     listed: `NaN > tol` is never true, so they can never register as a
+#     deviation, and listing them would raise a stale-row error. Do not
+#     generalise this into "cap.y=0 rows are never listed" — half of them
+#     are, and those are the rows below. (AGENTS.md said exactly that and was
+#     wrong; corrected.)
 classic_gain_exp_le1	0.001
 classic_gain_exp_le1	0.005
 classic_gain_exp_le1	0.01
