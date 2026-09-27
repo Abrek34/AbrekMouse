@@ -1209,16 +1209,18 @@ Odak: `gui/*.inl` (12 dosya), `app_state.hpp`.
 Odak: `include/accel-*.hpp`, `include/presets.hpp`, `tests/oracle/oracle_cases.hpp`.
 
 **PRE-1 · ORTA · Oracle gaming case'i artık satın alınmayan eğriyi test ediyor (bayat)**
-- Konum: `tests/oracle/oracle_cases.hpp:262-268` (cap_y=1.5) vs `include/presets.hpp:42-43` (cap_y=1.8)
+- Konum: `tests/oracle/oracle_cases.hpp:269-275` (`:272` `x.cap_y = 1.8`) vs `include/presets.hpp:67-68` (`cap = { 15, 1.8 }`)
 - Kategori: Test altyapısı / kapsam
 - Açıklama: Blok başlığı "EXACT parameter values from include/presets.hpp" vaat ediyor. C-5 sonrası gerçek preset cap={15,1.8}; oracle case hâlâ 1.5. Referans çapraz kontrolü artık gerçek preset'in dizini ve 1.5→1.8 kuyruk bölgesini **hiç test etmiyor** — C-5'in asıl değiştirdiği şey tam olarak kapsam dışı kaldı.
 - Öneri: `game_gaming_classic` cap_y'yi 1.8'e güncelle; yorumu notla; oracle'ı yeniden koş.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ (FIX_LOG.md:108) — kayıt BAYATTI, iki satır yanlış gösteriyordu.** (a) `262-268` gaming case'inin aralığı **değil**: o aralık `game_fps_classic`'e ait (`:264` `x.cap_y = 1.8`); gaming case'i `:269-275`, `cap_y` `:272`'de. (b) `presets.hpp:42-43` cap'in tanımı **değil**, O31'in o hatayı düzelten yorum bloğu; tanım `:67-68`. Yukarıdaki "hâlâ 1.5" ve "Öneri" cümleleri düzeltme öncesini anlatıyor.
 
 **PRE-2 · ORTA · "precision" preset: limit 1.2 ama eğri 1.5'e zirve yapıyor**
-- Konum: `include/presets.hpp:60-72` (limit=1.2, cap yok) + `rawaccel-base.hpp:56` (varsayılan cap {15,1.5} out)
+- Konum: `include/presets.hpp:95-96` (limit=1.2) + `:112-113` (`cap = { 24, 1.2 }`) + `rawaccel-base.hpp:78` (`vec2d cap = { 15, 0 }` = **cap YOK**)
 - Kategori: Preset / UX
 - Açıklama: `limit` classic modda inert; GAIN out-modda asimptot `cap.y=1.5`. exp=1.5, accel=0.002 ile diz `gain_inverse(0.5,0.002,1.5,0) ≈ 55.6 ips`; 100 ips'te gain zaten ~1.41 — belgelenen "precision" 1.2 sınırının %25 üstü. Diğer classic presetler cap.y=limit uyumlu (gaming 1.8/1.8, cs2 1.6/1.6, fps 1.8/1.8); precision yalnız uyumsuz.
 - Öneri: `cap = {k, 1.2}` veya yanıltıcı `limit` alanını kaldır.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ (FIX_LOG.md:123 `cap={24,1.2}`, oracle mirror güncel) — kayıt BAYATTI ve dayandığı iki referans da yanlıştı.** (a) `presets.hpp:60-72` precision bloğu **değil**; `limit` `:95-96`, yeni `cap` `:112-113`. (b) `rawaccel-base.hpp:56` **boş bir satır** (enum ayırıcı) ve oradaki varsayılan `{15,1.5}` hiçbir zaman mevcut olmadı: gerçek struct varsayılanı `:78` → `{ 15, 0 }`, yani "cap YOK" (`accel-classic.hpp:33`, `cap.y == 0 → DBL_MAX`). Yukarıdaki "asimptot `cap.y=1.5`" argümanı **ölçülen gerçek değil**: düzeltme öncesi sızma `presets.hpp:108`'de ölçülmüş **3.4495** idi (beyan edilen 1.2'nin 2.87 katı), yorumun dediği 1.4969 değil.
 
 **PRE-3 · DÜŞÜK-ORTA · "apex" output_offset=0.9 platosu kendi yorumuyla çelişiyor (sub-1:1)**
 - Konum: `include/presets.hpp:119-139` (output_offset=0.9) + `accel-power.hpp:112-120`
@@ -2205,7 +2207,8 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Durum: AÇIK (2026-09-13 bulundu)
 
 **T36-CLI06 · DÜŞÜK · Help preset tablosu bayat (apex 0.9 + gaming/precision capsız)**
-- Konum: `cli/main.cpp:2751,2753,2757` vs `include/presets.hpp:42-43` (`gaming {15,1.8}` C-5), `:79-80` (`precision {24,1.2}` PRE-2), `:145-146` (`apex 1.0` PRE-3)
+- Konum: `cli/main.cpp:2751,2753,2757` vs `include/presets.hpp:67-68` (`gaming {15,1.8}` C-5), `:112-113` (`precision {24,1.2}` PRE-2), `:178-179` (`apex output_offset 1.0` PRE-3)
+  - satır düzeltmesi: üç preset referansı da yanlış satırı gösteriyordu — `42-43` cap tanımı değil O31'in düzeltme yorumu, `79-80` **office** presetinin `limit = 1.3`'ü (office bloğu `:72`'de başlıyor), `145-146` apex değil (`accel_y.mode = natural`). apex'in `output_offset = 1.0`'ı `:178-179`'da; apex'in fiilen bağlayan `cap.y`'i `:198-199` → `{ 28.0, 2.2 }` ve `limit` hiç atanmıyor (`:180-181`).
 - Kategori: Help parity
 - Açıklama: C-5/PRE-2/PRE-3 değerleri değiştirdi, tablo kalmış. CLI-B domain metinlerini hizalamıştı, preset tablosu unutulmuş.
 - Öneri: `gaming [15.0,1.8]`, `precision [24.0,1.2]`, `apex 1.0` yaz.
