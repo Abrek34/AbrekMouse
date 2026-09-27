@@ -395,6 +395,55 @@ PY
     fi
     echo "SEC-2 config-yolu kapısı (CLI): atlatma/sembolik bağ/uzantı/varsayılan yol ✓"
 
+    # ── O31-L4: CLI-3 kendini-onarma bloğu OKUNAMADIĞI profil verisini yazıyor ──
+    # `load_config` bir dosyada profil bulamazsa, komut YÖNLENDİRMESİNDEN ÖNCE
+    # (cli/main.cpp:3219) bir "default" profil uydurup save_config çağırıyordu.
+    # `save_config` tam dört üst-düzey anahtar yazar ve app_config'in tek dizi
+    # üyesi `profiles` olduğu için, `profiles` DIŞINDA bir anahtarda duran veri
+    # tanımıyla kaybolur.  Ölçülen veri kaybı: 80 baytlık `profile_list`
+    # configi üzerinde SALT OKUNUR `list` (rc=0) dosyayı 2679 bayta yazıp
+    # `profile_list`'i yok ediyordu; `show x` ve `list --json` de aynısıydı.
+    #
+    # Kapı iki yönlüdür: (a) yabancı anahtarda hiçbir komut dosyayı bayt bayt
+    # DEĞİŞTİRMEZ, (b) meşru `delete`-son-profil kendini onarması ÇALIŞMAYA
+    # DEVAM EDER — (b) olmadan (a)'yi "CLI-3'ü kaldır" diye sağlamak da mümkün.
+    TMPL4=$(mktemp --suffix=.json)
+    TMP_FILES+=( "$TMPL4" )
+    rm -f "$TMPL4"
+    python3 - "$TMPL4" <<'PY4'
+import sys
+open(sys.argv[1], 'w').write(
+    '{"version":"1.2.3","active_profile":"x",'
+    '"profile_list":[{"name":"x","dpi":800,"polling_rate":1000}]}')
+PY4
+    chmod 0644 "$TMPL4"
+    L4_BEFORE=$(wc -c < "$TMPL4")
+    L4_SUM=$(md5sum < "$TMPL4" | cut -d' ' -f1)
+    for L4_CMD in list show list --json; do
+        set +e
+        "$CLI" -c "$TMPL4" --no-daemon $L4_CMD >/dev/null 2>&1
+        set -e
+        L4_AFTER=$(wc -c < "$TMPL4")
+        L4_SUM2=$(md5sum < "$TMPL4" | cut -d' ' -f1)
+        if [ "$L4_BEFORE" != "$L4_AFTER" ] || [ "$L4_SUM" != "$L4_SUM2" ]; then
+            echo "FAIL: O31-L4 — '$L4_CMD' yabanci anahtarli configi degistirdi ($L4_BEFORE -> $L4_AFTER bayt); veri kaybi."
+            exit 1
+        fi
+    done
+    # meşru onarma: delete son profil -> list kendini kendine onarmali
+    printf '{"version":"1.2.3","active_profile":"x","profiles":[{"name":"x","dpi":800}]}' > "$TMPL4"
+    chmod 0644 "$TMPL4"
+    set +e
+    "$CLI" -c "$TMPL4" --no-daemon delete x >/dev/null 2>&1
+    "$CLI" -c "$TMPL4" --no-daemon list >/dev/null 2>&1
+    set -e
+    L4_N=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['profiles']))" "$TMPL4" 2>/dev/null || echo ERR)
+    if [ "$L4_N" != "1" ]; then
+        echo "FAIL: O31-L4 — meşru delete-son-profil kendini onarmadi (profiles=$L4_N, beklenen 1); CLI-3 yanlislikla kaldirilmis olabilir."
+        exit 1
+    fi
+    echo "O31-L4 kapısı: yabancı anahtar korunuyor + delete-son-profil onarımı çalışıyor ✓"
+
     # ── AYNI KOPYANIN daemon/ varyantı ──────────────────────────────────────
     # Kusur cli/main.cpp ve daemon/main.cpp'de BİREBİR aynıydı; yalnız CLI
     # kopyasını kapamak yetmezdi (pozitif kontrolle ölçüldü: daemon kopyasındaki

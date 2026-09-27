@@ -1929,7 +1929,19 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - **Ayırıcı ÖLÇÜLDÜ, tahmin değil:** `save_config` tam olarak 4 üst-düzey anahtar yazıyor — `version`, `active_profile`, `use_raw_input`, `profiles` (`src/config.cpp:753-761`) — ve `app_config` (`include/config.hpp:44-49`) tek dizi üyesi `profiles`. Yani **`profiles` dışında nesne dizisi tutan her anahtar tanımıyla yabancı veridir.** Kural: kendini-onarma yalnız `profiles` mevcut ve boş (`[]`) iken, ya da `profiles` yokken **hiçbir yabancı dizi anahtarı yoksa** çalışsın.
 - Not: `safe_save` `.bak` döndürdüğü için özgün veri `.bak`'ta **korunuyor** — bu yüzden "sessiz ve kalıcı" değil, "sessiz ve geri dönüşü zor". Yine de `list` komutunun dosya değiştirmesi kendi başına bir sözleşme ihlali.
 - Öneri: `cli/main.cpp:3163` öncesine ham JSON'u okuyup yukarıdaki ayırıcıyı uygula; yabancı dizi anahtarı varsa onarma yapma, bunun yerine `validate`'a yönlendiren bir uyarı bas. `cmd_validate` (`cli/main.cpp:775`) zaten ham JSON okuyor — aynı yardımcı oradan paylaşılabilir.
-- Durum: ⏸ **AÇIK — doğrulandı, düzeltilmedi.** `cli/main.cpp` hattı AJ2'ye devredildi (config-presets bağlamı, kilidi zaten açık). Kapı: düzeltme AJ2'den gelince `tests/run_tests.sh`'e gerçek binary'ye karşı kapı konacak (AJ1 hattı) — 3 komutun da (`list`/`show`/`list --json`) dosyayı **bayt bayt** değiştirmemesi, artı meşru `delete`→`list` kendini onarmasının çalışmaya devam etmesi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ (`ce29a14a`, AJ2) + KAPILANDI (AJ1, `run_tests.sh`).** Düzeltme: `cli/main.cpp:2767` `cli3_foreign_profile_key()` — `save_config`'in yazdığı dört üst-düzey anahtar (`version`/`active_profile`/`use_raw_input`/`profiles`) dışında **dolu dizi** tutan herhangi bir anahtar yabancı veridir; `:3221`'de onarım bu durumda **çalışmaz**, `:3225`'te belirsizlikte de **fail-closed**. Boş dizi elenir (veri taşımaz).
+  **AJ1'in bağımsız ölçümü (gerçek `build-manual/rawaccel-cli`):**
+
+| senaryo | sonuç |
+|---|---|
+| yabancı `profile_list` + `list` / `show x` / `list --json` | üçü de **80→80 bayt**, veri sağlam ✔ |
+| meşru `delete` son profil → `list` | kendini onarıyor → 1 profil `default` ✔ |
+| `profiles` hiç yok, yabancı da yok | onarıyor → 1 profil ✔ |
+| yabancı **boş** dizi (`"tags":[]`) | onarıyor ✔ (veri taşımaz) |
+| yabancı **dolu** dizi (`"tags":["a","b"]`) | onarmıyor ✔ (güvenli yön; dizi nesne değil ama muhafazakâr) |
+
+  Kapı iki yönlü: (a) yabancı anahtarda hiçbir komut dosyayı **bayt bayt** değiştirmemeli, (b) meşru `delete`→`list` onarımı çalışmalı — (b) olmadan (a)'yi "CLI-3'ü kaldır" diye sağlamak da mümkün.
+  İki pozitif kontrol **farklı iddiaları** kırdı: koruma switch'i kapatılınca `FAIL: … 'list' yabanci anahtarli configi degistirdi (100 -> 2679 bayt)`; CLI-3 tümüyle kaldırılınca `FAIL: … meşru delete-son-profil kendini onarmadi (profiles=0)`. Birbirini taşımıyorlar.
   - Beklenen pozitif kontrol: CLI-3 bloğu geri açılırsa kapı kırılmalı; `profile_list` senaryosu yine yazıyor olmalı.
 
 **O31-L5 · DÜŞÜK · "eksik alan → varsayılan" testi `dpi >= 0`a denk düşüyordu; sözleşmeyi ölçmüyordu (test zayıflığı)**
