@@ -33,6 +33,11 @@ STD="-std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter"
 INC="-I$ROOT/include -I$ROOT/src"
 
 # backend label : compiler flag
+#
+# These flags select the backend ONLY.  They are deliberately NOT the shipping
+# flag set: scripts/build.sh:92 adds -mfma (and build.sh:87 -O3 -march=native),
+# and comparing this gate's AVX2 build against the shipping one is NOT the same
+# question this gate answers.  See the -mfma note above BILINEN_OLUMLER below.
 BACKENDS=(
     "avx2:-mavx2"
     "sse2:-mno-avx2"
@@ -55,10 +60,61 @@ echo "=== SIMD backend parity ==="
 # Bir fonksiyonun hem CANLI hem kapisiz olmasi KAPIDIR (kirilmis sozlesme).
 BILINEN_OLUMLER="v2d_cmp_ge v2d_cmp_gt v2d_cmp_le v2d_cmp_lt v2d_direction v2d_fast_exp v2d_fast_exp2 v2d_fast_pow v2d_rotate v2d_sub"
 
-python3 - "$ROOT" "$BILINEN_OLUMLER" <<'PYEOF'
+# OLU listesi tek duz bir sey DEGIL; iki farkli karari tasiyor ve kararin
+# gerekcesi farkli.  Ilk gercek cagri geldiginde hangisinin "beklenen"
+# hangisinin "sürpriz" oldugunu bilmek icin ayrim yazildi.
+#
+#   (A) CANLI OZELLIGIN BAGLANMAMIS SIMD IKIZI — silme.
+#       rotate()/direction() SKALER hali math-vec2.hpp:66/:70'te yasiyor ve
+#       canli: rawaccel.hpp:329, :357, :508.  Bu ikizler o ozelligin SIMD
+#       surumu; baglanmadiklari icin oluler, silinirlerse ozelligin SIMD
+#       yolu sessizce kaybolur.
+#   (B) KARSILIGI OLMAYAN SPEKULATIF — istege bagli.
+#       Bunlarin canli bir skaler karsiliklari yok; ilk cagri geldiginde
+#       hangi sozlesmenin dogru oldugu OLCULEMEYE calisilir.
+DEAD_TWINS="v2d_direction v2d_rotate"          # (A) canli ozelligin ikizi
+DEAD_SPECULATIVE="v2d_cmp_ge v2d_cmp_gt v2d_cmp_le v2d_cmp_lt v2d_sub v2d_fast_exp v2d_fast_exp2 v2d_fast_pow"  # (B)
+# (A) ve (B) birlikte tam olarak BILINEN_OLUMLER olmali; ayrim duzeni degil,
+# karsi lastigi tutmaz.  Asagida denetlenir.
+
+# -mfma NOTU (olculerek yazildi, tahmin degil)
+# ------------------------------------------
+# Bu kapi -O2 -mavx2 derler; sevkiyat build.sh:92'de -mfma da ekler.  Yani
+# kapi, sevkiyatin DERLEMEDIGI bir AVX2 ikilisini karsilastiriyor.  Olcum:
+# simd_math.hpp'teki 15 disa vurdugu fonksiyonun tamami, 40x40 girdi cifti
+# uzerinde bit-bit karsilastirildi (16539 vaka).
+#
+#   kapi (-O2 -mavx2)  vs  sevkiyat (-O3 -march=native ... -mfma) : 140 ayrisma
+#   kapi (-O2 -mavx2)  vs  -O2 -mavx2 -mfma  (yalnizca FMA)        : 140 ayrisma
+#   kapi (-O2 -mavx2)  vs  -O3 -mavx2         (yalnizca -O3)       :   0 ayrisma
+#
+# Yani suclu -O3 DEGIL, -mfma: 140 ayrismanin TAMAMI v2d_rotate'da, diger
+# 14 fonksiyonda sifir.  Sebep fiziksel: FMA a*b+c'yi tek yuvarlamada yapar,
+# ara cifti korur; iki ayri yuvarlamada ayni ifade bakiye vermez.  v2d_rotate
+# tam olarak x*cx - vy*sy + x*sy + vy*cx yaziyor (simd_math.hpp:174-186).
+#
+# BUGUN canli bir bozulma YOK: v2d_rotate'in 0 cagrani var (olculdu, pozitif
+# kontrol: ayni arama v2d_mul'u rawaccel.hpp'de buluyor), ve canli rotasyon
+# yolu skaler math-vec2.hpp:66 rotate()'e gidiyor.
+#
+# Neden 4. bir backend eklenmedi: bu kapi bit-bit karsilastirir ve bu degeri.
+# avx2 ile avx2-fma'yi toleransli karsilastirmak abs(-0)=+0 farkini (1 ULP)
+# yutar -- yani v2d_abs sinifini KORLEMEZDI.  Ayni kaynagin iki derlemesini
+# karsilastirmak bu kapinin isi degil: kapi UC AYRI ELLE YAZILMIS uygulamayi
+# karsilastirir.  Bayraktaki farkin karsi onlemi tolerans degil, (A)/(B)
+# ayrimidir: etkilenen fonksiyon zaten oluler, ilk cagri geldiginde o olcumu
+# kendisi yapacak.
+
+python3 - "$ROOT" "$BILINEN_OLUMLER" "$DEAD_TWINS" "$DEAD_SPECULATIVE" <<'PYEOF'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
 olum_ilan = set(sys.argv[2].split())
+# Olu listesinin IKI KATEGORISI. Ikisi de kayittan ayrilir: (A) canli bir
+# ozelligin baglanmamis SIMD ikizi, (B) karsiligi olmayan spekulatif.  Bir
+# fonksiyon iki listeye de girerse ya da hicbirine girmese BIRIMI KIRILMISTIR
+# bir kayittir — o zaman karar sahibi listede yazmadan bu kapi kirmizi verir.
+ikiz = set(sys.argv[3].split())
+spekulatif = set(sys.argv[4].split())
 
 def koddan_yorum_cikar(s):
     out, i, n = [], 0, len(s)
@@ -100,9 +156,18 @@ for f in sorted(olum_ilan & kapsamli):
     hata.append(f"BAYAT liste girdisi: {f} — artık kapıda kapsanıyor, listeden çıkar")
 for f in sorted(olum_ilan & canli):
     hata.append(f"BAYAT liste girdisi: {f} — artık üretimde çağrılıyor; ya kapıya ekle ya da sil")
+# Iki kategorinin birbirini tutmasi: A ∪ B tam olarak BILINEN_OLUMLER olmali.
+for f in sorted(ikiz & spekulatif):
+    hata.append(f"ÇİFTE KATEGORİ: {f} — hem (A) canlı özelliğin ikizi hem (B) spekülatif; karar tektir")
+for f in sorted(ikiz | spekulatif):
+    if f not in olum_ilan:
+        hata.append(f"KATEGORİSİZ ÖLÜ: {f} — (A) veya (B) listesinde ama BILINEN_OLUMLER'de yok")
+for f in sorted(olum_ilan - (ikiz | spekulatif)):
+    hata.append(f"SONRASI BELİRTİLMEMİŞ ÖLÜ: {f} — BILINEN_OLUMLER'de ama (A)/(B) listesinde değil; silinsin mi kalsın mı kararı yaz")
 
 print(f"    envanter: {len(tanimli)} v2d_* · kapsamlı {len(kapsamli)} · "
-      f"canlı {len(canli)} · beyan edilmiş ölü {len(olum_ilan & tanimli)}")
+      f"canlı {len(canli)} · beyan edilmiş ölü {len(olum_ilan & tanimli)} "
+      f"(A canlı-özellik-ikizi {len(ikiz & tanimli)} · B spekülatif {len(spekulatif & tanimli)})")
 if hata:
     print("    !!! ENVANTER İHLALİ:")
     for h in hata: print(f"        {h}")
