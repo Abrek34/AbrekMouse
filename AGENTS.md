@@ -133,6 +133,30 @@ documented "just run the tests" path exercises all three backends. A host that
 cannot execute the AVX2 binary makes the gate exit 77, and `run_tests.sh` prints
 a loud `DİKKAT: SIMD parity ATLANDI` line rather than passing quietly.
 
+**The gate also audits its own coverage (envanter denetimi).** Comparing the
+backends only proves the functions somebody remembered to put in
+`tests/simd_parity.cpp` agree. It says nothing about a `v2d_*` that was added to
+`simd_math.hpp` and never called from the gate — and that is exactly the shape
+the original Y-axis bug had. So the gate now classifies every `v2d_*` in
+`simd_math.hpp` into one of three buckets and fails on a violation:
+
+- **KAPSAMLI** — appears in `simd_parity.cpp` **code** (comments are stripped
+  before counting, so a mention in a comment does not count as coverage)
+- **CANLI** — has a call site outside `simd_math.hpp` and outside `tests/`;
+  a CANLI function that is not KAPSAMLI **fails the gate**
+- **ÖLÜ** — neither; must be named explicitly in `BILINEN_OLUMLER` at the top of
+  `run_simd_parity.sh`, otherwise it fails as unclassified
+
+The dead list is self-maintaining in both directions: an entry that is deleted,
+becomes covered, or gains a production caller is reported as stale. Current
+inventory: **26 `v2d_*` — 16 covered, 8 live, 10 declared dead, 0 violations.**
+All ten dead ones are genuinely uncalled (verified by a positive control — the
+same search does find `v2d_mul` in `rawaccel.hpp`). `v2d_blend` and `v2d_hypot`
+were removed for the same reason plus a real divergence: `v2d_blend` read three
+different mask conventions across the three backends (AVX2 sign bit, SSE2 full
+bitmask, scalar truthiness), and no caller existed from which to derive the
+correct contract — see `simd_math.hpp:30-41`.
+
 **Rule:** any change to `include/simd_math.hpp` (or to the SIMD block in
 `include/rawaccel.hpp`) must be validated with all three of:
 
@@ -320,7 +344,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
 | `tests/run_tr_coverage.sh` | Translation coverage runner (exit 1 on MISSING) |
 | `tests/simd_parity.cpp` | SIMD backend parity + Y-axis survival regression (compiled once per backend) |
-| `tests/run_simd_parity.sh` | Runs `simd_parity.cpp` under AVX2/SSE2/scalar and diffs the three backends against each other |
+| `tests/run_simd_parity.sh` | Runs `simd_parity.cpp` under AVX2/SSE2/scalar and diffs the three backends against each other; also audits its own coverage — every `v2d_*` in `simd_math.hpp` must be covered by the gate, live in production, or named in `BILINEN_OLUMLER` (a live-but-uncovered one fails, and stale dead-list entries fail) |
 | `scripts/build.sh` | Quick build script |
 | `setup.sh` | Canonical one-shot installer (all deps + build + system install + KDE fix) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (build + tests + oracle + sanitizers + fuzz smoke) |

@@ -41,6 +41,81 @@ BACKENDS=(
 
 echo "=== SIMD backend parity ==="
 
+# ── Envanter denetimi (derlemeden once, hizli basarisiz) ─────────────────────
+# Bu kapı YALNIZCA simd_parity.cpp'de yazilmis v2d_* cagrilarini karsilastirir.
+# simd_math.hpp'ye yeni bir v2d_* ekleyip kapida cagirmazsan kapi YESIL kalir —
+# ve o fonksiyonun uc backend'i sessizce ayrisabilir. Orijinal AVX2 Y-ekseni
+# hatasi tam olarak bu yoldan gecti: hatayi yazan kapiya girdi, onu kullanmayan
+# yeni bir yol ekledi.
+#
+# Buradaki kural her v2d_* fonksiyonunu UC kategoriden birine sokar:
+#   1) KAPSAMLI  — simd_parity.cpp'de koda gorunuyor (yorum saymaz)
+#   2) CANLI     — simd_math.hpp ve tests/ disinda cagri yeri var  → 1 olmali
+#   3) OLU       — ne kapsamli ne canli; o zaman acikca beyan edilmeli
+# Bir fonksiyonun hem CANLI hem kapisiz olmasi KAPIDIR (kirilmis sozlesme).
+BILINEN_OLUMLER="v2d_cmp_ge v2d_cmp_gt v2d_cmp_le v2d_cmp_lt v2d_direction v2d_fast_exp v2d_fast_exp2 v2d_fast_pow v2d_rotate v2d_sub"
+
+python3 - "$ROOT" "$BILINEN_OLUMLER" <<'PYEOF'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+olum_ilan = set(sys.argv[2].split())
+
+def koddan_yorum_cikar(s):
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s.startswith("//", i):
+            j = s.find("\n", i); i = n if j < 0 else j
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2); i = n if j < 0 else j + 2
+        else:
+            out.append(s[i]); i += 1
+    return "".join(out)
+
+def v2d_adlari(kod):
+    return set(re.findall(r'\b(v2d_[a-z0-9_]+)\s*\(', kod))
+
+hdr_kod = koddan_yorum_cikar((root / "include/simd_math.hpp").read_text())
+par_kod = koddan_yorum_cikar((root / "tests/simd_parity.cpp").read_text())
+tanimli = v2d_adlari(hdr_kod)
+kapsamli = v2d_adlari(par_kod) & tanimli
+
+# Uretim cagri yerleri: simd_math.hpp'nin kendi tanimlari ve tests/ HARIC.
+canli = set()
+for d in ("include", "src", "daemon", "cli", "gui"):
+    for p in (root / d).rglob("*"):
+        if p.suffix not in (".cpp", ".hpp", ".inl"): continue
+        if p.name == "simd_math.hpp": continue
+        for f in v2d_adlari(koddan_yorum_cikar(p.read_text(errors="replace"))):
+            canli.add(f)
+canli &= tanimli
+
+hata = []
+for f in sorted(canli - kapsamli):
+    hata.append(f"CANLI ama kapısız: {f} — üretimde çağrılıyor, simd_parity.cpp'de yok")
+for f in sorted(tanimli - kapsamli - canli - olum_ilan):
+    hata.append(f"SINIFLANDIRILMAMIŞ: {f} — ne kapsamlı ne canlı; ya kapıya ekle ya da BILINEN_OLUMLER'e al")
+for f in sorted(olum_ilan - tanimli):
+    hata.append(f"BAYAT liste girdisi: {f} — simd_math.hpp'te artık tanımlı değil, listeden çıkar")
+for f in sorted(olum_ilan & kapsamli):
+    hata.append(f"BAYAT liste girdisi: {f} — artık kapıda kapsanıyor, listeden çıkar")
+for f in sorted(olum_ilan & canli):
+    hata.append(f"BAYAT liste girdisi: {f} — artık üretimde çağrılıyor; ya kapıya ekle ya da sil")
+
+print(f"    envanter: {len(tanimli)} v2d_* · kapsamlı {len(kapsamli)} · "
+      f"canlı {len(canli)} · beyan edilmiş ölü {len(olum_ilan & tanimli)}")
+if hata:
+    print("    !!! ENVANTER İHLALİ:")
+    for h in hata: print(f"        {h}")
+    sys.exit(1)
+print("    envanter denetimi: OK (her v2d_* kapsamlı, canlı ya da beyan edilmiş ölü)")
+PYEOF
+envanter_rc=$?
+if [ "$envanter_rc" -ne 0 ]; then
+    echo
+    echo "Sonuç: FAIL — v2d_* envanter denetimi (bkz. yukarı)"
+    exit 1
+fi
+
 # Does this host even have AVX2? On non-x86 hosts skip it rather than fail.
 have_avx2=1
 if ! echo 'int main(){return 0;}' | $CXX $STD -mavx2 -x c++ - -o "$TMP/avx2probe" 2>/dev/null; then
