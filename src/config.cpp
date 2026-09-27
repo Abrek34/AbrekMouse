@@ -661,7 +661,18 @@ static bool version_lt(const std::string& lhs, const std::string& rhs);
 
 /// Shared app_config ↔ JSON object conversion.  Both the file loader and the
 /// IPC config-push RPC go through these so the two never drift apart.
-static app_config app_config_from_json_obj(const json& j) {
+///
+/// `max_profiles` is the retained-entry ceiling, and the two callers MUST pass
+/// different values — they are not the same trust level:
+///   * `app_config_from_json` (the daemon's config-push RPC, the sole SEC-9
+///     threat) passes MAX_PROFILES: a hostile client must not be able to make
+///     a root daemon retain an arbitrarily large array.
+///   * `load_config` passes MAX_PROFILES_FILE: the config file is root-owned,
+///     so it carries the same trust as the binary reading it.  Truncating here
+///     was destructive — the dropped tail was made permanent by the next
+///     load->modify->save round trip, so a config with more than 256 profiles
+///     lost entries with no warning and no way to recover them.
+static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
     app_config cfg;
 
     // P43-BF1 (critical): read the schema version back from JSON. Without this,
@@ -679,11 +690,14 @@ static app_config app_config_from_json_obj(const json& j) {
     if (j.contains("profiles") && j["profiles"].is_array()) {
         // SEC-9: a hostile IPC client can push an arbitrarily large "profiles"
         // array (easy to craft, each entry ~1 KB) → unbounded memory growth in
-        // a root daemon.  Cap the count at MAX_PROFILES; extra entries are
-        // silently dropped (sanitize already tolerates malformed entries).
+        // a root daemon.  Cap the retained count at `max_profiles`; extra
+        // entries are dropped (sanitize already tolerates malformed entries).
+        // The bound is the caller's, NOT a single global constant — see the
+        // note above: the file path needs a far higher ceiling because dropping
+        // there destroys the user's own profiles on the next save.
         for (auto& pj : j["profiles"]) {
             if (!pj.is_object()) continue;
-            if (cfg.profiles.size() >= MAX_PROFILES) break;
+            if (cfg.profiles.size() >= max_profiles) break;
             cfg.profiles.push_back(device_profile_from_json(pj));
         }
     }
@@ -717,7 +731,10 @@ std::string app_config_to_json(const app_config& cfg) {
 
 app_config app_config_from_json(const std::string& json_str) {
     // device_profile_from_json already sanitizes each profile on the way in.
-    app_config cfg = app_config_from_json_obj(json::parse(json_str));
+    // SEC-9: the UNTRUSTED path — this is the daemon's config-push RPC, so the
+    // tight MAX_PROFILES bound applies and a hostile client's overflow is
+    // dropped (its data, not the user's).
+    app_config cfg = app_config_from_json_obj(json::parse(json_str), MAX_PROFILES);
     migrate_config(cfg);
     return cfg;
 }
@@ -725,7 +742,13 @@ app_config app_config_from_json(const std::string& json_str) {
 app_config load_config(const std::string& path) {
     std::ifstream f(path);
     if (!f.is_open()) throw std::runtime_error("Cannot open config file: " + path);
-    app_config cfg = app_config_from_json_obj(json::parse(f));
+    // TRUSTED path: the file is root-owned, so retain up to MAX_PROFILES_FILE
+    // rather than MAX_PROFILES.  A config with more than MAX_PROFILES entries
+    // (hand-edited, or written by another tool) used to be silently truncated
+    // here and the loss was then committed to disk by the next
+    // load->modify->save round trip.  Every write path still refuses to
+    // exceed MAX_PROFILES, so this ceiling only bounds a pathological file.
+    app_config cfg = app_config_from_json_obj(json::parse(f), MAX_PROFILES_FILE);
     migrate_config(cfg);
     return cfg;
 }
@@ -779,11 +802,23 @@ void save_config(const app_config& cfg, const std::string& arg_path) {
         // `::stat(...)` expression unwieldy, and O_PATH avoids needing read
         // permission on the target.  O_NOFOLLOW keeps the B3 symlink rule:
         // we only ever copy the mode of a path we could otherwise write.
+        //
+        // S_ISREG is required, not merely defensive.  O_PATH|O_NOFOLLOW opens a
+        // symlink's *inode* rather than following it, and a symlink inode's
+        // st_mode & 0777 is always 0777.  A dangling symlink at the config path
+        // (the portable-install case: settings.json -> /mnt/disk/settings.json
+        // with the disk unmounted) also makes fs::canonical() fail, so `path`
+        // keeps the raw string and this branch runs on the link itself.  Without
+        // the S_ISREG test the new config was then created 0755 under umask 022
+        // and 0777 under umask 000 — i.e. world-WRITABLE, which lets another
+        // local user edit the profile the root daemon reads.  Any non-regular
+        // file (symlink, dir, fifo, device) therefore keeps the 0600 default.
         struct stat pst = {};
         mode_t mode = 0600;
         int pfd = ::open(path.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
         if (pfd >= 0) {
-            if (::fstat(pfd, &pst) == 0) mode = pst.st_mode & 0777;
+            if (::fstat(pfd, &pst) == 0 && S_ISREG(pst.st_mode))
+                mode = pst.st_mode & 0777;
             ::close(pfd);
         }
         int fd = ::open(tmp_path.c_str(),

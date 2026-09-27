@@ -314,10 +314,23 @@ private:
     /// Find the HID++ transport and device index matching the given evdev mouse.
     /// Matches by serial number (Unifying receiver) or vendor:product (direct).
     /// Returns {transport_ptr, device_index} or {nullptr, 0xFF} if no match.
+    ///
+    /// PRECONDITION: the caller must hold hidpp_devs_mutex_.  This function
+    /// deliberately does not lock it itself — see the AB-BA note in its
+    /// definition in daemon.cpp.  The returned pointer is valid only while that
+    /// lock is held (the periodic rescan erases hidpp_transports_).
     std::pair<HidppTransport*, uint8_t> find_hidpp_transport(const mouse_device& dev) const;
 
     // Guards hidpp_devs_ and hidpp_transports_ against concurrent access from
     // hidpp_thread_ (poll_hidpp_notifications) and loop_thread_ (find_hidpp_transport).
+    //
+    // LOCK ORDER: hidpp_devs_mutex_ is the OUTER lock, devices_mutex_ the INNER
+    // one — never the reverse.  A path needing both must acquire them with
+    // std::scoped_lock, never by taking devices_mutex_ first and then reaching
+    // for hidpp_devs_mutex_.  The two live threads reach this pair in opposite
+    // orders (loop_thread_'s apply_active_app vs hidpp_thread_'s
+    // poll_hidpp_notifications), so inverting them dead-locks the daemon for
+    // good.  See the comment on find_hidpp_transport in daemon.cpp.
     mutable std::mutex hidpp_devs_mutex_;
 
     // Config push slot: filled by the IPC thread (push_config), consumed by the

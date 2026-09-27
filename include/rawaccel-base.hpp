@@ -26,6 +26,21 @@ inline constexpr size_t MAX_NAME_LEN         = 256;
 inline constexpr size_t LUT_RAW_DATA_CAPACITY = 514;
 inline constexpr size_t LUT_POINTS_CAPACITY  = LUT_RAW_DATA_CAPACITY / 2;
 inline constexpr size_t MAX_PROFILES         = 256; // SEC-9: bound config size (IPC memory DoS guard)
+/// Ceiling for the *file* loader.  SEC-9 guards a hostile IPC client, so the
+/// tight MAX_PROFILES cap belongs on `app_config_from_json` (its only caller is
+/// the daemon's config-push RPC) and NOT on `load_config`: the config file is
+/// root-owned, i.e. exactly as trusted as the binary reading it, and it has
+/// already been read into memory in full by the `json::parse(f)` above it, so a
+/// higher cap adds no new exposure.  Applying MAX_PROFILES to the file path
+/// instead meant a config with more than 256 profiles (hand-edited, or written
+/// by a different tool) was silently TRUNCATED in memory and the truncation was
+/// then made permanent by the next load->modify->save round trip — a real
+/// destroy-my-data bug, in a codebase that already fixed the identical forward
+/// loss for the `version` field (CFG-5).  Every write path (CLI create /
+/// duplicate / import / create-preset, GUI) still refuses to go past
+/// MAX_PROFILES with an explicit error, so 65536 is unreachable in normal use
+/// and only bounds a pathological root-owned file.
+inline constexpr size_t MAX_PROFILES_FILE    = 65536;
 inline constexpr double MAX_NORM             = 16;
 inline constexpr double NORMALIZED_DPI       = 1000;
 

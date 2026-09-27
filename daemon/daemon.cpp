@@ -930,7 +930,15 @@ bool AccelDaemon::setup_devices() {
             continue;
         }
 
-        if (prof) apply_profile(dev, *prof);
+        // AB-BA fix: apply_profile() -> find_hidpp_transport() requires
+        // hidpp_devs_mutex_ to be held by the caller.  No other lock is held
+        // here (the device is pushed into devices_ further below), so the
+        // HID++ lock is taken on its own — see the lock-order note in
+        // daemon.hpp.
+        {
+            std::lock_guard<std::mutex> lkh(hidpp_devs_mutex_);
+            if (prof) apply_profile(dev, *prof);
+        }
 
         // Register in epoll
         epoll_event ev{};
@@ -1062,7 +1070,14 @@ void AccelDaemon::apply_active_app() {
     // LIVE-DISABLE: a profile that the app-switch just enabled/disabled is
     // applied/released in place — a device switched to a disabled profile is
     // released immediately instead of staying grabbed until replug.
-    std::lock_guard<std::mutex> lk(devices_mutex_);
+    //
+    // AB-BA fix: apply_profile() -> find_hidpp_transport() needs
+    // hidpp_devs_mutex_, which hidpp_thread_'s poll_hidpp_notifications()
+    // holds while asking for devices_mutex_ — the opposite order.  Taking both
+    // atomically via scoped_lock (std::lock semantics: try, back off, retry)
+    // removes the cycle; a plain nested lock_guard here is what wedged both
+    // threads permanently.  See the lock-order note in daemon.hpp.
+    std::scoped_lock lk(hidpp_devs_mutex_, devices_mutex_);
     for (auto it = devices_.begin(); it != devices_.end();) {
         const device_profile* prof = find_profile(it->device_id);
         if (prof && prof->dev_cfg.disable) {
@@ -1112,7 +1127,25 @@ std::pair<HidppTransport*, uint8_t> AccelDaemon::find_hidpp_transport(const mous
 
     if (needle.empty()) return {nullptr, 0xFF};
 
-    std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+    // LOCK DISCIPLINE (AB-BA fix): this function does NOT take
+    // hidpp_devs_mutex_ — the caller must already hold it.  It used to lock
+    // itself, which made the daemon dead-lockable:
+    //
+    //   loop_thread_  apply_active_app : devices_mutex_ (:1065)
+    //                                  -> apply_profile -> HERE -> hidpp_devs_mutex_
+    //   hidpp_thread_ poll_hidpp_notifications : hidpp_devs_mutex_ (:1669)
+    //                                  -> apply_hidpp_battery -> devices_mutex_ (:1586)
+    //
+    // i.e. two live threads acquiring the same pair in opposite order, which
+    // wedges BOTH of them permanently (the daemon then stops accelerating and
+    // stops hot-plugging until it is restarted).  The invariant is now that
+    // hidpp_devs_mutex_ is the OUTER lock and devices_mutex_ the INNER one, so
+    // no path ever holds devices_mutex_ while waiting for hidpp_devs_mutex_.
+    // Every apply_profile() call site therefore takes hidpp_devs_mutex_ (alone,
+    // or via scoped_lock together with devices_mutex_); apply_hidpp_battery()
+    // keeps taking devices_mutex_ itself because that is already the inner
+    // order.  scoped_lock's try-and-back-off makes the relative order of the
+    // two irrelevant, so a future site cannot reintroduce the inversion.
     for (const auto& hidpp_dev : hidpp_devs_) {
         bool match = false;
         if (!hidpp_dev.info.serial.empty()) {
@@ -1263,7 +1296,11 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
     // thread) never reads a half-updated config_.
     bool any_live = false;
     {
-        std::lock_guard<std::mutex> lk(devices_mutex_);
+        // AB-BA fix — same reason as in apply_active_app(): the apply_profile()
+        // below reaches find_hidpp_transport() (hidpp_devs_mutex_), which
+        // hidpp_thread_ holds while it waits for devices_mutex_.  scoped_lock
+        // takes both at once and cannot be part of a cycle.
+        std::scoped_lock lk(hidpp_devs_mutex_, devices_mutex_);
         config_ = new_cfg;
         config_hash_ = std::hash<std::string>{}(app_config_to_json(config_));
         for (auto it = devices_.begin(); it != devices_.end();) {
@@ -1306,7 +1343,9 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
             have_open = !devices_.empty();
         }
         if (have_open) {
-            std::lock_guard<std::mutex> lk(devices_mutex_);
+            // AB-BA fix — apply_profile() needs hidpp_devs_mutex_ (outer), and
+            // hidpp_thread_ takes devices_mutex_ (inner) while holding it.
+            std::scoped_lock lk(hidpp_devs_mutex_, devices_mutex_);
             static const device_profile identity{};
             for (auto& dev : devices_) apply_profile(dev, identity);
             log("Reload: no profile matched — re-applied identity to open devices (fast path).");
@@ -1476,7 +1515,14 @@ void AccelDaemon::do_hotplug_scan() {
         }
 
         // Apply per-device profile assignment (same logic as setup_devices)
-        if (prof) apply_profile(dev, *prof);
+        // AB-BA fix: apply_profile() -> find_hidpp_transport() requires
+        // hidpp_devs_mutex_ to be held by the caller; devices_mutex_ is not
+        // held yet here (the device is inserted below), so the HID++ lock
+        // stands alone.  See the lock-order note in daemon.hpp.
+        {
+            std::lock_guard<std::mutex> lkh(hidpp_devs_mutex_);
+            if (prof) apply_profile(dev, *prof);
+        }
 
         epoll_event eev{};
         eev.events  = EPOLLIN;

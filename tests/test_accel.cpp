@@ -5682,6 +5682,67 @@ static void test_syn_dropped_event_stream() {
 
 // ── Config edge cases ────────────────────────────────────────────────────
 
+static void test_config_profiles_over_max() {
+    SECTION("R10 — config: >MAX_PROFILES entries survive load→save (no silent data loss)");
+
+    // The file loader used to apply the SEC-9 cap (MAX_PROFILES = 256) to the
+    // config FILE as well as to the untrusted IPC push.  A config with more
+    // than 256 entries (hand-edited, or written by another tool) was therefore
+    // silently truncated in memory — and because every mutating path is
+    // load→modify→save, the next save made the loss PERMANENT on disk with no
+    // warning and no way to recover the tail.
+    //
+    // The two callers are not the same trust level and must not share a bound:
+    // the file is root-owned (as trusted as the binary reading it), whereas
+    // SEC-9 exists to stop a hostile config-push client.  So load_config takes
+    // MAX_PROFILES_FILE and app_config_from_json keeps MAX_PROFILES.
+
+    const size_t N = MAX_PROFILES + 44;   // 300 — the overflow this regressed on
+    std::string tmp = "/tmp/rawaccel_test_profiles_over_max.json";
+    {
+        std::ofstream f(tmp);
+        f << R"({"version":"1.1.0","active_profile":"p299","profiles":[)";
+        for (size_t i = 0; i < N; ++i) {
+            if (i) f << ',';
+            f << R"({"name":"p)" << i << R"(","device_id":"dev)" << i
+              << R"(","profile":{"speed_min":10,"speed_max":100}})";
+        }
+        f << "]}";
+    }
+
+    // (a) the file path must retain the whole array
+    app_config cfg = load_config(tmp);
+    EXPECT(cfg.profiles.size() == N);
+    if (cfg.profiles.size() == N) {
+        EXPECT(cfg.profiles[N - 1].name == "p" + std::to_string(N - 1));
+        EXPECT(cfg.profiles[0].name == "p0");
+    }
+
+    // (b) and the overflow must survive a save — this is the part that turned
+    //     the in-memory truncation into unrecoverable file loss
+    save_config(cfg, tmp);
+    app_config re = load_config(tmp);
+    EXPECT(re.profiles.size() == N);
+    if (re.profiles.size() == N)
+        EXPECT(re.profiles[N - 1].name == "p" + std::to_string(N - 1));
+
+    // (c) the SEC-9 memory bound must STILL hold on the untrusted IPC path.
+    //     100k entries is 100 MB of crafted JSON; the daemon must retain only
+    //     MAX_PROFILES of them.  This is the half of the fix that must not
+    //     regress into "we removed the cap".
+    std::string big = R"({"profiles":[)";
+    for (size_t i = 0; i < 100000; ++i) {
+        if (i) big += ',';
+        big += R"({"name":"p)" + std::to_string(i) +
+               R"(","profile":{"speed_min":10,"speed_max":100}})";
+    }
+    big += "]}";
+    app_config ipc = app_config_from_json(big);
+    EXPECT(ipc.profiles.size() == MAX_PROFILES);
+
+    std::remove(tmp.c_str());
+}
+
 static void test_config_empty_profiles() {
     SECTION("R10 — config: empty profiles array handling");
 
@@ -9059,6 +9120,7 @@ int main(int argc, char** argv) {
     test_speed_processor_smoothing();
     test_syn_dropped_reset_behavior();
     test_syn_dropped_event_stream();
+    test_config_profiles_over_max();
     test_config_empty_profiles();
     test_config_missing_active_profile();
     test_config_extreme_values();
