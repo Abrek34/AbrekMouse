@@ -1738,7 +1738,8 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Konum: `gui/ui_builder.inl:1474-1509` (idle görevi), `:960-1004` (destroy handler)
 - Açıklama: `kde_fix_finish` idle'ı `S->status_bar`/`S->kde_warn_bar`'a erişir; destroy handler GUI-O4 benzeri cancel-gate içermiyor (pkexec/hidpp/inotify/poll kaynakları kaldırılıyor, KDE fix için yok). Pencere destroy sonrası idle çalışırsa serbest widget'lara dokunur. S stack'ta olduğundan heap UAF değil, widget-yaşam döngüsü ihlali.
 - Öneri: `S->kde_fix_running` bayrağını destroy'da sıfırla + `kde_fix_finish`'te erken çıkış (GUI-O4/Y2 deseni).
-- Durum: `[ALINDI: opencode]` ⏸ ui_builder.inl kilidi (big-pickle DÜZELTİLDİ listesi) — kilit açılınca.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI.** Ölçüldü: `gui/ui_builder.inl:1048` `S2->window_destroyed = true;` ve `:1541` `if (S->window_destroyed) { delete t; return G_SOURCE_REMOVE; }` — guard mevcut.
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-G2 · ORTA · `rebuild_lut_list` `S->updating`'i mutlak sıfırlıyor (GUI A3)**
 - Konum: `gui/graph.inl:431-433,492`
@@ -1759,19 +1760,22 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Konum: `gui/ui_builder.inl:230-255`
 - Açıklama: `exponent_power` min 0.01 > floor 1e-4; `limit` min 0.1 > 0; `sync_speed` min 0.1 > 1e-4 → diskteki legal değerler yüklemede GtkRange'e tıraşlanır ve kayıtta bozulur. `scale` yüzeyi MATH-2 (config.cpp:408 scale≤0→0.01) ile uyumlu.
 - Öneri: Spin min'lerini floor'lara hizala.
-- Durum: `[ALINDI: opencode]` ⏸ ui_builder.inl kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI.** Dört spin'in **dördü de** hizalı, hepsi `O31-G4` etiketli yorumla: `:240` `make_spin(0.0001, …)` (exponent_power floor 1e-4) · `:241` `make_spin(0, …)` "sanitize floors limit at 0, not 0.1" · `:246` `make_spin(0.0001, …)` (sync_speed floor 1e-4) · `:411` `make_spin(0, …)` (Y ekseni limit).
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-G5 · DÜŞÜK · Grafik tıklama LUT ekleme `LUT_SPEED_SPIN_MAX` tavanından kaçıyor (GUI A9)**
 - Konum: `gui/ui_builder.inl:816-844` (tıklama) vs `gui/graph.inl:555-577` (`on_lut_add_point` BUG-NEW-51 clamp'lı)
 - Açıklama: Tıklama yolu speed'i pikselden üretir, 10000 üstü nokta saklanır; spin (0..10000) sonraki tick'te sessizce tıraşlar → yeniden yazım.
 - Öneri: Ortak clamp (`CLAMP(speed,0,LUT_SPEED_SPIN_MAX)`); `on_lut_add_point` mantığını tıklama yoluna da.
-- Durum: `[ALINDI: opencode]` ⏸ ui_builder.inl kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI.** Ölçüldü: `gui/ui_builder.inl:850` `constexpr double LUT_CLICK_SPEED_MAX = 10000.0;` ve `:851` `spd = std::min(spd, LUT_CLICK_SPEED_MAX);` — tavan uygulanıyor. (Not: sabit **yerelde** tanımlı, `LUT_SPEED_SPIN_MAX` değil; grep deseni `LUT_SPEED_SPIN_MAX` idi ve 0 döndü — yanlış ölçüm, sonradan yakalandı.)
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-G6 · INFO · `GtkFileDialog` unref'lenmiyor (GUI A10)**
 - Konum: `gui/profile_mgr.inl:504-508,565-570`
 - Açıklama: Her export/import dialogu oluşturuluyor, `g_object_unref` hiç çağrılmıyor → bellek birikimi.
 - Öneri: done callback'lerinde `g_object_unref(src)`.
-- Durum: `[ALINDI: opencode]` ⏸ profile_mgr.inl kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI.** Ölçüldü: `gui/profile_mgr.inl:510` ve `:559` `g_object_unref(dlg);` — iki dialog da unref'leniyor. Dosya nesneleri de unref'li (`:514`, `:525`, `:563`, `:574`).
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-C1 · DÜŞÜK · classic GAIN `cap_mode::in` `cap.x>=input_offset` clamp'ından yoksun (Config C1)**
 - Konum: `include/accel-classic.hpp:158-163` (in dalı) vs `:125` (io BUG-7), `:97` (legacy in)
@@ -1783,25 +1787,29 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Konum: `src/config.cpp:182-200` (parse), `:336-355` (`sort_lut_data`)
 - Açıklama: `a.length` gerçek parse edilen çift sayısına daraltılmıyor; eksik girişler (0,0) öne sıralanır → o bantta gain 0 = ölü imleç; serialize aynı bozuk 200'ü yeniden yazar.
 - Öneri: Parse sonrası `a.length = 2*n_pairs_parsed` (nokta sayısıyla hizala).
-- Durum: `[ALINDI: opencode]` ⏸ config.cpp kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI.** Ölçüldü: `src/config.cpp:221-227` — `O31-C2` yorumuyla `a.length = static_cast<int>((n / 2) * 2);`, yani `length` gerçekten parse edilen çift sayısına daraltılıyor. Yorum, kaydın gerekçesini birebir tekrarlıyor.
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-C3 · DÜŞÜK · `gain`/`raw_passthrough` sayısal 0/1 yok sayılıyor (Config C3)**
 - Konum: `src/config.cpp:122-123,252-253`
 - Açıklama: `"gain":0` (sayısal) varsayılan `true`'ya düşer (intent tersi); `"raw_passthrough":1` kapalı kalır. Sayısal alanlarda tip guard varken bu ikisi is_boolean eleği.
 - Öneri: `is_number_integer` 0/1 kabul (`v.get<int>() != 0`).
-- Durum: `[ALINDI: opencode]` ⏸ config.cpp kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI, ayrıca satırları da kaymıştı.** Kayıt `:122-123,252-253` diyor; gerçek yerler `:132-137` (gain) ve `:281-288` (raw_passthrough) — `:122-123` artık mod ayrıştırma, `:252-253` `speed_processor` serileştirme. Düzeltme tam kaydın önerisiyle aynı: `is_number_integer() && (get<long long>()==0 || ==1)`.
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-C4 · INFO · `active_profile` cap 256 vs isim 255 → hiç eşleşmez (Config C4)**
 - Konum: `src/config.cpp:242-246,615-616`
 - Açıklama: İsim 255'e kesilir, `active_profile` 256'ya izin verir → elle yazılmış 256-karakter aktif profil eşleşemez, daemon ilk profile düşer.
 - Öneri: Her iki tarafta aynı kesme (CFG-6 ile simetrik düzeltilir).
-- Durum: `[ALINDI: opencode]` ⏸ config.cpp kilidi; CFG-6 (big-pickle) aynı dosya/tema — çakışmayı önlemek için kilit açılınca birlikte.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ — kayıt BAYATTI, ve "CFG-6 engel" de kalkmış.** Üç cap'in **üçü de** `MAX_NAME_LEN` (256): `src/config.cpp:271` `strncpy(p.name, s.c_str(), MAX_NAME_LEN)` + `:275` konvansiyonel NUL · `:633` `dp.name = json_get_string_limited(j["name"], "", MAX_NAME_LEN)` · `:686` `cfg.active_profile = json_get_string_limited(j["active_profile"], "default", MAX_NAME_LEN)`.  tampon `include/rawaccel-base.hpp:122` `char name[MAX_NAME_LEN + 1]` — 256 + NUL sığar. CFG-6 `ca163631`'da uygulanmış, yani kaydın "çakışmayı önlemek için birlikte" notu bayattı.
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-C5 · INFO · Symlink'li config yolu save'de normal dosyaya dönüşür (Config C5)**
 - Konum: `src/config.cpp:730` (O_PATH|O_NOFOLLOW), `:779` (rename)
 - Açıklama: Symlink mevcutsa nendi mode 0600 varsayılan; rename symlink'in kendisini değiştirir → dotfiles/`~/.config`→`/etc` yönlendirmesi kalıcı bozulur, sessiz.
 - Öneri: B3 kuralını koru; symlink tespitinde `readlink` ile hedef mode/owner kopyala ya da en azından uyar.
-- Durum: `[ALINDI: opencode]` ⏸ config.cpp kilidi.
+- Durum: ✅ **KAYIT BAYATTI — ve bu bir *bug* değil, bir *karar*.** Ölçüldü: `src/config.cpp:797-798` symlink politikasını açıkça yazıyor, `:804` `fs::path canon = fs::canonical(arg_path, ec_canon);` kullanılıyor; `:840-845` "dangling symlink" durumunu da kasten belgeliyor. Kayıt bir eksiklik raporluyor, kod ise **kararı** uyguluyor. Etiketten de çıkarıldı.
+  Kayıt↔kod köprüsü 22 commit bayat kalmıştı: `⏸` etiketini `ca163631` (12 Eyl 01:40) yazdı, kodu `170c5e14` (12 Eyl 23:34, **22 saat sonra**) düzeltti ve tracker'a **hiç dokunmadı** — oysa düzeltici kayıt ID'sini koda yorum olarak yazmıştı. Sınıf: **kayıt↔kod bağı hiç kapatılmıyor.**
 
 **O31-H1 · ORTA · `write_onboard_profile_sector` 18 param 16 sınırıyla her zaman reddedilir (HIDPP A1)**
 - Konum: `src/logitech_hidpp.cpp:2179-2207` (`write_onboard_profile_sector`, chunk at `:2193`) — asıl sınır `:747` (`param_len > HIDPP_SHORT_PAYLOAD_MAX`); isimli sabitler `include/logitech_hidpp.hpp:85-111`; koruma testi `tests/test_accel.cpp:814` `test_hidpp_short_payload_budget()`
