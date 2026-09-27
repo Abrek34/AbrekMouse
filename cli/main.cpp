@@ -2744,8 +2744,48 @@ static int cmd_hidpp_set_lod(const std::vector<std::string>& args) {
 
 // ── Help ──────────────────────────────────────────────────────────────────────
 
-static void print_help() {
-    std::cout <<
+/// O31-L4 — decide whether CLI-3's "recreate the default profile" repair may run.
+///
+/// The repair rewrites the whole file through save_config, which emits exactly
+/// four top-level keys (`version`, `active_profile`, `use_raw_input`,
+/// `profiles` — src/config.cpp).  `app_config` has exactly one array member
+/// (include/config.hpp), so **every other array of objects in the file is data
+/// this binary does not understand but would destroy.**  A config written by an
+/// older/renamed schema (measured: an 81-byte file whose only profile lived
+/// under `profile_list`) loads as an empty profile list; the repair then turned
+/// it into a 2679-byte file holding a single `default`, and a read-only `list`
+/// did it.
+///
+/// Returns:
+///   1  no foreign array key  -> repair is safe
+///   0  foreign array key     -> `foreign` set to the first offending key
+///  -1  could not determine   -> caller must NOT repair (fail closed)
+///
+/// Fails closed on purpose: refusing the repair leaves a profile-less config
+/// reporting no profiles (the pre-CLI-3 symptom, recoverable by hand), while
+/// running it destroys whatever the unrecognized key held.
+static int cli3_foreign_profile_key(const std::string& path, std::string& foreign) {
+    foreign.clear();
+    std::ifstream f(path);
+    if (!f.is_open()) return -1;              // load_config() already succeeded, so this is odd — fail closed
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(f); }
+    catch (const std::exception&) { return -1; }
+    if (!j.is_object()) return -1;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string& k = it.key();
+        if (k == "version" || k == "active_profile" || k == "use_raw_input" || k == "profiles")
+            continue;
+        // An empty array carries no data, so it cannot make the repair lossy.
+        if (it.value().is_array() && !it.value().empty()) {
+            foreign = k;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void print_help() {    std::cout <<
 R"(rawaccel-cli v)" << VERSION << R"( — Raw Accel Linux
 
 Usage: rawaccel-cli [OPTIONS] <COMMAND> [ARGS...]
@@ -3160,7 +3200,32 @@ int main(int argc, char* argv[]) {
         // left active_profile dangling).  Mirrors the missing-file branch; a
         // read-only `list`/`show` on such a config now regenerates it rather
         // than reporting "no profiles".
-        if (cfg.profiles.empty()) {
+        //
+        // O31-L4: that repair is only safe when the emptiness is the ONE
+        // condition this block exists for.  It ran before command dispatch, so
+        // even a read-only `list`/`show`/`list --json` rewrote the file.  If
+        // the file has no `profiles` key at all but DOES carry another
+        // top-level array of objects (an older/renamed schema key — measured
+        // with an 81-byte `profile_list` config: `list` exited 0 and grew the
+        // file 81 -> 2679 bytes, destroying the only profile it held), the
+        // sanitizer saw an empty list while the FILE still held the data, and
+        // save_config's four top-level keys (src/config.cpp) overwrote it.
+        //
+        // `app_config` has exactly one array member (include/config.hpp), so by
+        // definition any other array of objects is foreign data.  Repair only
+        // when: `profiles` is present and empty (the delete case), or
+        // `profiles` is absent AND no foreign array key exists.  Narrowing, not
+        // removal — delete-last-profile must keep self-healing.
+        bool cli3_repair = cfg.profiles.empty();
+        std::string foreign;
+        if (cli3_repair) {
+            switch (cli3_foreign_profile_key(config_path, foreign)) {
+                case 1: break;                       // no foreign data — repair
+                case 0: cli3_repair = false; break;  // foreign data — do NOT
+                default: cli3_repair = false; break; // could not tell — do NOT
+            }
+        }
+        if (cli3_repair) {
             device_profile dp;
             dp.name = "default";
             dp.dev_cfg.dpi = 800;
@@ -3173,6 +3238,13 @@ int main(int argc, char* argv[]) {
                           << e.what() << "\n";
                 return 1;
             }
+        } else if (!foreign.empty()) {
+            // Loud, not silent: the user must know why the file is being
+            // reported as profile-less when the parser can see no 'profiles'.
+            std::cerr << "WARNING: '" << config_path << "' has no 'profiles' key but has '"
+                      << foreign << "' — NOT rewriting it, that array is not a "
+                      << "recognized profile list and would be lost.\n"
+                      << "  Fix the key name by hand, or run `rawaccel-cli validate`.\n";
         }
     }
 
