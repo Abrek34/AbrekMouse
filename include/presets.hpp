@@ -144,6 +144,24 @@ inline device_profile make_preset(const std::string& preset_name, const std::str
         dp.prof.accel_y.input_offset = 0.02;
         dp.prof.accel_x.output_offset = 1.0;
         dp.prof.accel_y.output_offset = 1.0;
+        // O31 (K2): `limit` burada HIC ATANMAMIS birakiliyordu, yani struct
+        // varsayilani 1.5 config'e yaziliyordu — ama fiilen baglayan cap.y
+        // 2.2.  Olcum (8 presetin tamami, 0.01..3000 ips taramasi):
+        //   apex  limit=1.50  cap.y=2.20  gercek azami kazanc 2.1998  → %46.7 sapma
+        // diger presetler bu konvansiyonu t utuyor:
+        //   gaming    limit 1.8 / cap.y 1.8 · precision 1.2 / 1.2
+        //   cs2       limit 1.6 / cap.y 1.6 · fps     1.8 / 1.8
+        //   valorant  limit 1.3 / cap.y 2.0 (limitin USTUNE bilerek cikiyor)
+        // yani apex tek ihlal eden.
+        // Calisma zamani etkisi YOK: `limit` yalnizca accel-natural.hpp tarafindan
+        // okunuyor (accel-power.hpp ve accel-classic.hpp icinde hic gecmiyor,
+        // olculdu), power modu cap.y'a bagli. Bu yuzden bu bir davranis hatasi
+        // degil, VERI BUTUNLUGU hatasi: yanlis sayi JSON'a yaziliyor ve
+        // gui/profile_mgr.inl:98'de `tr("limit")` ile KULLANICIYA gorunuyor.
+        // Ayni sekilde: accel-classic.hpp'de de limit okunmadigi icin
+        // gaming/precision/cs2/fps'in limit degeri de bildirimsel.
+        dp.prof.accel_x.limit = 2.2;
+        dp.prof.accel_y.limit = 2.2;
         dp.prof.accel_x.cap = { 28.0, 2.2 };
         dp.prof.accel_y.cap = { 28.0, 2.2 };
         dp.prof.accel_x.cap_mode_val = cap_mode::out;
