@@ -871,6 +871,23 @@ void save_config(const app_config& cfg, const std::string& arg_path) {
         if (fd < 0)
             throw std::runtime_error("Cannot write temp config: " + tmp_path +
                                      " (" + std::strerror(errno) + ")");
+        // K4 (config-presets denetimi): open(2) masks the mode argument with the
+        // process umask, so the "preserve the existing permission bits" contract
+        // above only ever held in one direction.  The shipped unit sets
+        // `UMask=0077` (scripts/rawaccel.service:60) and runs
+        // `rawaccel-daemon -c /etc/rawaccel/settings.json` (service:27), while
+        // setup.sh:288 creates that file with `cp` (0644 under the installer's
+        // umask) — so the daemon's very first save deterministically narrowed a
+        // 0644 config to 0600, and an admin's deliberate `chmod 644` was undone
+        // on the next save.  Measured: umask 0022 -> 0644, umask 0077 -> 0600,
+        // umask 0000 -> 0644; and `.bak` (the old inode) kept 0644 while the live
+        // config became 0600, so the two disagreed.
+        //
+        // fchmod applies the mode verbatim, after creation, with the umask out
+        // of the picture.  Best-effort: if it fails the file is still written
+        // with the umask-narrowed mode, which is the pre-existing (safe) side of
+        // the asymmetry — open() can only ever narrow, never widen.
+        (void)::fchmod(fd, mode);
         const char* p = content.c_str();
         size_t left = content.size();
         while (left > 0) {
