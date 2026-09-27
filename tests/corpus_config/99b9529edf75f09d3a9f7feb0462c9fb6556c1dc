@@ -1,1 +1,0 @@
-{"acofile":"default","profiles":[{"name":"default","dce_id":"","dpi":800,"polling_rate":1000,"profile":{"accel_x":{"mode":"classic","gain":true,"aname":"default","device_id":"","dpi":0,"pe":1000,"proficcel":{"x":12,"y":1.8},"cap_mode":"ott"},"acceldegrees_rotation":15,"degrees_snap":65,"s@eed_min":1,"speed_max":80}}]}

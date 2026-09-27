@@ -1,1 +1,0 @@
-{"acile":"a","profiles":[{"name":"a","dpi":8115,"polling_rate":1000,"profile":{"accel_x":{"mode":"nl","decay_rate":5.1,"limit":2},"accel_y":{"mode":"p","scal_power":1.5}}},{"name":"b","profile":{"accel_x":{"mode":"jump","smooth":0.5},"accel_y":{"motei":0.01,"sync_speed":5}}},{"name":"c","profile":{"accel_x":{"mode":"looku?","lut_points":[[5,1],[10,1.5],[20,2]]}}}]}

@@ -1,1 +1,0 @@
-{"avtice_profile":"a","profiles":[{"name":"a","dpi":1600,"polling_rate":1000,"profile":{"l_x":{"mode":"nmp","smooth":0.5,"scale":0.5,"exponent_power":0.1,"limit":2},"accel_y":{"mode":"pnwer","scale":[[0,1],[10,1.5],[20,2]]}}}]}

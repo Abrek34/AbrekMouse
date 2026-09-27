@@ -12,3 +12,15 @@ build/
 
 # E2E harness binary (tests/run_e2e.sh uretir) — R10-E2EBIN
 tests/e2e_harness
+
+# ── Fuzzer koşu girdileri (libFuzzer üretimi) ────────────────────────────────
+# tests/corpus_config/ ve tests/corpus_accel/ altındaki 40 onaltılık karakterli
+# dosya adları libFuzzer'ın "yeni birim" çıktısıdır: fuzher çalıştıkça birikir.
+# Elle yazılmış GERÇEK seed'ler (minimal.json, full_profile.json,
+# all_modes.json, extreme_values.json) .json uzantılıdır ve korunur.
+#
+# Bu diziler commit edilirse depo kalıcı olarak ~69 MB / 17.4k dosya şişer ve
+# her fuzzer koşusu yeni dosya daha ekler. AGENTS.md'deki "seed corpus" amacı
+# 4 gerçek seed ile zaten sağlanıyor.
+tests/corpus_config/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+tests/corpus_accel/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
