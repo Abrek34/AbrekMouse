@@ -675,6 +675,26 @@ static bool version_lt(const std::string& lhs, const std::string& rhs);
 static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
     app_config cfg;
 
+    // AJ4-K5 (config-presets denetimi, K1 ile AYNI sınıf): the K1 guard two
+    // screens below rejects a `profiles` key of the wrong type, but the ROOT
+    // itself was never type-checked.  `json::parse` happily accepts any valid
+    // JSON — `42`, `[...]`, `true` — and `j.contains(...)` returns false for a
+    // non-object rather than throwing, so every one of those fell through to a
+    // default-constructed config with ZERO profiles while the file on disk
+    // still held real ones.  The next save (daemon reload->mutate->save, or any
+    // mutating CLI command) then wrote `"profiles": []` and destroyed them —
+    // measured: a 3-profile array root loaded 0 profiles and rewrote 0.
+    //
+    // Reject (same policy and same caller-safety argument as K1: both callers
+    // log and fall back WITHOUT touching the file).
+    //
+    // `null` is exempted, for the same reason K1 exempts it: it is the common
+    // "unset" idiom and carries no profile data, so there is nothing for the
+    // next save to destroy.
+    if (!j.is_object() && !j.is_null())
+        throw std::runtime_error(std::string("config root must be an object, got ")
+                                 + j.type_name());
+
     // P43-BF1 (critical): read the schema version back from JSON. Without this,
     // cfg.version stays empty on every load, so migrate_config() re-runs
     // migrate_lookup_gain() on each load->save round trip, re-scaling stored

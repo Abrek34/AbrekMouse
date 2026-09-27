@@ -1,0 +1,99 @@
+# AJ4 config-presets ölçümü — 2026-09-28 02:06:11
+HEAD: 47be7e6d
+LANG=tr_TR.UTF-8  LC_ALL=C
+[derleme] exit=0 uyari=0
+
+=== POZITIF KONTROL (§4) ===
+PC-1 çöküş algılama : GEÇTİ  (vaka=selftest-segv durum=ÇÖKÜŞ (sinyal 11))
+PC-2 FAIL algılama  : GEÇTİ  (vaka=selftest-diff durum=FAIL)
+PC-3 kaynak doğrulama: GEÇTİ  (vaka=rt-file<maydosya> durum=FAIL)
+PC sonucu: 3/3 geçti  → ÖLÇÜM GEÇERLİ
+PC-4 serialize enjeksiyonu: GEÇTİ  (rc=1)
+    RESULT rt-preset-gaming FAIL 0 bayt fark | ALAN: accel_x.limit=1.800000->1.500000; accel_y.limit=1.800000->1.500000; 
+PC-4 yapısal denetim enjeksiyonu: GEÇTİ
+
+=== YAPISAL DENETIM: struct alani ↔ serialize / deserialize ===
+  accel_args: temiz (18 alan)
+  speed_args: temiz (5 alan)
+  profile: temiz (15 alan)
+  device_config: temiz (3 alan)
+  device_profile: temiz (5 alan)
+  app_config: temiz (4 alan)
+yapisal denetim sonucu: 0 sorun
+PC vakaları (ana koşudan çıkarıldı, PC bölümünde doğrulandı): selftest-segv, selftest-diff
+
+=== VAKALAR ===
+OK           rt-preset-gaming             RESULT rt-preset-gaming PASS 0 bayt fark
+OK           preset-gaming                RESULT preset-gaming PASS tum alanlar ayni
+OK           values-gaming                RESULT values-gaming PASS mode=classic gain=1 limit=1.8 cap=(15,1.8) cap_mode=out acc=0.005 expC=2 scale=1 expP=0.05 decay=0.1 mot=1.5 in_off=0 out_off=0 raw=0 out_dpi=1000 | vaat: limit==cap.y ✓
+OK           rt-preset-office             RESULT rt-preset-office PASS 0 bayt fark
+OK           preset-office                RESULT preset-office PASS tum alanlar ayni
+OK           values-office                RESULT values-office PASS mode=natural gain=1 limit=1.3 cap=(15,0) cap_mode=out acc=0.005 expC=2 scale=1 expP=0.05 decay=0.08 mot=1.2 in_off=0 out_off=0 raw=0 out_dpi=1000 | natural: limit okunur, cap
+OK           rt-preset-precision          RESULT rt-preset-precision PASS 0 bayt fark
+OK           preset-precision             RESULT preset-precision PASS tum alanlar ayni
+OK           values-precision             RESULT values-precision PASS mode=classic gain=1 limit=1.2 cap=(24,1.2) cap_mode=out acc=0.002 expC=1.5 scale=1 expP=0.05 decay=0.1 mot=1.5 in_off=0 out_off=0 raw=0 out_dpi=1000 | vaat: limit==cap.y ✓
+OK           rt-preset-disable            RESULT rt-preset-disable PASS 0 bayt fark
+OK           preset-disable               RESULT preset-disable PASS tum alanlar ayni
+OK           values-disable               RESULT values-disable PASS mode=noaccel gain=1 limit=1.5 cap=(15,0) cap_mode=out acc=0.005 expC=2 scale=1 expP=0.05 decay=0.1 mot=1.5 in_off=0 out_off=0 raw=1 out_dpi=1000 | mod=noaccel (limit/cap vaa
+OK           rt-preset-cs2                RESULT rt-preset-cs2 PASS 0 bayt fark
+OK           preset-cs2                   RESULT preset-cs2 PASS tum alanlar ayni
+OK           values-cs2                   RESULT values-cs2 PASS mode=classic gain=1 limit=1.6 cap=(18,1.6) cap_mode=out acc=0.004 expC=2 scale=1 expP=0.05 decay=0.1 mot=1.5 in_off=0 out_off=0 raw=0 out_dpi=1000 | vaat: limit==cap.y ✓
+OK           rt-preset-valorant           RESULT rt-preset-valorant PASS 0 bayt fark
+OK           preset-valorant              RESULT preset-valorant PASS tum alanlar ayni
+OK           values-valorant              RESULT values-valorant PASS mode=natural gain=1 limit=1.3 cap=(30,2) cap_mode=out acc=0.005 expC=2 scale=1 expP=0.05 decay=0.08 mot=1.2 in_off=0.02 out_off=0 raw=0 out_dpi=1000 | natural: limit okunur
+OK           rt-preset-apex               RESULT rt-preset-apex PASS 0 bayt fark
+OK           preset-apex                  RESULT preset-apex PASS tum alanlar ayni
+OK           values-apex                  RESULT values-apex PASS mode=power gain=1 limit=2.2 cap=(28,2.2) cap_mode=out acc=0.005 expC=2 scale=2.2 expP=0.8 decay=0.1 mot=1.5 in_off=0.02 out_off=1 raw=0 out_dpi=1000 | vaat: limit==cap.y ✓
+OK           rt-preset-fps                RESULT rt-preset-fps PASS 0 bayt fark
+OK           preset-fps                   RESULT preset-fps PASS tum alanlar ayni
+OK           values-fps                   RESULT values-fps PASS mode=classic gain=1 limit=1.8 cap=(20,1.8) cap_mode=out acc=0.005 expC=2 scale=1 expP=0.05 decay=0.1 mot=1.5 in_off=0.01 out_off=0 raw=0 out_dpi=1000 | vaat: limit==cap.y ✓
+OK           rt-app-file                  RESULT rt-app-file PASS 0 bayt fark | satir_a=620 satir_b=620
+OK           rt-app-mem                   RESULT rt-app-mem PASS 0 bayt fark
+OK           rt-zero-vs-missing           RESULT rt-zero-vs-missing PASS 0 bayt fark
+OK           rt-lut                       RESULT rt-lut PASS 0 bayt fark
+OK           rt-clamp                     RESULT rt-clamp PASS idempotans(2. tur vs 3. tur): 0 bayt fark | ilk turda degisen alanlar: dpi=999999->32000; polling_rate=1->125; output_dpi=0.500000->1.000000; lr_output_dpi_ratio=500.000000->100.0
+OK           mig-unknown                  RESULT mig-unknown PASS yuklendi; bilinmeyen alanlar: kok=DUSTU profil=DUSTU accel=DUSTU
+OK           mig-missing                  RESULT mig-missing PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-missing-profile          RESULT mig-missing-profile PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-missing-all              RESULT mig-missing-all PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-type-limit               RESULT mig-type-limit PASS RED: config field 'limit' must be a number, got string
+OK           mig-type-cap                 RESULT mig-type-cap PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-mode                RESULT mig-type-mode PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-gain                RESULT mig-type-gain PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-halflife            RESULT mig-type-halflife PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-raw                 RESULT mig-type-raw PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-dpi                 RESULT mig-type-dpi PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-active              RESULT mig-type-active PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-type-disable             RESULT mig-type-disable PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-unknown-mode             RESULT mig-unknown-mode PASS RED: unknown accel mode: 'clasic'
+OK           mig-unknown-capmode          RESULT mig-unknown-capmode PASS RED: unknown cap_mode: 'outt'
+OK           mig-profiles-type            RESULT mig-profiles-type PASS RED: config field 'profiles' must be an array, got string
+OK           mig-profiles-entry           RESULT mig-profiles-entry PASS RED: config field 'profiles[0]' must be an object, got number
+OK           mig-lut-overflow             RESULT mig-lut-overflow PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-dpi-overflow             RESULT mig-dpi-overflow PASS yüklendi (profiles=1, version='0.9.0')
+OK           mig-inf                      RESULT mig-inf PASS RED: [json.exception.out_of_range.406] number overflow parsing '1e999'
+OK           mig-version-corrupt          RESULT mig-version-corrupt PASS yüklendi (profiles=1, version='1.2.3')
+OK           mig-version-negative         RESULT mig-version-negative PASS yüklendi (profiles=1, version='1.2.3')
+OK           mig-broken-trunc             RESULT mig-broken-trunc PASS RED: [json.exception.parse_error.101] parse error at line 1, column 121: syntax error while parsing object - unexpected end of input; expected '}'
+OK           mig-broken-empty             RESULT mig-broken-empty PASS RED: [json.exception.parse_error.101] parse error at line 1, column 1: attempting to parse an empty input; check that your input string or stream contains the expected JSO
+OK           mig-broken-garbage           RESULT mig-broken-garbage PASS RED: [json.exception.parse_error.101] parse error at line 1, column 7: syntax error while parsing value - unexpected ','; expected '[', '{', or a literal
+OK           mig-broken-half              RESULT mig-broken-half PASS RED: [json.exception.parse_error.101] parse error at line 1, column 55: syntax error while parsing value - unexpected end of input; expected '[', '{', or a literal
+OK           mig-broken-nulls             RESULT mig-broken-nulls PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-broken-array             RESULT mig-broken-array PASS RED: config root must be an object, got array
+OK           mig-broken-number            RESULT mig-broken-number PASS RED: config root must be an object, got number
+OK           mig-root-array-profiles      RESULT mig-root-array-profiles PASS RED — dosya dokunulmaz: config root must be an object, got array
+OK           mig-nest-100                 RESULT mig-nest-100 PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-nest-1000                RESULT mig-nest-1000 PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-nest-5000                RESULT mig-nest-5000 PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-nest-20000               RESULT mig-nest-20000 PASS yüklendi (profiles=0, version='1.2.3')
+OK           mig-nest-100000              RESULT mig-nest-100000 PASS yüklendi (profiles=0, version='1.2.3')
+OK           rt-file:default.json         RESULT rt-file PASS KARARLILIK(A==B): 0 bayt fark | ilk-yazim orig==A: FARKLI | satir_orig=134 satir_A=159 | SEMANTIK: $.version EKLENDI; 
+OK           rt-file:settings.json        RESULT rt-file PASS KARARLILIK(A==B): 0 bayt fark | ilk-yazim orig==A: bayt-bayt esit | satir_orig=83 satir_A=83
+
+=== ÖZET ===
+  FAIL: 0
+  OK: 66
+  yapısal sorun: 0
+  PC: 4/4 geçti
+
+TOPLAM vaka=66  başarısız=0
