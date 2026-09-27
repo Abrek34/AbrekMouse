@@ -178,7 +178,9 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 200 test groups, 33956 runtime assertions covering: algorithms, JSON round-trips,
+- 147 `test_` functions / 210 `SECTION` groups, 34037 runtime assertions (the
+  runner's own count; the source has 1541 `EXPECT` sites — loops multiply them)
+  covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -275,7 +277,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33956 assertions, 200 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (147 functions / 210 `SECTION` groups, 34037 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -447,6 +449,19 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **IPC reload command**: `"reload\n"` via Unix socket schedules config reload (alternative to SIGHUP); GUI prefers IPC then falls back to SIGHUP
 - **NaN sanitization**: `sanitize_accel_args()` and `sanitize_profile()` replace all NaN/Inf double fields (including `output_dpi`) with safe defaults before range-clamping (NaN silently passes `<`/`>` comparisons)
 - **Version-stamped config migration**: every `save_config` stamps the current schema version; migration steps (`migrate_lookup_gain`, renamed fields) run only when a stored version is missing/stale — reloading a current file is a no-op (P43-BF1)
+- **A missing config field falls back to the STRUCT DEFAULT, not to 0**: the
+  defaults live in `device_config` (`include/config.hpp:24-28`, e.g. `dpi = 800`)
+  and `load_config` simply does not assign when `j.contains("dpi")` is false, so
+  "no key" and "key present but unusable" converge on the same value — which is
+  why the type guards above can degrade instead of throwing. The fallback test
+  asserted `dpi == 0 || dpi >= 0`, which is logically just `dpi >= 0`: it
+  accepted 1, 800 and 99999 alike and could not detect the defaults being
+  dropped, and its comment claimed the default was 0, which it is not. Any test
+  of "falls back to the default" must compare against `device_config{}` — a
+  literal pins the number and breaks when the default is retuned, a range
+  check does not test the fallback at all. Note `sanitize` can move the
+  observed value off the default (`if (dc.dpi < 1) dc.dpi = 1`), so a PC that
+  writes 0 for a missing field lands on 1, not 0.
 - **Config type guards**: on JSON load, scalar/string fields (`mode`, `gain`, `cap_mode`, `active_profile`, `use_raw_input`, `device_id`, `name`) are type-checked (`is_boolean`/`is_string` or a length-limited getter); `device_id` and `name` are capped at 256 chars; malformed types degrade to defaults instead of throwing (P54-B4)
 - **CLI config safety**: `safe_save` writes atomically with a `.bak` rotate (the previous config is rotated to `path.bak` before the atomic tmp+rename+fsync overwrite) and exits cleanly (no SIGABRT) on I/O errors; a missing command argument reports a targeted error; a trailing bare `-c` is reported; an existing-but-corrupt config is never overwritten (P42, P82-MED-2)
 - **CLI `--no-daemon` flag**: mutating commands (create, set, set-param, rename, duplicate, delete, import, create-preset) save the config locally and push it to the daemon by default; `rawaccel-cli --no-daemon` (or `--dry-run`) skips the daemon push so one-shot edits to a `-c /tmp/...` config never touch the live daemon config or /etc/rawaccel/settings.json. Apply later with `rawaccel-cli reload` (P82-CRIT-1)

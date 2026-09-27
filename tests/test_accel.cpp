@@ -2160,8 +2160,17 @@ static void test_config_error_paths() {
         app_config cfg = load_config(tmp);
         EXPECT(!cfg.profiles.empty());
         EXPECT(cfg.profiles[0].name == "x");
-        // DPI should fall back to struct default (0 — not yet overridden)
-        EXPECT(cfg.profiles[0].dev_cfg.dpi == 0 || cfg.profiles[0].dev_cfg.dpi >= 0);
+        // A missing field must fall back to the STRUCT DEFAULT, whatever that
+        // default happens to be.  Was `dpi == 0 || dpi >= 0`, which is
+        // logically just `dpi >= 0` — it accepted 1, 800 and 99999 alike, so
+        // it could not detect load_config() silently stopping to apply the
+        // defaults.  It also passed for the wrong reason: include/config.hpp:26
+        // is `int dpi = 800;`, not 0, so the old comment was factually wrong
+        // and anyone "correcting" the expression to match it (dpi == 0) would
+        // have broken the test.  Comparing against `device_config{}` states
+        // the real contract and survives the default being retuned.
+        EXPECT(cfg.profiles[0].dev_cfg.dpi == device_config{}.dpi);
+        EXPECT(cfg.profiles[0].dev_cfg.polling_rate == device_config{}.polling_rate);
         std::remove(tmp.c_str());
     }
 
