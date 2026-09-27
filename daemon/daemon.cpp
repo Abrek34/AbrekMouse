@@ -1101,7 +1101,8 @@ void AccelDaemon::apply_active_app() {
     rescan_needed_.store(true);
 }
 
-std::pair<HidppTransport*, uint8_t> AccelDaemon::find_hidpp_transport(const mouse_device& dev) const {
+std::pair<std::shared_ptr<HidppTransport>, uint8_t>
+AccelDaemon::find_hidpp_transport(const mouse_device& dev) const {
     std::string needle;
     // Check if device_id contains a serial number (format: usb:VVVV:PPPP:SERIAL)
     size_t serial_pos = dev.device_id.find_last_of(':');
@@ -1158,7 +1159,11 @@ std::pair<HidppTransport*, uint8_t> AccelDaemon::find_hidpp_transport(const mous
         if (match) {
             auto it = hidpp_transports_.find(hidpp_dev.hidraw_path);
             if (it != hidpp_transports_.end() && it->second && it->second->is_open()) {
-                return {it->second.get(), hidpp_dev.device_index};
+                // O31-D1: return the shared_ptr BY VALUE, not .get().  The
+                // caller may keep it after releasing hidpp_devs_mutex_ (the
+                // queued write path does), and the rescan erases map entries
+                // while the worker drains.
+                return {it->second, hidpp_dev.device_index};
             }
         }
     }
@@ -1174,33 +1179,45 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
 
     // Apply polling rate and DPI to Logitech HID++ hardware if available.
     //
-    // O31-D1: both calls below block on USB round-trips (worst case derived from
-    // the timeouts: 2.6 s + 3.2 s = 5.8 s per device) and we are the motion loop
-    // thread holding devices_mutex_ AND hidpp_devs_mutex_.  Push only the fields
-    // this device's hardware has not already been told about, so a config edit
-    // that touches no hardware field — or a SIGHUP that re-loads a byte-identical
-    // file — no longer walks the blocking path.  See hidpp_hw_sync for the
-    // sentinel and transport-rebuild contract.
+    // O31-D1: both calls used to run HERE, inline, on the motion loop thread
+    // while it held devices_mutex_ AND hidpp_devs_mutex_.  They are USB
+    // round-trips whose worst case is derived from the timeouts: 2.6 s +
+    // 3.2 s = 5.8 s per device (11.6 s for two) — and that worst case is
+    // reached exactly when the device is NOT answering, i.e. precisely when a
+    // stall is least acceptable.  A 125 µs frame budget thread cannot pay it.
+    //
+    // The writes now go to hidpp_thread_'s queue (see drain_hidpp_writes);
+    // the reads already moved there in P171-BFIX.  Two consequences worth
+    // stating:
+    //   - The "Set polling rate to N Hz" log line now comes from the worker,
+    //     AFTER the write actually returned, so it reports a fact instead of
+    //     an intention.  Before, a timed-out write logged success if the
+    //     device answered late and failure if it did not — but the line was
+    //     emitted from the wrong thread at a moment unrelated to completion.
+    //   - The sentinel is marked at ENQUEUE, not at completion.  It must be:
+    //     plan_for() is the only dedup, so a burst of edits arriving while the
+    //     queue is still draining would otherwise enqueue one write per edit
+    //     for the same value.  The cost matches the pre-existing contract —
+    //     "record an attempt, not a success" (a transient failure is retried
+    //     only when the value changes, the profile is edited, or the mouse
+    //     replugs, and every attempt is logged).
     auto [transport, dev_idx] = find_hidpp_transport(dev);
     if (transport && dev_idx != 0xFF) {
-        const hidpp_hw_plan plan =
-            dev.hw_sync.plan_for(transport, dev.poll_rate, dev.dpi);
-        // Set polling rate on hardware
-        if (plan.polling_rate &&
-            !transport->set_polling_rate(static_cast<uint32_t>(dev.poll_rate), dev_idx)) {
-            log("Failed to set polling rate " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
-        } else if (plan.polling_rate) {
-            log("Set polling rate to " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
+        // Plan + mark in one step (hidpp_hw_plan_job), so there is no window
+        // in which a concurrent apply could read a stale sentinel and enqueue
+        // the same write twice.
+        hidpp_hw_job job = hidpp_hw_plan_job(dev.hw_sync, transport.get(),
+                                             dev.poll_rate, dev.dpi, dev_idx,
+                                             transport, dev.name);
+        if (job.enqueueable()) {
+            {
+                // Leaf mutex: no daemon mutex is taken while holding it, and
+                // no blocking write happens under it.
+                std::lock_guard<std::mutex> lk(hidpp_wq_mu_);
+                hidpp_hw_enqueue(hidpp_wq_, std::move(job));
+            }
+            hidpp_wq_pending_.store(true, std::memory_order_release);
         }
-        // Set DPI on hardware (if device supports it)
-        if (plan.dpi &&
-            !transport->set_dpi(static_cast<uint16_t>(dev.dpi), dev_idx)) {
-            log("Failed to set DPI " + std::to_string(dev.dpi) + " on " + dev.name, true);
-        } else if (plan.dpi) {
-            log("Set DPI to " + std::to_string(dev.dpi) + " on " + dev.name, true);
-        }
-        if (plan.any())
-            dev.hw_sync.mark_attempted(transport, dev.poll_rate, dev.dpi);
     }
 
     // O6: reference uses input_dpi_normalization_factor = NORMALIZED_DPI / dpi
@@ -1613,10 +1630,106 @@ void AccelDaemon::do_hotplug_scan() {
 /// endpoint as the mouse HID reports).
 void AccelDaemon::run_hidpp_worker() {
     while (running_.load()) {
+        // O31-D1: queued hardware writes FIRST, so a DPI/rate change is not
+        // stuck behind a notification drain (which can itself take up to its
+        // own timeout budget on a silent device).
+        drain_hidpp_writes();
         poll_hidpp_notifications();
         // Wake frequently so stop() joins promptly, while keeping the
         // hidraw I/O rate at poll_hidpp_notifications()' own 1–2 s cadence.
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        //
+        // O31-D1: when a write is queued, shorten the nap so the change lands
+        // in tens of ms instead of up to 200 ms.  This is a LATENCY hint only.
+        // The codebase uses no condition_variable (sticky-flag + sleep-poll
+        // convention), so a lost or late wakeup can cost one tick — it can
+        // never drop a job, because the queue itself, not the flag, is the
+        // source of truth.  drain_hidpp_writes() clears the flag only after
+        // finding the queue empty, so work enqueued during the drain is not
+        // left for a full 200 ms.
+        if (hidpp_wq_pending_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    // O31-D1: writes still queued at shutdown are deliberately NOT drained.
+    // Draining would add up to 5.8 s per device to stop(), and a write that
+    // never happened is harmless: the hardware keeps the last state it was
+    // given, and hw_sync is in-memory, so the next daemon start re-pushes
+    // (a fresh sentinel records 0/0, and plan_for()'s transport comparison
+    // short-circuits to {true,true} anyway).  Say so out loud rather than
+    // exiting quietly on work we knowingly dropped.
+    size_t dropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(hidpp_wq_mu_);
+        dropped = hidpp_wq_.size();
+    }
+    if (dropped)
+        log("HID++ write queue discarded at shutdown: " + std::to_string(dropped) +
+            " pending write(s) (device keeps its last rate/DPI; re-pushed on next start)", true);
+}
+
+/// O31-D1: perform the queued HID++ hardware writes.  Runs on hidpp_thread_
+/// only, so there is a single consumer and FIFO order is the order applies
+/// happened.
+///
+/// NO LOCK IS HELD ACROSS A WRITE.  That is the whole point: the previous code
+/// performed these round-trips while holding devices_mutex_ AND
+/// hidpp_devs_mutex_, which froze the motion loop for 5.8 s per device.  The
+/// job owns a shared_ptr to the transport, so neither mutex is needed to keep
+/// it alive — the daemon locks protect the CONTAINERS, and the write touches
+/// neither.
+///
+/// Bounded per pass: a queue that keeps refilling (a user dragging a slider
+/// across DPI values enqueues one job per apply) must not starve the
+/// notification poll in the same iteration.  One full pass is enough — each
+/// job is one device's worth of writes, and the next pass is 20 ms away.
+void AccelDaemon::drain_hidpp_writes() {
+    for (;;) {
+        hidpp_hw_job job;
+        {
+            std::lock_guard<std::mutex> lk(hidpp_wq_mu_);
+            if (!hidpp_hw_take(hidpp_wq_, job)) {
+                // Queue empty: clear the hint so the worker returns to its
+                // 200 ms cadence.  Done under the lock so a concurrent
+                // enqueue either lands before this and re-sets the flag, or
+                // after and sets it again — never lost in between.
+                hidpp_wq_pending_.store(false, std::memory_order_release);
+                return;
+            }
+        }
+        try {
+            // shared_ptr<void> → the concrete transport.  Safe by construction:
+            // the job is only ever built from a HidppTransport* (apply_profile),
+            // and the shared_ptr keeps that object alive across the cast.
+            auto tp = std::static_pointer_cast<HidppTransport>(job.transport);
+            if (job.do_polling_rate) {
+                if (tp->set_polling_rate(
+                        static_cast<uint32_t>(job.polling_rate), job.dev_idx)) {
+                    log("Set polling rate to " + std::to_string(job.polling_rate) +
+                        " Hz on " + job.dev_name, true);
+                } else {
+                    log("Failed to set polling rate " + std::to_string(job.polling_rate) +
+                        " Hz on " + job.dev_name, true);
+                }
+            }
+            if (job.do_dpi) {
+                if (tp->set_dpi(
+                        static_cast<uint16_t>(job.dpi), job.dev_idx)) {
+                    log("Set DPI to " + std::to_string(job.dpi) +
+                        " on " + job.dev_name, true);
+                } else {
+                    log("Failed to set DPI " + std::to_string(job.dpi) +
+                        " on " + job.dev_name, true);
+                }
+            }
+        } catch (const std::exception& e) {
+            // One device's bad write must not kill the worker (the thread body
+            // would request_stop() and take the whole daemon down with it).
+            log(std::string("HID++ write failed on ") + job.dev_name + ": " + e.what(), true);
+        } catch (...) {
+            log("HID++ write failed on " + job.dev_name + ": unknown exception", true);
+        }
     }
 }
 
@@ -1730,7 +1843,7 @@ void AccelDaemon::poll_hidpp_notifications() {
         for (auto& dev : hidpp_devs_) {
             auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
             if (!transport_ptr || !transport_ptr->is_open()) {
-                transport_ptr = std::make_unique<HidppTransport>(dev.hidraw_path);
+                transport_ptr = std::make_shared<HidppTransport>(dev.hidraw_path);
                 if (!transport_ptr->is_open()) continue;
                 transport_ptr->clear_feature_cache();
             }

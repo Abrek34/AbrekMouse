@@ -4,6 +4,7 @@
 #include <vector>
 #include <array>
 #include <deque>
+#include <memory>
 #include <functional>
 #include <cstddef>
 #include <cstdint>
@@ -577,6 +578,120 @@ struct hidpp_hw_sync {
         dpi          = dpi_written;
     }
 };
+
+// ── O31-D1: the HID++ WRITE path, moved off the motion loop thread ──────────
+// set_polling_rate() / set_dpi() are USB round-trips.  Their worst case is
+// derived from the timeouts (see hidpp_hw_sync): 3.2 s + 2.6 s = 5.8 s per
+// device, and that worst case is reached exactly when the device is NOT
+// answering.  Doing them in apply_profile() meant the motion loop thread held
+// devices_mutex_ AND hidpp_devs_mutex_ for 5.8 s per device (11.6 s for two)
+// — a total input freeze, on a thread whose whole job is 125 µs frames.
+// The reads already moved to hidpp_thread_ (P171-BFIX); the writes join them.
+//
+// WHY A QUEUE ITEM OWNS THE TRANSPORT (the subtle part):
+//   hidpp_transports_ is a map of unique_ptr that the periodic rescan ERASES
+//   (:1693 daemon.cpp) when a mouse is unplugged.  A raw HidppTransport* in a
+//   queue item would therefore dangle the moment an unplug raced the drain —
+//   the rescan's erase runs on this same worker thread, but stop()/teardown and
+//   any future re-scan path need not, and a dangling write to a freed hidraw
+//   handle is a use-after-free on a kernel fd.  So a job holds a
+//   std::shared_ptr<void> (HidppTransport* converts implicitly), and the
+//   drain then performs the blocking write with NO lock held at all.  The
+//   object dies only when the last holder releases: the map entry, or a queued
+//   job still in flight.
+//
+// LOCK ORDER (new invariant — keep hidpp_wq_mu_ a LEAF):
+//   hidpp_wq_mu_ guards only the deque.  It is never held while taking
+//   devices_mutex_ or hidpp_devs_mutex_, and never held across a blocking
+//   HID++ write.  apply_profile() takes it while already holding both daemon
+//   mutexes (fine — a leaf adds no cycle); the worker pops under it, releases,
+//   and only then writes.  Holding it during the write, or taking a daemon
+//   mutex under it, would reintroduce a stall for every other thread.
+
+struct hidpp_hw_job {
+    /// Keeps the transport alive past any rescan erase.  Typed void so this
+    /// header stays free of the HidppTransport definition (unit-testable, like
+    /// hidpp_hw_sync above).
+    std::shared_ptr<void> transport;
+    uint8_t               dev_idx = 0xFF;
+    int                   polling_rate = 0;
+    int                   dpi          = 0;
+    bool                  do_polling_rate = false;
+    bool                  do_dpi          = false;
+    std::string           dev_name;   // for the worker's log lines
+
+    /// A job with no transport, no device index, or nothing to write is not
+    /// worth enqueueing — and enqueueing it would make the queue grow on every
+    /// apply for a device that has no HID++ hardware at all.
+    bool enqueueable() const {
+        return transport && dev_idx != 0xFF && (do_polling_rate || do_dpi);
+    }
+};
+
+/// Append a job.  Returns false (and enqueues nothing) for a job that is not
+/// enqueueable, so callers can treat the sentinel mark as unconditional.
+inline bool hidpp_hw_enqueue(std::deque<hidpp_hw_job>& q, hidpp_hw_job&& job) {
+    if (!job.enqueueable()) return false;
+    q.push_back(std::move(job));
+    return true;
+}
+
+/// Pop the oldest job.  Strict FIFO, so per-device ordering is the order the
+/// applies happened: polling rate is written before DPI within one job, and
+/// two applies for the same device cannot interleave.
+inline bool hidpp_hw_take(std::deque<hidpp_hw_job>& q, hidpp_hw_job& out) {
+    if (q.empty()) return false;
+    out = std::move(q.front());
+    q.pop_front();
+    return true;
+}
+
+/// Build the COMPLETE job for this apply, and mark the sentinel — as ONE step,
+/// on purpose (O31-D1).
+///
+/// The sentinel is what deduplicates repeated applies, and with the write
+/// moved off the loop thread the two must be inseparable: if a caller marked
+/// after enqueueing, a second apply arriving in between would read a stale
+/// record and enqueue the same write twice, and a burst of edits (dragging a
+/// DPI slider) would queue one job per edit.  Folding the mark into the same
+/// function that builds the job makes that window unrepresentable, and lets
+/// the invariant be asserted directly:
+///
+///     job = hidpp_hw_plan_job(sync, t, rate, dpi, idx, transport);
+///     assert(hidpp_hw_enqueue(q, std::move(job)));
+///     assert(!hidpp_hw_plan_job(sync, t, rate, dpi, idx, transport).enqueueable());
+///
+/// `t` is the transport identity compared by hidpp_hw_sync (a pointer, never
+/// dereferenced) and `transport` the OWNING reference the job keeps — they
+/// are the same object, passed twice on purpose: hidpp_hw_sync predates the
+/// queue and compares a bare `const void*` so this header stays free of the
+/// HidppTransport definition, while a queued job must hold a reference that
+/// outlives hidpp_devs_mutex_.
+///
+/// The transport is a parameter, not something the caller attaches afterwards:
+/// an earlier draft returned a transport-less job and had the caller fill it
+/// in "if job.enqueueable()" — which is never true without a transport, so
+/// nothing was ever enqueued and the whole O31-D1 change was a silent no-op in
+/// production.  The returned job is complete and ready for hidpp_hw_enqueue().
+/// Returns a default (non-enqueueable) job when the device has nothing new to
+/// push, in which case the sentinel is left alone.
+inline hidpp_hw_job hidpp_hw_plan_job(hidpp_hw_sync& sync, const void* t,
+                                      int rate, int dpi, uint8_t idx,
+                                      std::shared_ptr<void> transport,
+                                      std::string name = {}) {
+    const hidpp_hw_plan plan = sync.plan_for(t, rate, dpi);
+    if (!plan.any()) return {};
+    sync.mark_attempted(t, rate, dpi);
+    hidpp_hw_job job;
+    job.transport        = std::move(transport);
+    job.dev_idx          = idx;
+    job.polling_rate     = rate;
+    job.dpi              = dpi;
+    job.do_polling_rate  = plan.polling_rate;
+    job.do_dpi           = plan.dpi;
+    job.dev_name         = std::move(name);
+    return job;
+}
 
 // ── High-level notification handler (SOLAAR FAZ-B / P168) ───────────────────
 

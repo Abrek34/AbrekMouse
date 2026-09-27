@@ -1007,6 +1007,182 @@ static void test_hidpp_hw_sync_guard() {
     }
 }
 
+// ── O31-D1: the queued HID++ write path ─────────────────────────────────────
+// The write moved off the motion loop thread, so the transport's lifetime has
+// to outlive hidpp_devs_mutex_: the rescan erases hidpp_transports_ entries
+// whenever a mouse is unplugged, and the queued job is drained afterwards.
+// These tests pin the three properties that makes safe.
+
+// 1) OWNERSHIP — the load-bearing one.  A job's transport survives the map
+//    entry it came from being erased, and is destroyed when the last holder
+//    lets go.  The second half matters as much as the first: "still alive"
+//    would also be true of a leak, and a leak is not a fix.
+static void test_hidpp_hw_queue_ownership() {
+    SECTION("job transport outlives the map entry (rescan erase)");
+    {
+        // Stands in for hidpp_transports_: path -> owning transport.
+        std::unordered_map<std::string, std::shared_ptr<void>> map;
+        std::weak_ptr<void> probe;
+
+        {
+            auto transport = std::make_shared<int>(42);
+            probe = transport;
+            map["/dev/hidraw3"] = transport;
+            EXPECT(map["/dev/hidraw3"].use_count() == 2);   // map + local
+        }                                                 // local drops
+        EXPECT(map["/dev/hidraw3"].use_count() == 1);       // map only
+
+        // This is find_hidpp_transport()'s return value, copied into a job.
+        hidpp_hw_job job;
+        job.transport = map["/dev/hidraw3"];
+        job.dev_idx   = 0x00;
+        job.do_dpi    = true;
+        job.dpi       = 800;
+        EXPECT(job.enqueueable());
+
+        // The periodic rescan erases the entry (daemon.cpp rescan: an unplugged
+        // mouse).  With unique_ptr this freed the object the job points at.
+        map.erase("/dev/hidraw3");
+        EXPECT(!probe.expired());                          // ← the guarantee
+        EXPECT(*static_cast<int*>(job.transport.get()) == 42);  // still usable
+
+        // ...and it is really an owning reference, not a leak that merely
+        // keeps memory alive.  Dropping the last holder must destroy it.
+        job.transport.reset();
+        EXPECT(probe.expired());
+    }
+}
+
+// 2) DEDUP — hidpp_hw_plan_job() plans and marks in one step, so a second
+//    apply for the same values cannot enqueue the same write again while the
+//    first is still queued.  This is the invariant the un-split version (mark
+//    after enqueue) would violate.
+static void test_hidpp_hw_queue_dedup() {
+    SECTION("same values twice -> exactly one job");
+    {
+        const void* t = reinterpret_cast<const void*>(0x1);
+        hidpp_hw_sync sync;                 // fresh, as a new mouse_device holds
+        std::deque<hidpp_hw_job> q;
+        auto transport = std::shared_ptr<void>(std::make_shared<int>(1));
+
+        hidpp_hw_job j1 = hidpp_hw_plan_job(sync, t, 1000, 800, 0x00, transport);
+        EXPECT(j1.enqueueable());
+        EXPECT(j1.do_polling_rate && j1.do_dpi);
+        EXPECT(hidpp_hw_enqueue(q, std::move(j1)));
+
+        // Second apply, identical values: nothing left to push.
+        hidpp_hw_job j2 = hidpp_hw_plan_job(sync, t, 1000, 800, 0x00, transport);
+        EXPECT(!j2.enqueueable());
+        EXPECT(!hidpp_hw_enqueue(q, std::move(j2)));
+        EXPECT(q.size() == 1);
+
+        // A real change is picked up, and only for the field that changed.
+        hidpp_hw_job j3 = hidpp_hw_plan_job(sync, t, 500, 800, 0x00, transport);
+        EXPECT(j3.enqueueable());
+        EXPECT(j3.do_polling_rate && !j3.do_dpi);
+        EXPECT(hidpp_hw_enqueue(q, std::move(j3)));
+        EXPECT(q.size() == 2);
+    }
+    SECTION("slider drag: N distinct values -> N jobs, never more");
+    {
+        // A user dragging a DPI slider generates an apply per intermediate
+        // value.  Each must queue exactly one job, and — the sharper claim —
+        // the queue must hold exactly N *writes*, not N jobs that each re-push
+        // both fields.  Job count alone would not catch a broken sentinel: a
+        // sentinel that never updates still yields one job per distinct value
+        // (the DPI differs every time) but doubles the USB round-trips, which
+        // is the cost O31-D1 exists to remove.
+        const void* t = reinterpret_cast<const void*>(0x2);
+        hidpp_hw_sync sync;
+        std::deque<hidpp_hw_job> q;
+        auto transport = std::shared_ptr<void>(std::make_shared<int>(1));
+        const int first = 400, step = 50, last = 1600;
+        const int n = (last - first) / step + 1;          // 25 applies
+        int enqueued = 0, writes = 0;
+        for (int dpi = first; dpi <= last; dpi += step) {
+            hidpp_hw_job j = hidpp_hw_plan_job(sync, t, 1000, dpi, 0x00, transport);
+            if (!j.enqueueable()) continue;
+            const int w = (j.do_polling_rate ? 1 : 0) + (j.do_dpi ? 1 : 0);
+            if (hidpp_hw_enqueue(q, std::move(j))) {
+                ++enqueued;
+                writes += w;
+            }
+        }
+        EXPECT(enqueued == n);
+        EXPECT(static_cast<int>(q.size()) == n);
+        // The first apply pushes rate + DPI; every later apply changes DPI
+        // only, so it costs one write.  Derived from n, not a literal: a
+        // hand-counted constant here is exactly the kind of number that goes
+        // stale when the drag range changes.
+        EXPECT(writes == 2 + (n - 1));
+        // Re-applying the final value adds nothing.
+        EXPECT(!hidpp_hw_plan_job(sync, t, 1000, last, 0x00, transport).enqueueable());
+        EXPECT(static_cast<int>(q.size()) == n);
+        EXPECT(writes == 2 + (n - 1));
+    }
+    SECTION("replug re-pushes both fields");
+    {
+        const void* t1 = reinterpret_cast<const void*>(0x1);
+        const void* t2 = reinterpret_cast<const void*>(0x2);
+        hidpp_hw_sync sync;
+        auto transport = std::shared_ptr<void>(std::make_shared<int>(1));
+        EXPECT(hidpp_hw_plan_job(sync, t1, 1000, 800, 0x00, transport).enqueueable());
+        EXPECT(!hidpp_hw_plan_job(sync, t1, 1000, 800, 0x00, transport).enqueueable());
+        // Different transport = hardware state unknown again.
+        hidpp_hw_job j = hidpp_hw_plan_job(sync, t2, 1000, 800, 0x00, transport);
+        EXPECT(j.enqueueable());
+        EXPECT(j.do_polling_rate && j.do_dpi);
+    }
+}
+
+// 3) FIFO + rejection — ordering is what makes two applies for one device
+//    safe, and a job that is not enqueueable must not grow the queue.
+static void test_hidpp_hw_queue_fifo() {
+    SECTION("FIFO order preserved");
+    {
+        std::deque<hidpp_hw_job> q;
+        for (int i = 0; i < 5; ++i) {
+            hidpp_hw_job j;
+            j.transport = std::shared_ptr<void>(std::make_shared<int>(i));
+            j.dev_idx   = 0x00;
+            j.do_dpi    = true;
+            j.dpi       = 100 * (i + 1);
+            EXPECT(hidpp_hw_enqueue(q, std::move(j)));
+        }
+        EXPECT(q.size() == 5);
+        for (int i = 0; i < 5; ++i) {
+            hidpp_hw_job out;
+            EXPECT(hidpp_hw_take(q, out));
+            EXPECT(out.dpi == 100 * (i + 1));               // order, not set order
+            EXPECT(*static_cast<int*>(out.transport.get()) == i);
+        }
+        hidpp_hw_job out;
+        EXPECT(!hidpp_hw_take(q, out));                      // empty -> false
+    }
+    SECTION("non-enqueueable jobs are rejected and do not grow the queue");
+    {
+        std::deque<hidpp_hw_job> q;
+        auto live = std::shared_ptr<void>(std::make_shared<int>(1));
+
+        hidpp_hw_job no_transport;                 // no HID++ hardware at all
+        no_transport.dev_idx = 0x00; no_transport.do_dpi = true;
+        EXPECT(!no_transport.enqueueable());
+        EXPECT(!hidpp_hw_enqueue(q, std::move(no_transport)));
+
+        hidpp_hw_job bad_index;                    // 0xFF = "shell"/no device
+        bad_index.transport = live; bad_index.dev_idx = 0xFF; bad_index.do_dpi = true;
+        EXPECT(!bad_index.enqueueable());
+        EXPECT(!hidpp_hw_enqueue(q, std::move(bad_index)));
+
+        hidpp_hw_job nothing;                      // sentinel already current
+        nothing.transport = live; nothing.dev_idx = 0x00;
+        EXPECT(!nothing.enqueueable());
+        EXPECT(!hidpp_hw_enqueue(q, std::move(nothing)));
+
+        EXPECT(q.empty());                         // none of the three landed
+    }
+}
+
 // ── Test 1: noaccel ──────────────────────────────────────────────────────────
 
 static void test_noaccel() {
@@ -9813,6 +9989,9 @@ int main(int argc, char** argv) {
     test_logitech_quirks_model_id_shape();
     test_hidpp_short_payload_budget();
     test_hidpp_hw_sync_guard();
+    test_hidpp_hw_queue_ownership();
+    test_hidpp_hw_queue_dedup();
+    test_hidpp_hw_queue_fifo();
 
     // P114 BUG-A: a --filter that matched nothing silently reported "0/0 geçti"
     // + exit 0 (a typo hid the whole suite behind a green gate). No match is a

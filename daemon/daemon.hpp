@@ -306,7 +306,12 @@ private:
     // Paths of currently-identified Logitech hidraw devices with their
     // cached feature maps (post-replug cache is cleared + re-identified).
     std::vector<hidpp_device> hidpp_devs_;
-    std::unordered_map<std::string, std::unique_ptr<HidppTransport>> hidpp_transports_;
+    // shared_ptr, not unique_ptr (O31-D1): a queued HID++ write job holds its
+    // own reference, so an unplug that erases this map entry cannot dangle an
+    // in-flight write on a kernel hidraw fd.  The rescan at daemon.cpp:1693
+    // erases entries freely; with unique_ptr a queued job's pointer died with
+    // the entry.
+    std::unordered_map<std::string, std::shared_ptr<HidppTransport>> hidpp_transports_;
     double hidpp_rescan_ms_ = 0;    // next hidraw re-scan time
     double hidpp_drain_ms_  = 0;    // next notification drain time
 
@@ -321,9 +326,12 @@ private:
     ///
     /// PRECONDITION: the caller must hold hidpp_devs_mutex_.  This function
     /// deliberately does not lock it itself — see the AB-BA note in its
-    /// definition in daemon.cpp.  The returned pointer is valid only while that
-    /// lock is held (the periodic rescan erases hidpp_transports_).
-    std::pair<HidppTransport*, uint8_t> find_hidpp_transport(const mouse_device& dev) const;
+    /// definition in daemon.cpp.  Returns an OWNING reference (O31-D1): the
+    /// periodic rescan erases hidpp_transports_ entries, so a bare pointer was
+    /// only valid while that lock was held, and the queued write path outlives
+    /// the lock by design.  An empty shared_ptr means "no transport".
+    std::pair<std::shared_ptr<HidppTransport>, uint8_t>
+    find_hidpp_transport(const mouse_device& dev) const;
 
     // Guards hidpp_devs_ and hidpp_transports_ against concurrent access from
     // hidpp_thread_ (poll_hidpp_notifications) and loop_thread_ (find_hidpp_transport).
@@ -336,6 +344,33 @@ private:
     // poll_hidpp_notifications), so inverting them dead-locks the daemon for
     // good.  See the comment on find_hidpp_transport in daemon.cpp.
     mutable std::mutex hidpp_devs_mutex_;
+
+    // ── O31-D1: async HID++ hardware writes ───────────────────────────────
+    // apply_profile() no longer performs set_polling_rate()/set_dpi() inline.
+    // Those are USB round-trips whose worst case is 5.8 s per device (2.6 s
+    // DPI + 3.2 s rate, both hit exactly when the device is not answering),
+    // and the motion loop thread was paying it while holding devices_mutex_
+    // AND hidpp_devs_mutex_ — a full input freeze on a 125 µs frame budget.
+    // It now enqueues a hidpp_hw_job (see include/logitech_hidpp.hpp) and
+    // returns; hidpp_thread_'s drain performs the writes.
+    //
+    // LOCK ORDER: hidpp_wq_mu_ is a LEAF.  It guards the deque and nothing
+    // else — never held while taking devices_mutex_ or hidpp_devs_mutex_, and
+    // never held across a blocking HID++ write.  The enqueue side takes it
+    // while already holding both daemon mutexes, which is safe for a leaf; the
+    // drain pops under it, RELEASES, and only then writes.  Holding it across
+    // the write would stall every other thread exactly as badly as before, and
+    // taking a daemon mutex under it would add a second lock cycle.
+    //
+    // Following the codebase's sticky-flag + sleep-poll convention (the project
+    // uses no condition_variable anywhere): hidpp_wq_pending_ is a hint only —
+    // the worker's cadence shortens when it is set, and a lost wakeup costs at
+    // most one sleep tick, never a dropped job.  Correctness never depends on
+    // the flag, only latency does.
+    std::mutex                hidpp_wq_mu_;
+    std::deque<hidpp_hw_job>  hidpp_wq_;
+    std::atomic<bool>         hidpp_wq_pending_{false};
+    void drain_hidpp_writes();
 
     // Config push slot: filled by the IPC thread (push_config), consumed by the
     // loop thread.  push_cfg_ is fully parsed+sanitized before being stored, so
