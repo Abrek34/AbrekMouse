@@ -543,3 +543,48 @@ fi
 if ! bash tests/run_tracker_bridge.sh; then
     exit 1
 fi
+
+# ── SIMD backend parity kapısı ───────────────────────────────────────────────
+# Neden run_tests.sh'in İÇİNDE: AVX2 yolu üretimde çalışıyor
+# (scripts/build.sh + CMakeLists.txt `-march=native`; Haswell'den beri her
+# x86-64) ama BU koşucu `-march` vermiyor, yalnız SSE2'yi geziyordu.  Üretimi
+# vuran hata tam olarak bu boşluktan geçti: `v2d_store`/`v2d_get_y` lane 2
+# (sıfır dolgu lane) okuduğu için her AVX2 derlemesi Y bileşenine 0.0 yazdı
+# ve dikey fare hareketi sessizce ölüydü.  run_simd_parity.sh bu boşluğu
+# kapatıyordu ama yalnız CI'da ve elle çalışıyordu — AGENTS.md'de belgelenen
+# "bash tests/run_tests.sh" komutu AVX2'yi HİÇ çalıştırmıyordu.
+#
+# Ölçülen maliyet: 2710 ms (3 derleme + 3 koşum + 2 diff).  run_tests.sh'in
+# 35902 ms'ine %7.5 ekliyor.  Doğruluk bedelini ödüyor.
+#
+# exit 77 = konak AVX2 ikili dosyasını çalıştıramıyor (x86 dışı).  Bu da
+# SESSİZCE GEÇİŞ DEĞİLDİR: ne geçtiğini ne yapmadığını açıkça yazar ve
+# çalışmanın sonunda tekrar hatırlatır (SEC-2 emeli).  x86 olmayan bir katkıcıyı
+# bloklamamak için hata değildir — ama saklanmaz da.
+#
+# exit 1 (ayrışma/başarısızlık) ve beklenmeyen her çıkış kodu HATADIR.
+set +e
+bash "$ROOT/tests/run_simd_parity.sh"
+SIMD_RC=$?
+set -e
+case "$SIMD_RC" in
+    0)
+        echo "SIMD parity kapısı: AVX2/SSE2/skaler birebir aynı ✓"
+        ;;
+    77)
+        echo "UYARI: SIMD parity kapısı ATLANDI (exit 77) — bu konak AVX2'yi"
+        echo "       çalıştıramıyor.  Üretimde çalışan AVX2 yolu BU KOŞUDA"
+        echo "       denenmedi; AVX2'ye özgü bir hata burada görünmez."
+        echo "=== Sonuç: N/N geçti — DİKKAT: SIMD parity ATLANDI (konak AVX2 çalıştıramıyor) ==="
+        ;;
+    1)
+        echo "FAIL: SIMD backend parity — backend'ler farklı sonuç üretti"
+        echo "      (yukarıya bak: run_simd_parity.sh ayrışan satırları basar)"
+        exit 1
+        ;;
+    *)
+        echo "FAIL: SIMD parity kapısı beklenmeyen çıkış kodu: $SIMD_RC"
+        echo "      (run_simd_parity.sh yalnız 0 / 1 / 77 dönmeli)"
+        exit 1
+        ;;
+esac

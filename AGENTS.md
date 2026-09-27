@@ -83,10 +83,16 @@ sudo bash tests/run_e2e.sh          # exit 0 = pass, 1 = failed check, 77 = env 
 bash tests/run_tr_coverage.sh
 
 # SIMD backend parity: compile tests/simd_parity.cpp once per backend
-# (AVX2 / SSE2 / scalar), assert a Y-only input survives modifier::modify(),
-# then diff the three backends' numeric output against each other.
+# (AVX2 / SSE2 / scalar), assert a Y-only input survives modifier::modify()
+# AND the extreme-value/IEEE contract (see tests/simd_parity.cpp), then diff
+# the three backends' numeric output against each other.
 # Exit 0 = all pass AND agree; 1 = failure or backend mismatch; 77 = host
 # cannot run the AVX2 binary (skips gracefully).
+#
+# NOTE: run_tests.sh runs this gate internally, so the two commands below are
+# not independent — `bash tests/run_tests.sh` alone DOES cover all three
+# backends. Run it separately only to iterate on simd_math.hpp without paying
+# for the full 34k-assertion suite.
 bash tests/run_simd_parity.sh
 ```
 
@@ -108,12 +114,15 @@ hmin/hmax : reduce lanes 0,1 only (folding in the padding makes hmin 0.0)
 
 This exact mistake shipped once: `v2d_store`/`v2d_get_y` read lane 2, so every
 AVX2 build wrote `0.0` into the Y component and **vertical mouse movement was
-silently dead in the shipped daemon**. It reached production because
-`tests/run_tests.sh` has no `-march` flag, `tests/oracle/run_oracle.sh`
+silently dead in the shipped daemon**. It reached production because at the time
+`tests/run_tests.sh` had no `-march` flag, `tests/oracle/run_oracle.sh`
 deliberately drops `-march`, and CI sets `RAWACCEL_PORTABLE=1` — so all three
 exercised SSE2 only, while `CMakeLists.txt` / `scripts/build.sh` add
-`-march=native` and shipped AVX2. `tests/run_simd_parity.sh` now closes that
-gap and runs in CI.
+`-march=native` and shipped AVX2. `tests/run_simd_parity.sh` closed that gap;
+it now runs **inside `tests/run_tests.sh`** as well as standalone in CI, so the
+documented "just run the tests" path exercises all three backends. A host that
+cannot execute the AVX2 binary makes the gate exit 77, and `run_tests.sh` prints
+a loud `DİKKAT: SIMD parity ATLANDI` line rather than passing quietly.
 
 **Rule:** any change to `include/simd_math.hpp` (or to the SIMD block in
 `include/rawaccel.hpp`) must be validated with all three of:
@@ -124,7 +133,8 @@ bash tests/run_tests.sh              # SSE2-path unit/integration suite
 bash tests/oracle/run_oracle.sh      # differential vs official reference
 ```
 
-A green `run_tests.sh` alone does **not** mean the AVX2 path is correct.
+`run_simd_parity.sh` is the only one of the three that touches AVX2 or the
+scalar fallback, so it is the one to run first while iterating.
 
 # Expected output: "=== Sonuç: N/N geçti ===" (N/N passed)
 # Exits with code 1 if any FAIL line appears.
