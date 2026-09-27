@@ -392,16 +392,33 @@ static void modify_separate_simd(vec2d& in, speed_processor& sp,
     v2d v_dw = v2d_set(args.domain_weights.x, args.domain_weights.y);
     v2d v_abs_vel = v2d_abs(v2d_mul(v2d_mul(v_in, v_ips), v_dw));
     
-    // Store back for smoother
-    double abs_vel_arr[2];
-    v2d_store(abs_vel_arr, v_abs_vel);
-    
+    // Store back for the smoother.
+    //
+    // O31 (strict-aliasing): this used to be
+    //   double abs_vel_arr[2];
+    //   v2d_store(abs_vel_arr, v_abs_vel);
+    //   sp.calc_speed_separate(*reinterpret_cast<vec2d*>(abs_vel_arr), time);
+    //   ... apply(abs_vel_arr[0]) ... apply(abs_vel_arr[1])
+    // i.e. a `double[2]` written THROUGH a `vec2d&` and then read back through
+    // `double[]` — two different types for the same object, which is exactly
+    // what -Wstrict-aliasing=2 flags (the project's -Wall -Wextra gate does not,
+    // so the warning was latent).  `calc_speed_separate` mutates in place
+    // (`in.x = std::fabs(in.x)`), so the write and the read were both live.
+    //
+    // Not a misalignment bug: alignof(vec2d) == alignof(double[2]) == 8 and
+    // UBSan -fsanitize=alignment reports 0 violations on this path (AJ1, 3
+    // backends).  Using a real `vec2d` for the whole round trip removes the
+    // aliasing question entirely at zero cost — the compiler emits the same
+    // stores either way, which the oracle + parity gates confirm.
+    vec2d abs_vel;
+    v2d_store(&abs_vel.x, v_abs_vel);
+
     // Call speed processor (processes X/Y separately)
-    sp.calc_speed_separate(*reinterpret_cast<vec2d*>(abs_vel_arr), time);
-    
+    sp.calc_speed_separate(abs_vel, time);
+
     // SIMD acceleration evaluation - process X and Y together
-    double scale_x = 1.0 + (data.accel_x.apply(abs_vel_arr[0], args.accel_x) - 1.0) * args.range_weights.x;
-    double scale_y = 1.0 + (data.accel_y.apply(abs_vel_arr[1], args.accel_y) - 1.0) * args.range_weights.y;
+    double scale_x = 1.0 + (data.accel_x.apply(abs_vel.x, args.accel_x) - 1.0) * args.range_weights.x;
+    double scale_y = 1.0 + (data.accel_y.apply(abs_vel.y, args.accel_y) - 1.0) * args.range_weights.y;
     
     v2d v_scale = v2d_set(scale_x, scale_y);
     
