@@ -411,6 +411,31 @@ compute sample staleness). Design keeps the hot path lock-free:
   The round-trip is therefore a normalisation, not an identity — `from_bytes`
   returns `0x04` for a packet built with `0x48`. Asserted in
   `test_hidpp_short_payload_budget()`.
+- **Config-path policy is applied to the RESOLVED path, on every entry point**
+  (O31-S1): `validate_config_path()` lives in **two byte-identical copies** —
+  `daemon/main.cpp` and `cli/main.cpp` — and **both must stay in sync**. It runs
+  two steps: `resolve_config_target()` canonicalises the deepest existing
+  ancestor and re-appends the not-yet-created tail (so the check cannot be
+  fooled by `..` or a symlink, without requiring the target to exist), then
+  `check_config_path_policy()` applies the `.json` + `/proc/` `/sys/` `/dev/`
+  rules to that resolved path. The rules are **not** re-derived per call branch:
+  R5-S-9 applied them to the canonical path on the "file exists" branch and to
+  the *raw string* on the other one, so `-c /tmp/x/../../../dev/shm/a.json`
+  passed while the same target spelled directly was rejected — `stat()` resolves
+  the `..` components the raw string still contained.
+  It is called for **every** path, not only an explicit `-c` — `find_config_path()`
+  derives the default from `XDG_CONFIG_HOME`/`SUDO_USER`/`HOME`, and that path used
+  to skip validation entirely, so the same target was rejected with `-c` and
+  accepted via `XDG_CONFIG_HOME`. Only the "parent directory must exist" rule
+  stays exclusive to `-c` (`require_existing_parent`), because
+  `~/.config/rawaccel/` legitimately does not exist on first run.
+  Scope boundary: the policy is a *prefix* comparison and is not
+  path-component-aware, so a directory literally named `dev` under a user
+  directory is still allowed — same as before the fix; what the fix removed is
+  the bypass, not a policy change. Gated by the SEC-2 config-path block in
+  `tests/run_tests.sh` against the real binaries (both copies, checked
+  separately); traversal depth is computed and verified with `readlink -f`, and
+  a missing `/dev/shm` fails the gate rather than skipping it.
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment

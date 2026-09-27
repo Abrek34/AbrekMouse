@@ -172,26 +172,109 @@ static std::string resolve_config_path() {
 }
 
 /// Validate a user-supplied config path when the daemon runs as root.
+/// Resolve `path` as far as the filesystem allows: the deepest existing
+/// ancestor is canonicalised and the not-yet-created tail is re-appended, so a
+/// prefix check on the result can never be fooled by ".." or by a symlink hop
+/// — without requiring the target itself to exist.
+/// `target_exists` (optional) reports whether the FULL path already resolves.
+static bool resolve_config_target(const std::string& path,
+                                  std::string* out,
+                                  bool* target_exists = nullptr) {
+    if (path.empty()) return false;
+    if (target_exists) *target_exists = false;
+
+    char buf[PATH_MAX] = {};
+    if (realpath(path.c_str(), buf) != nullptr) {
+        *out = buf;
+        if (target_exists) *target_exists = true;
+        return true;
+    }
+
+    // Walk up until something resolves, remembering the tail we peeled off.
+    std::string head = path, tail;
+    for (;;) {
+        const size_t slash = head.find_last_of('/');
+        if (slash == std::string::npos) {
+            // Relative path with no directory part: resolve the CWD and re-join.
+            if (realpath(".", buf) != nullptr) {
+                *out = std::string(buf) + "/" + tail;
+                return true;
+            }
+            break;
+        }
+        const std::string last = head.substr(slash + 1);
+        head = (slash == 0) ? "/" : head.substr(0, slash);
+        if (!last.empty() && last != ".")
+            tail = tail.empty() ? last : (last + "/" + tail);
+        if (realpath(head.c_str(), buf) != nullptr) {
+            *out = buf;
+            if (!tail.empty()) {
+                if (out->back() != '/') *out += '/';
+                *out += tail;
+            }
+            return true;
+        }
+    }
+    *out = path;   // nothing on the way resolved — hand back what we were given
+    return true;
+}
+
+/// The ONE place the config-path policy lives, so it cannot drift per call
+/// branch again (see R5-S-9 below).  Takes an already-RESOLVED path.
+static bool check_config_path_policy(const std::string& canonical) {
+    if (canonical.size() < 5 ||
+        canonical.compare(canonical.size() - 5, 5, ".json") != 0) {
+        std::cerr << "[rawaccel] Config path '" << canonical
+                  << "' does not have a .json extension.\n";
+        return false;
+    }
+    for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
+        if (canonical.rfind(bad, 0) == 0) {
+            std::cerr << "[rawaccel] Config path '" << canonical
+                      << "' is in a disallowed directory.\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Returns true if the path is acceptable; prints an error and returns false otherwise.
 /// Checks:
 ///   1. Path must not be empty.
-///   2. Resolved (realpath) path must have a ".json" extension.
-///   3. If the file exists, it must be a regular file (not /dev/*, /proc/*, special nodes).
-///   4. If the file exists, it must be ≤ 4 MB (sanity guard against reading huge files).
-static bool validate_config_path(const std::string& path) {
+///   2. The RESOLVED path must have a ".json" extension.
+///   3. The RESOLVED path must not be under /proc/, /sys/ or /dev/.
+///   4. If the file exists, it must be a regular file (not /dev/*, /proc/*, special nodes).
+///   5. If the file exists, it must be ≤ 4 MB (sanity guard against reading huge files).
+///   6. With `require_existing_parent`, the parent directory must exist too.
+///
+/// R5-S-9 (COMPLETED here) — the ban was applied to the canonical path on the
+/// "file exists" branch and to the RAW STRING on the other one, and `stat()`
+/// resolved the ".." components the raw string still contained, so
+/// `/tmp/x/../../../dev/shm/a.json` passed.  Measured: that input was accepted
+/// while the same target spelled directly was rejected.  The policy now runs on
+/// the resolved path on EVERY branch, via check_config_path_policy().
+static bool validate_config_path(const std::string& path,
+                                 bool require_existing_parent = true) {
     if (path.empty()) {
         std::cerr << "[rawaccel] Config path is empty.\n";
         return false;
     }
 
-    // Resolve to canonical path (removes ../ traversal, symlinks, etc.)
-    char resolved[PATH_MAX] = {};
-    if (realpath(path.c_str(), resolved) != nullptr) {
-        // File exists — validate it
+    std::string canonical;
+    bool exists = false;
+    if (!resolve_config_target(path, &canonical, &exists)) {
+        std::cerr << "[rawaccel] Config path '" << path
+                  << "' cannot be resolved.\n";
+        return false;
+    }
+
+    if (!check_config_path_policy(canonical)) return false;
+
+    if (exists) {
         struct stat st {};
-        if (stat(resolved, &st) == 0) {
+        if (stat(canonical.c_str(), &st) == 0) {
             if (!S_ISREG(st.st_mode)) {
-                std::cerr << "[rawaccel] Config path '" << resolved
+                std::cerr << "[rawaccel] Config path '" << canonical
                           << "' is not a regular file.\n";
                 return false;
             }
@@ -202,46 +285,15 @@ static bool validate_config_path(const std::string& path) {
                 return false;
             }
         }
-        // Require .json extension on the resolved path
-        std::string rp(resolved);
-        if (rp.size() < 5 || rp.substr(rp.size() - 5) != ".json") {
-            std::cerr << "[rawaccel] Config path '" << rp
-                      << "' does not have a .json extension.\n";
-            return false;
-        }
-        // R5-S-9: the /proc/ /sys/ /dev/ prefix ban was only applied on the
-        // "file does not exist" branch; an EXISTING file inside those trees
-        // (or one reachable through a symlink that resolves there) slipped
-        // past it.  Apply the same check to the canonical path.
-        for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
-            if (rp.rfind(bad, 0) == 0) {
-                std::cerr << "[rawaccel] Config path '" << rp
-                          << "' is in a disallowed directory.\n";
-                return false;
-            }
-        }
-    } else {
-        // File does not yet exist — validate the path string itself
-        std::string p(path);
-        if (p.size() < 5 || p.substr(p.size() - 5) != ".json") {
-            std::cerr << "[rawaccel] Config path '" << p
-                      << "' does not have a .json extension.\n";
-            return false;
-        }
-        // Disallow obviously dangerous prefixes even before the file exists
-        for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
-            if (p.rfind(bad, 0) == 0) {
-                std::cerr << "[rawaccel] Config path '" << p
-                          << "' is in a disallowed directory.\n";
-                return false;
-            }
-        }
+    }
+
+    if (require_existing_parent && !exists) {
         // FINDING-30-1: the file doesn't exist yet, so the parent directory
         // must exist or the daemon will fail with a confusing startup error.
         std::string parent = ".";
-        const size_t slash = p.find_last_of('/');
+        const size_t slash = canonical.find_last_of('/');
         if (slash != std::string::npos)
-            parent = (slash == 0) ? "/" : p.substr(0, slash);
+            parent = (slash == 0) ? "/" : canonical.substr(0, slash);
         struct stat pst {};
         if (stat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)) {
             std::cerr << "[rawaccel] Config directory '" << parent
@@ -570,7 +622,18 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
-        if (explicit_path && !validate_config_path(config_path)) {
+        // The policy (.json + /proc/ /sys/ /dev/) is checked on EVERY path,
+        // not only on an explicit -c.  find_config_path() derives the default
+        // from XDG_CONFIG_HOME / SUDO_USER / HOME (src/config.cpp:1027), i.e.
+        // from the environment — and that path used to skip validation
+        // entirely.  Measured before the fix:
+        //     XDG_CONFIG_HOME=/dev/shm/aj2xdg rawaccel-daemon
+        //       -> "Config: /dev/shm/aj2xdg/rawaccel/settings.json"  (accepted)
+        //     ... the same path spelled with -c  ->  rejected.
+        // The parent-directory requirement stays exclusive to an explicit -c
+        // (FINDING-30-1), because the default ~/.config/rawaccel/ directory may
+        // legitimately not exist yet on first run.
+        if (!validate_config_path(config_path, /*require_existing_parent=*/explicit_path)) {
             remove_pid();
             return 1;
         }

@@ -28,6 +28,7 @@ echo ""
 
 # ── CLI davranış kapıları (P83: create-preset 256-char senkronu) ──────────────
 CLI="$ROOT/build-manual/rawaccel-cli"
+DAEMON="$ROOT/build-manual/rawaccel-daemon"
 TMP_FILES=()
 cleanup_tmp() {
     rm -f "${TMP_FILES[@]}"
@@ -290,6 +291,162 @@ PY
     fi
     echo "CLI diff kapısı: özdeş/dosya-gidiş-geliş/eksik-kaynak ✓"
     rm -f "$TMPD1" "$TMPD1.bak" "$TMPDF"
+
+    # ── SEC-2: config yolu politikası ÇÖZÜLMÜŞ yola uygulanmalı (R5-S-9) ─────
+    # Yasağın (".json" + /proc/ /sys/ /dev/) "dosya yok" dalında ham dizgeye
+    # uygulanması ve stat()'in ".." bileşenlerini çözmesi atlatmaya yol açıyordu:
+    # doğrudan /dev/shm reddedilirken /tmp/x/../../../dev/shm/a.json kabul ediliyordu.
+    # Bu kapı iki şeyi birden kilitler: atlatma kapalı, meşru yol hâlâ açık.
+    if [ ! -d /dev/shm ]; then
+        echo "FAIL: /dev/shm yok — config-yolu güvenlik kapısı çalıştırılamıyor (sessizce atlanmaz)" >&2
+        exit 1
+    fi
+    SECD=$(mktemp -d)
+    TMP_FILES+=( "$SECD" )
+    # Traversal'ı: gerekli ".." sayısını HESAPLA ve çözümlemeyi
+    # DOĞRULA — derinlik yanlışsa kapı yanlış sebeple kırılıp yeşil görünebilir.
+    SECD4="$SECD/a/b/c/d"
+    mkdir -p "$SECD4" /dev/shm/rawaccel-secdir
+    UP=""
+    probe="$SECD4"
+    while [ "$probe" != "/" ]; do
+        probe=$(dirname "$probe")
+        UP="../$UP"
+    done
+    if [ "$(readlink -f "$SECD4/$UP/dev/shm")" != "/dev/shm" ]; then
+        echo "FAIL: traversal çözümlemesi beklenmedik: '$SECD4/$UP/dev/shm' -> '$(readlink -f "$SECD4/$UP/dev/shm")'" >&2
+        exit 1
+    fi
+    # kanıt: yasak önek doğrudan yazıldığında reddediliyor (kapının canlı olduğunun
+    # ilk kanıtı) ve aynı hedef yalnızca ".." ile erişildiğinde de reddedilmeli.
+    case "$UP" in *..*) ;; *) echo "FAIL: traversal üretilemedi (UP='$UP')" >&2; exit 1 ;; esac
+
+    # reddedilmesi gerekenler: çıkış kodu 1 + BEKLENEN SPESİFİK mesaj.
+    # Mesaj ayrımı şart: tek bir regex iki kuralı ayırt edemiyorsa, birinin
+    # kaldırılması kapıyı geçiyordu (pozitif kontrolle ölçüldü — PC4).
+    secd_reject () {
+        local desc="$1" path="$2" want="$3"
+        set +e
+        OUT=$("$CLI" -c "$path" list 2>&1)
+        RC=$?
+        set -e
+        if [ $RC -ne 1 ]; then
+            echo "FAIL: config yolu [$desc] reddedilmedi (rc=$RC): $OUT"
+            exit 1
+        fi
+        if ! echo "$OUT" | grep -qE "$want"; then
+            echo "FAIL: config yolu [$desc] yanlış sebeple reddedildi — '/$want/' bekleniyordu: $OUT"
+            exit 1
+        fi
+    }
+    # kabul edilmesi gerekenler: çıkış kodu 0
+    secd_accept () {
+        local desc="$1" path="$2"
+        set +e
+        OUT=$("$CLI" -c "$path" list 2>&1)
+        RC=$?
+        set -e
+        if [ $RC -ne 0 ]; then
+            echo "FAIL: meşru config yolu [$desc] reddedildi (rc=$RC): $OUT"
+            exit 1
+        fi
+    }
+
+    # (1) doğrudan yasak önek — düzeltme öncesi de reddediliyordu (kontrol)
+    secd_reject "doğrudan /dev/shm" "/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    # (2) ATLATMA: çözülen yol /dev/shm — düzeltme öncesi KABUL ediliyordu
+    secd_reject "traversal → /dev/shm" "$SECD4/$UP/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    # (3) aynı atlatma /proc ve /sys için
+    secd_reject "traversal → /proc" "$SECD4/$UP/proc/a.json" "disallowed directory"
+    secd_reject "traversal → /sys"  "$SECD4/$UP/sys/a.json"  "disallowed directory"
+    # (4) UZANTI kuralı BAĞIMSIZ ölçülmeli: yasak önek altında değil, meşru dizinde.
+    #     (yasak önek altında denemek iki kuralı birbirine bulaştırıyordu)
+    secd_reject "uzantısız, meşru dizin" "$SECD4/a.txt" "does not have a .json extension"
+    secd_reject "uzantısız, sembolik bağ" "$SECD/badlink2/a.txt" "does not have a .json extension"
+    ln -sf "$SECD4" "$SECD/goodlink"
+    secd_reject "sembolik bağ → uzantısız" "$SECD/goodlink/a.txt" "does not have a .json extension"
+    # (5) sembolik bağ /dev/shm'yi göstermeli → çözülünce yakalanmalı
+    ln -sf /dev/shm "$SECD/badlink"
+    secd_reject "sembolik bağ → /dev/shm" "$SECD/badlink/a.json" "disallowed directory"
+    # (6) meşru yeni dosya hâlâ kabul edilmeli (ilk çalıştırma)
+    secd_accept "meşru yeni dosya" "$SECD4/yeni.json"
+    # (7) sembolik bağ üzerinden MEŞRU yol da kabul edilmeli
+    secd_accept "sembolik bağ → meşru" "$SECD/goodlink/yeni2.json"
+    # (7) varsayılan yol da denetlenmeli: find_config_path() XDG_CONFIG_HOME'dan
+    #     türetiyor ve o yol düzeltme öncesi HİÇ doğrulanmıyordu — aynı hedef
+    #     -c ile verilince reddedilirken burada KABUL ediliyordu.
+    set +e
+    OUT=$(XDG_CONFIG_HOME=/dev/shm/rawaccel-secdir "$CLI" list 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "disallowed directory"; then
+        echo "FAIL: varsayılan config yolu (XDG_CONFIG_HOME=/dev/shm/...) doğrulanmadı (rc=$RC): $OUT"
+        exit 1
+    fi
+    # (8) ... ve varsayılan yolun kabul edildiği hâl durumu bozulmamalı
+    mkdir -p "$SECD/xdg/rawaccel"
+    set +e
+    OUT=$(XDG_CONFIG_HOME="$SECD/xdg" "$CLI" list 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 0 ]; then
+        echo "FAIL: meşru varsayılan config yolu reddedildi (rc=$RC): $OUT"
+        exit 1
+    fi
+    echo "SEC-2 config-yolu kapısı (CLI): atlatma/sembolik bağ/uzantı/varsayılan yol ✓"
+
+    # ── AYNI KOPYANIN daemon/ varyantı ──────────────────────────────────────
+    # Kusur cli/main.cpp ve daemon/main.cpp'de BİREBİR aynıydı; yalnız CLI
+    # kopyasını kapamak yetmezdi (pozitif kontrolle ölçüldü: daemon kopyasındaki
+    # "varsayılan yolu doğrulama" bozulunca kapı yeşil kaldı).  daemon root
+    # çalıştığı için bu kopyası asıl önemli olan.
+    if [ ! -x "$DAEMON" ]; then
+        echo "FAIL: daemon kapısı çalıştırılamadı: $DAEMON (sessizce atlanmaz)" >&2
+        exit 1
+    fi
+    # daemon reddederse 1 ile çıkar; kabul ederse çalışmaya devam eder (timeout).
+    # Ayrıştırıcı: reddedilmemek = "doğrulama hatası mesajı yok VE rc 1 değil".
+    secd_daemon_reject () {
+        local desc="$1" path="$2" want="$3"
+        set +e
+        OUT=$(timeout 5 "$DAEMON" -c "$path" 2>&1)
+        RC=$?
+        set -e
+        if [ $RC -ne 1 ] || ! echo "$OUT" | grep -qE "$want"; then
+            echo "FAIL: daemon config yolu [$desc] reddedilmedi (rc=$RC): $OUT"
+            exit 1
+        fi
+    }
+    secd_daemon_accept () {
+        local desc="$1" path="$2"
+        set +e
+        OUT=$(timeout 3 "$DAEMON" -c "$path" 2>&1)
+        RC=$?
+        set -e
+        if [ $RC -eq 1 ] || echo "$OUT" | grep -qE "disallowed directory|does not have a .json extension"; then
+            echo "FAIL: daemon meşru config yolu [$desc] reddetti (rc=$RC): $OUT"
+            exit 1
+        fi
+    }
+    secd_daemon_reject "doğrudan /dev/shm" "/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    secd_daemon_reject "traversal → /dev/shm" "$SECD4/$UP/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    secd_daemon_reject "traversal → /proc" "$SECD4/$UP/proc/a.json" "disallowed directory"
+    secd_daemon_reject "uzantısız, meşru dizin" "$SECD4/a.txt" "does not have a .json extension"
+    secd_daemon_reject "sembolik bağ → /dev/shm" "$SECD/badlink/a.json" "disallowed directory"
+    secd_daemon_accept "meşru yeni dosya" "$SECD4/yeni.json"
+    # daemon'ın varsayılan yolu da doğrulanmalı (bu kopyada düzeltilen boşluk)
+    set +e
+    OUT=$(XDG_CONFIG_HOME=/dev/shm/rawaccel-secdir timeout 5 "$DAEMON" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "disallowed directory"; then
+        echo "FAIL: daemon varsayılan config yolu (XDG_CONFIG_HOME) doğrulanmadı (rc=$RC): $OUT"
+        exit 1
+    fi
+    # ilk çalıştırma: config dizini YOK — doğrulama bunu kırmamalı
+    secd_daemon_accept "ilk çalıştırma (dizin yok)" "$SECD4/yeni.json"
+    echo "SEC-2 config-yolu kapısı (daemon): atlatma/sembolik bağ/varsayılan yol ✓"
+    rm -rf "$SECD" /dev/shm/rawaccel-secdir
 
     # ── monitor: arity + aralık kapıları (daemon yoksa çalışmaz — kapı değil) ─
     # Monitor, daemon gerektirir; testte sadece argüman doğrulama + (daemon
