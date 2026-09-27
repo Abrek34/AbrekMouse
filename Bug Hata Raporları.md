@@ -1747,10 +1747,13 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Durum: ✅ **BU TUR DÜZELTİLDİ** (graph.inl `prev_updating` save/restore). Build(warning:0)+unit+oracle yeşil.
 
 **O31-G3 · DÜŞÜK · `refresh_language` canlı etiketleri statik metne eziyor (GUI A6)**
-- Konum: `gui/tr.inl:688-697` (registry replay); `gui/ui_builder.inl:595,606,612,923`
+- Konum: `gui/tr.inl:730-739` (registry replay); `gui/ui_builder.inl:618,629,635,965` (satırlar 1750'de düzeltildi: kayıt `688-697` / `595,606,612,923` diyordu, ~35-40 kaymıştı)
 - Açıklama: Registry, canlı değer taşıyan `hw_status_lbl`/`hw_battery_lbl`/`hw_caps_lbl`/`latency_lbl`'i statik başlangıcına döndürür; `update_daemon_status` (tr.inl:703) status/battery'yi geri yazarken caps/latency sonraki olaya dek bayat kalır.
 - Öneri: Replay'i statik etiketlerle sınırla ya da sonrasında dinamik değerleri yeniden bas.
-- Durum: `[ALINDI: opencode]` ⏸ tr.inl kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLMİŞ — kayıt BAYATTI, düzeltildi.** Kod zaten düzeltilmişti; tracker hâlâ "`⏸ tr.inl kilidi`" diyordu. AJ1 tarafından yeniden ölçüldü.
+  **Kök neden ve ölçüm:** registry'ye yazan tek yol `tr_register()` (`tr.inl:38`); onu çağıran yardımcılar `trlbl`/`trmlbl`/`trbtn`/`trchk`/`trtip` (`tr.inl:592-616`). Düzeltme, dört canlı etiketi bu yardımcılar yerine düz `gtk_label_new(tr(...))` ile üretmekte — yani `S->updating=false` olduktan sonra koşan replay onları **göremez**. Dördü de ölçüldü: `:618` `:629` `:635` `:965` → hepsi `gtk_label_new(`, hiçbiri `trlbl(`.
+  `📌 Kontrol ölçümü yapıldı:` "0 kayıt" sonucunun `0/0` (yani *ölçülmedi*) değil gerçek bir sıfır olduğunu kanıtlamak için kayıt yolunun erişilebilirliği doğrulandı — `trlbl("● Checking...")` ve `trlbl("Lp Norm:")` çağrıları bulundu (2 çağrı). İlk ölçüm denememde grep deseni yanlıştı (`trlbl` değişken adı değil *anahtar* alıyor) ve kontrol boş döndü; bu, "temiz" değil **"alet hatası"** ayrımına somut bir örnek.
+  Aynı sınıf: bugün ikinci kez (O31-L1'den sonra) kayıt kodun gerisinde kalmış.
 
 **O31-G4 · DÜŞÜK · Spin min'leri config floor'larından büyük → sessiz tıraşı (GUI A8)**
 - Konum: `gui/ui_builder.inl:230-255`
@@ -1885,13 +1888,21 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Konum: `cli/main.cpp:951-954,919`; sanitize `config.cpp:432,446,450`
 - Açıklama: `input_offset 1000` kabul edilir → 500'e sessiz kırpılır, rc=0; `cap_x=2` sonra `input_offset=10` benzeri cap.x itilir. P107 "byte-correctness" ihlali. output_dpi yüzü CLI-2 (big-pickle) ✅.
 - Öneri: CLI domain tablosuna input_offset üst sınırı + cap_x≥input_offset çapraz kısıtı.
-- Durum: `[ALINDI: opencode]` ⏸ cli/main.cpp kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLMİŞ — kayıt BAYATTI, düzeltildi.** Kod düzeltilmişti (`cli/main.cpp:1146-1157` çapraz kısıt, `:1176-1179` `input_offset` tavanı); tracker hâlâ "`⏸ cli/main.cpp kilidi`" diyordu. AJ1 tarafından **gerçek binary** ile yeniden ölçüldü:
+  - `set-param t input_offset 1000` → **REDDEDİLDİ**: `Invalid value for 'input_offset': 1000  (valid range: 0..500)`. Kaydın "500'e sessiz kırpılır, rc=0" iddiası artık **doğru değil** — sert hata.
+  - `input_offset=10` iken `cap_x 2` → **REDDEDİLDİ**: `must be >= input_offset 10 — a lower cap would make the loader silently raise cap_x to the input_offset`.
+  - `cap_x 20` (meşru) → **KABUL**. Kısıt ne aşırı sıkı ne de ölü.
+  `📌 Bu ölçüm sırasında bir YANLIŞ POZİTİF ürettim ve kendi yakaladım:` ilk denemede "başarı diyor ama dosyada 0.0 kalıyor" dedim. Hata **bende**ydi: `rawaccel-cli create t` **İKİ** profil üretiyor (`['default','t']`), ben `profiles[0]`'ı okudum — o `default`'tı. `t` profilinde `input_offset=10.0` doğru saklanmıştı. Kayda **yazılmadı**, rapor edilmeden önce doğrulandı.
 
 **O31-L3 · INFO · Help/çıktı metinleri davranıştan sapıyor (CLI F7)**
 - Konum: `cli/main.cpp:2080,575-577,243`
 - Açıklama: `--json` receivers/hidpp'yi de kapsıyor (help eksik); preset hata mesajı "none/off" alias'larını saymıyor; push sonrası "Daemon reloaded." (reload değil).
 - Öneri: Metinleri davranışla eşitle.
-- Durum: `[ALINDI: opencode]` ⏸ cli/main.cpp kilidi.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLMİŞ — kayıt BAYATTI, düzeltildi.** Üç alt iddianın üçü de artık yanlış; AJ1 gerçek binary ile ölçtü:
+  - "`--json` help'te eksik" → **yanlış**: `receivers` ve `hidpp` yardım çıktısında **var** (`--help` satır 26-27), ve ikisi de `--json` kabul edip **geçerli JSON** basıyor: her ikisi de `[]` döndü (bu makinede alıcı/cihaz yok, yani çıktı boş ama **uygulanabilir**).
+  - "preset hata mesajı `none/off` alias'larını saymıyor" → **yanlış**: `cli/main.cpp:737` metni `(alias: none/off)` içeriyor.
+  - "push sonrası 'Daemon reloaded.' (reload değil)" → **yanlış**: `Daemon reloaded.` yalnız `cmd_reload()` içinde, `daemon_reload_via_any_path()` `sent` döndürdüğünde basılıyor (`cli/main.cpp:1806-1813`); push yolu `cmd_reload()`'ı çağırmıyor. Satır 338 ve 382'deki yorumlar eski yalanın **kaldırıldığını** belgeliyor.
+  Aynı sınıf, aynı gün: kayıt kodun gerisinde kalmış (O31-G3, O31-L1, O31-L2'den sonra 4.).
 
 **Negatif teyid — bulgu değil (deneysel):** HIDPP C2 (`kde-fix-accel.sh` ilk çalıştırmada backup rotasyonu abort) ÜRETİLEMEDİ: `cp -a` (satır 48) backup'ı `ls` glob'undan ÖNCE yaratır → glob her zaman en az bir dosya eşleştirir, exit-2 senaryosu oluşmaz. Test: boş backup setinde betik geçti. Loglanmadı/üstlenilmedi.
 
