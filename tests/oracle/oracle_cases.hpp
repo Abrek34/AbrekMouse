@@ -71,6 +71,12 @@ inline std::vector<Case> cases() {
     c.push_back(mkclass("classic_gain_exp_le1",      true,  0.005, 0.5, 15,   1.5, 2));
     c.push_back(mkclass("classic_gain_offset",       true,  0.005, 2.0, 50,   1.5, 0, 10));
     c.push_back(mkclass("classic_legacy_out_default",false, 0.005, 2.0, 15,   1.5, 2));
+    // K1 probe: LEGACY + cap_mode::in — bu yol (init_legacy, cap_mode::in)
+    // oracle'da HICBIR vaka ile calistirilmiyordu. Iki vaka ekleniyor:
+    //   _normal   : cap_x >  input_offset  (kontrol — esitlenmemeli)
+    //   _boundary : cap_x == input_offset  (sanitize'in uretebildigi tam sinir)
+    c.push_back(mkclass("k1_legacy_in_normal",  false, 0.005, 2.0, 150, 1.5, 1, 10));
+    c.push_back(mkclass("k1_legacy_in_boundary", false, 0.005, 2.0, 10, 1.5, 1, 10));
 
     // ── Jump ───────────────────────────────────────────────────────────────
     auto mkjump = [&](const std::string& n, bool gain, double step_x, double step_y,

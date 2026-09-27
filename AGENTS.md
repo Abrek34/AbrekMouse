@@ -146,7 +146,7 @@ gain row. Rows that intentionally deviate (classic exponent<=1 "linear path"
 constant gain, `power`/`synchronous` identity at speed 0, and the power
 `io` cap.y=0 identity guard — ref yields NaN/0 for that degenerate input,
 P155) are listed in `tests/oracle/known_deviations.txt` and do not fail the
-run. Current grid: **1071 rows compared, 67 documented deviations** (R3-NEW-2
+run. Current grid: **1119 rows compared, 67 documented deviations** (R3-NEW-2
 added `power_tinyexp_floor` with exponent_power=5e-4 inside the BUG-02 floor
 band — the local port evaluates a shared exponent floored at 1e-3, the
 reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
@@ -178,7 +178,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 193 test groups, 33832 runtime assertions covering: algorithms, JSON round-trips,
+- 195 test groups, 33851 runtime assertions covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -275,7 +275,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33832 assertions, 193 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (33851 assertions, 195 groups) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -325,6 +325,16 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Signal safety**: signal handler only sets an atomic flag (`request_stop()`), never joins threads
 - **Sub-pixel accumulation**: `remainder_x/y` carries fractional movement so no micro-moves are lost
 - **Float comparisons**: use epsilon (`1e-9`) instead of `!= 0` / `!= 1`
+- **classic LEGACY `cap_mode::in` boundary (K1)**: the guard is
+  `cap.x > 0 && cap.x >= input_offset` — the `>=` is load-bearing. The official
+  reference guards ONLY on `cap.x > 0`; at `cap.x == input_offset` it computes
+  `base_fn(input_offset) = 0` and freezes the whole curve at gain 1. A strict `>`
+  skipped the cap and applied full unclipped acceleration instead — measured by
+  the oracle at up to 500.9x the reference gain. The state is reachable from a
+  real config because `sanitize_accel_args` clamps `cap.x < input_offset` UP to
+  `input_offset`. Covered by `test_classic_legacy_in_cap_boundary()` and the
+  `k1_legacy_in_*` oracle cases; the NaN guard for `cap.x < input_offset` (BUG-9)
+  and the `cap.x == 0` 0/0 guard are asserted in the same test.
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment

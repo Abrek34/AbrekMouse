@@ -88,13 +88,30 @@ private:
                 double ar = std::pow(args.acceleration, args.exponent_classic - 1);
                 accel_raised = std::isfinite(ar) ? ar : 0.0; // NaN guard: neg accel + non-int exp
             }
-            // BUG-9: when cap.x <= input_offset, base_fn computes
+            // BUG-9: when cap.x < input_offset, base_fn computes
             // pow(negative_base, exp) which yields NaN for non-integer
             // exponents.  That NaN then poisons every operator() call
             // (`min(finite, NaN)` returns NaN per IEEE 754 ordering).
             // Treat the degenerate config as "no input cap" so output
-            // remains finite.
-            if (args.cap.x > 0 && args.cap.x > args.input_offset) {
+            // remains finite.  Only reachable on paths that skip
+            // sanitize_accel_args(), which clamps cap.x up to input_offset.
+            //
+            // K1: the boundary must be `>=`, not `>`.  The official
+            // reference (ref/accel-classic.hpp cap_mode::in) guards ONLY on
+            // `cap.x > 0` — it has no input_offset comparison at all.  At
+            // cap.x == input_offset the reference therefore evaluates
+            // base_fn(input_offset) = 0 and clamps the whole curve to gain 1
+            // (no acceleration).  The former strict `>` skipped the cap here,
+            // leaving cap = DBL_MAX, so the port applied FULL unclipped
+            // acceleration where the reference applies none.  sanitize makes
+            // this exact state reachable: config.cpp clamps any cap.x <
+            // input_offset up to input_offset, so a user cap.x = 5 with
+            // input_offset = 10 lands precisely on the boundary.
+            //   measured (oracle, k1_legacy_in_boundary): 13/13 speeds above
+            //   the boundary diverged, up to 500.9x gain (ref 1 vs local 500.9)
+            // `>=` restores the reference result while still blocking the NaN
+            // case; `cap.x > 0` keeps the 0/0 division out of reach.
+            if (args.cap.x > 0 && args.cap.x >= args.input_offset) {
                 cap = base_fn(args.cap.x, accel_raised, args);
                 if (!std::isfinite(cap)) cap = DBL_MAX;
             }

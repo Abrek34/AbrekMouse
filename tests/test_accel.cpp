@@ -2488,6 +2488,70 @@ static void test_classic_degenerate() {
     EXPECT(g >= 1.0);
 }
 
+// ── Test: classic LEGACY cap_mode::in at the cap.x == input_offset boundary ──
+//
+// K1.  The official reference (tests/oracle/ref/accel-classic.hpp, cap_mode::in)
+// guards ONLY on `cap.x > 0` — it has no input_offset comparison.  At
+// cap.x == input_offset it evaluates base_fn(input_offset) = 0 and therefore
+// clamps the entire curve to gain 1 (no acceleration).  The port used a strict
+// `>`, skipped the cap, left cap = DBL_MAX and applied FULL unclipped
+// acceleration — measured by the oracle as up to 500.9x the reference gain.
+//
+// The state is reachable from a real config: sanitize_accel_args (src/config.cpp)
+// clamps any cap.x < input_offset UP to input_offset, so a profile with
+// cap.x = 5 and input_offset = 10 lands exactly on the boundary.
+
+static void test_classic_legacy_in_cap_boundary() {
+    SECTION("classic LEGACY cap_mode::in — cap.x == input_offset == reference");
+
+    accel_args args = make_args(accel_mode::classic);
+    args.gain = false;                  // LEGACY -> init_legacy
+    args.cap_mode_val = cap_mode::in;
+    args.acceleration = 0.005;
+    args.exponent_classic = 2.0;
+    args.input_offset = 10.0;
+    args.cap.x = 10.0;                  // exactly on the boundary
+    classic c(args);
+
+    // Reference behaviour: base_fn(input_offset) = 0 -> min(gain, 0) = 0 -> 1.0.
+    // Every x at or above input_offset must be frozen at unity.
+    EXPECT_NEAR(c(10.0, args), 1.0, 1e-12);
+    EXPECT_NEAR(c(20.0, args), 1.0, 1e-12);
+    EXPECT_NEAR(c(100.0, args), 1.0, 1e-12);
+    EXPECT_NEAR(c(100000.0, args), 1.0, 1e-12);
+
+    SECTION("classic LEGACY cap_mode::in — cap.x < input_offset keeps the NaN guard");
+
+    // BUG-9: base_fn would compute pow(negative_base, 1.5) = NaN, and NaN then
+    // poisons every operator() call.  The `cap.x >= input_offset` guard must
+    // still block it.  Only reachable on paths that skip sanitize_accel_args.
+    accel_args deg = args;
+    deg.exponent_classic = 1.5;         // non-integer exponent -> negative base = NaN
+    deg.cap.x = 2.0;                    // 2 < 10
+    classic cd(deg);
+    for (double x : { 0.0, 5.0, 10.0, 20.0, 100.0 })
+        EXPECT(std::isfinite(cd(x, deg)));
+
+    SECTION("classic LEGACY cap_mode::in — cap.x == 0 must not divide by zero");
+
+    accel_args z = args;
+    z.input_offset = 0.0;
+    z.cap.x = 0.0;                      // cap.x > 0 is false -> guard blocks 0/0
+    classic cz(z);
+    for (double x : { 0.001, 1.0, 100.0 })
+        EXPECT(std::isfinite(cz(x, z)));
+
+    SECTION("classic LEGACY cap_mode::in — cap.x > input_offset clips as before");
+
+    accel_args n = args;
+    n.cap.x = 150.0;                    // 150 > 10 -> normal capped path
+    classic cn(n);
+    EXPECT_NEAR(cn(50.0, n), 1.16, 1e-9);
+    // Saturated at the cap for every x beyond it.
+    EXPECT_NEAR(cn(150.0, n), 1.65333333, 1e-6);
+    EXPECT_NEAR(cn(400.0, n), cn(150.0, n), 1e-12);
+}
+
 // ── Test: power with exponent_power=0 ────────────────────────────────────────
 
 static void test_power_zero_exponent() {
@@ -9096,6 +9160,7 @@ int main(int argc, char** argv) {
     test_pipeline_nan_injection();
     test_classic_io_degenerate_cap();
     test_classic_in_degenerate_cap_naninf();
+    test_classic_legacy_in_cap_boundary();
     test_motion_math_clamp_remainder_reset();
     test_save_config_durability_path();
     test_power_output_offset();
