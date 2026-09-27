@@ -40,9 +40,24 @@ CXX="${CXX:-g++}"
 
 # Architecture flags: -march=native optimises for this machine's CPU but breaks portability.
 # Set RAWACCEL_PORTABLE=1 to build a portable binary (runs on other CPU architectures).
+#
+# PORTABILITY IS TWO SWITCHES, NOT ONE.  MARCH controls -march=native, but the
+# SIMD_FLAGS list below was appended unconditionally, so the "portable" branch
+# only dropped -march=native and still compiled in -mavx2 -mfma.  Backend
+# selection is compile-time only (simd_math.hpp:48-60 keys off __AVX2__ /
+# __SSE2__; measured: zero uses of __builtin_cpu_supports/cpuid/xgetbv in the
+# tree), and an AVX2 instruction on a CPU without AVX2 is #UD -> SIGILL.  So
+# RAWACCEL_PORTABLE=1 produced a binary that died on startup on any x86-64 CPU
+# older than Haswell -- while build.sh's own comment and AGENTS.md promised
+# exactly the opposite.  ARM/aarch64 was never affected: the uname case below
+# adds nothing there, which is why this survived.
+#
+# The portable branch therefore also drops every optional ISA level.  SSE2 is
+# the floor and is always on: it is part of the x86-64 baseline ABI, so naming
+# it is a no-op on this target and is kept only to document the intent.
 if [ "${RAWACCEL_PORTABLE:-0}" = "1" ]; then
     MARCH=""
-    echo "[INFO] Portable build enabled ( -march=native disabled )"
+    echo "[INFO] Portable build enabled ( -march=native, AVX2/AVX/FMA disabled )"
 else
     MARCH="-march=native"
     echo "[INFO] Native architecture build ( -march=native )"
@@ -88,8 +103,18 @@ BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wpedantic -Wno-unused-parame
 
 # Additional performance flags
 PERF_FLAGS="-fomit-frame-pointer -funroll-loops -ftree-vectorize -fvect-cost-model=very-cheap"
-# SIMD math optimizations
-SIMD_FLAGS="-mfpmath=sse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mavx -mavx2 -mfma"
+# SIMD math optimizations.
+# These are what the ORACLE/GATE flags are checked against conceptually, so
+# they must follow the same portability switch as MARCH above -- see the note
+# at :41.  Kept in one place on purpose: tests/run_simd_parity.sh has its own
+# BACKENDS list because it must select each backend EXPLICITLY (including the
+# scalar fallback), which is a different question from "what does shipping
+# compile with".
+if [ "${RAWACCEL_PORTABLE:-0}" = "1" ]; then
+    SIMD_FLAGS="-mfpmath=sse -msse2"          # baseline x86-64 only
+else
+    SIMD_FLAGS="-mfpmath=sse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mavx -mavx2 -mfma"
+fi
 case "$(uname -m)" in
     x86_64|amd64) BASE_CXXFLAGS="$BASE_CXXFLAGS $SIMD_FLAGS" ;;
 esac

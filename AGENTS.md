@@ -459,9 +459,38 @@ compute sample staleness). Design keeps the hot path lock-free:
   requested rate; the cost is that a *transient* failure is not retried until the
   value changes, a profile is edited, or the device replugs (every attempt is
   logged, and the pre-fix code retried unconditionally).
-  Still **not** done: the writes themselves are still on the loop thread. The
-  structural fix — queue them onto `hidpp_thread_`, which is what P171-BFIX
-  started for the read path — is a separate job touching the same two mutexes.
+  **DONE — the writes now run on `hidpp_thread_`, not the loop thread
+  (`93ec6277`).** The note that used to sit here ("still not done … queue them
+  onto `hidpp_thread_`") is obsolete. `apply_profile()` plans, marks the
+  sentinel and enqueues; `drain_hidpp_writes()` performs the writes. Three
+  things were load-bearing and are not obvious from the code:
+  - **Ownership had to change with the timing.** `hidpp_transports_` was a map
+    of `unique_ptr` that the periodic rescan erases on unplug, and a queued job
+    is drained *after* the lock is gone — so a raw `HidppTransport*` in a job
+    dangles onto a freed kernel hidraw fd. The map holds `shared_ptr` and
+    `find_hidpp_transport()` returns an owning reference. A positive control
+    confirms the alternative: a job holding a raw pointer makes the transport
+    get destroyed and the test then **segfaults** (exit 139) — the production
+    use-after-free, reproduced.
+  - **`hidpp_hw_plan_job()` plans AND marks in one step.** The sentinel is the
+    only dedup, and with the write now asynchronous a plan-then-mark split lets
+    a second apply arriving mid-flight enqueue the same write again — a slider
+    drag would queue one job per intermediate value. Folding them together
+    makes that window unrepresentable.
+  - **The drain holds no lock at all** (verified mechanically: both write call
+    sites have 0 locks open, and it takes neither daemon mutex), so the
+    5.8 s stall no longer blocks the motion loop. `hidpp_wq_mu_` is a LEAF
+    mutex: never taken under a daemon mutex, never held across a blocking
+    write.
+  Two behaviour changes worth stating: the "Set polling rate to N Hz" log is
+  now emitted by the worker *after* the write returns, so it reports a fact
+  rather than an intention; and writes still queued at `stop()` are discarded
+  rather than drained (draining would add 5.8 s per device to shutdown, and an
+  unwritten value is harmless — `hidpp_hw_sync` is in-memory so the next start
+  re-pushes). The discard is logged, never silent. The worker shortens its
+  200 ms nap to 20 ms while a job is queued: a latency hint only — this
+  codebase uses no `condition_variable`, and correctness never depends on the
+  flag, only latency does.
 - **HID++ function ids normalise at the packet boundary**: `to_bytes()` packs
   `normalize_function_id(fn) << 4 | software_id`, and `normalize_function_id`
   folds the request-id spelling (`0x48`) to the bare 4-bit selector (`0x4`).
