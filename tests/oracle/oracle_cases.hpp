@@ -274,7 +274,18 @@ inline std::vector<Case> cases() {
         c.push_back(x);
     }
     {
-        Case x; // office (presets.hpp) — natural, default cap {15,1.5} out
+        // natural mode with NO cap — this case represents natural's capless
+        // behaviour, NOT the office preset's cap.  The label used to claim
+        // "default cap {15,1.5}" and that is wrong twice over: the struct
+        // default is {15, 0} (rawaccel-base.hpp:78), and accel-natural.hpp
+        // never reads cap at all (measured: 62 lines, 0 mentions) — so
+        // cap_y below cannot change this row.  It is kept as 1.5 on purpose:
+        // 259 grid points are bit-identical between cap.y=0 and cap.y=1.5
+        // here, and that equality is the measurement proving natural is
+        // cap-independent.  Setting it to 0 (the real office value) would
+        // delete that measurement.  AJ2 measured this and recommended the
+        // label-only fix for exactly this reason.
+        Case x; // office (presets.hpp) — natural, no cap
         x.name = "game_office_natural"; x.mode = "natural"; x.gain = true;
         x.limit = 1.3; x.decay_rate = 0.08; x.motivity = 1.2;
         x.input_offset = 0; x.cap_x = 15; x.cap_y = 1.5; x.cap_mode = 2;
