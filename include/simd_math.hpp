@@ -15,6 +15,9 @@
 // Bugun proje TU'lari buraya rawaccel.hpp uzerinden gectigi icin hicbiri bu
 // yolu denemiyor — yani KORUMA KAZARA. tests/simd_parity.cpp:26-28 std
 // basliklarini once include ediyor ve tuzagi KACANIYOR, kapatmiyor.
+// (Duzeltilmis gerekce: once bir <cmath> yeterli DEGIL — olculdu, yalniz
+//  <cstdlib> sonuza ulastiriyor. O yuzden ogrenilen ders "bir standart
+//  baslik ekle" degil, "dogru olanini ekle".)
 #include <cstdlib>
 
 #include "rawaccel-base.hpp"
