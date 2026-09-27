@@ -1008,26 +1008,37 @@ void AccelDaemon::teardown_devices() {
 const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const {
     // P-APP: a profile with a non-empty match_app applies ONLY while the
     // focused application matches.  current_app_ is set from the GUI's
-    // "set_active_app" IPC (WM_CLASS class, lowercased).  We check the app
-    // constraint FIRST, per device preference order:
-    //   1. device_id + app match       (highest priority)
-    //   2. "all devices" + app match
-    //   3. device_id (no app constraint, i.e. generic binding)
-    //   4. "all devices" (generic fallback)
-    //   5. active_profile / first profile (historic fallbacks)
-    const bool have_app = !current_app_.empty();
-    if (have_app) {
-        for (auto& p : config_.profiles)
-            if (!p.device_id.empty() && p.device_id == dev_id &&
-                profile_matches_app(p, current_app_)) return &p;
-        for (auto& p : config_.profiles)
-            if (p.device_id.empty() &&
-                profile_matches_app(p, current_app_)) return &p;
-    }
-    // 1. Device-specific assignment takes priority (C29-N1: apply the same
-    //    app gate as the app-aware pass above — an app-scoped binding must
-    //    NEVER leak into this generic pass, or it becomes a catch-all for
-    //    every non-matching app / no-focus state).
+    // "set_active_app" IPC (WM_CLASS class, lowercased).  Preference order:
+    //   1. device_id match, app-scope satisfied   (highest priority)
+    //   2. "all devices" match, app-scope satisfied
+    //   3. active_profile
+    //   4. first profile (last-resort fallback)
+    // Steps 1 and 2 are the SAME loops whether or not an app is focused — the
+    // app scope is a gate inside each of them (C29-N1), not a separate pass.
+    // The header used to advertise a 5-step order with separate "no app
+    // constraint" steps 3/4; that order was never implemented, and the stale
+    // list is what made the duplicate `if (have_app)` block above look
+    // load-bearing.  What "app-scope satisfied" means for an empty
+    // current_app_ is spelled out at the first loop.
+    // 1. Device-specific assignment takes priority.
+    // C29-N1: the app gate applies in EVERY pass, so an app-scoped binding must
+    //    NEVER leak into the generic passes below or become a catch-all for
+    //    every non-matching app / no-focus state.  No separate "have_app" pass
+    //    is needed for that: with current_app_ empty, profile_matches_app()
+    //    already returns true only for a profile whose match_app is empty
+    //    (ascii_icontains("", needle) is false for every non-empty needle), so
+    //    the gate degenerates to exactly the "generic binding only" rule.
+    //    This used to run these same two loops FIRST, guarded by
+    //    `if (!current_app_.empty())`, and then run them AGAIN below with
+    //    byte-identical predicates — two provably dead full passes over
+    //    config_.profiles on every lookup, each re-running a string compare
+    //    and a profile_matches_app() per profile.  Measured equivalent: an
+    //    exhaustive enumeration over 4092 profile lists (0..4 profiles;
+    //    device_id in {"", "d1"} x match_app in {"", "a"}, every active_profile
+    //    in {"", "n1", "default"}, both focus states, both query ids) selects
+    //    the SAME profile with and without the block.  That enumeration's
+    //    positive control — the same app gate removed from pass 1 — reports
+    //    436 differing cases, so it is sensitive to exactly this class.
     for (auto& p : config_.profiles)
         if (!p.device_id.empty() && p.device_id == dev_id &&
             profile_matches_app(p, current_app_)) return &p;
@@ -2362,8 +2373,19 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
             // SM-4/…-FIX: re-measure against the best-known polling rate.
             // Priority: real-time measured (from event timestamps) > sysfs-detected > profile nominal.
             // The real_polling_rate is computed from median kernel frame intervals (POLL-1 fix).
-            const double det_hz = dev.telemetry->real_polling_rate.load(std::memory_order_relaxed) > 0
-                ? static_cast<double>(dev.telemetry->real_polling_rate.load(std::memory_order_relaxed))
+            // Load it ONCE.  It used to be loaded twice — once in the ternary
+            // condition and once in the taken branch — so the test and the value
+            // were two separate reads (the one place in this file that did not
+            // follow the store-into-a-local pattern status_json() uses for all
+            // six telemetry fields).  Only the loop thread writes this field
+            // (store at the POLL-1 ring feed below), so the pair is not a data
+            // race today, but it is a redundant load on the motion path and a
+            // read-then-reread that would silently become one if the writer
+            // ever moves to the IPC or HID++ thread.
+            const double measured_hz =
+                dev.telemetry->real_polling_rate.load(std::memory_order_relaxed);
+            const double det_hz = measured_hz > 0
+                ? measured_hz
                 : (dev.detected_polling_rate > 0
                     ? static_cast<double>(dev.detected_polling_rate)
                     : static_cast<double>(dev.poll_rate));
