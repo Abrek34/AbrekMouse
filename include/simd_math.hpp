@@ -299,7 +299,20 @@ static inline v2d v2d_div(v2d a, v2d b) { return {a.x / b.x, a.y / b.y}; }
 static inline v2d v2d_min(v2d a, v2d b) { return {a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y}; }
 static inline v2d v2d_max(v2d a, v2d b) { return {a.x > b.x ? a.x : b.x, a.y > b.y ? a.y : b.y}; }
 static inline v2d v2d_sqrt(v2d a) { return {std::sqrt(a.x), std::sqrt(a.y)}; }
-static inline v2d v2d_abs(v2d a) { return {a.x < 0 ? -a.x : a.x, a.y < 0 ? -a.y : a.y}; }
+// O31: std::fabs, `x < 0 ? -x : x` DEGIL.  IEEE'de -0.0 == 0.0 oldugu icin
+// karsilastirma -0.0'da false donuyor ve -0.0 OLDUGU GIBI donuyordu.  Iki SIMD
+// backend'i isaret bitini kosulsuz temizliyor:
+//   :97-100  AVX2   _mm256_andnot_pd(sign_mask, a)   ->  -0.0 => +0.0
+//   :205-208 SSE2   _mm_andnot_pd(sign_mask, a)      ->  -0.0 => +0.0
+// Yani ayni sozlesmenin iki farkli uygulamasi ayrim veriyordu.  Olcum
+// (uc backend, isaret biti ayirt edilerek): avx2 +0, sse2 +0, skaler -0.
+// Canli bir hata DEGIL: modify() sonundaki isfinite guard'i ve
+// calc_speed_separate icindeki fabs yutuyor, uc backend'in modify() ciktisi
+// birebir ayni.  Ama kirilgan — `x<0?-x:x` kalipti her kozmetik degisiklikte
+// geri gelebilir ve hicbir sey onu yakalamaz (v2d_hypot'un silinme nedeni:
+// ayrim vardi, kapi koruyordu, capraz-dif kirilmadan kimse fark etmedi).
+// std::fabs her zaman isaret bitini temizler.
+static inline v2d v2d_abs(v2d a) { return {std::fabs(a.x), std::fabs(a.y)}; }
 
 static inline v2d v2d_cmp_lt(v2d a, v2d b) { return {a.x < b.x ? -1.0 : 0.0, a.y < b.y ? -1.0 : 0.0}; }
 static inline v2d v2d_cmp_le(v2d a, v2d b) { return {a.x <= b.x ? -1.0 : 0.0, a.y <= b.y ? -1.0 : 0.0}; }
