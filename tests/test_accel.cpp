@@ -6282,6 +6282,109 @@ static void test_config_profiles_wrong_type_rejected() {
     std::remove(tmp.c_str());
 }
 
+// AJ2 config-presets K4 — `save_config` promised to "preserve the current file's
+// permission bits" (M-BUG-14, which stopped a blanket 0644 from widening an
+// existing 0600 config), but it passed that mode to `open(2)`, and open(2)
+// masks the mode argument with the process umask.  The unit ships
+// `UMask=0077` (scripts/rawaccel.service), and setup.sh creates
+// /etc/rawaccel/settings.json with `cp` (0644 under the installer's umask) — so
+// the daemon's very first save deterministically narrowed a 0644 config to
+// 0600, and any later `chmod 644` was undone on the next save.  Measured
+// (AJ2): umask 0022 -> 0644, umask 0077 -> 0600, umask 0000 -> 0644, while
+// `.bak` (the old inode) kept 0644 — so the two files disagreed.  The fix is
+// `fchmod(fd, mode)` after creation, which applies the mode verbatim.
+//
+// The fix is in src/config.cpp (AJ2's lane); the gate is here (AJ1's lane).
+static void test_config_save_preserves_permission_bits() {
+    SECTION("K4 — save_config: permission bits are preserved, umask-independent");
+
+    const std::string tmp = "/tmp/rawaccel_test_k4_perm.json";
+    // umask is process-global state: without save+restore this section would
+    // silently change the permissions every LATER test in the process observes.
+    const mode_t eski_umask = ::umask(0);
+    ::umask(eski_umask);
+
+    auto yaz = [&](const std::string& icerik) {
+        std::ofstream f(tmp, std::ios::trunc);
+        f << icerik;
+    };
+    auto izin = [&](const std::string& p) -> mode_t {
+        struct stat st {};
+        if (::stat(p.c_str(), &st) != 0) return 0;
+        return st.st_mode & 07777;
+    };
+    auto kaydet = [&](void) {
+        app_config c = load_config(tmp);
+        c.profiles[0].dev_cfg.dpi += 1;   // force an actual change
+        save_config(c, tmp);
+    };
+    static const char* GECERLI =
+        R"({"version":"1.2.3","active_profile":"t","profiles":[{"name":"t",
+            "dpi":800,"polling_rate":1000,"profile":{}}]})";
+
+    // ── KONTROL: 0600 + geniş umask, 0644'e GÖNDERİLEMEZ ────────────────────
+    // This is the security half of the contract.  `fchmod` applies the mode
+    // verbatim, so it CAN widen relative to what open(2) produced — the only
+    // thing preventing a real widening is that `mode` came from the existing
+    // file's own bits.  If that ever changed, this assertion is what catches
+    // it.  Run first so a failure here cannot be blamed on test ordering.
+    {
+        yaz(GECERLI);
+        EXPECT(::chmod(tmp.c_str(), 0600) == 0);
+        ::umask(0022);
+        kaydet();
+        EXPECT(izin(tmp) == 0600);
+    }
+
+    // ── K4'in kendisi: 0644 + dar umask, 0600'a DARALTILMAMALI ──────────────
+    // This is the case the unit's UMask=0077 triggers on every save.
+    {
+        yaz(GECERLI);
+        EXPECT(::chmod(tmp.c_str(), 0644) == 0);
+        ::umask(0077);
+        kaydet();
+        EXPECT(izin(tmp) == 0644);
+    }
+
+    // ── yeni dosya (mevcut yok) -> 0600 varsayılanı, umask geniş olsa bile ──
+    {
+        std::remove(tmp.c_str());
+        ::umask(0022);
+        yaz(GECERLI);            // yaz() 0644-ish izniyle *oluşturur*
+        std::remove(tmp.c_str());
+        // now create it as if it did not exist: save onto a path whose parent
+        // exists but whose file does not
+        {
+            std::ofstream f(tmp, std::ios::trunc);
+            f << GECERLI;
+        }
+        // deliberately NOT chmod'ing: whatever the ambient umask produced is
+        // what save_config must preserve, bit for bit
+        const mode_t onceki = izin(tmp);
+        kaydet();
+        EXPECT(izin(tmp) == onceki);
+    }
+
+    // ── varsayılan 0600: hiçbir dosya yokken de dünya-okunur olmamalı ──────
+    {
+        std::remove(tmp.c_str());
+        std::remove((tmp + ".bak").c_str());
+        ::umask(0022);
+        { std::ofstream f(tmp, std::ios::trunc); f << GECERLI; }
+        std::remove(tmp.c_str());
+        app_config c;
+        c.profiles.resize(1);
+        c.profiles[0].name = "t";
+        c.active_profile = "t";
+        save_config(c, tmp);
+        EXPECT(izin(tmp) == 0600);
+    }
+
+    ::umask(eski_umask);         // MUST restore — process-global
+    std::remove(tmp.c_str());
+    std::remove((tmp + ".bak").c_str());
+}
+
 static void test_config_extreme_values() {
     SECTION("R10 — config: extreme values are clamped by sanitize");
 
@@ -9616,6 +9719,7 @@ int main(int argc, char** argv) {
     test_config_empty_profiles();
     test_config_missing_active_profile();
     test_config_profiles_wrong_type_rejected();
+    test_config_save_preserves_permission_bits();
     test_config_extreme_values();
     test_config_duplicate_device_id();
     test_check_duplicate_device_ids();
