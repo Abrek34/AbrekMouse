@@ -527,3 +527,19 @@ PY4
     fi
     echo "CLI monitor kapısı: aralık doğrulama ✓"
 fi
+
+# ── kayıt↔kod köprü kapısı ────────────────────────────────────────────────────
+# Bir kayıt ⏸ <dosya> kilidi / AÇIK etiketiyle dururken kodda o kaydın düzeltme
+# işareti varsa çelişki vardır.  170c5e14 tam olarak bunu yaptı: 8 kaydın kodu
+# düzeltildi (düzeltici `// O31-C2:` yorumunu bıraktı), tracker'daki ⏸
+# etiketlerine dokunulmadı → kayıtlar 22 commit bayat kaldı.  Sinyal vardı,
+# yazıldığı yer ölçülmüyordu.
+#
+# Karşı yön ("✅ ama kodda işaret yok") BİLEREK DIŞARIDA: 23 kapalı kaydın 4'ünde
+# işaret yok, 3'ü fiilen düzeltilmiş ama işaret commit mesajına yazılmış —
+# ~%15-17 yanlış pozitif, kapı olarak kullanılamaz.
+#
+# SESSİZCE ATLANMAZ: python3 veya tracker yoksa hata verir (SEC-2 emeli).
+if ! bash tests/run_tracker_bridge.sh; then
+    exit 1
+fi
