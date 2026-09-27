@@ -93,17 +93,47 @@ DEAD_SPECULATIVE="v2d_cmp_ge v2d_cmp_gt v2d_cmp_le v2d_cmp_lt v2d_sub v2d_fast_e
 # ara cifti korur; iki ayri yuvarlamada ayni ifade bakiye vermez.  v2d_rotate
 # tam olarak x*cx - vy*sy + x*sy + vy*cx yaziyor (simd_math.hpp:174-186).
 #
-# BUGUN canli bir bozulma YOK: v2d_rotate'in 0 cagrani var (olculdu, pozitif
-# kontrol: ayni arama v2d_mul'u rawaccel.hpp'de buluyor), ve canli rotasyon
-# yolu skaler math-vec2.hpp:66 rotate()'e gidiyor.
+# !! BU YORUMUN KAPSAMI: YUKARDAKI SAYILAR YALNIZCA simd_math.hpp'in IZOLE
+# YUZEYI icindir.  "Bilesik/canli yolda da ayni sonuc" DENILMEZ -- ve bir
+# surekle de denilmemisti.  AJ2'nin olcumu (ve benden bagimsiz teyit) canli
+# yolda SAPMA OLDUGUNU gosteriyor:
+#
+#   tests/oracle 1119 vaka, %.17g (bit duzeyine inen cozunurluk):
+#     kapi (-O2 -mavx2)  vs  sevkiyat (-O3 -mfma)  : 6 satIR farkli
+#     kapi (-O2 -mavx2)  vs  -O2 -mavx2 -mfma     : 6 satir  (-O3 degil, FMA)
+#     kapi (-O2 -mavx2)  vs  -O3 -mavx2 (FMA'siz) : 0 satir
+#
+#   6 vakanin HEPSI 'natural' profili (canli: accel-union.hpp:18/34) ve
+#   known_deviations.txt'te YOK:
+#     game_office_natural  spd=0.001  350 ULP  rel 7.77e-14   <- 3 mertebe ayri
+#     game_office_natural  spd=0.005   10 ULP  rel 2.22e-15
+#     game_office_natural  spd=0.01     5 ULP  rel 1.11e-15
+#     game_office_natural  spd=0.1      4 ULP  rel 8.85e-16
+#     game_valorant_natural spd=0.1     2 ULP  rel 4.43e-16
+#     game_valorant_natural spd=15      1 ULP  rel 1.81e-16
+#
+# Buradaki 140/16539 ile oradaki 6/1119 birbirine ZIT degil, FARKLI cozunurluk.
+# onceki kayit bu ayrimi yapmadan "sinif olu kodda kalmis" diyordu; AJ2'nin
+# geri cekmesiyle duzeltildi.  Ders: bir olcumun kapsamini yazmadan
+# "temiz" demek, o olcumun sessizce genisletilmesidir.
+#
+# run_oracle.sh BU SAPMAYI iki bagimsiz sebepten GOREMEZ:
+#   1) -O1 derliyor (run_oracle.sh:52) -- FMA hic derlenmiyor
+#   2) %.9g basiyor (local.cpp:61, reference.cpp:81) -- 9 basamak, oluan fark
+#      7.77e-14, yani cozunurlugun 1e-9'unun 4 mertebe ALTINDA.  %.9g en kotu
+#      4.5 milyon ULP yutar (1 ULP = 2.22e-16).  Kanit: 0.1 ile 0.1+1e-12
+#      %.9g ile AYNI metin, %.17g ile AYRI metin.
+# Yani kapinin "bu derlemede sapma yok" cumlesi "bu derlemede" demek; sevkiyat
+# derlemesi hic denenmemis oldugu icin bu bir KAPSAM boşlugu.
 #
 # Neden 4. bir backend eklenmedi: bu kapi bit-bit karsilastirir ve bu degeri.
 # avx2 ile avx2-fma'yi toleransli karsilastirmak abs(-0)=+0 farkini (1 ULP)
-# yutar -- yani v2d_abs sinifini KORLEMEZDI.  Ayni kaynagin iki derlemesini
-# karsilastirmak bu kapinin isi degil: kapi UC AYRI ELLE YAZILMIS uygulamayi
-# karsilastirir.  Bayraktaki farkin karsi onlemi tolerans degil, (A)/(B)
-# ayrimidir: etkilenen fonksiyon zaten oluler, ilk cagri geldiginde o olcumu
-# kendisi yapacak.
+# yutar -- yani v2d_abs sinifini KORLEMEZDI.  Ayrica olculerek kapatildi: en
+# buyuk sapma 7.77e-14, oracle'in TOL=1e-9 toleransinin 4 mertebe altinda, yani
+# avx2-fma backend'i 350 ULP'lik vakayi da GECIRIRDI -- gordugu sey yok, maliyeti
+# var.  Ayni kaynagin iki derlemesini karsilastirmak bu kapinin isi degil: kapi
+# UC AYRI ELLE YAZILMIS uygulamayi karsilastirir.  Asil onlem bayragin TEK
+# kaynaktan gelmesi (SIMD_FLAGS) ve oracle cozunurlugunun yukseltilmesi.
 
 python3 - "$ROOT" "$BILINEN_OLUMLER" "$DEAD_TWINS" "$DEAD_SPECULATIVE" <<'PYEOF'
 import re, sys, pathlib
