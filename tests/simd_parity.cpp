@@ -93,9 +93,12 @@ static void test_lane_roundtrip() {
     expect_true("!v2d_all_finite(NaN in Y)",
                 !simd::v2d_all_finite(nan_v));
 
-    simd::v2d h = simd::v2d_hypot(simd::v2d_set(3.0, 4.0), simd::v2d_set(0.0, 0.0));
-    expect("v2d_hypot x", simd::v2d_get_x(h), 3.0, 1e-12);
-    expect("v2d_hypot y", simd::v2d_get_y(h), 4.0, 1e-12);
+    // O31: v2d_hypot SİLİNDİ (include/simd_math.hpp) — bu üç çağrı yüzünden
+    // buradan da kalktı. Nedeni: SIMD backend'leri sqrt(x*x+y*y) kullandığı
+    // için 1e200'de `inf` veriyor, skaler `std::hypot` ile 1.41421e+200 döndüğü
+    // halde bu kapı yalnız hypot(3,4) denediği için ayrışmaya KÖR kalıyordu.
+    // Yenisi, uç-sınır girdileriyle (1e200, 1e-200, denormal, ±0, NaN, sonsuz)
+    // ve v2d_hypot'un YOKLUĞUNDA çalışacak şekilde yazılacak.
 }
 
 // ── 2. End-to-end: the acceleration pipeline must not eat the Y axis ───────

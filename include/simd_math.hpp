@@ -6,6 +6,20 @@
 namespace rawaccel {
 namespace simd {
 
+// O31: v2d_blend ve v2d_hypot SILINDI (uc backend tanimi da).
+//   v2d_blend: 0 cagran. Uretici maskesiyle (v2d_cmp_ge) uc backend anlasiyor,
+//     ama baska bir maske biciminde ucu uc ayri cevap veriyordu: AVX2 yalnizca
+//     isaret bitine, SSE2 bit-butune, skaler truthiness'e bakiyor. Cagri olmadigi
+//     icin "dogru sozlesme" cikarilamaz; sonraki cagiran keyfi birini secmek
+//     zorunda kalirdi. Bir sonraki cagiranda URETICI maskesiyle yeniden yazilmali.
+//   v2d_hypot: SIMD tarafi sqrt(x*x+y*y) kullaniyor ve 1e200'de `inf` donuyor
+//     (skaler std::hypot 1.41421e+200 veriyor) — gercek tasma kusuru, ama
+//     uretimde cagri yeri YOK; yalnizca tests/simd_parity.cpp deniyordu ve o
+//     da yalnizca hypot(3,4) ile, yani bu ayrisma karsi KOR. Dogru formuller
+//     skalerde duruyor; SIMD taraf ilk cagri ciktiginda olcekli uygulamayla
+//     geri gelmeli.
+
+
 // ============================================================================
 // Compile-time feature detection
 // ============================================================================
@@ -73,11 +87,6 @@ static inline v2d v2d_cmp_le(v2d a, v2d b) { return _mm256_cmp_pd(a, b, _CMP_LE_
 static inline v2d v2d_cmp_gt(v2d a, v2d b) { return _mm256_cmp_pd(a, b, _CMP_GT_OQ); }
 static inline v2d v2d_cmp_ge(v2d a, v2d b) { return _mm256_cmp_pd(a, b, _CMP_GE_OQ); }
 
-// Blend: select a where mask is set, else b
-static inline v2d v2d_blend(v2d mask, v2d a, v2d b) {
-    return _mm256_blendv_pd(b, a, mask);
-}
-
 // Horizontal operations
 // BUGFIX: reduce over lanes 0,1 only. The previous body folded in lanes 2,3
 // (zero padding), so v2d_hmin always returned 0.0.
@@ -115,11 +124,6 @@ static inline v2d v2d_fast_pow(v2d base, v2d exp) {
     b[0] = std::pow(b[0], e[0]);
     b[1] = std::pow(b[1], e[1]);
     return v2d_load(b);
-}
-
-// Hypot for 2-wide: sqrt(x^2 + y^2)
-static inline v2d v2d_hypot(v2d x, v2d y) {
-    return v2d_sqrt(v2d_add(v2d_mul(x, x), v2d_mul(y, y)));
 }
 
 // Check if all lanes are finite
@@ -190,10 +194,6 @@ static inline v2d v2d_cmp_le(v2d a, v2d b) { return _mm_cmple_pd(a, b); }
 static inline v2d v2d_cmp_gt(v2d a, v2d b) { return _mm_cmpgt_pd(a, b); }
 static inline v2d v2d_cmp_ge(v2d a, v2d b) { return _mm_cmpge_pd(a, b); }
 
-static inline v2d v2d_blend(v2d mask, v2d a, v2d b) {
-    return _mm_or_pd(_mm_and_pd(mask, a), _mm_andnot_pd(mask, b));
-}
-
 static inline double v2d_hmin(v2d a) {
     double arr[2];
     v2d_store(arr, a);
@@ -228,10 +228,6 @@ static inline v2d v2d_fast_pow(v2d base, v2d exp) {
     b[0] = std::pow(b[0], e[0]);
     b[1] = std::pow(b[1], e[1]);
     return v2d_load(b);
-}
-
-static inline v2d v2d_hypot(v2d x, v2d y) {
-    return v2d_sqrt(v2d_add(v2d_mul(x, x), v2d_mul(y, y)));
 }
 
 static inline bool v2d_all_finite(v2d a) {
@@ -292,19 +288,12 @@ static inline v2d v2d_cmp_le(v2d a, v2d b) { return {a.x <= b.x ? -1.0 : 0.0, a.
 static inline v2d v2d_cmp_gt(v2d a, v2d b) { return {a.x > b.x ? -1.0 : 0.0, a.y > b.y ? -1.0 : 0.0}; }
 static inline v2d v2d_cmp_ge(v2d a, v2d b) { return {a.x >= b.x ? -1.0 : 0.0, a.y >= b.y ? -1.0 : 0.0}; }
 
-static inline v2d v2d_blend(v2d mask, v2d a, v2d b) {
-    return {mask.x ? a.x : b.x, mask.y ? a.y : b.y};
-}
-
 static inline double v2d_hmin(v2d a) { return a.x < a.y ? a.x : a.y; }
 static inline double v2d_hmax(v2d a) { return a.x > a.y ? a.x : a.y; }
 
 static inline v2d v2d_fast_exp(v2d x) { return {std::exp(x.x), std::exp(x.y)}; }
 static inline v2d v2d_fast_exp2(v2d x) { return {std::exp2(x.x), std::exp2(x.y)}; }
 static inline v2d v2d_fast_pow(v2d base, v2d exp) { return {std::pow(base.x, exp.x), std::pow(base.y, exp.y)}; }
-// BUGFIX: the old body crossed the operands ({hypot(x.x,x.y), hypot(y.x,y.y)}).
-static inline v2d v2d_hypot(v2d x, v2d y) { return {std::hypot(x.x, y.x), std::hypot(x.y, y.y)}; }
-
 static inline bool v2d_all_finite(v2d a) { return std::isfinite(a.x) && std::isfinite(a.y); }
 static inline double v2d_get_x(v2d a) { return a.x; }
 static inline double v2d_get_y(v2d a) { return a.y; }
