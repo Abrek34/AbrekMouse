@@ -82,6 +82,34 @@ enum class hidpp_feature_index : uint16_t {
     // Aşama 2: DPI sliding — DPISliding is a sub-function of adjustable_dpi
 };
 
+/// HID++ 0x11 short message budget: a 4-byte header (report id, device index,
+/// feature index, function/software id) plus at most 16 payload bytes.
+/// `HidppTransport::send_feature_request()` rejects any `param_len > 16`
+/// outright, so EVERY caller must build its parameter vector inside this budget
+/// — exceeding it is a silent, total failure of that request, not a truncation.
+///
+/// Named because getting it wrong is invisible until a feature stops working:
+/// see HIDPP_ONBOARD_SECTOR_DATA_CHUNK for the one caller that did (O31-H1).
+inline constexpr size_t HIDPP_SHORT_PAYLOAD_MAX = 16;
+
+/// 0x8100 OnboardProfiles — `write_sector` (fn 0x48) parameter layout is
+/// `sector (u16 big-endian) + flash data`, so the 2-byte sector prefix is paid
+/// out of the 16-byte short-message budget and the data chunk is 14 — NOT 16.
+///
+/// O31-H1: with chunk = 16 the parameter vector is 2 + 16 = 18 bytes, which the
+/// `param_len > HIDPP_SHORT_PAYLOAD_MAX` guard rejects, so every write returned
+/// nullopt and the whole path was unwriteable — the only caller-visible symptom
+/// was that onboard profile sectors never landed. The chunk size is derived from
+/// the budget here so the two can no longer drift apart, and the invariant is
+/// asserted at compile time and re-checked by
+/// test_hidpp_short_payload_budget().
+inline constexpr size_t HIDPP_ONBOARD_SECTOR_DATA_CHUNK =
+        HIDPP_SHORT_PAYLOAD_MAX - 2;
+static_assert(HIDPP_ONBOARD_SECTOR_DATA_CHUNK == 14,
+              "onboard sector data chunk must be 14 (16-byte budget minus the "
+              "2-byte sector prefix); 16 would overflow the budget and make "
+              "every sector write a silent no-op (O31-H1)");
+
 struct hidpp_short_packet {
     uint8_t report_id    = 0x10;
     uint8_t device_index = 0xFF;

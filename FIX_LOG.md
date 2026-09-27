@@ -65,7 +65,7 @@ big-pickle oturumunun kilidindeki dosyalar için eşzamanlı edit YAPILMADI, mad
 | O31-C3 (Config C3) | src/config.cpp:122-123,252-253 | gain/raw_passthrough sayısal 0/1 yok sayılıyor | `✅ opencode — accept 0/1 integers, unit test added` |
 | O31-C4 (Config C4) | src/config.cpp:242-246,615-616 | active_profile cap 256 vs isim 255 → hiç eşleşmez (CFG-6 ile birlikte) | `✅ no-op — CFG-6 already resolved (both capped at MAX_NAME_LEN=256)` |
 | O31-C5 (Config C5) | src/config.cpp:730,779 | symlink config save'de normal dosyaya döner | `✅ opencode — fs::canonical resolves symlink before atomic save` |
-| O31-H1 (HIDPP A1) | src/logitech_hidpp.cpp:1990-1998 vs :679 | write_onboard 18>>16 bayt → hep false | `✅ opencode — chunk 16→14, params fit in 16-byte HID++ limit` |
+| O31-H1 (HIDPP A1) | include/logitech_hidpp.hpp:85-108 + src/logitech_hidpp.cpp (5 sabit) + tests/test_accel.cpp | 0x8100 write_sector 18-byte parametre | ✅ **DOĞRULANDI + KORUMA EKLENDİ** — `chunk=14` zaten vardı; bütçe isimli sabite bağlandı, `static_assert` + test eklendi (pozitif kontrollü). Cihaz round-trip'i hâlâ test edilmiyor (test dikiği eklenmedi) |
 | O31-H2 (HIDPP A2) | include/logitech_quirks.hpp (ölü kısa-anahtar döngüsü kaldırıldı) + tests/test_accel.cpp | G522 "32" ölü kod | ◑ **KISMEN DÜZELTİLDİ** — ölü döngüler kaldırıldı (1.510.738 girdi, 0 fark), değişmezlik testi eklendi ve pozitif kontrollü. `📌 KARAR` geçerli: gerçek 12-char id doğrulanmadan yazılmıyor |
 | O31-H3 (HIDPP B1) | daemon/main.cpp:293-298 | `-c -v` sonraki bayrağı yutar | `✅ opencode — reject arg starting with '-' for -c and -f` |
 | O31-H4 (HIDPP C4) | scripts/bench_hotpath.sh:58 | geçersiz perf olayı syscalls | `✅ opencode — syscalls→syscalls:sys_enter (tracepoint)` |

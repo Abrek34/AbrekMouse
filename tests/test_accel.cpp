@@ -792,6 +792,96 @@ static void test_logitech_quirks_model_id_shape() {
     EXPECT(find_logitech_quirks(std::string("32")) != nullptr);
 }
 
+// ── O31-H1: HID++ short-message payload budget ───────────────────────────────
+//
+// Every 0x8110 feature request is rejected outright when its parameter vector
+// exceeds the 16 payload bytes of the short-message envelope
+// (`send_feature_request`: `param_len > HIDPP_SHORT_PAYLOAD_MAX` → nullopt).
+// That is a SILENT total failure, not a truncation, so an over-budget caller
+// looks exactly like a device that ignores the request.
+//
+// The onboard-profile sector writer is the one caller that got this wrong:
+// params = sector (u16 BE) + data, so a 16-byte data chunk made an 18-byte
+// vector and every sector write was rejected.  The chunk is now derived from
+// the budget, and these assertions are what keep the two from drifting again.
+//
+// Note: the full write path still needs a real hidraw device (HidppTransport
+// opens the node and ioctls it; send_feature_request/resolve_feature_index are
+// private), so this covers the arithmetic and the wire layout, not the device
+// round-trip.  Adding a test seam to HidppTransport purely for this was
+// deliberately NOT done — it would change the class's shape for a test.
+
+static void test_hidpp_short_payload_budget() {
+    SECTION("O31-H1 — onboard sector chunk fits the short-message budget");
+
+    EXPECT(HIDPP_SHORT_PAYLOAD_MAX == 16);
+    EXPECT(HIDPP_ONBOARD_SECTOR_DATA_CHUNK == 14);
+
+    // The invariant that was violated: sector prefix (2) + data chunk must
+    // stay within the payload budget.
+    EXPECT(2 + HIDPP_ONBOARD_SECTOR_DATA_CHUNK <= HIDPP_SHORT_PAYLOAD_MAX);
+    EXPECT(2 + HIDPP_ONBOARD_SECTOR_DATA_CHUNK == HIDPP_SHORT_PAYLOAD_MAX);
+
+    // And the value that caused the bug is still over budget, so this test
+    // would have failed before the fix rather than merely describing it.
+    EXPECT(2 + 16 > HIDPP_SHORT_PAYLOAD_MAX);
+
+    // Chunking arithmetic: any payload length must divide into requests that
+    // each fit the budget, with nothing lost.
+    for (size_t len : {size_t(0), size_t(1), size_t(13), size_t(14), size_t(15),
+                       size_t(28), size_t(29), size_t(112), size_t(113)}) {
+        size_t requests = 0, covered = 0;
+        for (size_t off = 0; off < len; off += HIDPP_ONBOARD_SECTOR_DATA_CHUNK) {
+            const size_t n = std::min(HIDPP_ONBOARD_SECTOR_DATA_CHUNK, len - off);
+            EXPECT(2 + HIDPP_ONBOARD_SECTOR_DATA_CHUNK <= HIDPP_SHORT_PAYLOAD_MAX);
+            covered += n;
+            ++requests;
+        }
+        EXPECT(covered == len);
+        EXPECT(requests == (len + 13) / 14);  // ceil(len / 14)
+    }
+
+    SECTION("O31-H1 — long packet wire layout is 4-byte header + 16 payload");
+
+    hidpp_long_packet pkt;
+    pkt.report_id = 0x11;
+    pkt.device_index = 0x02;
+    pkt.feature_index = 0x81;
+    pkt.function_id = 0x48;   // 0x8100 write_sector
+    pkt.software_id = 0x00;
+    for (size_t i = 0; i < 16; ++i) pkt.params[i] = static_cast<uint8_t>(0xA0 + i);
+
+    const auto bytes = pkt.to_bytes();
+    EXPECT(bytes.size() == 4 + HIDPP_SHORT_PAYLOAD_MAX);
+    EXPECT(bytes[0] == 0x11);
+    EXPECT(bytes[1] == 0x02);
+    EXPECT(bytes[2] == 0x81);
+    // Byte 3 packs function-selector (high nibble) | software-id (low nibble).
+    // NOTE this is a NORMALISATION, not an identity: normalize_function_id()
+    // accepts both spellings Solaar uses (bare 4-bit 0x4) and this API's
+    // historical request-id form (0x48 = 0x4 << 4 | 0x8), and folds the latter
+    // to the former.  Measured, not assumed: 0x48 -> 0x4 -> wire byte 0x40.
+    EXPECT(hidpp_normalize_function_id(0x48) == 0x04);
+    EXPECT(hidpp_normalize_function_id(0x04) == 0x04);  // narrow form kept
+    EXPECT(hidpp_normalize_function_id(0x50) == 0x05);
+    EXPECT(bytes[3] == ((0x04 << 4) | 0x00));
+    for (size_t i = 0; i < HIDPP_SHORT_PAYLOAD_MAX; ++i)
+        EXPECT(bytes[4 + i] == static_cast<uint8_t>(0xA0 + i));
+
+    // Round-trips the full 16-byte payload (a 14-byte payload here would be the
+    // budget bug reappearing as truncation), and the function comes back in
+    // normalised 4-bit form.
+    const auto back = hidpp_long_packet::from_bytes(bytes.data(), bytes.size());
+    EXPECT(back.has_value());
+    if (back) {
+        EXPECT(back->feature_index == 0x81);
+        EXPECT(back->function_id == 0x04);
+        EXPECT(back->software_id == 0x00);
+        for (size_t i = 0; i < HIDPP_SHORT_PAYLOAD_MAX; ++i)
+            EXPECT(back->params[i] == static_cast<uint8_t>(0xA0 + i));
+    }
+}
+
 // ── Test 1: noaccel ──────────────────────────────────────────────────────────
 
 static void test_noaccel() {
@@ -9374,6 +9464,7 @@ int main(int argc, char** argv) {
     test_logitech_hidpp_hardware_controls();
     test_logitech_hidraw_discovery();
     test_logitech_quirks_model_id_shape();
+    test_hidpp_short_payload_budget();
 
     // P114 BUG-A: a --filter that matched nothing silently reported "0/0 geçti"
     // + exit 0 (a typo hid the whole suite behind a green gate). No match is a

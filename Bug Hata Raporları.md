@@ -1801,10 +1801,10 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Durum: `[ALINDI: opencode]` ⏸ config.cpp kilidi.
 
 **O31-H1 · ORTA · `write_onboard_profile_sector` 18 param 16 sınırıyla her zaman reddedilir (HIDPP A1)**
-- Konum: `src/logitech_hidpp.cpp:1990-1998` (chunk=16 → params(2+16)=18) vs `:679` (`param_len>16 → nullopt`)
+- Konum: `src/logitech_hidpp.cpp:2179-2207` (`write_onboard_profile_sector`, chunk at `:2193`) — asıl sınır `:747` (`param_len > HIDPP_SHORT_PAYLOAD_MAX`); isimli sabitler `include/logitech_hidpp.hpp:85-111`; koruma testi `tests/test_accel.cpp:814` `test_hidpp_short_payload_budget()`
 - Açıklama: Onboard profil sektörü hiç yazılamaz; yol yalnızca negatif testten erişiliyor (test_accel.cpp:571).
 - Öneri: `chunk=12/14` (2+chunk ≤ 16) + pozitif yol testi.
-- Durum: `[ALINDI: opencode]` ⏸ logitech_hidpp.cpp (big-pickle B6/B3 tamamladı; yeniden edit riski) — kilit açılınca.
+- Durum: ✅ **DOĞRULANDI + KORUMA EKLENDİ** — `chunk = 14` düzeltmesi zaten mevcuttu (`src/logitech_hidpp.cpp:2191`), ama **pozitif yol testi yoktu**. Ölçülen arıtmetik davranış, üretim kodunun yapısı değişmeden test edilebilir hale getirildi: `HIDPP_SHORT_PAYLOAD_MAX = 16` ve türetilmiş `HIDPP_ONBOARD_SECTOR_DATA_CHUNK = MAX-2` isimli sabitler (`include/logitech_hidpp.hpp:85-111`), 5 sihirli `16`/`14` bunlara bağlandı (`src/logitech_hidpp.cpp:486,499,747,1072,2193`). `static_assert` + `test_hidpp_short_payload_budget()` değişmezi iki katmanda tutuyor. Pozitif kontrollü: chunk 14→16 → `static_assert` derleme zamanında ateşliyor; assert gevşetilip çalıştırılınca 30 FAIL (33922/33952). ⚠ **Cihaz round-trip'i hâlâ test edilmiyor** — `send_feature_request`/`resolve_feature_index` private, `HidppTransport` gerçek hidraw düğümü istiyor; bunun için sınıfa test dikişi EKLENMEDİ (üretim kodunun yapısını yalnız test için değiştirmek doğru değil).
 
 **O31-H2 · DÜŞÜK · G522 LIGHTSPEED `"32"` quirk kaydı ölü kod (HIDPP A2)**
 - Konum: `include/logitech_quirks.hpp:106` (`"32"` satırı, erişilemezliği `:87-103` yorumunda belgeli), `:113` (string overload arama), `:141` (`hidpp_device_info` overload arama); koruma testi `tests/test_accel.cpp:709` `test_logitech_quirks_model_id_shape()`
@@ -1813,16 +1813,16 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
   - Durum: ◑ **KISMEN DÜZELTİLDİ** — ölü kısa-anahtar döngüsü ve ölü `info.model_id` yeniden-sorgusu kaldırıldı (1.510.738 girdi üzerinde eski↔yeni karşılaştırması: 0 fark; 1/2/3/4 karakterlik tüm diziler ayrıntılı tarandı). `test_logitech_quirks_model_id_shape()` değişmezlik testi eklendi ve pozitif kontrollü (kimlik ayrıştırması kısa anahtarı erişilebilir kılarsa kırılıyor). 📌 KARAR **hâlâ geçerli**: tahmini 12-char id yazılmıyor, `"32"` satırı bilinçli olarak ölü bırakıldı — ya gerçek G522 donanımında okunacak, ya satır kaldırılacak. Bkz. AGENTS.md "Logitech quirks keying".
 
 **O31-H3 · DÜŞÜK · `-c`/`--config` sonraki bayrağı config yolu sanıyor (HIDPP B1)**
-- Konum: `daemon/main.cpp:293-298` vs `--config=`/`--log-format` arity hatası
+- Konum: `daemon/main.cpp:298-304` (`-c`/`--config` guard) ve `:318-324` (`-f`/`--log-format` guard) — ikisi de `argv[i+1][0] == '-'` ile bir sonraki bayrağı reddediyor
 - Açıklama: `rawaccel-daemon -c -v` → config_path="-v", verbose sessizce yutulur.
 - Öneri: `argv[i+1]` `-` ile başlıyorsa exit 1.
-- Durum: `[ALINDI: opencode]` ⏸ daemon/main.cpp kilidi.
+- Durum: ✅ **BU TUR DOĞRULANDI (zaten düzeltilmiş)** — `daemon/main.cpp:298-304` (`-c`/`--config`) ve `:319-324` (`-f`/`--log-format`) sonraki bayrağın `-` ile başlamasını reddediyor; ayrıca `-f` `text`/`json` doğruluyor. Canlı binary'de 9 argüman vakası ölçüldü, hepsi doğru: `-c -v`, `--config -v`, `-c`, `-f -v`, `--log-format -c`, `-f`, `-f bogus`, `--config=`, `--log-format=` → hepsi exit 1 + hedefli mesaj; `-V` → exit 0.
 
 **O31-H4 · DÜŞÜK · `bench_hotpath.sh` geçersiz perf olayı `syscalls` (HIDPP C4)**
-- Konum: `scripts/bench_hotpath.sh:58`
+- Konum: `scripts/bench_hotpath.sh:89` (perf olay listesi) ve `:83-91` (ROUND4-FIX: perf hatasının benchmark'i düşürmemesi)
 - Açıklama: `perf stat -e cyc,instructions,syscalls` — `syscalls` yazılım olayı değil → "event syntax error" → pipefail abort (yerelde perf yok, kod analizi).
 - Öneri: `-e syscalls`'i çıkar veya `syscalls:sys_enter_*` tracepoint.
-- Durum: `[ALINDI: opencode]` ⏸ bench_hotpath.sh SH-1 (big-pickle) kapsamında; kilit açılınca.
+- Durum: ✅ **BU TUR DOĞRULANDI (zaten düzeltilmiş)** — `scripts/bench_hotpath.sh:89` artık geçersiz yazılım olayı `syscalls` yerine tracepoint `syscalls:sys_enter` kullanıyor; `:83-91` ROUND4-FIX ile perf'in yetki/paranoia kaynaklı başarısızlığı `set -euo pipefail` altında benchmark'i düşürmüyor (best-effort). Betik fiilen çalıştırıldı: `bash -n` OK, exit 0, perf yokken graceful mesaj + 6 satırlık baseline üretildi. ⚠ Sayaç yolu bu ortamda ÇALIŞTIRILAMADI (`perf` kurulu değil) — yalnızca kod düzeyi ve perf-yok dalı doğrulandı.
 
 **O31-H5 · DÜŞÜK · `kde-fix-accel.sh --remove` symlink'i yok ediyor + sabit tmp adı (HIDPP C3)**
 - Konum: `scripts/kde-fix-accel.sh:322-325` vs `:126-145` (--fix mkstemp+realpath+fsync)

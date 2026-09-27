@@ -178,7 +178,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 198 test groups, 33862 runtime assertions covering: algorithms, JSON round-trips,
+- 200 test groups, 33956 runtime assertions covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
   accel_args sanitize, fuzz tests, extreme speeds, EMA stability, subpixel
@@ -275,7 +275,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (33862 assertions, 198 groups) |
+| `tests/test_accel.cpp` | Unit + integration tests (33956 assertions, 200 groups) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -349,6 +349,23 @@ compute sample staleness). Design keeps the hot path lock-free:
   code: its match condition was a strict subset of the loop above it, proven
   identical over 1,510,738 inputs including an exhaustive sweep of every 1-4
   char string.
+- **HID++ short-message payload budget is a named constant, not a literal**:
+  `HIDPP_SHORT_PAYLOAD_MAX` (16) is the payload room in a 0x8110 request, and
+  `send_feature_request()` rejects any `param_len` above it outright — a silent
+  total failure, not a truncation. `HIDPP_ONBOARD_SECTOR_DATA_CHUNK` is derived
+  as `MAX - 2` because the 0x8100 `write_sector` params are `sector(u16) + data`
+  (O31-H1: a literal 16 made an 18-byte vector, so *every* onboard sector write
+  was rejected and the path silently never wrote). A `static_assert` and
+  `test_hidpp_short_payload_budget()` both hold the invariant. The full device
+  round-trip is still untested — `send_feature_request`/`resolve_feature_index`
+  are private and `HidppTransport` needs a real hidraw node; no test seam was
+  added to the class for this.
+- **HID++ function ids normalise at the packet boundary**: `to_bytes()` packs
+  `normalize_function_id(fn) << 4 | software_id`, and `normalize_function_id`
+  folds the request-id spelling (`0x48`) to the bare 4-bit selector (`0x4`).
+  The round-trip is therefore a normalisation, not an identity — `from_bytes`
+  returns `0x04` for a packet built with `0x48`. Asserted in
+  `test_hidpp_short_payload_budget()`.
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment

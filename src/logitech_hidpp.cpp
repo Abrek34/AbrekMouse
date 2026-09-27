@@ -483,7 +483,7 @@ std::array<uint8_t, 20> hidpp_long_packet::to_bytes() const {
     buf[2] = feature_index;
     buf[3] = static_cast<uint8_t>(
         (normalize_function_id(function_id) << 4) | (software_id & 0x0F));
-    std::memcpy(buf.data() + 4, params, 16);
+    std::memcpy(buf.data() + 4, params, HIDPP_SHORT_PAYLOAD_MAX);
     return buf;
 }
 
@@ -496,7 +496,7 @@ std::optional<hidpp_long_packet> hidpp_long_packet::from_bytes(const uint8_t* da
     pkt.feature_index = data[2];
     pkt.function_id  = static_cast<uint8_t>(data[3] >> 4);
     pkt.software_id   = static_cast<uint8_t>(data[3] & 0x0F);
-    std::memcpy(pkt.params, data + 4, 16);
+    std::memcpy(pkt.params, data + 4, HIDPP_SHORT_PAYLOAD_MAX);
     return pkt;
 }
 
@@ -744,7 +744,7 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
     uint8_t feature_index, uint8_t function_id, const uint8_t* params,
     size_t param_len, std::chrono::milliseconds timeout,
     uint8_t target_device_index) {
-    if (param_len > 16) return std::nullopt;
+    if (param_len > HIDPP_SHORT_PAYLOAD_MAX) return std::nullopt;
     const uint8_t wire_function = normalize_function_id(function_id);
 
     std::lock_guard lock(request_mutex_);
@@ -1069,7 +1069,7 @@ std::optional<std::vector<uint8_t>> HidppTransport::feature_request(
     uint16_t feature_id, uint8_t function_id, const uint8_t* params,
     size_t param_len, std::chrono::milliseconds timeout,
     uint8_t target_device_index) {
-    if (feature_id == 0 || param_len > 16)
+    if (feature_id == 0 || param_len > HIDPP_SHORT_PAYLOAD_MAX)
         return std::nullopt;
     const uint8_t target = target_device_index != 0xFF
         ? target_device_index : device_index_.load(std::memory_order_relaxed);
@@ -2180,15 +2180,17 @@ bool HidppTransport::write_onboard_profile_sector(
     uint16_t sector, const std::vector<uint8_t>& data,
     uint8_t target_device_index) {
     // 0x8100 OnboardProfiles — write a single flash sector.
-    // fn=0x48 write_sector: params = sector (u16 BE) + up to 16 bytes.
-    // O31-H1: chunk must be 14, NOT 16 — with chunk=16 the param vector is
-    // 2+16=18 bytes, and send_feature_request() rejects any param_len > 16
-    // (the HID++ 0x11 short-message envelope only has 16 payload bytes), so
-    // every write call returned std::nullopt → this could never write.
+    // fn=0x48 write_sector: params = sector (u16 BE) + flash data. The data
+    // chunk is derived from HIDPP_SHORT_PAYLOAD_MAX rather than written out, so
+    // it cannot drift past the budget again (O31-H1: chunk 16 made the vector
+    // 18 bytes, `param_len > 16` rejected every call, and the path silently
+    // never wrote anything). See HIDPP_ONBOARD_SECTOR_DATA_CHUNK.
     auto index = resolve_feature_index(hidpp_feature_index::onboard_profiles,
                                        target_device_index);
     if (!index) return false;
-    const size_t chunk = 14;
+    // params is always the full 2+chunk width; the final partial chunk is
+    // zero-padded, which stays inside the budget.
+    const size_t chunk = HIDPP_ONBOARD_SECTOR_DATA_CHUNK;
     for (size_t off = 0; off < data.size(); off += chunk) {
         std::vector<uint8_t> params(2 + chunk, 0);
         params[0] = static_cast<uint8_t>(sector >> 8);
