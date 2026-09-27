@@ -72,6 +72,15 @@ bash tests/run_tests.sh
 # Same tests under AddressSanitizer + UBSan (slower, catches memory/UB bugs)
 bash tests/run_tests_asan.sh
 
+# The CLI itself under ASan + UBSan. run_tests_asan.sh only runs
+# tests/test_accel.cpp, so cli/main.cpp (arg parsing, config-path validation,
+# JSON round-trip, print_profile, diff/export) was executed by NO sanitizer.
+# run_tests.sh runs the real CLI but without sanitizers — the two jobs together
+# left cli/main.cpp uncovered. Exit 0 = clean, 1 = sanitizer report or a command
+# that stopped doing real work, 77 = host compiler has no ASan/UBSan (skips
+# loudly, never quietly). Needs no root, no /dev/uinput, no daemon.
+bash tests/run_cli_sanitized.sh
+
 # End-to-end: REAL daemon against synthetic uinput source/sink (needs root +
 # /dev/uinput). SIGSTOPs a running system daemon for the duration and SIGCONTs
 # it on exit (trap), so it cannot steal the synthetic source's grab.
@@ -243,13 +252,16 @@ Seed corpus: `tests/corpus_config/`
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
-Four jobs run on every push/PR (Ubuntu 24.04):
+Five jobs run on every push/PR (Ubuntu 24.04):
 - **build-and-test** — portable build (`RAWACCEL_PORTABLE=1`), warning-as-failure gate
   via `grep -E "warning:|error:"`, then `tests/run_tests.sh`, then `tests/run_tr_coverage.sh`,
   then the differential oracle (`bash tests/oracle/run_oracle.sh`) which fails if any
   gain row drifts outside `tests/oracle/known_deviations.txt`.
 - **sanitizers** — rebuilds tests with `-fsanitize=address,undefined` and runs them
   with `halt_on_error=1` so any leak/UB fails CI.
+- **sanitize-cli** — runs `tests/run_cli_sanitized.sh`, which builds and executes
+  `cli/main.cpp` under the same sanitizers. This TU is covered by no other
+  sanitizer job; see the Test section above for why that hole mattered.
 - **fuzz-smoke** — 60 s per harness via `tests/run_fuzz.sh 60`. Skipped on PRs to
   keep them fast; runs on any push (`!= pull_request`) and `workflow_dispatch`.
   Crash inputs are uploaded as artifacts on failure.
@@ -303,6 +315,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/e2e_harness.cpp` | E2E harness: synthetic uinput mouse + REAL daemon + virtual sink; accel (T-A1..T-A4) + raw (T-B1) phase checks |
 | `tests/run_e2e.sh` | E2E runner (root): builds harness, SIGSTOP/SIGCONT-sensitive system-daemon isolation, runs both phases, propagates 0/1/77 |
 | `tests/run_tests_asan.sh` | Unit test runner under ASan + UBSan |
+| `tests/run_cli_sanitized.sh` | Runs `cli/main.cpp` under ASan + UBSan over 31 real commands (8 presets, profile CRUD, JSON round-trip, config-path rejections); each command asserts its own expected output marker, so an arg rename can't silently turn the gate into 31 no-ops. Exit 0/1/77 |
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
 | `tests/run_tr_coverage.sh` | Translation coverage runner (exit 1 on MISSING) |

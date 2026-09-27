@@ -107,6 +107,28 @@ jobs:
               -o build-manual/test_accel_asan
           build-manual/test_accel_asan
 
+  sanitize-cli:
+    name: CLI under ASan + UBSan
+    runs-on: ubuntu-24.04
+    # cli/main.cpp (3285 lines: arg parsing, config-path validation, JSON
+    # round-trip, print_profile, diff/export) is executed by NO other sanitizer
+    # job — `sanitizers` only runs tests/test_accel.cpp, and run_tests.sh runs
+    # the real CLI without sanitizers. This job closes that hole.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev python3
+
+      - name: Run tests/run_cli_sanitized.sh
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+        run: bash tests/run_cli_sanitized.sh
+
   fuzz-smoke:
     name: Fuzz smoke (60s per harness)
     runs-on: ubuntu-24.04
