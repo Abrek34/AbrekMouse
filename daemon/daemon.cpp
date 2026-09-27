@@ -1172,21 +1172,35 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
     dev.poll_rate = std::clamp(prof.dev_cfg.polling_rate,
                                (int)POLL_RATE_MIN, (int)POLL_RATE_MAX);
 
-    // Apply polling rate and DPI to Logitech HID++ hardware if available
+    // Apply polling rate and DPI to Logitech HID++ hardware if available.
+    //
+    // O31-D1: both calls below block on USB round-trips (worst case derived from
+    // the timeouts: 2.6 s + 3.2 s = 5.8 s per device) and we are the motion loop
+    // thread holding devices_mutex_ AND hidpp_devs_mutex_.  Push only the fields
+    // this device's hardware has not already been told about, so a config edit
+    // that touches no hardware field — or a SIGHUP that re-loads a byte-identical
+    // file — no longer walks the blocking path.  See hidpp_hw_sync for the
+    // sentinel and transport-rebuild contract.
     auto [transport, dev_idx] = find_hidpp_transport(dev);
     if (transport && dev_idx != 0xFF) {
+        const hidpp_hw_plan plan =
+            dev.hw_sync.plan_for(transport, dev.poll_rate, dev.dpi);
         // Set polling rate on hardware
-        if (!transport->set_polling_rate(static_cast<uint32_t>(dev.poll_rate), dev_idx)) {
+        if (plan.polling_rate &&
+            !transport->set_polling_rate(static_cast<uint32_t>(dev.poll_rate), dev_idx)) {
             log("Failed to set polling rate " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
-        } else {
+        } else if (plan.polling_rate) {
             log("Set polling rate to " + std::to_string(dev.poll_rate) + " Hz on " + dev.name, true);
         }
         // Set DPI on hardware (if device supports it)
-        if (!transport->set_dpi(static_cast<uint16_t>(dev.dpi), dev_idx)) {
+        if (plan.dpi &&
+            !transport->set_dpi(static_cast<uint16_t>(dev.dpi), dev_idx)) {
             log("Failed to set DPI " + std::to_string(dev.dpi) + " on " + dev.name, true);
-        } else {
+        } else if (plan.dpi) {
             log("Set DPI to " + std::to_string(dev.dpi) + " on " + dev.name, true);
         }
+        if (plan.any())
+            dev.hw_sync.mark_attempted(transport, dev.poll_rate, dev.dpi);
     }
 
     // O6: reference uses input_dpi_normalization_factor = NORMALIZED_DPI / dpi

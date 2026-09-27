@@ -374,6 +374,37 @@ compute sample staleness). Design keeps the hot path lock-free:
   round-trip is still untested — `send_feature_request`/`resolve_feature_index`
   are private and `HidppTransport` needs a real hidraw node; no test seam was
   added to the class for this.
+- **`apply_profile()` pushes HID++ polling-rate/DPI only when the value changed**
+  (O31-D1): `set_polling_rate()` + `set_dpi()` are USB round-trips that run on the
+  motion loop thread while it holds `devices_mutex_` AND `hidpp_devs_mutex_`.
+  Their worst case is derived from the timeouts, not estimated: 2.6 s + 3.2 s =
+  **5.8 s blocked per device** (11.6 s for two), and the worst case is reached
+  exactly when the device is *not* answering. `hidpp_hw_sync` (in
+  `include/logitech_hidpp.hpp`, next to `HidppTransport`) records what was last
+  pushed; `plan_for()` returns which fields still need a write. Measured over the
+  real trigger sequence (initial grab, no-op SIGHUP, software-only profile edit,
+  real rate change, no-op SIGHUP, real DPI change, replug) it skips 6 of the 10
+  possible writes.
+  **The transport-pointer comparison is the load-bearing part, not the `0`
+  sentinel.** `plan_for()` short-circuits on `t != transport` and returns
+  `{true, true}` *without reading either value*, so a fresh record yields the
+  same plan whether it holds `0/0` or `800/1000` — measured, and the reason a
+  first draft that seeded the record from `mouse_device`'s defaults
+  (`dpi 800`/`poll_rate 1000`, `daemon.hpp:48-49` — the same numbers a default
+  profile carries) would have skipped the very first write. The `0` sentinel is
+  defence-in-depth behind that check; `test_hidpp_hw_sync_guard()` asserts the
+  sentinel **fields directly**, because an assertion written against `plan_for()`
+  passes for both seedings (proven: that draft's test was green while broken).
+  A different transport re-pushes both fields — an unplugged mouse returns at its
+  onboard DPI/rate, not at whatever was last pushed. The record is written on
+  *attempt*, not on success (`mark_attempted`): recording only on success would
+  re-pay the full timeout on every apply for a device that permanently lacks the
+  requested rate; the cost is that a *transient* failure is not retried until the
+  value changes, a profile is edited, or the device replugs (every attempt is
+  logged, and the pre-fix code retried unconditionally).
+  Still **not** done: the writes themselves are still on the loop thread. The
+  structural fix — queue them onto `hidpp_thread_`, which is what P171-BFIX
+  started for the read path — is a separate job touching the same two mutexes.
 - **HID++ function ids normalise at the packet boundary**: `to_bytes()` packs
   `normalize_function_id(fn) << 4 | software_id`, and `normalize_function_id`
   folds the request-id spelling (`0x48`) to the bare 4-bit selector (`0x4`).

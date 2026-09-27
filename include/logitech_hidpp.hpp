@@ -511,6 +511,73 @@ private:
     std::vector<hidpp_notification> pending_notifications_;
 };
 
+// ── O31-D1: which hardware settings still need pushing ───────────────────────
+
+/// What apply_profile() should actually push to a device's HID++ hardware.
+struct hidpp_hw_plan {
+    bool polling_rate = false;
+    bool dpi          = false;
+    bool any() const { return polling_rate || dpi; }
+};
+
+/// Remembers what the daemon has already pushed to a device's HID++ hardware,
+/// so a profile apply that changed nothing the device can see does not repeat
+/// the blocking set_polling_rate() / set_dpi() round-trips.
+///
+/// WHY (O31-D1, measured): those two calls run on the motion loop thread while
+/// it holds devices_mutex_ AND hidpp_devs_mutex_.  Their worst case is derived
+/// from the code, not estimated: set_dpi = disable_onboard_profiles_for_write
+/// (500+700) + get_dpi_info (700) + one write (700) = 2600 ms, and
+/// set_polling_rate = disable_onboard_profiles_for_write (1200) + two branches
+/// x two requests x 500 = 3200 ms, i.e. **5.8 s of blocked loop thread per
+/// device** (11.6 s for two).  Both timeouts are reached exactly when the device
+/// is NOT answering, and a SIGHUP reload had no guard at all, so re-loading a
+/// byte-identical config re-walked the whole path.
+///
+/// SENTINEL CONTRACT — 0 means "never pushed".  dpi is clamped to >= 1 and
+/// polling_rate to >= POLL_RATE_MIN (125) before it reaches here, so 0 can
+/// never be a real value, and 0/0 records the one state that is definitely not
+/// a hardware state.  It must NOT be seeded from mouse_device's own defaults
+/// (800 / 1000): a fresh device whose profile happens to carry those same two
+/// values would then have a record indistinguishable from "already pushed".
+///
+/// MEASURED — the transport comparison, not the sentinel, is what actually
+/// protects the first write: plan_for() short-circuits on `t != transport` and
+/// returns {true, true} without reading either value, so a fresh record yields
+/// the same plan whether it holds 0/0 or 800/1000.  The sentinel is therefore
+/// defence-in-depth behind that check, not the load-bearing part.
+/// test_hidpp_hw_sync_guard() asserts the sentinel fields directly, because an
+/// assertion written against plan_for() would pass for both seedings.
+///
+/// A rebuilt transport means the hardware state is unknown again — an unplugged
+/// mouse comes back at its onboard DPI/rate, not at whatever we last pushed — so
+/// a different transport re-pushes both fields.  This is the check that carries
+/// the first-write and replug guarantees.  `transport` is compared, never
+/// dereferenced, so this header stays free of the HidppTransport definition and
+/// remains unit-testable.
+struct hidpp_hw_sync {
+    const void* transport    = nullptr;  // transport we last pushed through
+    int         polling_rate = 0;         // 0 = never pushed
+    int         dpi          = 0;         // 0 = never pushed
+
+    hidpp_hw_plan plan_for(const void* t, int want_rate, int want_dpi) const {
+        if (t != transport) return {true, true};   // transport rebuilt
+        return {polling_rate != want_rate, dpi != want_dpi};
+    }
+
+    /// Record an ATTEMPT, not a success.  A device that does not advertise the
+    /// requested DPI/rate fails the write permanently, so recording only on
+    /// success would retry (and re-pay the full timeout) on every later apply.
+    /// The cost of this choice: a *transient* failure is not retried until the
+    /// requested value changes, a profile edit, or a replug.  The failure is
+    /// logged at every attempt, and the previous code re-tried unconditionally.
+    void mark_attempted(const void* t, int rate_written, int dpi_written) {
+        transport    = t;
+        polling_rate = rate_written;
+        dpi          = dpi_written;
+    }
+};
+
 // ── High-level notification handler (SOLAAR FAZ-B / P168) ───────────────────
 
 /// Normalized, transport-independent classification of a HID++ notification.

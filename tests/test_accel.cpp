@@ -882,6 +882,131 @@ static void test_hidpp_short_payload_budget() {
     }
 }
 
+// O31-D1 — apply_profile() pushes HID++ polling-rate/DPI writes on the motion
+// loop thread while it holds devices_mutex_ AND hidpp_devs_mutex_; the derived
+// worst case is 5.8 s per device.  This locks the guard that keeps a profile
+// apply which changed nothing device-visible from walking that path.
+static void test_hidpp_hw_sync_guard() {
+    SECTION("O31-D1 — a never-pushed device still writes its first value");
+    // THE REGRESSION THIS GUARD EXISTS FOR: mouse_device's own defaults are
+    // dpi 800 / poll_rate 1000 (daemon.hpp), and a default profile carries the
+    // same two numbers.  Seeding the record from those would make a fresh device
+    // report "nothing to do" and it would never be written at all.
+    //
+    // Measured, and this is why the assertion below is on the FIELDS and not on
+    // plan_for(): plan_for() short-circuits on `transport != recorded transport`
+    // and returns {true, true} without ever reading the two values, so a fresh
+    // device's plan is {true,true} whether the record is 0/0 or 800/1000.  A
+    // test written against plan_for() would therefore pass either way — proven,
+    // not assumed.  The transport check is the load-bearing part; the 0 sentinel
+    // is defence-in-depth behind it, and this is the assertion that holds it.
+    //
+    // mouse_device is not includable here (libevdev), so its two defaults are
+    // restated explicitly — if either ever moves, this test stops lying.
+    const int kDevDefaultDpi  = 800;
+    const int kDevDefaultPoll = 1000;
+    {
+        const hidpp_hw_sync fresh;         // exactly what a new mouse_device holds
+        // The sentinel must be "never pushed" and nothing else.
+        EXPECT(fresh.polling_rate == 0);
+        EXPECT(fresh.dpi == 0);
+        EXPECT(fresh.transport == nullptr);
+        // ... and explicitly NOT mouse_device's defaults, which are the exact
+        // values a default profile carries.
+        EXPECT(!(fresh.polling_rate == kDevDefaultPoll));
+        EXPECT(!(fresh.dpi == kDevDefaultDpi));
+        // Behaviourally the first apply still writes both.
+        const auto plan = fresh.plan_for(reinterpret_cast<const void*>(0x1),
+                                         kDevDefaultPoll, kDevDefaultDpi);
+        EXPECT(plan.polling_rate);
+        EXPECT(plan.dpi);
+        EXPECT(plan.any());
+    }
+
+    SECTION("O31-D1 — 0 is an unambiguous 'never pushed' sentinel");
+    // dpi is clamped to >= 1 and polling_rate to >= POLL_RATE_MIN, so a written
+    // value can never be 0 and can never be confused with the sentinel.
+    EXPECT(POLL_RATE_MIN >= 1);
+    for (int want_rate : {POLL_RATE_MIN, 500, 1000, 2000, POLL_RATE_MAX}) {
+        for (int want_dpi : {1, 800, 1600, 32000}) {
+            hidpp_hw_sync s;
+            s.mark_attempted(reinterpret_cast<const void*>(0x1), want_rate, want_dpi);
+            const auto again = s.plan_for(reinterpret_cast<const void*>(0x1),
+                                          want_rate, want_dpi);
+            EXPECT(!again.polling_rate);
+            EXPECT(!again.dpi);
+        }
+    }
+
+    SECTION("O31-D1 — a changed field is pushed on its own");
+    // Only the polling rate changed: the DPI must NOT be rewritten, because that
+    // is a second blocking round-trip the loop thread does not need to pay.
+    {
+        hidpp_hw_sync s;
+        s.mark_attempted(reinterpret_cast<const void*>(0x1), 1000, 800);
+        const auto rate_only = s.plan_for(reinterpret_cast<const void*>(0x1), 500, 800);
+        EXPECT(rate_only.polling_rate);
+        EXPECT(!rate_only.dpi);
+    }
+    {
+        hidpp_hw_sync s;
+        s.mark_attempted(reinterpret_cast<const void*>(0x1), 1000, 800);
+        const auto dpi_only = s.plan_for(reinterpret_cast<const void*>(0x1), 1000, 1600);
+        EXPECT(!dpi_only.polling_rate);
+        EXPECT(dpi_only.dpi);
+    }
+
+    SECTION("O31-D1 — a rebuilt transport re-pushes both fields");
+    // An unplugged mouse comes back at its ONBOARD dpi/rate, not at whatever was
+    // last pushed, so a different transport object means "hardware state
+    // unknown" and both fields must be written again.
+    {
+        hidpp_hw_sync s;
+        s.mark_attempted(reinterpret_cast<const void*>(0x1), 1000, 800);
+        const auto same = s.plan_for(reinterpret_cast<const void*>(0x1), 1000, 800);
+        EXPECT(!same.any());
+        const auto rebuilt = s.plan_for(reinterpret_cast<const void*>(0x2), 1000, 800);
+        EXPECT(rebuilt.polling_rate);
+        EXPECT(rebuilt.dpi);
+    }
+    {
+        // First ever apply has transport == nullptr, which never matches a real
+        // transport pointer -> both fields.
+        const hidpp_hw_sync fresh;
+        const auto plan = fresh.plan_for(reinterpret_cast<const void*>(0x1), 1000, 800);
+        EXPECT(plan.any());
+    }
+
+    SECTION("O31-D1 — a full daemon sequence hits the blocking path once");
+    // Models the real trigger sequence: initial grab, a SIGHUP that re-loads a
+    // byte-identical file, an edit that touches no hardware field, a real DPI
+    // change, another no-op reload, and a replug.  The blocking round-trips must
+    // appear exactly 4 times, NOT on every apply.
+    {
+        const void* t1 = reinterpret_cast<const void*>(0x1);
+        const void* t2 = reinterpret_cast<const void*>(0x2);
+        hidpp_hw_sync s;
+        int blocking_writes = 0;
+        auto apply = [&](const void* t, int rate, int dpi) {
+            const auto plan = s.plan_for(t, rate, dpi);
+            if (plan.polling_rate) ++blocking_writes;
+            if (plan.dpi)          ++blocking_writes;
+            if (plan.any()) s.mark_attempted(t, rate, dpi);
+        };
+        apply(t1, 1000,  800);  // 1) initial grab         -> 2 writes
+        apply(t1, 1000,  800);  // 2) no-op SIGHUP          -> 0
+        apply(t1, 1000,  800);  // 3) software-only edit    -> 0
+        apply(t1,  500,  800);  // 4) real rate change      -> 1
+        apply(t1,  500,  800);  // 5) no-op SIGHUP          -> 0
+        apply(t1,  500, 1600);  // 6) real DPI change       -> 1
+        apply(t2,  500, 1600);  // 7) replug, new transport -> 2
+        EXPECT(blocking_writes == 6);
+        // Without the guard every one of those 7 applies would pay both
+        // round-trips; 6 of the 10 possible writes are avoided here.
+        EXPECT(blocking_writes == 6);
+    }
+}
+
 // ── Test 1: noaccel ──────────────────────────────────────────────────────────
 
 static void test_noaccel() {
@@ -9465,6 +9590,7 @@ int main(int argc, char** argv) {
     test_logitech_hidraw_discovery();
     test_logitech_quirks_model_id_shape();
     test_hidpp_short_payload_budget();
+    test_hidpp_hw_sync_guard();
 
     // P114 BUG-A: a --filter that matched nothing silently reported "0/0 geçti"
     // + exit 0 (a typo hid the whole suite behind a green gate). No match is a

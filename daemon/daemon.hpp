@@ -39,6 +39,10 @@ struct mouse_device {
     std::string      name;
     std::string      path;           // e.g. /dev/input/event3
     std::string      device_id;
+    // O31-D1: what we have already pushed to this device's HID++ hardware.
+    // Plain ints, guarded by the same devices_mutex_ that guards dpi/poll_rate
+    // just above — apply_profile() is only ever reached with that held.
+    hidpp_hw_sync    hw_sync;
     int              fd_in  = -1;    // grabbed evdev fd
     libevdev_uinput* uidev  = nullptr; // uinput virtual device handle
     int              dpi    = 800;
