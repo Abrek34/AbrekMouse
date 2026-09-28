@@ -43,6 +43,27 @@ struct power {
             // ref derives scale=0 from the "gain 0" output point, or produces a flat
             // zero-threshold clamp that freezes the cursor gain. Treat as "no cap
             // requested": identity scale, no legacy clamp, base curve active.
+            //
+            // This guard is a DELIBERATE divergence from the official reference,
+            // not an accident, and it is the reason the oracle carries 12
+            // deviations for the degenerate input (measured 2026-09-28, cap.x=15,
+            // cap.y=0, %.17g, the oracle's own -O1, all 12 grid speeds):
+            //
+            //   p155_io_cap0_legacy   ref = 0 (hard zero, every speed)
+            //   p155_io_cap0_gain     ref = NaN (every speed)
+            //   both families          local = 0.063095734448019331 at spd 1e-4
+            //                          ... 1 at spd 1 ... 31.622776601683789 at
+            //                          spd 1e5 — identical in both modes, which is
+            //                          what "no cap requested" means.
+            //
+            // A frozen zero/NaN is a dead curve, so the local answer is the more
+            // useful one; but the 12 legacy rows ARE listed in
+            // tests/oracle/known_deviations.txt (class 4) because ref's hard 0
+            // is comparable. The sibling gain family is deliberately NOT listed:
+            // `NaN > tol` is never true, so those rows can never surface as a
+            // deviation and listing them would only raise a stale-row error.
+            // Do not "fix" this by matching the reference — that is the bug
+            // P155 was filed for.
             scale = 1.0;
             legacy_cap = DBL_MAX;
             constant = 0;
