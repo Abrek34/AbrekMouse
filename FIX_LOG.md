@@ -150,6 +150,7 @@ Not: GUI-D4 + PRE-1 + MATH-2 son edit'leri 2026-09-12 build'inde derlendi (warni
 | YENİ-2 | DÜŞÜK | cli/main.cpp:351-352 | "disabled: dormant, hot path ignores" mesajı YANLIŞ — daemon disable'ı onurlandırıyor (PAS-2) | `✅ ağaçta teyit (C29-N6 mesajı var, dormant yok) — kod değişmedi` |
 | YENİ-3 | SÜREÇ | FIX_LOG.md | "GUI-D4+PRE-1+MATH-2 derlenmedi" notu build ile geçersiz — güncellenmeli | `✅ güncellendi (satır 51 notu) — kod değişmedi` |
 | NEW-4 | DÜŞÜK | scripts/build.sh:124 | GUI derleme satırı `$HARDENING` içermiyor (daemon:104, cli:114 var) → GUI `-fstack-protector`/`FORTIFY` SIZ | `✅ big-pickle (09-12): GUI satırına $HARDENING eklendi; build + test (33792/33792) yeşil` |
+| SH-5 | DÜŞÜK | scripts/bench_hotpath.sh, tests/bench_hotpath.cpp | G-6: `ulimit -f` **yok** — çıktı dosyası (`bench_hotpath_results.txt`) sınırsız büyüyebilir, `perf` yokluğunda tek koruyucu bu | `⬜ AÇIK (09-29, AJ1): 10. kez ölçüldü — \`grep -c 'ulimit'\` her iki dosyada da **0**. AJ3 önce raporunda "G-6 ✅" dedi, sonra o satırı **SİLDİ**; iş yapılmadı, sadece iddia kalktı. Kayıt, rapordan bağımsız izlenebilsin diye buraya yazıldı` |
 
 ---
 
