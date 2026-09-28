@@ -43,4 +43,42 @@ Bu projede yolun açtığı üç tuzak, aracın docstring'inde ve burada:
 | `include/simd_math.hpp` | 56 satır | 241 → 241 | byte-level ayni |
 | `include/math-vec2.hpp` | 35 satır | 45 → 45 | byte-level ayni |
 
-Bunların commit'leri: `b01342b1`, `207732a3`, `36825e55`.
+Commit'ler: `b01342b1`, `207732a3`, `36a53c8c`.
+
+## ⛔ Hangi dosyayı HANGİ KAPI doğruluyor — karıştırma
+
+Bu ayrım ölçülerek konuldu (2026-09-28) çünkü "oracle'da gerçek fark yok"
+gerekçesi **üç dosyanın ikisinde geçerli değil**:
+
+| dosya | `run_oracle.sh` | hangi kapı gerçekten doğruluyor |
+|---|---|---|
+| `include/accel-*.hpp` | ✅ 1407 satır | `run_oracle.sh` **+** `run_tests.sh` |
+| `include/simd_math.hpp` | ❌ hiç çağrılmıyor | `run_simd_parity.sh` (kendi envanter denetimli) |
+| **`include/math-vec2.hpp`** | ❌ **hiç çağrılmıyor** | **yalnız `run_tests.sh`** |
+
+Ölçüm — oracle harness'inde (`local.cpp` + `reference.cpp`) ve
+`oracle_cases.hpp`'te geçen sayılar:
+
+```
+  lp_distance        harness 0   oracle_cases 0
+  calc_speed_whole   harness 0   oracle_cases 0
+  speed_processor    harness 0   oracle_cases 0
+  rotate             harness 0   oracle_cases 0
+  magnitude          harness 0   oracle_cases 2   (alan adi, cagri degil)
+```
+
+Yani oracle ızgarası hızı **skaler** verip doğrudan kazanç eğrisine sokuyor;
+**vektör → hız** katmanı (`speed_processor`, `lp_distance`, `magnitude`,
+`rotate`) ne yerelde ne referansta **hiç çalışmıyor**.
+
+`simd_math.hpp` için bu boşluğu `run_simd_parity.sh`'in `BILINEN_OLUMLER`
+envanteri kapatıyor. **`math-vec2.hpp` için hiçbir şey kapatmıyor** — onu
+sadece `run_tests.sh`'in 34k iddiası doğruluyor, ve o iddialar
+`lp_distance`'ı doğrudan, çoğu **sonlu** girdiyle çağırıyor.
+
+**Bu yüzden:** `math-vec2.hpp` hakkındaki bir değişikliği gerekçelendirirken
+*"oracle 1407 satırı yeşil"* demek **yanlış kapsamdır** — doğrusu
+*"bu katman oracle'ın dışında; doğrulaması `run_tests.sh` + ölçülen
+erişilebilirlik zinciri"*. Oracle yeşil kalması bu katmanda **bilgi
+vermez**, çünkü katman orada çalışmıyor.
+
