@@ -32,6 +32,30 @@
 # Bu liste kapsamli DEGILDIR: yalnizca denetlenmesi deger gorulen sayilar
 # var. Kapsam genisletmek bir karar; her yeni iddia bir capraz referans
 # denetimiyle birlikte eklenir.
+#
+# ============================================================================
+# KASTI DENETLENMEYEN sayilar — bunlari "duzeltme"
+# ============================================================================
+# Asagidaki sayilar BAYAT DEGILDIR; onlar TARIHI KAYITLARDIR ve dogru
+# olduklari icin guncellenmemelidir. Kayit, "bir noktada su kosul olcu" demeyi
+# ifade eder; o noktadan sonra degismek kaydi YANLIS yapar.
+#
+#   FIX_LOG.md:519        "oracle OK (1407 satir / 67 known deviation)"
+#   FIX_LOG.md:544        "oracle 1407 / 79 / 79 / OK"
+#   FIX_LOG.md:607        Round-16'nin ayni satiri, alinti olarak
+#   FIX_LOG.md:611        "1407 eski adin sayimdi" -- yorum, sayi iddiasi degil
+#   FIX_LOG.md:617        "1407 yaziliysa exit 77" -- bir onerme, olcum degil
+#   Bug Hata Raporlari.md:1867  "oracle RESULT: OK (1119 satir / 67 sapma)"
+#   Bug Hata Raporlari.md:1889  "oracle RESULT: OK (1119/67) ... 34015/34015"
+#
+# Olculdu: bugun AGENTS.md 1408/79 ve 34164/34164 veriyor; ama o andaki
+# gercek 1119/67 ve 34015/34015 idi. Bunlari 1408/34164 yapmak, bir olcum
+# kaydini, hicbir zaman o olcummedigi bir sayiyi yazmis saymak olurdu.
+#
+# ⭐ BAYAT ile TARIHI ayirt etmek zorunlu: "bayat" = belgenin bugun yanlis
+# iddia ettigi sayi; "tarihi" = dogruydu, olculdugu anin kaydi. Ikisi de
+# eski gorunur ve yalnizca olcumle ayirt edilir. Bir FIX_LOG dogrulama
+# satiri "su an" demiyorsa tarihidir.
 AGENTS.md	Current grid: \*\*(\d+) rows compared	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^total rows compared : \([0-9]*\)$/\1/p'	oracle izgara satiri (L288)
 AGENTS.md	The oracle's (\d+) rows	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^total rows compared : \([0-9]*\)$/\1/p'	AYNI sayi IKINCI kez (L318); eskiden 1407/1408 celisiyordu
 AGENTS.md	rows compared, (\d+) documented deviations	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^documented deviations: \([0-9]*\) .*/\1/p'	belgelenen sapma (L288)
