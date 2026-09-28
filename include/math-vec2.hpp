@@ -77,7 +77,8 @@ inline double lp_distance(vec2d v, double p) {
     // lp_norm >= MAX_NORM || lp_norm <= 0 to max-norm without ever calling this
     // function.  So in production p is only guaranteed to be *positive*, and a
     // denormal (e.g. lp_norm = 1e-320 in a hand-edited config) passes both
-    // finite_or() and the <= 0 test — measured, that reaches the L137 branch
+    // finite_or() and the <= 0 test — measured, that reaches the
+    // `isfinite(expanded) ? expanded : M` branch at the end of this function
     // below.
     double M = ax > ay ? ax : ay;
     double m = ax > ay ? ay : ax;
@@ -94,7 +95,7 @@ inline double lp_distance(vec2d v, double p) {
     const double log_inner = p * std::log(m / M); // ≤ 0 since m/M ≤ 1
     // MEASURED (2026-09-28): in the full 34 092-assertion suite this whole log
     // block is entered EXACTLY ONCE — test_accel.cpp:9043-9047, lp_norm=1e-9 on
-    // (3,4) — and it leaves through the `else` below (L133), returning M.
+    // (3,4) — and it leaves through the `else` below, returning M.
     //
     // The two flanking branches are NOT dead code — do not delete them.  They
     // are unreachable with FINITE COMPONENTS.  An earlier revision of this
@@ -111,23 +112,33 @@ inline double lp_distance(vec2d v, double p) {
     //    with a COMPILER counter, not a hand-placed one —
     //    olcum/aj2/prove_kod_ayni.py --dallar (gcov -fprofile-arcs; the counter
     //    is therefore independent of this file):
-    //      driver      L131 b0   L132 b0   L137 b0
-    //      grid        0          0          0
-    //      search      0          0          0
+    //      The three branches below are named by their CODE, never by line
+    //      number: a line citation inside the file it cites breaks the moment
+    //      anything is inserted above it, and that happened twice here.
+    //        A = `if (log_inner < -600.0)  log_1pi = 0.0;`
+    //        B = `else if (log_inner > 600.0)  log_1pi = log_inner;`
+    //        C = `return std::isfinite(expanded) ? expanded : M;`
+    //      driver        A        B        C
+    //      grid          0        0        0
+    //      search        0        0        0
     //    The search driver covers both signs, ±Inf, NaN, denormals and a
     //    logarithmic m/M × p cross-sweep (>100 000 calls) and leaves all three
-    //    at 0.  POSITIVE CONTROL: relaxing L131's threshold -600 -> 1e300 moved
-    //    its counter 0 -> 511 500, so the zero is a real reachability result
-    //    and not a stuck instrument.  The component guard's own branches moved
-    //    0 -> 972 / 99 592 / 100 564 in the same run, which is what makes the
-    //    "M = ±Inf" case below impossible.
+    //    at 0.  POSITIVE CONTROL: relaxing A's threshold -600 -> 1e300 (one
+    //    token) moved A's taken-count 0 -> 68 on the grid and took the file
+    //    from 6 zero branches to 8, so the zeros are a real reachability
+    //    result and not a stuck instrument.  The component guard's own three
+    //    branches went 0 -> 972 / 99 592 / 100 564 under the search driver,
+    //    which is what makes the "M = ±Inf" case below impossible.
+    //    Cite-check: `prove_kod_ayni.py --atif` flags any self-citation whose
+    //    target line is itself a comment.
     //
     //  * M = ±Inf.  SUPERSEDED by the component guard at the top of the
     //    function (R16), which returns 0 before this block: an infinite
     //    component can no longer reach here, so the 708 bound above holds
     //    unconditionally again.  The reachability that used to be listed here
-    //    ((Inf,3) p=2 / (3,Inf) p=1 / (Inf,0) p=1 → L131, (Inf,3) p=-1 /
-    //    (Inf,0) p=-1 → L132) is now dead.  Kept as a record of the change.
+    //    ((Inf,3) p=2 / (3,Inf) p=1 / (Inf,0) p=1 → the `log_inner < -600.0`
+    //    branch, (Inf,3) p=-1 / (Inf,0) p=-1 → the `log_inner > 600.0` one)
+    //    is now dead.  Kept as a record of the change.
     //
     //  * In PRODUCTION the components are finite — the reason is the CEILING
     //    (int32 events into a double over a 32-event batch), not a guard; see
@@ -139,7 +150,8 @@ inline double lp_distance(vec2d v, double p) {
     //    — lp_distance is public and inline, and tests call it directly.
     //    NOT dead code; do not delete.
     //
-    // L137 below is likewise not dead: a denormal p reaches it (note above).
+    // The `isfinite(expanded) ? expanded : M` line below is likewise not dead:
+    // a denormal p reaches it (note above).
     double log_1pi;
     if (log_inner < -600.0)     log_1pi = 0.0;       // exp underflows → 1
     else if (log_inner > 600.0) log_1pi = log_inner; // exp overflows → term dominates

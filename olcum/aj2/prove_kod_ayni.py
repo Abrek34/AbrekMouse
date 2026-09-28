@@ -85,8 +85,12 @@ def main() -> int:
                     help="--dallar icin girdi surucusu (main zorunlu)")
     ap.add_argument("--arama", metavar="CPP",
                     help="erisilebilir girdi arayan ikinci surucu")
+    ap.add_argument("--atif", metavar="DOSYA",
+                    help="yorumdaki kendi satir atiflarini denetle")
     args = ap.parse_args()
 
+    if args.atif:
+        return run_atif(args.atif)
     if args.dallar:
         if not args.surucu:
             sys.exit("--dallar icin --surucu ZORUNLU (sayac olculecek cagriyi "
@@ -182,6 +186,78 @@ def _branches(data, header_rel: str):
 def _src_line(src: str, n: int) -> str:
     lines = src.splitlines()
     return lines[n - 1].strip() if 0 < n <= len(lines) else ""
+
+
+def run_atif(dosya: str) -> int:
+    """Yorumun kendi satir atiflarini denetler.
+
+    KIRILGANLIK: bir dosyaya satir atfi yazmak, dosyanin ustunden bir satir
+    eklemekle kirilir. Burada olmus tuzak: 4 bayat atif (L45/L46/L47/L49)
+    duzeltildi, ANCAK ayni commit icinde yorum genisletildi ve gercek kod
+    L131'den L144'e kaydi — duzeltilen atiflar KENDI ISLETMIZle bayatlasti.
+    Satir numarasi degil, satirin KODU kalicidir.
+
+    Kural: her "L<n>" atfi n. satiri gostermelidir ve o satir YORUM olmamalidir.
+
+    PC zorunludur ve gomuludur: alet once iki kucuk YAPAY dosya uzerinde
+    dogrulanir (biri iyi atif, biri kendine donen kotu atif) ve yalnizca kotu
+    olani isaretlemede PASS verir. Boylece "0 bulundu" ile "arac bozuk"
+    ayirt edilir.
+    """
+    IYI = ("// kod asagida: L3\n"
+           "int a = 1;\n"
+           "int b = 2;\n"
+           "int c = 3;\n")
+    KOTU = ("// kendine donen atif: L1\n"
+            "int a = 1;\n"
+            "int b = 2;\n")
+
+    def tara(text: str):
+        satirlar = text.splitlines()
+        kotu = []
+        for i, ln in enumerate(satirlar, 1):
+            if "//" not in ln and "/*" not in ln:
+                continue
+            yorum = ln[ln.index("//"):] if "//" in ln else ln
+            for m in re.finditer(r"\bL(\d{1,4})\b", yorum):
+                n = int(m.group(1))
+                if not (0 < n <= len(satirlar)):
+                    kotu.append((i, n, "dosya disi satir"))
+                    continue
+                hedef = satirlar[n - 1].strip()
+                if hedef.startswith("//") or hedef.startswith("*") \
+                        or hedef.startswith("/*"):
+                    kotu.append((i, n, "hedef bir YORUM satiri"))
+        return kotu
+
+    iyi_kotu = tara(IYI)
+    kotu_kotu = tara(KOTU)
+    print("  === --atif: kendi satir atiflarini denetle ===")
+    if iyi_kotu:
+        print(f"  ⛔ PC KALMADI — iyi olmasi gereken dosyada {len(iyi_kotu)} "
+              f"kaydi isaretledi. Alet duyarsiz.")
+        for k in iyi_kotu:
+            print(f"     yanlis pozitif: yorum L{k[0]} -> L{k[1]} ({k[2]})")
+        return 2
+    if not kotu_kotu:
+        print("  ⛔ PC KALMADI — kotu olmasi gereken dosya TEMIZ cikti. "
+              "Alet duyarsiz.")
+        return 2
+    print(f"  ✔ PC gecti (yapay dosyalar: iyi=0 kayit, kotu={len(kotu_kotu)} "
+          f"kayit)")
+
+    src = read(dosya)
+    kotu = tara(src)
+    if not kotu:
+        print(f"  ✔ {dosya}: {dosya} icinde bozuk satir atifi yok")
+        return 0
+    print(f"  ⛔ {dosya}: {len(kotu)} atif BOZUK — hedef bir yorum satiri "
+          f"veya dosya disi:")
+    for yorum_satiri, hedef, sebep in kotu:
+        print(f"     yorum L{yorum_satiri}  ->  L{hedef}  ({sebep})")
+    print("  Duzeltme: atfi KODUyla yaz, numarayla degil. Numara, dosyanin")
+    print("  ustune bir satir eklenince kirilir; kod metni kirilmaz.")
+    return 1
 
 
 def run_dallar(header: str, driver: str, arama: str | None) -> int:
