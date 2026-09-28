@@ -85,17 +85,23 @@ namespace simd {
 //   header, which is a label, not a number.)
 //
 // So the shipping flag set does NOT change the numeric result of this code.
-// The gap is still large, though, and it is worth recording why that is not a
-// surprise.  `g++ -Q --help=target` on this machine: `-march=native` differs
-// from `-mavx2` in 23 settings — 21 of them ISA instruction-set flags (abm,
-// adx, aes, bmi, bmi2, clflushopt, cx16, f16c, fma, fsgsbase, hle, lzcnt,
-// movbe, pclmul, prfchw, rdrnd, rdseed, sahf, xsavec, xsaveopt, xsaves) plus
-// -march=skylake / -mtune=skylake.  Exactly ONE of those 21 can affect
-// floating-point codegen: FMA.  The other 20 are integer, bitwise, vector-
-// integer, crypto or state-management instructions, none of which this file
-// emits.  The preprocessor-macro subset is 9 (lzcnt, bmi, bmi2, aes, f16c,
-// rdseed, clflushopt, adx, fma).
-//
+  // The gap is still large, though, and it is worth recording why that is not a
+  // surprise.  `g++ -Q --help=target` on this machine: `-march=native` differs
+  // from `-mavx2` in 20 ISA instruction-set flags (abm, adx, aes, bmi, bmi2,
+  // clflushopt, cx16, f16c, fma, fsgsbase, hle, lzcnt, movbe, pclmul, prfchw,
+  // rdrnd, rdseed, sahf, xsavec, xsaveopt, xsaves).  The arch/tune settings
+  // (-march=skylake / -mtune=skylake) differ too, but they are not activity
+  // flags and so are not part of that count; a raw `comm` over the whole flag
+  // list mixes the two quantities and reports 23.
+  // Exactly TWO of the 20 can affect floating-point codegen: FMA (fused
+  // multiply-add) and F16C (half-precision conversion).  This file has zero
+  // half-precision intrinsics - every one is `_pd` (packed double) or `_sd`
+  // (scalar double) - so only FMA can matter here.  The other 18 produce
+  // integer, bitwise, vector-integer, crypto or state-management instructions,
+  // none of which this file emits.  A separate and different measurement: the
+  // preprocessor defines a macro for 9 of the 20 (lzcnt, bmi, bmi2, aes, f16c,
+  // rdseed, clflushopt, adx, fma).  "Has a macro" is not the same quantity as
+  // "differs", and the two must not be used interchangeably.
 // Note also that `-mavx2` already IMPLIES sse3/ssse3/sse4.1/sse4.2/avx, which
 // is why those never show up as a difference — and why the `-msse3` … `-msse4.2`
 // tail of scripts/build.sh's SIMD_FLAGS changes nothing (measured: the whole
