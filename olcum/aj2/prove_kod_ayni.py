@@ -6,6 +6,9 @@ Kullanim:
     prove_kod_ayni.py --git <dosya>                     # HEAD~1 .. HEAD (commit)
     prove_kod_ayni.py --pc <dosya>                      # yontemin duyarli oldugunu
                                                          # dogrula (mutasyonla kirma)
+    prove_kod_ayni.py --atif <dosya>                    # yorumdaki satir atiflarini denetle
+    prove_kod_ayni.py --sayi <iddialar.txt>             # belgedeki SAYISAL iddialari olc
+                                                         # (satir atfi DEGIL — sayi denetimi)
 
 Yontem: yorumlar ve bos satirlar atilir, satir ici // silinir, kalan iki
 cikti bayt bayt karsilastirilir. 0 fark = yorum eklmek derlenmis artefakti
@@ -87,6 +90,9 @@ def main() -> int:
                     help="erisilebilir girdi arayan ikinci surucu")
     ap.add_argument("--atif", metavar="DOSYA",
                     help="yorumdaki kendi satir atiflarini denetle")
+    ap.add_argument("--sayi", metavar="IDDIALAR",
+                    help="belgedeki sayisal iddialari olc (satir atfi DEGIL, "
+                         "SAYI denetimi; --atif bunu yapmaz)")
     ap.add_argument("--aktif", metavar="ESKI::YENI",
                     help="mutasyon PC'si: bir KOD satiri secip geri al, "
                          "sayacin kipirdadigini olc")
@@ -102,6 +108,8 @@ def main() -> int:
         return run_aktif(args.dallar, args.surucu, eski, yeni)
     if args.atif:
         return run_atif(args.atif)
+    if args.sayi:
+        return run_sayi(args.sayi)
     if args.dallar:
         if not args.surucu:
             sys.exit("--dallar icin --surucu ZORUNLU (sayac olculecek cagriyi "
@@ -419,6 +427,265 @@ def run_atif(dosya: str) -> int:
         print(f"     yorum L{yorum_satiri}  ->  L{hedef}  ({sebep})")
     print("  Duzeltme: atfi KODUyla yaz, numarayla degil. Numara, dosyanin")
     print("  ustune bir satir eklenince kirilir; kod metni kirilmaz.")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# --sayi: belgedeki SAYISAL iddialari OLCE.
+#
+# --atif satir atifini denetler, SAYIYI denetlemez. Bu bosluk olculerek
+# bulundu: AGENTS.md'de dort sayi bayatlamisti ve ustelik AYNI dosyanin
+# icinde birbirini tutmayan iki sayi vardi (L288 "1407 rows compared",
+# L318 "The oracle's 1408 rows"). Satir atiflari temizdi — sayi rotu tamamen
+# gorunmezdi, cunku hicbir arac ona bakmiyordu.
+#
+# AYNI sinifin daha kotu ornegi de bu dosyaya girmisti: tavan zinciri sayisi
+# once dogru yazildi (3.2767e16), sonra BIR YERDE "3.3e16" bicimiyle
+# kisaltildi. `grep -n '3.3e16'` YAKALAMADI. Dogru degeri arayan grep de o
+# satiri yakalayamazdi — cunku sorun sayinin DEGERINDE degil, NEREDE
+# yazildigi degildi.
+#
+# Yontem: iddianin KENDISI belgede kalir. Iddialar dosyasi yalniz "bu
+# regex'te yakalanan sayi, su komutun ciktisiyla ayni mi" der. Boylece
+# tablo elle yazilan bir HAKEM degil, denetlenen bir BEYANDIR: iddia
+# bayatladiginda kapi kirmizi olur.
+#
+# Karsilastirma SAYI olarak yapilir, metin olarak degil. "100000" ile "1e5"
+# ayni miktardir ve FIRKATI degildir; "3.3e16" ile "3.2767e16" FARKLIDIR ve
+# kirmizidir — bicimle geldigi icin yakalanmamasi gereken tam olarak bu
+# yuzden, yazi olarak degil sayi olarak karsilastirilir.
+# ---------------------------------------------------------------------------
+_SAYI_RE = re.compile(r"^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+
+
+def _sayi_mi(s):
+    """'3.2767e16' -> float; gecersizse None.  Metin DEGIL sayi dondurur."""
+    t = s.strip()
+    if not _SAYI_RE.match(t):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _iddi_satirlari(dosya):
+    """iddialar dosyasini oku -> [(no, hedef_dosya, regex, komut)]"""
+    out = []
+    for i, ham in enumerate(read(dosya).splitlines(), 1):
+        if not ham.strip() or ham.lstrip().startswith("#"):
+            continue
+        # TAB ayirici. Gorunur bir ayirici kullanilsaydi kacinin alan
+        # oldugu belirsizlesirdi.
+        alan = ham.split("\t")
+        if len(alan) != 4:
+            raise ValueError(
+                f"{dosya}:{i}: 4 alan beklenir (hedef<TAB>regex<TAB>komut<TAB>aciklama), "
+                f"{len(alan)} alan var: {ham!r}")
+        hedef, des, komut = alan[0], alan[1], alan[2]
+        try:
+            rx = re.compile(des)
+        except re.error as e:
+            raise ValueError(f"{dosya}:{i}: regex derlenemedi {des!r}: {e}")
+        out.append((i, hedef, rx, komut))
+    return out
+
+
+def _komut_olc(komut, kok):
+    """Komutu calistir, stdout'u TEK sayi olarak dondur. Tek sayi degilse hata.
+
+    Buradaki katilik olcunun kendisidir: komutun sonunda `| head` varsa ya da
+    iki deger basiyorsa sonuc TEK sayiya inmez ve arac bunu HATA sayar.
+    Boylece boru tuzagi sessizce gecmez.
+    """
+    p = subprocess.run(["bash", "-c", komut], cwd=kok, capture_output=True,
+                       text=True, env=dict(os.environ, LC_ALL="C"))
+    if p.returncode != 0:
+        return None, (f"komut rc={p.returncode}; stderr: "
+                      f"{p.stderr.strip()[:160] or '(bos)'}")
+    ham = p.stdout.strip()
+    if not ham:
+        return None, "komut bos cikti (hicbir sey yazmadi)"
+    if "\n" in ham:
+        return None, f"komut {len(ham.splitlines())} satir yazdi, TEK sayi beklenir"
+    v = _sayi_mi(ham)
+    if v is None:
+        return None, f"komut tek sayi yazmadi, got: {ham[:80]!r}"
+    return v, None
+
+
+def _sayi_ara(hedef, rx, kok, yol=None):
+    """Belgede regex'i ara -> (metin, deger, hata). Tek eslesme sarttir."""
+    yol = yol or os.path.join(kok, hedef)
+    bul = rx.findall(read(yol))
+    if not bul:
+        return None, None, f"{hedef}: regex HIC eslesmedi: {rx.pattern!r}"
+    if len(bul) > 1:
+        return None, None, (f"{hedef}: regex {len(bul)} yerde eslesti "
+                            f"(belirsiz — ilkini secmek yanlis olur): "
+                            f"{[b if isinstance(b, str) else b for b in bul][:6]}")
+    m = rx.search(read(yol))
+    v = _sayi_mi(m.group(1))
+    if v is None:
+        return None, None, (f"{hedef}: yakalanan grup sayi DEGIL: "
+                            f"{m.group(1)!r} (regex: {rx.pattern!r})")
+    return m.group(1), v, None
+
+
+def _sayi_karsilastir(hedef, rx, kok, komut, yol=None):
+    """None = tutuyor; hata metni = bayat.  Ardisik cagrilarda dosya OLUZ
+    yaratilir, bu yuzden PC'ler cagridan once dosyayi kendileri yazar."""
+    yol = yol or os.path.join(kok, hedef)
+    metin, belgede, hata = _sayi_ara(hedef, rx, kok, yol=yol)
+    if hata:
+        return hata
+    olculen, hata = _komut_olc(komut, kok)
+    if hata:
+        return f"hedef {hedef} sayi {metin!r}, ama {hata}"
+    if belgede != olculen:
+        return (f"hedef {hedef} sayi {metin!r} yaziyor, olcum {olculen!r} "
+                f"(komut: {komut})")
+    return None
+
+
+def run_sayi(iddialar):
+    """Belgedeki sayisal iddialari olc ve karsilastir. 0=tutuyor 1=bayat
+    2=arac/iddia hatasi (bunu 'gecmedi' ile 'olcemedim' olarak ayirir).
+
+    ⭐ KARARLASTIRMA HASSASIYETI: karsilastirmannin hassasiyeti, komutun
+    CIKTI BICIMINE baglidir -- arac tarafindan degil. Olcum komutu `:.3g` ile
+    3 anlamli basamağa yuvarlıyorsa, belgenin de ayni hassasiyeti yazmasi
+    gerekir; yoksa arac fark gorur. Bu bir arac hatasi DEGIL, ozelligi:
+
+        komut  :.3g  -> 6.87e+22     belgede `6.87e22`   -> esit  (gecer)
+        komut  repr   -> 6.8719476704e+22
+                                       belgede `6.87e22`   -> FARKLI (kirmizi)
+                                       belgede tam yazim  -> esit  (gecer)
+
+    Yani: "belge hicbir seyin olcemedigi kadar hassas bir sayi iddia ediyor"
+    huku, KIRMIZI bir hukiimdur ve dogrudur -- ama gurultu degildir, cunku
+    belgenin iddiasi ozetlenmis bir bicimle yazilmistir. Bu ozelligi bilmeden
+    yazilan bir PC kendi kurgusunu yanlislikla dogrular: "yalniz bicim farki"
+    diye tam yazimi (`68719476704000000000000`) enjekte eden bir PC aslinda
+    HASSASIYET farki enjekte eder ve yesil beklerken kirmizi gorur.
+
+    Oyle bir PC yazildi, olculdu ve duzeltildi:
+      PC-C  enjeksiyon `6.87e22` -> `68719476704000000000000`
+             beklenti rc=0, olculen rc=1  ==> PC YANDI (kendi kurgusu hatali)
+      PC-C' enjeksiyon `6.87e22` -> `6.87E22`   (yalniz E buyuk harf)
+             beklenti rc=0, olculen rc=0  ==> gecer, yanlis pozitif YOK
+    Ikisi de AGENTS.md uzerinde, kopya agacta olculdu; canli agac yazilmadi.
+    Kayit: cozum "komutu tam hassasiyete cevir" degildi -- bu, belgenin 3
+    basamakli ozet yazimini de dogru kabul eder ve hizlidir.
+    """
+    kok = os.getcwd()
+    print("  === --sayi: belgedeki SAYISAL iddialari olc ===")
+    print("  karsilastirma METIN olarak degil SAYI olarak yapilir:")
+    print("  '100000' == '1e5' ayni miktardir; '3.3e16' != '3.2767e16'")
+    print("  ⭐ hassasiyet komutun cikti bicimine bagli: `:.3g` ise belgede de")
+    print("    3 basamakli yazilmalidir (bkz. run_sayi docstring)")
+
+    # --- PC gomulu: bes durum. Arac hepsinde dogru davranmali. ---
+    # PC dosyalari KOPYA agacinda degil, gecici dizinde uretilir; canli agaca
+    # hicbir sey yazilmaz. (Onceki taslak bunlari repo kokune yaziyordu.)
+    gecici = tempfile.mkdtemp(prefix="sayi-pc-")
+    try:
+        def yaz(ad, icerik):
+            p = os.path.join(gecici, ad)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(icerik)
+            return p
+
+        def kosul(ad, kosul_pc, ne, hata_kodu):
+            try:
+                sonuc = kosul_pc()
+            except Exception as e:                       # noqa: BLE001
+                print(f"  ⛔ PC[{ad}] istisna: {e}")
+                return False
+            if not sonuc:
+                print(f"  ⛔ PC KALMADI [{ad}] — {ne}")
+                return False
+            return True
+
+        d = "pc.md"
+        # (1) hic eslesme -> kesin hata
+        p1 = yaz(d, "burada hicbir sayi yok\n")
+        ok1 = kosul("bulunamadi",
+                    lambda: _sayi_ara(d, re.compile(r"yoktur(\d+)"), gecici,
+                                      yol=p1)[2] is not None,
+                    "regex eslesmedi ama arac hata vermedi", 2)
+        # (2) coklu eslesme -> kesin hata
+        p2 = yaz(d, "a: 5 rows\nb: 7 rows\n")
+        ok2 = kosul("coklu",
+                    lambda: _sayi_ara(d, re.compile(r"(\d+) rows"), gecici,
+                                      yol=p2)[2] is not None,
+                    "2 eslesme varken belirsizlik bildirilmedi", 2)
+        # (3) bayat tam sayi -> kirmizi
+        p3 = yaz(d, "grid: 1407 rows\n")
+        ok3 = kosul("bayat",
+                    lambda: _sayi_karsilastir(d, re.compile(r"grid: (\d+) rows"),
+                                              gecici, "echo 1408", yol=p3)
+                    is not None,
+                    "1407/1408 ayrismasi yakalanmadi", 1)
+        # (4) bicimle gelen sapma -> kirmizi. ASIL sinif.
+        p4 = yaz(d, "ceiling: 3.3e16\n")
+        ok4 = kosul("bicim-sapmasi",
+                    lambda: _sayi_karsilastir(d, re.compile(r"ceiling: (\S+)"),
+                                              gecici, "echo 3.2767e16", yol=p4)
+                    is not None,
+                    "3.3e16 / 3.2767e16 bicim sapmasi yakalanmadi", 1)
+        # (5) yalniz bicim farki -> FIRKATI OLMAZ
+        p5 = yaz(d, "limit: 100000\n")
+        ok5 = kosul("yanlis-pozitif-yok",
+                    lambda: _sayi_karsilastir(d, re.compile(r"limit: (\S+)"),
+                                              gecici, "echo 1e5", yol=p5)
+                    is None,
+                    "100000 ve 1e5 ayni miktar ama arac AYRISIK dedi", 0)
+        # (6) boru tuzagi: iki deger basan komut TEK sayi sayilmaz
+        ok6 = kosul("boru-tuzağı",
+                    lambda: _komut_olc("echo 1; echo 2", gecici)[0] is None,
+                    "iki deger basan komut kabul edildi", 0)
+    finally:
+        shutil.rmtree(gecici, ignore_errors=True)
+
+    if not all([ok1, ok2, ok3, ok4, ok5, ok6]):
+        return 2
+    print("  ✔ PC gecti: bulunamadi->hata · coklu eslesme->hata · bayat->kirmizi"
+          " · bicim sapmasi->kirmizi · yalniz bicim farki->temiz · coklu cikti->hata")
+
+    try:
+        liste = _iddi_satirlari(iddialar)
+    except ValueError as e:
+        print(f"  ⛔ {e}")
+        return 2
+    if not liste:
+        print(f"  ⛔ {iddialar}: denetlenecek iddia yok (bos dosya)")
+        return 2
+
+    ayrik = []
+    for no, hedef, rx, komut in liste:
+        yol = hedef if os.path.isabs(hedef) else os.path.join(kok, hedef)
+        if not os.path.exists(yol):
+            print(f"  ⛔ {iddialar}:{no}: hedef dosya yok: {hedef}")
+            return 2
+        sonuc = _sayi_karsilastir(hedef, rx, kok, komut, yol=yol)
+        if sonuc is None:
+            print(f"  ✔ {hedef}: {rx.pattern[:52]}")
+        else:
+            ayrik.append((no, hedef, sonuc))
+            print(f"  ⛔ {hedef}: {rx.pattern[:52]}")
+
+    print()
+    if not ayrik:
+        print(f"  ✔ {len(liste)} sayisal iddia denetlendi, hepsi tutuyor")
+        return 0
+    print(f"  ⛔ {len(ayrik)}/{len(liste)} sayisal iddia BAYAT:")
+    for no, hedef, detay in ayrik:
+        print(f"     {iddialar}:{no}  ({hedef})")
+        print(f"       {detay}")
+    print("  Duzeltme: iddiayi olculecek degerle ayni yaz. Degistirilemiyorsa")
+    print("  iddiayi kaldir — 'yanlis oldugu haliyle' tutulan iddia, denetlenmeyen")
+    print("  bir iddiadir.")
     return 1
 
 

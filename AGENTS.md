@@ -285,7 +285,7 @@ gain row. Rows that intentionally deviate (classic exponent<=1 "linear path"
 constant gain, `power`/`synchronous` identity at speed 0, and the power
 `io` cap.y=0 identity guard — ref yields NaN/0 for that degenerate input,
 P155) are listed in `tests/oracle/known_deviations.txt` and do not fail the
-run. Current grid: **1407 rows compared, 79 documented deviations** (R3-NEW-2
+run. Current grid: **1408 rows compared, 79 documented deviations** (R3-NEW-2
 added `power_tinyexp_floor` with exponent_power=5e-4 inside the BUG-02 floor
 band — the local port evaluates a shared exponent floored at 1e-3, the
 reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
@@ -341,8 +341,9 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 147 `test_` functions / 210 `SECTION` groups, 34164 runtime assertions (the
-  runner's own count; the source has 1541 `EXPECT` sites — loops multiply them)
+- 151 `test_` functions / 217 `SECTION` groups, 34164 runtime assertions (the
+  runner's own count; the source has 1603 `EXPECT` call sites — `#define` lines
+  excluded, loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
   config error paths, LUT sort, int overflow guard, NaN/Inf remainder guard,
@@ -369,6 +370,25 @@ Test file: `tests/test_accel.cpp`
   guards + 256-char name/device_id caps, version-stamped config migration
   runs exactly once, lookup zero-width segment denominator guard,
   lat_stats non-finite/negative-sample guard
+
+**These counts are machine-checked, not hand-maintained.** Every number in this
+section and in the oracle section is recomputed by
+
+```bash
+python3 olcum/aj2/prove_kod_ayni.py --sayi olcum/aj2/sayisal_iddialar.txt
+```
+
+which exits 1 if this file disagrees with a live measurement, naming the claim's
+line. The check, not the digits, is the fix: four of these numbers had rotted
+while this file stated **1407 and 1408 about the same quantity two paragraphs
+apart** — a class of error no amount of careful retyping prevents. The same
+class produced a wrong ceiling that was written in the right value once and then
+shortened to a different notation elsewhere, where `grep` for the correct value
+cannot find it. Comparison is **numeric**, so `100000` vs `1e5` is not a
+difference, but `3.3e16` vs `3.2767e16` is. Where the same number appears twice
+it is claimed twice, deliberately: a claim repeated in two places is the only way
+the second place cannot drift from the first. `prove_kod_ayni.py --atif` is the
+sibling check for *line* citations, and it does **not** cover numbers.
 
 ## Fuzz Testing
 
@@ -444,7 +464,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (147 functions / 210 `SECTION` groups, 34164 runtime assertions) |
+| `tests/test_accel.cpp` | Unit + integration tests (151 functions / 217 `SECTION` groups, 34164 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -458,6 +478,8 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/run_tr_coverage.sh` | Translation coverage runner (exit 1 on MISSING) |
 | `tests/simd_parity.cpp` | SIMD backend parity + Y-axis survival regression (compiled once per backend) |
 | `tests/run_simd_parity.sh` | Runs `simd_parity.cpp` under AVX2/SSE2/scalar and diffs the three backends against each other; also audits its own coverage — every `v2d_*` in `simd_math.hpp` must be covered by the gate, live in production, or named in `BILINEN_OLUMLER` (a live-but-uncovered one fails, and stale dead-list entries fail) |
+| `olcum/aj2/prove_kod_ayni.py` | Measurement tool: `--git` (code-unchanged proof), `--pc` (built-in positive control), `--dallar` (branch counts via `-fprofile-arcs`), `--atif` (audits its own `L<n>` line citations), `--sayi` (audits numeric claims in a doc) |
+| `olcum/aj2/sayisal_iddialar.txt` | The numeric-claim list `--sayi` verifies: `target<TAB>regex<TAB>measurement command<TAB>note`. The claim itself stays in the document; this file only says how to check it, so a stale claim turns the check red instead of being silently trusted |
 | `scripts/build.sh` | Quick build script |
 | `setup.sh` | Canonical one-shot installer (all deps + build + system install + KDE fix) |
 | `.github/workflows/ci.yml` | GitHub Actions CI (build + tests + oracle + sanitizers + fuzz smoke) |

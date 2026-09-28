@@ -1,0 +1,48 @@
+# sayisal_iddialar.txt — belgedeki SAYISAL iddialarin DENETIM LISTESI
+#
+#   python3 olcum/aj2/prove_kod_ayni.py --sayi olcum/aj2/sayisal_iddialar.txt
+#
+# Format (TAB ayirici, 4 alan):
+#   hedef_dosya <TAB> regex <TAB> olcum_komutu <TAB> aciklama
+#
+# Bu tablo bir HAKEM degil, denetlenen bir BEYANDIR: iddianin kendisi belgede
+# kalir, bu dosya yalniz "bu regex'te yakalanan sayi su komutun ciktisiyla
+# ayni mi" der. Elle yazilan tablo arac tarafindan olculebiliyor.
+#
+# Kurallar:
+#   * regex TAM OLARAK 1 kez eslesmeli. 0 = dosya degismis, >1 = belirsiz; ikisi
+#     de rc=2. Sessizce ilk eslesmeyi secmek YANLIS olurdu.
+#   * komut stdout'u TEK sayi yazmali; cok satir yazarsa rc=2. Boylece
+#     `| head` gibi boru tuzaklari sessizce gecmez.
+#   * karsilastirma SAYI olarak yapilir: "100000" == "1e5" (firkati degil),
+#     "3.3e16" != "3.2767e16" (bicimle gelen sapma -> kirmizi).
+#   * ⭐ HASSASIYET komutun cikti bicimine baglidir. Komut `:.3g` ile 3
+#     anlamli basamağa yuvarliyorsa, belgenin de ayni hassasiyeti yazmasi
+#     gerekir. Asagidaki tavan iddiasi `:.3g` kullandigi icin belgede
+#     `6.87e22` dogru, `68719476704000000000000` (tam yazim) kirmizidir --
+#     ve bu dogru bir hukiimdur, gurultu degil: belge olcemedigi kadar
+#     hassas bir sayi iddia ediyor. Komutu tam hassasiyete cevirmek bu
+#     belgenin ozet yazimini da kirmizi yapardi. Ayrinti: prove_kod_ayni.py
+#     icindeki run_sayi() docstring'i, ve oradaki PC-C -> PC-C' kaydi.
+#
+# Ayni sayinin birden fazla yerde yazilmasi BILINCLI olarak ayri ayri denetlenir:
+# iki yerin ayrilmasi bir belgenin icindeki celiskiyi uretir (olculdu: once
+# 1407 ve 1408, ayni dosyada).
+#
+# Bu liste kapsamli DEGILDIR: yalnizca denetlenmesi deger gorulen sayilar
+# var. Kapsam genisletmek bir karar; her yeni iddia bir capraz referans
+# denetimiyle birlikte eklenir.
+AGENTS.md	Current grid: \*\*(\d+) rows compared	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^total rows compared : \([0-9]*\)$/\1/p'	oracle izgara satiri (L288)
+AGENTS.md	The oracle's (\d+) rows	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^total rows compared : \([0-9]*\)$/\1/p'	AYNI sayi IKINCI kez (L318); eskiden 1407/1408 celisiyordu
+AGENTS.md	rows compared, (\d+) documented deviations	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^documented deviations: \([0-9]*\) .*/\1/p'	belgelenen sapma (L288)
+AGENTS.md	(\d+) `test_` functions	grep -cE '^static void test_[A-Za-z0-9_]*\(\) \{' tests/test_accel.cpp	test_ fonksiyon (L344)
+AGENTS.md	integration tests \((\d+) functions	grep -cE '^static void test_[A-Za-z0-9_]*\(\) \{' tests/test_accel.cpp	AYNI sayi dosya tablosunda (L448)
+AGENTS.md	(\d+) `SECTION` groups, 34164 runtime assertions \(the	grep -cE '^[[:space:]]*SECTION\("' tests/test_accel.cpp	SECTION grubu (L344); satir sonu '(the' tekillik icin
+AGENTS.md	integration tests \(\d+ functions / (\d+) `SECTION`	grep -cE '^[[:space:]]*SECTION\("' tests/test_accel.cpp	AYNI sayi dosya tablosunda (L448)
+AGENTS.md	the source has (\d+) `EXPECT` call sites	grep -vE '^[[:space:]]*#define' tests/test_accel.cpp | grep -oE '\bEXPECT(_NEAR|_NEAR_REL|_TRUE|_LT|_LE|_GT|_GE)?[[:space:]]*\(' | wc -l	EXPECT cagri (L345); metin degistiginde regex de guncellenmeli
+AGENTS.md	(\d+) runtime assertions \(the	bash tests/run_tests.sh 2>/dev/null | sed -n 's/.*Sonuç: \([0-9][0-9]*\)\/[0-9]*.*/\1/p' | tail -1	kosudaki assertion (L344)
+AGENTS.md	≫ ([0-9][^ `]*)	python3 -c 'print(f"{32*2147483647*1e6*1e6:.3g}")'	tavan zinciri 32*INT32_MAX*IPS_FACTOR_MAX*1e6 YENIDEN hesaplaniyor (L317)
+AGENTS.md	inventory: \*\*(\d+)	bash tests/run_simd_parity.sh 2>/dev/null | sed -n 's/^ *envanter: \([0-9]*\) v2d_.*/\1/p'	v2d envanter toplam (L238)
+AGENTS.md	v2d_\*` — (\d+) covered	bash tests/run_simd_parity.sh 2>/dev/null | sed -n 's/.*kapsamlı \([0-9]*\) .*/\1/p'	v2d kapsamli (L238)
+AGENTS.md	covered, (\d+) live	bash tests/run_simd_parity.sh 2>/dev/null | sed -n 's/.*canlı \([0-9]*\) .*/\1/p'	v2d canli (L238)
+AGENTS.md	live, (\d+) declared dead	bash tests/run_simd_parity.sh 2>/dev/null | sed -n 's/.*beyan edilmiş ölü \([0-9]*\).*/\1/p'	v2d beyan edilmis olu (L238)
