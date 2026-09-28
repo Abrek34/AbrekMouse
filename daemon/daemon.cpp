@@ -1370,6 +1370,17 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
             fd_to_dev_[devices_[i].fd_in] = i;
     }
 
+    // R5-DUP: the "nothing open" case and the PAS-1-flag case below both want a
+    // teardown+setup, and a reload that hit BOTH used to run the pair TWICE —
+    // the first setup's devices were opened and then torn straight back down
+    // and re-opened.  Measured over the 8 combinations of (any_live, have_open,
+    // flag-changed), read off this function's own branch structure: 1 of the 8
+    // reached teardown=2 AND setup=2, i.e. 4 device passes in one call.  Cost
+    // is one discarded enumeration plus one extra grab/release cycle, and the
+    // grab cycle is the ~100-150 ms of mouse dropout the surrounding comments
+    // go to such lengths to avoid.  Both requests are now collected into one
+    // flag and satisfied by a single pass at the bottom.
+    bool need_full_rescan = false;
     if (!any_live) {
         // No grabbed devices yet — do a full setup so new devices are opened.
         // F-4 (INFO) fast path: if the live grab set is unchanged (devices are
@@ -1392,9 +1403,11 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
             for (auto& dev : devices_) apply_profile(dev, identity);
             log("Reload: no profile matched — re-applied identity to open devices (fast path).");
         } else {
-            teardown_devices();
-            if (!setup_devices())
-                log("Reload: no devices available after reload.");
+            // Nothing is open, so the devices have to be (re-)opened — but that
+            // is exactly what the single teardown+setup below does.  Record the
+            // request instead of running a pass here and letting the flag check
+            // below run a second one.
+            need_full_rescan = true;
         }
     }
 
@@ -1404,14 +1417,39 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
     // a "raw" config), and re-enabling grabbed nothing until a restart.  The
     // grab set must follow the flag, so release everything on a turn-off and
     // re-scan on a turn-on (teardown/setup take devices_mutex_ themselves).
-    const bool raw_now = config_.use_raw_input;
-    if (raw_now != raw_input_enabled_.load(std::memory_order_relaxed)) {
-        teardown_devices();
+    //
+    // Read the flag off the ARGUMENT, not off config_.  config_ is written at
+    // the top of this function under devices_mutex_, and the comment there
+    // states the contract that it is guarded by that mutex; reading it here
+    // unlocked broke that contract.  It happens to be harmless TODAY — config_
+    // has exactly two writers (start(), before the threads exist, and the
+    // assignment at the top of this function, which runs on the loop thread,
+    // the only caller) — so this is a latent defect, not a live data race, and
+    // it is fixed here by not reading the shared member at all: new_cfg is
+    // this call's own copy of the very thing config_ was just assigned.
+    const bool raw_now = new_cfg.use_raw_input;
+    const bool raw_changed =
+        (raw_now != raw_input_enabled_.load(std::memory_order_relaxed));
+    if (raw_changed) {
+        // Store BEFORE the re-setup, not between the teardown and the setup:
+        // setup_devices() consults the flag (:887), so a setup run under the
+        // stale flag opens the devices in the wrong mode and would have to be
+        // repeated to correct it.
         raw_input_enabled_.store(raw_now, std::memory_order_relaxed);
-        if (raw_now) {
-            if (!setup_devices())
-                log("Reload: no devices available after raw-input re-enable.");
-        }
+        need_full_rescan = true;
+    }
+
+    // The one teardown+setup that satisfies both requests.  Order matters and is
+    // unchanged: teardown_devices() also clears opened_paths_ /
+    // opened_device_ids_ / fd_to_dev_ (:986-988), which is what lets the
+    // following setup_devices() re-open rather than skip.
+    if (need_full_rescan) {
+        teardown_devices();
+        if (!setup_devices())
+            log(raw_changed
+                    ? (raw_now ? "Reload: no devices available after raw-input re-enable."
+                               : "Reload: no devices available after raw-input disable.")
+                    : "Reload: no devices available after reload.");
     }
     // R10-REGRB: this push may have re-enabled a profile whose device was
     // live-released earlier (it is no longer in devices_, so the loop above
