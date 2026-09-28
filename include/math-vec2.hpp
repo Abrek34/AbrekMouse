@@ -41,13 +41,22 @@ inline double lp_distance(vec2d v, double p) {
     //      it continues to apply_motion_math() at 2510.
     //   2. modifier::modify() has no input-side guard either: 612-613 runs at
     //      the END, whereas calc_speed_whole() → lp_distance() is called at 555.
-    // The real reason is the CEILING: dx/dy sums the kernel's int32 ev.value
-    // (daemon.cpp:2808/2810, __s32 at linux/input.h:44) into a double, over a
-    // 32-event read_batch (daemon.cpp:2573), so |dx| <= 32*INT32_MAX = 6.87e10,
-    // and |in| <= that * dpi_factor(<=1000) * domain_weight(<=1e6) = 6.87e19 —
-    // ~1.34e154 orders below the reference's sqrt(x*x+y*y) overflow threshold.
-    // The subpixel remainder is added at motion_math.hpp:37-38, AFTER
-    // modify() returns, so it cannot reach here either.
+    // The real reason is the CEILING.  dx/dy sums the kernel's int32 ev.value
+    // (daemon.cpp:2808/2810, __s32 at linux/input.h:44) into a double over a
+    // 32-event read_batch (daemon.cpp:2573), so |dx| <= 32*INT32_MAX = 6.87e10.
+    // Then rawaccel.hpp:548 multiplies by `ips_factor`, NOT by dpi_factor:
+    //   rawaccel.hpp:350   ips_factor = dpi_factor / time
+    //   rawaccel.hpp:351   IPS_FACTOR_MAX = 1e6
+    //   rawaccel.hpp:352-353  if (!isfinite(ips_factor) || > 1e6) -> 1e6
+    // That is an ENFORCED clamp and it absorbs the `/time` (including time=0,
+    // which would be inf), so ips_factor <= 1e6 unconditionally.  The tempting
+    // "dpi_factor <= 1000" (NORMALIZED_DPI, rawaccel-base.hpp:45, with dpi >= 1
+    // at config.cpp:361) is only a DERIVED bound and is not what the code
+    // multiplies by — an omitted upper bound is an unproven one.
+    // So:  |abs_vel| <= 6.87e10 * 1e6 * 1e6 = 6.87e22,
+    // which is ~1.3e131 orders below the reference's sqrt(x*x+y*y) overflow
+    // threshold (1.34e154).  The subpixel remainder is added at
+    // motion_math.hpp:37-38, AFTER modify() returns, so it cannot reach here.
     // Evidence: olcum/aj2/guard_konumu.cpp (S1 branch, S2/S3 ceiling) and
     // olcum/aj2/run_guard_pc.sh (PC1 sensitivity, PC2 effect).
     if (!std::isfinite(ax) || !std::isfinite(ay)) return 0;
