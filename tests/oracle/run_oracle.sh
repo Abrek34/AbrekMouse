@@ -9,7 +9,7 @@
 #   bash tests/oracle/run_oracle.sh [--verbose] [--tolerance REL]
 set -u
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 REF_DIR="$HERE/ref"
 CXX="${CXX:-g++}"
@@ -68,9 +68,16 @@ python3 - "$work/ref.out" "$work/local.out" "$TOL" "$VERBOSE" "$known_set_file" 
 import sys
 import math
 import os
-ref = sys.argv[1]; loc = sys.argv[2]; tol = float(sys.argv[3]); verbose = int(sys.argv[4])
+
+ref = sys.argv[1]
+loc = sys.argv[2]
+tol = float(sys.argv[3])
+verbose = int(sys.argv[4])
 known_file = sys.argv[5]
 repo_root = sys.argv[6]
+
+# repo_root is passed directly from the shell script's REPO variable
+# which correctly points to the repository root (/home/a/Masaüstü/AbrekMouse-main)
 
 def load(p):
     rows = {}
@@ -83,7 +90,8 @@ def load(p):
 
 r, l = load(ref), load(loc)
 if r.keys() != l.keys():
-    onlyr = r.keys() - l.keys(); onlyl = l.keys() - r.keys()
+    onlyr = r.keys() - l.keys()
+    onlyl = l.keys() - r.keys()
     print(f"ERROR: row-set mismatch (ref-only={len(onlyr)}, local-only={len(onlyl)})")
     for x in list(onlyr)[:5]: print("  ref-only:", x)
     for x in list(onlyl)[:5]: print("  local-only:", x)
@@ -100,7 +108,7 @@ for lineno, raw in enumerate(open(known_file), 1):
         print(f"ERROR: {known_file}:{lineno}: expected '<case>\t<speed>', "
               f"got {len(fields)} field(s): {line!r}")
         sys.exit(1)
-    # Normalize speed to canonical string format
+    # Normalize speed to canonical string format (remove trailing zeros, no scientific notation)
     spd_norm = format(float(fields[1]), 'g')
     known.add((fields[0], spd_norm))
 
@@ -117,11 +125,7 @@ for (name, spd) in r:
     # Finiteness mismatch: one side NaN/Inf, other finite -> genuine deviation
     if math.isfinite(rv) != math.isfinite(lv):
         worst.append((float('inf'), name, spd, rv, lv, (name, spd) in known))
-        # Do NOT continue here — the relative check below is left to run for the
-        # non-finite halves too, so a row that is BOTH a finiteness mismatch AND
-        # past tolerance is still recorded.  Note it cannot double-append for a
-        # NaN side: `rel` is then NaN and `NaN > tol` is False (measured), so
-        # :117 above is the single record for that case.
+        continue
     denom = max(abs(rv), abs(lv), 1e-300)
     rel = abs(rv - lv) / denom
     if rel > tol:
@@ -137,8 +141,6 @@ deviating = set()
 for (name, spd) in r:
     rv, lv = r[(name, spd)], l[(name, spd)]
     # Finiteness mismatch: one side NaN/Inf, other finite -> genuine deviation
-    # This MUST be in deviating set to avoid STALE errors for known deviations
-    # (like p155_io_cap0_gain where ref=NaN, port=finite).
     if math.isfinite(rv) != math.isfinite(lv):
         deviating.add((name, spd))
         continue
@@ -154,18 +156,18 @@ known_cnt = len(known & deviating)
 stale = sorted(known - deviating)
 
 # ===== ORACLE COVERAGE CHECK =====
-# The oracle grid only tests accel_* gain functions directly via au.apply() / run().
+# The oracle grid ONLY tests accel_* gain functions directly via au.apply() / run().
 # It does NOT exercise the vector-to-speed layer (speed_processor, lp_distance,
 # magnitude, rotate, direction, smoother/EMA, modifier::modify). This check
 # verifies that the oracle's coverage declaration matches reality by scanning
-# the local.cpp and reference.cpp source files for production function calls.
+# the ACTUAL PRODUCTION SOURCE FILES for function definitions and calls.
 
 # Declared coverage — list of production functions the oracle actually exercises.
 # If you add a call to a production function in local.cpp or reference.cpp,
-# add it here. If a production function is used but NOT listed here, the
-# oracle coverage is incomplete and this check will warn.
+# add it here. If a production function is used in the oracle binaries but
+# NOT listed here, the oracle coverage is incomplete and this check will FAIL.
 ORACLE_COVERED = {
-    # accel gain functions (all modes)
+    # accel gain functions (all modes) - tested via au.apply() / run()
     "accel_classic", "accel_power", "accel_natural", "accel_jump",
     "accel_synchronous", "accel_lookup", "accel_noaccel",
     "accel_union_apply", "accel_union_init",
@@ -193,7 +195,8 @@ def extract_calls(source_path, patterns):
             if re.search(pattern, content):
                 found.add(key)  # Add the function NAME (key), not the regex pattern
     except FileNotFoundError:
-        pass
+        print(f"ERROR: Oracle coverage check file not found: {source_path}")
+        sys.exit(1)
     return found
 
 # Patterns to search for in C++ source files
@@ -217,45 +220,65 @@ PATTERNS = {
     "accel_union_init": r"accel_union.*init|au\.init\(",
 }
 
-# Scan both oracle binaries' source files
-local_cpp = os.path.join(repo_root, "tests", "oracle", "local.cpp")
-reference_cpp = os.path.join(repo_root, "tests", "oracle", "reference.cpp")
+# Scan the ACTUAL production source files (not oracle test harnesses)
+repo_root = sys.argv[6]
+
+# Production source files that contain the actual implementation
+PRODUCTION_FILES = [
+    os.path.join(repo_root, "include", "accel-classic.hpp"),
+    os.path.join(repo_root, "include", "accel-power.hpp"),
+    os.path.join(repo_root, "include", "accel-natural.hpp"),
+    os.path.join(repo_root, "include", "accel-jump.hpp"),
+    os.path.join(repo_root, "include", "accel-synchronous.hpp"),
+    os.path.join(repo_root, "include", "accel-lookup.hpp"),
+    os.path.join(repo_root, "include", "accel-noaccel.hpp"),
+    os.path.join(repo_root, "include", "accel-union.hpp"),
+    os.path.join(repo_root, "include", "rawaccel.hpp"),
+    os.path.join(repo_root, "src", "config.cpp"),
+    os.path.join(repo_root, "include", "math-vec2.hpp"),
+    os.path.join(repo_root, "src", "logitech_hidpp.cpp"),
+    os.path.join(repo_root, "src", "logitech_receiver.cpp"),
+    os.path.join(repo_root, "daemon", "daemon.cpp"),
+    os.path.join(repo_root, "daemon", "motion_math.hpp"),
+]
 
 found_calls = set()
-for cpp_file in [local_cpp, reference_cpp]:
+for cpp_file in PRODUCTION_FILES:
     found_calls |= extract_calls(cpp_file, PATTERNS)
 
-# Check for unlisted covered functions
-# FATAL, not a warning: the run below ends in "RESULT: OK — local port matches
-# official reference ... on every row", and that claim is an attribution claim.
-# A production function the oracle actually called but never declared makes the
-# grid's coverage unstated, so OK would be printed for a scope nobody wrote down.
-# A warning here left the gate green while saying the same thing (measured).
-unlisted_covered = found_calls - ORACLE_COVERED
+# Also scan the oracle test harnesses for any direct calls they make
+ORACLE_HARNESS_FILES = [
+    os.path.join(repo_root, "tests", "oracle", "local.cpp"),
+    os.path.join(repo_root, "tests", "oracle", "reference.cpp"),
+]
+
+oracle_harness_calls = set()
+for cpp_file in ORACLE_HARNESS_FILES:
+    oracle_harness_calls |= extract_calls(cpp_file, PATTERNS)
+
+# ===== COVERAGE VALIDATION =====
+# 1. Check that ALL functions used in oracle harnesses are declared as COVERED
+unlisted_covered = oracle_harness_calls - ORACLE_COVERED
 if unlisted_covered:
-    print(f"ERROR: {len(unlisted_covered)} unlisted production function call(s):")
+    print(f"❌ ORACLE COVERAGE ERROR: Found unlisted production function calls in oracle harnesses:")
     for fn in sorted(unlisted_covered):
-        print(f"  unlisted  {fn}")
-    print("  The oracle called these but ORACLE_COVERED does not declare them, so")
-    print("  the coverage behind 'RESULT: OK' is unaccounted for. Add them to")
-    print("  ORACLE_COVERED if intentional (then re-run) — do not ignore.")
+        print(f"  {fn}")
+    print("  Add these to ORACLE_COVERED in run_oracle.sh if intentional.")
     sys.exit(1)
 
-# Check for a self-contradictory coverage declaration.
-# This was `pass` — the loop body computed nothing and the set stayed empty, so
-# the branch was unreachable dead code.  The condition that is actually
-# reachable here is the OVERLAP: a name in both lists is by definition not
-# "unlisted", so the check above cannot see it, and it makes one name both
-# covered and not covered.  Fatal.
-#
-# Note on the original "called but declared NOT covered" formulation: it is
-# strictly subsumed.  If a name is called and declared NOT covered, it is
-# caught by the unlisted check above unless it is also in ORACLE_COVERED — and
-# then it is an overlap, which is this check.  So it is reported here as extra
-# detail on the overlapping names, not as a second independent guard.
+# 2. Check that NO supposedly uncovered functions are called in oracle harnesses
+undeclared_used = oracle_harness_calls & ORACLE_NOT_COVERED
+if undeclared_used:
+    print(f"❌ ORACLE COVERAGE ERROR: Oracle harness calls functions declared as NOT COVERED:")
+    for fn in sorted(undeclared_used):
+        print(f"  {fn}")
+    print("  These functions should be moved to ORACLE_COVERED or removed from oracle harnesses.")
+    sys.exit(1)
+
+# 3. Check for overlapping declarations (COVERED and NOT_COVERED must be disjoint)
 both_lists = ORACLE_COVERED & ORACLE_NOT_COVERED
 if both_lists:
-    print(f"ERROR: {len(both_lists)} name(s) declared COVERED *and* NOT COVERED:")
+    print(f"❌ ORACLE COVERAGE ERROR: {len(both_lists)} name(s) declared COVERED *and* NOT COVERED:")
     for fn in sorted(both_lists):
         tag = " (and the grid calls it)" if fn in found_calls else " (not called)"
         print(f"  contradicted  {fn}{tag}")
@@ -264,14 +287,27 @@ if both_lists:
     print("  one list, then re-run.")
     sys.exit(1)
 
+# 3. Report production functions that exist but are NOT covered by oracle (WARNING only)
+all_production_calls = set()
+for cpp_file in PRODUCTION_FILES:
+    all_production_calls |= extract_calls(cpp_file, PATTERNS)
+
+uncovered_in_production = all_production_calls - ORACLE_COVERED - ORACLE_NOT_COVERED
+if uncovered_in_production:
+    print(f"❌ ORACLE COVERAGE GAP: Production functions exist but are NOT covered by oracle:")
+    for fn in sorted(uncovered_in_production):
+        print(f"  {fn}")
+    print("  These functions are in production code but NOT tested by oracle grid.")
+    print("  Add them to ORACLE_COVERED or ORACLE_NOT_COVERED, or extend the oracle grid.")
+    sys.exit(1)
+
 # Report coverage summary
 if verbose:
-    # found_calls ⊆ ORACLE_COVERED is guaranteed by the fatal check above, so
-    # this prints the verified fact rather than a re-derived guess.
-    print(f"  Oracle coverage scan: found {len(found_calls)} production function "
-          f"patterns, all declared in ORACLE_COVERED")
+    print(f"  Oracle coverage scan: oracle harness uses {len(oracle_harness_calls)} patterns")
+    print(f"  Production code contains {len(found_calls)} function patterns")
     for fn in sorted(found_calls):
-        print(f"  {fn}: COVERED")
+        status = "COVERED" if fn in ORACLE_COVERED else "NOT COVERED (expected)"
+        print(f"  {fn}: {status}")
 
 # ===== END ORACLE COVERAGE CHECK =====
 
