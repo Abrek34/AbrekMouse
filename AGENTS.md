@@ -99,7 +99,57 @@ Side effect worth keeping: the baseline build is the one that matches the
 oracle's own `-O2 -mavx2` numbers (0 differing rows at `%.17g`), so it is also
 free of the `-mfma` drift class documented in `tests/run_simd_parity.sh`.
 
-## Test
+## Test — Canonical Seven Gates
+
+These seven gates are the canonical verification pipeline. Run them in order;
+each must exit 0 before the next runs. Missing or skipped gates are not
+acceptable — "yedi kapı yeşil" means all seven.
+
+```bash
+# 1. Build with zero warnings
+bash scripts/build.sh
+
+# 2. Unit + integration tests (includes SIMD parity gate)
+bash tests/run_tests.sh
+
+# 3. Oracle (reference cross-check)
+bash tests/oracle/run_oracle.sh
+
+# 4. SIMD backend parity (AVX2 / SSE2 / scalar)
+bash tests/run_simd_parity.sh
+
+# 5. Translation coverage (every UI string has Turkish entry)
+bash tests/run_tr_coverage.sh
+
+# 6. CLI under ASan + UBSan (31 real commands)
+bash tests/run_cli_sanitized.sh
+
+# 7. Tracker bridge (record↔code consistency)
+bash tests/run_tracker_bridge.sh
+```
+
+**Measured gate times on this machine (HEAD, portable build):**
+
+| gate | command | time (s) |
+|------|---------|----------|
+| 1 | `scripts/build.sh` | 71.0 |
+| 2 | `tests/run_tests.sh` | 43.2 |
+| 3 | `tests/oracle/run_oracle.sh` | 1.8 |
+| 4 | `tests/run_simd_parity.sh` | 3.3 |
+| 5 | `tests/run_tr_coverage.sh` | 1.1 |
+| 6 | `tests/run_cli_sanitized.sh` | 48.4 |
+| 7 | `tests/run_tracker_bridge.sh` | 0.1 |
+| **total** | | **~168.9** |
+
+**Exit codes:** 0 = pass, 1 = fail, 77 = environment unusable (skip with message).
+All seven must pass before push. `run_tests_asan.sh` is an **internal mode** of
+gate 2 (invoked by `run_tests.sh`), not a separate gate. `run_e2e.sh` requires
+root + `/dev/uinput` and is not in CI.
+
+NOT: `scripts/bench_hotpath.sh` yedi kapidan biri **DEGILDIR** - CI'daki
+`perf-gate` isidir (kirilim olcum kapisi, dogruluk kapisi degil).
+NOT: `tests/run_fuzz.sh` ve `tests/run_e2e.sh` de yedi kapidan biri **DEGILDIR**
+(sira sirasiyla CI disi ve root + /dev/uinput gerektirir).
 
 ```bash
 # All unit tests (compile + run)
@@ -235,25 +285,36 @@ gain row. Rows that intentionally deviate (classic exponent<=1 "linear path"
 constant gain, `power`/`synchronous` identity at speed 0, and the power
 `io` cap.y=0 identity guard — ref yields NaN/0 for that degenerate input,
 P155) are listed in `tests/oracle/known_deviations.txt` and do not fail the
-run. Current grid: **1119 rows compared, 67 documented deviations** (R3-NEW-2
+run. Current grid: **1407 rows compared, 79 documented deviations** (R3-NEW-2
 added `power_tinyexp_floor` with exponent_power=5e-4 inside the BUG-02 floor
 band — the local port evaluates a shared exponent floored at 1e-3, the
 reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked
 because both sides reduce to 1^n with scale=1 exactly.  PRE-3 raised the apex
 `output_offset` to 1.0, which made the power identity row at speed 0 line up
 with the reference — `game_apex_power 0` was removed from the deviation list).
-Of the two `io`-gain `cap.y=0` grid families, only the **`p155_io_cap0_gain`**
-rows are intentionally NOT listed: the reference emits NaN there, `NaN > tol`
-is never true, so they can never appear as a deviation — listing them would
-raise a stale-row error. The sibling `p155_io_cap0_legacy` family is the same
-degenerate input and the same local result, but the reference returns a hard
-**0** instead of NaN, so those **12 rows ARE listed** (measured: ref=0 vs
-local 0.125893 at spd 0.001, 1 at spd 1, 7.94328 at spd 1000). Do not
-generalise the unlisted rule to all `cap.y=0` rows — measured over the grid,
-`known_deviations.txt` holds 67 rows in four classes (23 `classic_gain_exp_le1`
-+ 9 `power`/`sync` at speed 0 + 23 `power_tinyexp_floor` + 12
-`p155_io_cap0_legacy`), each documented in that file's header. Run this after
-EVERY change to `include/accel-*.hpp`.
+G-2 added 12 natural `limit ≥ 10` cases (+288 rows). G-3 fixed the oracle's
+finiteness check so that **both** `p155_io_cap0` families are now listed:
+the `legacy` family (ref=0) and the `gain` family (ref=NaN — the oracle now
+explicitly checks for finiteness mismatch). `known_deviations.txt` holds 79
+rows in five classes (23 `classic_gain_exp_le1` + 9 `power`/`sync` at speed 0
++ 23 `power_tinyexp_floor` + 12 `p155_io_cap0_legacy` + 12 `p155_io_cap0_gain`),
+each documented in that file's header. Run this after EVERY change to
+`include/accel-*.hpp`.
+
+**Oracle domain boundary (reachability of the match):** The oracle grid covers
+speeds up to `1e5` (`default_speeds()` in `oracle_cases.hpp`). The port's
+production pipeline is bounded by `sanitize_device_config` (DPI ≤ 32 000),
+`IPS_FACTOR_MAX = 1e6`, and domain/range weights ≤ `1e6` (P86), yielding a
+max observed `|abs_vel| ≤ 32 767 × 1e6 × 1e6 ≈ 3.3e16`. The reference's
+`magnitude(v)` uses `sqrt(x*x + y*y)` which overflows to `inf` at
+`|v| ≳ 1.34e154`. The port uses `std::hypot` (R14) and log-space `lp_distance`
+(ORTA-BUG-MOTION-03), so it **deliberately diverges** from the reference for
+`|v| ≫ 3.3e16` — but this region is **unreachable from any valid config**.
+The oracle's 1407 rows (max speed `1e5`) sit entirely inside the matching
+envelope. If a future change widens the envelope (e.g. raises `IPS_FACTOR_MAX`
+or weight ceilings), the oracle grid must be extended with a dedicated
+boundary case at the production ceiling (`3.3e16` scale) so the gate detects
+divergence before it becomes reachable.
 
 ## Translation Coverage
 
@@ -275,7 +336,7 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 147 `test_` functions / 210 `SECTION` groups, 34037 runtime assertions (the
+- 147 `test_` functions / 210 `SECTION` groups, 34164 runtime assertions (the
   runner's own count; the source has 1541 `EXPECT` sites — loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
@@ -378,7 +439,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (147 functions / 210 `SECTION` groups, 34037 runtime assertions) |
+| `tests/test_accel.cpp` | Unit + integration tests (147 functions / 210 `SECTION` groups, 34164 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
