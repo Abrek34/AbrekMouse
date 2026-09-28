@@ -31,9 +31,25 @@ inline double lp_distance(vec2d v, double p) {
     // (pow(pow(|x|,p) + pow(|y|,p), 1/p)) and propagates NaN/Inf, where the
     // port folds "unmeasurable input" to "no motion" — the same policy
     // modifier::modify() already applies to its output at rawaccel.hpp:612-613.
-    // Unreachable in production either way: daemon.cpp:2360-2361 zeroes a
-    // non-finite dx/dy long before this, and the subpixel remainder is added in
-    // motion_math.hpp:35-36 AFTER modify() returns.
+    //
+    // Unreachable in production — but NOT for the reason an earlier revision of
+    // this comment gave.  It claimed daemon.cpp:2360-2361 "zeroes a non-finite
+    // dx/dy long before this".  MEASURED, that is wrong twice over (AJ1 §3
+    // flagged the line; the claim itself did not survive checking):
+    //   1. That guard is inside flush_motion()'s raw_passthrough column, which
+    //      opens at 2352 and RETURNS at 2383.  The accel path never runs it —
+    //      it continues to apply_motion_math() at 2510.
+    //   2. modifier::modify() has no input-side guard either: 612-613 runs at
+    //      the END, whereas calc_speed_whole() → lp_distance() is called at 555.
+    // The real reason is the CEILING: dx/dy sums the kernel's int32 ev.value
+    // (daemon.cpp:2808/2810, __s32 at linux/input.h:44) into a double, over a
+    // 32-event read_batch (daemon.cpp:2573), so |dx| <= 32*INT32_MAX = 6.87e10,
+    // and |in| <= that * dpi_factor(<=1000) * domain_weight(<=1e6) = 6.87e19 —
+    // ~1.34e154 orders below the reference's sqrt(x*x+y*y) overflow threshold.
+    // The subpixel remainder is added at motion_math.hpp:37-38, AFTER
+    // modify() returns, so it cannot reach here either.
+    // Evidence: olcum/aj2/guard_konumu.cpp (S1 branch, S2/S3 ceiling) and
+    // olcum/aj2/run_guard_pc.sh (PC1 sensitivity, PC2 effect).
     if (!std::isfinite(ax) || !std::isfinite(ay)) return 0;
     // Factor out the larger component so the inner ratio is always ≤ 1,
     // preventing pow overflow for large inputs with high p norms.
@@ -56,51 +72,6 @@ inline double lp_distance(vec2d v, double p) {
     // below.
     double M = ax > ay ? ax : ay;
     double m = ax > ay ? ay : ax;
-    // AJ1 §5 (R16, savunma-derinligi — HATA DUZELTMESI DEGIL): anlasilamayan
-    // bir bileseni "hareket yok" say.  Buradan Inf yaymak, onu motion_math'in
-    // trunc -> isfinite(tx) -> 0 zincirinden gecirip TAMAMEN SESSIZCE yutuyor:
-    // fare bir an duruyor, sonra normale donuyor, hicbir yerde kayit yok.
-    // Proje karari zaten bu: rawaccel.hpp:612-613 girdinin sonunda
-    // `if (!isfinite(in.x)) in.x = 0;` — olculemez girdi = hareket yok.
-    //
-    // ⚠️ AJ1'in TARIHINDEN AYRILDIK — ve sebebi olcum. AJ1 "M hesaplandiktan
-    // hemen sonra `if (!std::isfinite(M)) return 0;`" dedi; ONCE YAPTIM, ve
-    // PC2 KIRMIZI GELDI: iki bilesenden biri NaN ise guard HIC DEVREYE
-    // GIRMiyor.  Sebep: M bir KARSILASTIRMALLA seciliyor ve NaN her
-    // karsilastirmada false:
-    //     M = (ax > ay ? ax : ay)   ->   (NaN,3) icin M = 3 (SONLU!)
-    // yani NaN asla M'ye girmez, NaN m'ye girer ve m/M NaN olur; sonuc
-    // "uydurma bir sayi" olarak cikar.  OLCULDU: (NaN,3) p=2 -> 3.
-    // Dahası, sonuc ASIMETRIK: (3,NaN) -> 0 iken (NaN,3) -> 3. Ayni girdi,
-    // iki bilesen yer degistirilmis, iki farkli HIZ.  Bu tam da AJ1'in
-    // §1'de "hata gorunmez" dedigi kotu sey.
-    // DOGRULAMA: guard M UZERINDE degil, KAYNAK BILESENLER uzerinde olmali —
-    // NaN ancak orada yakalanabilir.  (olcum: olcum/aj2/run_guard_pc.sh PC2)
-    //
-    // DELIBEREN OLARAK REFERANSTAN AYRILIR: resim RawAccel'in lp_distance'i
-    // (tests/oracle/ref/math-vec2.hpp:34-37) Inf/NaN'yi OLDUGU GIBI
-    // yayiyor — (Inf,3) p=2 icin O DA inf donuyor. Yani "port ozel
-    // sizinti" DEGIL, iki tarafta da var. Portun farki: olculemez girdiyi
-    // 0 sayiyor. Uretimde erisilemez (asagida), yani bu bir tutarlilik
-    // tercihidir, bir hata onarimi degil.
-    //
-    // URETIMDE NASIL SONLU? — once bunu dogru yazelim, cunku onceki yorum
-    // YANLIŞ GEREKCEYI veriyordu: "daemon.cpp:2323-2324 sonlu olmayan dx/dy'yi
-    // daha ilk adimda sifirlar" (AJ1 §3 bunun 2360-2361 oldugunu duzeltti, ama
-    // HALA YANLIŞ). OLCULDU: guard 2360-2361, flush_motion()'in
-    // raw_passthrough KOLUNDA (2352'de acilir) ve o kol 2383'te return eder;
-    // ivme yolu 2510'daki apply_motion_math'e gider. Yani guard IVME YOLUNDA
-    // CALISMIYOR. modifier::modify()'de de girdi tarafinda isfinite korumasi
-    // YOK: rawaccel.hpp:612-613 sona yakin, lp_distance ise 555'te cagriliyor
-    // -> once gelir, sonra koruma.  (olcum: olcum/aj2/guard_konumu.cpp S1)
-    //
-    // Gercek gerekce TAVAN: dx/dy, kernel'in int32 ev.value'larinin
-    // double'a toplamidir (daemon.cpp:2808/2810, linux/input.h:44 __s32) ve
-    // read_batch 32 olayliktir (daemon.cpp:2573) -> |dx| <= 32 * INT32_MAX
-    // = 6.87e10. |in| <= bunun * dpi_factor(<=1000) * domain_weight(<=1e6)
-    // = 6.87e19. Referansin sqrt(x*x+y*y) tasma esigi ~1.34e154, yani
-    // uretimde referans ASLA taslamaz ve 1e200 ayrimi 1.46e180 kat uzakta
-    // kalir.  (olcum: ayni dosya S2/S3.)
     double result = M * std::pow(1.0 + std::pow(m / M, p), 1.0 / p);
     if (std::isfinite(result)) return result;
     // ORTA-BUG-MOTION-03: for p < 1 the exponent 1/p is large and the factored
@@ -129,27 +100,22 @@ inline double lp_distance(vec2d v, double p) {
     //    threshold from 600 to -600 moved its counter 0 -> 61 760 and L47 to 0,
     //    so the zeros are real, not a dead instrument.
     //
-    //  * M = ±Inf.  SUPERSEDED by the isfinite(M) guard above (R16): that
-    //    guard returns 0 before this block, so an infinite component can no
-    //    longer reach here.  The reachability that used to be listed here
+    //  * M = ±Inf.  SUPERSEDED by the component guard at the top of the
+    //    function (R16), which returns 0 before this block: an infinite
+    //    component can no longer reach here, so the 708 bound above holds
+    //    unconditionally again.  The reachability that used to be listed here
     //    ((Inf,3) p=2 / (3,Inf) p=1 / (Inf,0) p=1 → L45, (Inf,3) p=-1 /
-    //    (Inf,0) p=-1 → L46) is now dead, and the 708 bound above holds
-    //    unconditionally again.  Kept as a record of what the guard changed.
+    //    (Inf,0) p=-1 → L46) is now dead.  Kept as a record of the change.
     //
-    //  * In PRODUCTION the components are finite — but NOT because of a guard.
-    //    The previous text here cited daemon.cpp:2323-2324 as zeroing a
-    //    non-finite dx/dy "before anything else"; AJ1 §3 flagged the line, and
-    //    measuring the branch showed the CLAIM was wrong too: the real guard
-    //    (2360-2361) sits in the raw_passthrough column that RETURNS at 2383,
-    //    so the accel path never runs it, and modifier::modify() has no
-    //    input-side guard either (612-613 runs after this call site).
-    //    The genuine reason is the CEILING, documented at the guard above:
-    //    int32 events summed into a double over a 32-event batch.  The
-    //    subpixel remainder is still added in motion_math.hpp:37-38 AFTER
-    //    modify() returns, so it cannot reach this function either.
-    //    So the branches stay unreachable in production but live on the API
-    //    surface — lp_distance is public and inline, and tests call it
-    //    directly.  NOT dead code; do not delete.
+    //  * In PRODUCTION the components are finite — the reason is the CEILING
+    //    (int32 events into a double over a 32-event batch), not a guard; see
+    //    the measurement at the top of the function, which also records why
+    //    the daemon.cpp guard an earlier revision cited does not apply here.
+    //    The subpixel remainder is added in motion_math.hpp:37-38 AFTER
+    //    modify() returns, so it cannot reach this function either.  So the
+    //    branches stay unreachable in production but live on the API surface
+    //    — lp_distance is public and inline, and tests call it directly.
+    //    NOT dead code; do not delete.
     //
     // L49 below is likewise not dead: a denormal p reaches it (note above).
     double log_1pi;
