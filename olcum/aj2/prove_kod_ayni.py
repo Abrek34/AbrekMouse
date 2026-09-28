@@ -87,8 +87,19 @@ def main() -> int:
                     help="erisilebilir girdi arayan ikinci surucu")
     ap.add_argument("--atif", metavar="DOSYA",
                     help="yorumdaki kendi satir atiflarini denetle")
+    ap.add_argument("--aktif", metavar="ESKI::YENI",
+                    help="mutasyon PC'si: bir KOD satiri secip geri al, "
+                         "sayacin kipirdadigini olc")
     args = ap.parse_args()
 
+    if args.aktif:
+        if not args.dallar:
+            sys.exit("--aktif icin --dallar ZORUNLU (sayac olculecek dosya)")
+        if "::" not in args.aktif:
+            sys.exit("--aktif bicisi: 'ESKI::YENI' (orn. "
+                     "'log_inner < -600.0::log_inner < 1e300')")
+        eski, yeni = args.aktif.split("::", 1)
+        return run_aktif(args.dallar, args.surucu, eski, yeni)
     if args.atif:
         return run_atif(args.atif)
     if args.dallar:
@@ -183,9 +194,151 @@ def _branches(data, header_rel: str):
     return out
 
 
-def _src_line(src: str, n: int) -> str:
-    lines = src.splitlines()
+def _src_line(src, n: int) -> str:
+    if isinstance(src, str):
+        lines = src.splitlines()
+    else:
+        lines = list(src)
     return lines[n - 1].strip() if 0 < n <= len(lines) else ""
+
+
+def _is_kod_satiri(ln: str) -> bool:
+    """Satirin yorum disinda gercek kodu var mi? (bosluk = yorum satiridir)"""
+    return bool(strip_code(ln + "\n").strip())
+
+
+def _hedef_satirlar(src: str, eski: str) -> tuple:
+    """ESKI metnini iceren satirlari KOD/YORUM olarak ayirir.
+
+    Neden ayiriliyor: yorum icinde de ayni metin gecebilir (olcum sonrasi
+    kanit yorumlarinda gecer). Ilk metin gecisini degistirmek kodu DEGISTIRMEZ,
+    sayac kipirdamaz ve PC YANLIŞ NEGATIF verir — sessizce. Bu, projenin
+    en pahalı tuzak turlerinden: alet "olculmedi" degil, "olculdu ve degismez"
+    der.
+    """
+    kod, yorum = [], []
+    for i, ln in enumerate(src.splitlines(), 1):
+        if eski in ln:
+            (kod if _is_kod_satiri(ln) else yorum).append(i)
+    return kod, yorum
+
+
+def run_aktif(header: str, driver: str, eski: str, yeni: str) -> int:
+    """Mutasyon PC'si: bir KOD satirini geri al, sayacin KIPIRDADIGINI olc.
+
+    Rapor satirlari INDEKSLE degil, SATIR + KOD METNIyle verilir. Indeks
+    (b0/b1) hangi kolun koll oldugunu SOYLEMEZ; olcumlenmis olarak kararli
+    olsa da (ayni kosu iki kez birebir, mutasyon altinda da ayni indeks)
+    okuyucu icin bilgidir degildir ve iki olcum arasinda karsilastirilamaz.
+    """
+    header = os.path.abspath(header)
+    hdr_rel = "include/" + os.path.basename(header)
+    inc_root = os.path.dirname(header)
+    src = read(header)
+
+    print(f"  === --aktif: mutasyon PC'si ===")
+    print(f"  hedef metin: {eski!r}\n  degistirilecek: {yeni!r}")
+
+    kod, yorum = _hedef_satirlar(src, eski)
+    print(f"  eslesme: {len(kod)} KOD satiri, {len(yorum)} yorum satiri")
+    if yorum:
+        print(f"    ⓘ ayni metin yorumda da geciyor (L{', L'.join(map(str, yorum))}) — "
+              f"BU YUZDEN ilk metin gecisi hedef DEGILDIR.")
+    if len(kod) != 1:
+        print(f"  ⛔ Hedef sayisi {len(kod)} — TAM OLSA (1) gerekir.")
+        print(f"    {'KOD satirlari: ' + str(kod) if kod else 'KOD satiri YOK'}")
+        print("    0 ise metin kodda degildir; >1 ise hangi kodu "
+              "mutasyonlayacagin belirsiz.")
+        print("    Bu bir arac hatasi degil, BELIRSIZ BIR HEDEF. Cumle "
+              "basina numarayla hedefle.")
+        return 2
+    hedef = kod[0]
+    print(f"  ✔ tek KOD satiri hedef: L{hedef}")
+
+    mut = src.splitlines()
+    mut[hedef - 1] = mut[hedef - 1].replace(eski, yeni, 1)
+    mut_src = "\n".join(mut) + "\n"
+
+    # KOD gercekten degisti mi? Yorum degisimi sayilmaz.
+    if strip_code(src) == strip_code(mut_src):
+        print("  ⛔ Mutasyon YORUMDA kaldi — kod satiri degismedi. "
+              "PC anlamsiz, gecersiz.")
+        return 2
+    print("  ✔ mutasyon KOD satirina uygulandi (kod metni degisti)")
+
+    def olc(icerik: str, etiket: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copytree(inc_root, os.path.join(tmp, "include"))
+            with open(os.path.join(tmp, "include", os.path.basename(header)),
+                      "w", encoding="utf-8") as fh:
+                fh.write(icerik)
+            shutil.copy(driver, os.path.join(tmp, "drv.cpp"))
+            data, err = _build_run_gcov(tmp, hdr_rel, "drv.cpp")
+            if err:
+                print(f"  ⛔ {etiket}: {err}")
+                return None
+            return _branches(data, hdr_rel)
+
+    ori = olc(src, "orijinal")
+    mut_br = olc(mut_src, "mutasyonlu")
+    if ori is None or mut_br is None:
+        return 2
+    if len(ori) != len(mut_br):
+        print(f"  ⛔ dal sayisi degisti: {len(ori)} -> {len(mut_br)}. "
+              f"Karsilastirilamaz.")
+        return 2
+
+    o = {(r[0], r[1]): r[2] for r in ori}
+    m = {(r[0], r[1]): r[2] for r in mut_br}
+    # INDeks yerine ANLAMSAL etiket. gcov her dal icin fallthrough verir:
+    # dusen = kosulun DOGRULU koll (gövdeye giriyor), atlayan = YANLIS koll.
+    # Bu etiket indeksle degil, KODUN YAPISIYLA tanimlidir; satir numarasi
+    # gibi kayabilir ama b0/b1 gibi "hangi koldur" bilgisini TASIYAMAZ.
+    def kollar(brs):
+        t = {}
+        for ln, _bi, c, _th, fall in brs:
+            t[(ln, "dusen (kosul dogru)" if fall else "atlayan (kosul yanlis)")] \
+                = t.get((ln, "dusen (kosul dogru)" if fall
+                         else "atlayan (kosul yanlis)"), 0) + c
+        return t
+    ol, ml = kollar(ori), kollar(mut_br)
+    lines = src.splitlines()
+    z_o = sum(1 for r in ori if r[2] == 0)
+    z_m = sum(1 for r in mut_br if r[2] == 0)
+
+    print(f"\n  --- ORIG/MUT tablosu (makine uretimli; kollar ANLAMSAL "
+          f"etiketli, indeksle DEGIL) ---")
+    print(f"  {'satir':<7}{'kol':<26}{'orijinal':>9}{'mutasyon':>10}   kod")
+    for k in sorted(set(ol) | set(ml)):
+        if ol.get(k) == ml.get(k):
+            continue
+        ln, kol = k
+        print(f"  L{ln:<6}{kol:<26}{ol.get(k,'-'):>9}{ml.get(k,'-'):>10}   "
+              f"{_src_line(lines, ln)[:40]}")
+    print(f"\n  sifir sayan dal: {z_o} -> {z_m}   "
+          f"({'mutasyon sayaci KIPIRDIRDI' if z_o != z_m else 'KIPIRMADI'})")
+
+    yeni_sifir = [(k, ol.get(k, 0), ml.get(k, 0)) for k in sorted(ml)
+                  if ol.get(k, 0) > 0 and ml.get(k, 0) == 0]
+    yeni_canli = [(k, ol.get(k, 0), ml.get(k, 0)) for k in sorted(ml)
+                  if ol.get(k, 0) == 0 and ml.get(k, 0) > 0]
+    if yeni_canli:
+        print("  sayaci 0'dan canliya giden (mutasyonun DOGRULANMASI):")
+        for (ln, kol), a, b in yeni_canli:
+            print(f"    L{ln} [{kol}]: {a} -> {b}   "
+                  f"{_src_line(lines, ln)[:44]}")
+    if yeni_sifir:
+        print("  sayaci canlidan 0'a giden (mutasyonun DOLAYLI etkisi):")
+        for (ln, kol), a, b in yeni_sifir:
+            print(f"    L{ln} [{kol}]: {a} -> {b}   "
+                  f"{_src_line(lines, ln)[:44]}")
+
+    if z_o == z_m:
+        print("  ⛔ PC KALMADI — mutasyon sayaci degistirmedi.")
+        return 2
+    print("  ✔ PC gecti — mutasyon sayaci degistirdi; sifirlar tutulmus "
+          "sayac degil")
+    return 0
 
 
 def run_atif(dosya: str) -> int:

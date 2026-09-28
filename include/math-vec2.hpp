@@ -130,7 +130,11 @@ inline double lp_distance(vec2d v, double p) {
     //    branches went 0 -> 972 / 99 592 / 100 564 under the search driver,
     //    which is what makes the "M = ±Inf" case below impossible.
     //    Cite-check: `prove_kod_ayni.py --atif` flags any self-citation whose
-    //    target line is itself a comment.
+    //    target line is itself a comment.  Reproduce the control above with
+    //      --aktif 'log_inner < -600.0::log_inner < 1e300'
+    //    which prints the ORIG/MUT table machine-generated; the branches are
+    //    labelled by ARM (condition true/false), never by an index — an index
+    //    says nothing about which arm it is.
     //
     //  * M = ±Inf.  SUPERSEDED by the component guard at the top of the
     //    function (R16), which returns 0 before this block: an infinite

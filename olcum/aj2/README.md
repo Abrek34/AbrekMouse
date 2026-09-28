@@ -54,6 +54,42 @@ demiyordu. Kalan üç dal (`L131`/`L132`/`L137`) bulunamadı ve **silme önerilm
 mutasyon `L131`'in eşiğini `1e300` yapınca sayac `0 → 511 500` oldu, yani
 sıfırlar **tutulmuş sayaç** değil, gerçek erişilemezlik ölçümü.
 
+### `--aktif` — mutasyon PC'si: **KOD satırını** geri al, sayac kıpırdı mı bak
+
+```bash
+python3 olcum/aj2/prove_kod_ayni.py --dallar include/math-vec2.hpp \
+    --surucu olcum/aj2/dal_surucu.cpp \
+    --aktif 'log_inner < -600.0::log_inner < 1e300'
+```
+
+`--aktif "ESKI::YENI"` hedefi **KOD satırı** olarak seçer, `include/`'in
+tamamını geçici bir dizine kopyalar, orijinal ile mutasyonlu'yu **aynı
+sürücüyle** ölçüp **ORIG/MUT tablosunu makine üretimli** basar.
+
+> ⭐ **Seçici ilk metin geçişini DEĞİL, tek KOD satırını hedefler.**
+> Ölçüm yorumları aynı metni içerebildiği için (`grep -c 'log_inner < -600.0'`
+> → **3**: `L118` ve `L139` yorum, `L156` kod) ilk geçişe uygulanan mutasyon
+> **kodu değiştirmez**, sayaç kıpırdamaz ve PC **sessizce yanlış negatif**
+> verir. Araç bu yüzden: eşleşmeleri kod/yorum olarak ayırır, **tam 1 KOD
+> satırı** ister (`0` veya `>1` → `rc=2`, hangi satırların çakıştığını listeleyerek),
+> ve mutasyonun **yorumda kaldığını** ayrıca doğrular.
+
+### ⭐ Kollar **anlamsal** etiketlenir, indeksle değil
+
+Tablo `L156 b0` / `L156 b1` yazmaz. `b0/b1` **hangi kolun** olduğunu söylemez;
+iki ölüm arasında karşılaştırılamaz. Bunun yerine gcov'un `fallthrough`
+bilgisi kullanılır:
+
+```
+  L156  dusen  (kosul dogru)     0 -> 68    if (log_inner < -600.0) ...
+  L156  atlayan(kosul yanlis)   68 -> 0     if (log_inner < -600.0) ...
+```
+
+> ⭐ **Ölçüldü:** indeks aslında *kararsız* değil — aynı koşu iki kez **birebir**
+> aynı, mutasyon altında da indeks aynı kalıyor. Yani sorun kararlılık değil,
+> **bilgi**: indeks etiketi iki rapor arasında **anlam taşımıyor**. Bu yüzden
+> kaldırıldı, yerine anlamsal etiket kondu.
+
 ### Tuzaklar (bu modda yaşandı)
 
 * **`gcov --json-format` `-b` olmadan branch YAZMAZ.** `-b` unutulursa her dal
