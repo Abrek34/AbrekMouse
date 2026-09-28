@@ -64,11 +64,13 @@ echo "[oracle] running local port ..."
 
 known_set_file="$HERE/known_deviations.txt"
 
-python3 - "$work/ref.out" "$work/local.out" "$TOL" "$VERBOSE" "$known_set_file" <<'PY'
+python3 - "$work/ref.out" "$work/local.out" "$TOL" "$VERBOSE" "$known_set_file" "$REPO" <<'PY'
 import sys
 import math
+import os
 ref = sys.argv[1]; loc = sys.argv[2]; tol = float(sys.argv[3]); verbose = int(sys.argv[4])
 known_file = sys.argv[5]
+repo_root = sys.argv[6]
 
 def load(p):
     rows = {}
@@ -150,6 +152,100 @@ unknown = [w for w in worst if not w[-1]]
 known_cnt = len(known & deviating)
 
 stale = sorted(known - deviating)
+
+# ===== ORACLE COVERAGE CHECK =====
+# The oracle grid only tests accel_* gain functions directly via au.apply() / run().
+# It does NOT exercise the vector-to-speed layer (speed_processor, lp_distance,
+# magnitude, rotate, direction, smoother/EMA, modifier::modify). This check
+# verifies that the oracle's coverage declaration matches reality by scanning
+# the local.cpp and reference.cpp source files for production function calls.
+
+# Declared coverage — list of production functions the oracle actually exercises.
+# If you add a call to a production function in local.cpp or reference.cpp,
+# add it here. If a production function is used but NOT listed here, the
+# oracle coverage is incomplete and this check will warn.
+ORACLE_COVERED = {
+    # accel gain functions (all modes)
+    "accel_classic", "accel_power", "accel_natural", "accel_jump",
+    "accel_synchronous", "accel_lookup", "accel_noaccel",
+    "accel_union_apply", "accel_union_init",
+}
+
+# Production functions NOT covered by the oracle grid (intentionally).
+# These are tested elsewhere (tests/test_accel.cpp, run_simd_parity.sh, etc.).
+ORACLE_NOT_COVERED = {
+    "modifier_modify", "speed_processor", "lp_distance", "magnitude",
+    "rotate", "direction", "smoother_ema", "modifier_init",
+    "speed_processor_init", "lp_norm", "lp_distance_impl", "rotate_vec",
+    "direction_angle", "magnitude_impl", "hypot",
+}
+
+def extract_calls(source_path, patterns):
+    """Scan a C++ source file for calls to production functions."""
+    import re
+    found = set()
+    try:
+        with open(source_path, 'r') as f:
+            content = f.read()
+        for pattern in patterns:
+            if re.search(pattern, content):
+                found.add(pattern.replace(r'\(', '').replace(r'\)', ''))
+    except FileNotFoundError:
+        pass
+    return found
+
+# Patterns to search for in C++ source files
+PATTERNS = {
+    "modifier_modify": r"modifier.*\.modify\(",
+    "speed_processor": r"speed_processor\b",
+    "lp_distance": r"lp_distance\(",
+    "magnitude": r"\bmagnitude\(",
+    "rotate": r"\brotate\(",
+    "direction": r"\bdirection\b",
+    "smoother_ema": r"smoother\b|ema\b|exp2\(",
+    "modifier_init": r"modifier\b.*init",
+    "speed_processor_init": r"speed_processor\b.*init",
+    "lp_norm": r"\blp_norm\b",
+    "lp_distance_impl": r"lp_distance\b",
+    "rotate_vec": r"rotate.*vec|vec.*rotate",
+    "direction_angle": r"direction\b",
+    "magnitude_impl": r"magnitude\(",
+    "hypot": r"std::hypot\(",
+    "accel_union_apply": r"accel_union.*apply|au\.apply\(",
+    "accel_union_init": r"accel_union.*init|au\.init\(",
+}
+
+# Scan both oracle binaries' source files
+local_cpp = os.path.join(repo_root, "tests", "oracle", "local.cpp")
+reference_cpp = os.path.join(repo_root, "tests", "oracle", "reference.cpp")
+
+found_calls = set()
+for cpp_file in [local_cpp, reference_cpp]:
+    found_calls |= extract_calls(cpp_file, PATTERNS)
+
+# Check for unlisted covered functions
+unlisted_covered = found_calls - ORACLE_COVERED
+if unlisted_covered:
+    print(f"⚠️  ORACLE COVERAGE WARNING: Found unlisted production function calls:")
+    for fn in sorted(unlisted_covered):
+        print(f"  {fn}")
+    print("  Add these to ORACLE_COVERED in run_oracle.sh if intentional.")
+
+# Check for production functions used in oracle but not declared as covered
+undeclared_used = set()
+for key in ORACLE_NOT_COVERED:
+    if key in found_calls:
+        # This would be a problem — a supposedly uncovered function is being called
+        pass  # Currently none expected
+
+# Report coverage summary
+if verbose:
+    print(f"  Oracle coverage scan: found {len(found_calls)} production function patterns")
+    for fn in sorted(found_calls):
+        status = "COVERED" if fn in ORACLE_COVERED else "NOT COVERED (expected)"
+        print(f"  {fn}: {status}")
+
+# ===== END ORACLE COVERAGE CHECK =====
 
 print(f"total rows compared : {len(r)}")
 print(f"documented deviations: {len(known)} (known_deviations.txt)")

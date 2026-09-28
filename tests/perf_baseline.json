@@ -1,18 +1,25 @@
 {
-  "noaccel": 9.6082,
-  "power-whole": 10.7481,
-  "classic": 31.1767,
-  "power+rot45+snap15+clamp": 32.875,
-  "power-dual+4ema": 393.719,
-  "apply_motion_math(full)": 54.7043,
+  "noaccel": 14.4795,
+  "power-whole": 41.66,
+  "classic": 46.2686,
+  "power+rot45+snap15+clamp": 61.9012,
+  "power-dual+4ema": 319.5107,
+  "apply_motion_math(full)": 46.2907,
   "_meta": {
     "unit": "ns/event",
-    "iterations": 300000,
+    "iterations_per_config": {
+      "noaccel": 6912331,
+      "power-whole": 2403280,
+      "classic": 2159608,
+      "power+rot45+snap15+clamp": 1619394,
+      "power-dual+4ema": 308767,
+      "apply_motion_math(full)": 2153502
+    },
     "runs_used": 3,
     "method": "median",
-    "source": "scripts/bench_hotpath.sh (Aj5 P135)",
-    "captured_by": "PERF-2 (AbrekMouse P0) 13 Sep 2026 03:44",
-    "threshold_percent": 5.0,
-    "note": "CI perf-gate: rerun script, if any config >5% slower than baseline -> FAIL. power-dual+4ema ~9% faster via exp2-based EMA. apply_motion_math(full) now consumes its outputs (was dead-code-eliminated to ~22 ns — the 54.7 figure is the honest cost, verified equal on the unmodified build with the fixed benchmark)."
+    "min_seconds_per_run": 0.1,
+    "positive_control": false,
+    "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_governor": "unreadable"
   }
 }

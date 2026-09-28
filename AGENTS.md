@@ -303,18 +303,23 @@ each documented in that file's header. Run this after EVERY change to
 
 **Oracle domain boundary (reachability of the match):** The oracle grid covers
 speeds up to `1e5` (`default_speeds()` in `oracle_cases.hpp`). The port's
-production pipeline is bounded by `sanitize_device_config` (DPI ≤ 32 000),
-`IPS_FACTOR_MAX = 1e6`, and domain/range weights ≤ `1e6` (P86), yielding a
-max observed `|abs_vel| ≤ 32 767 × 1e6 × 1e6 ≈ 3.3e16`. The reference's
+production pipeline is bounded by `sanitize_device_config` (DPI ≤ 32 000,
+`src/config.cpp:362`), `IPS_FACTOR_MAX = 1e6` (`rawaccel.hpp:351-353` — clamp
+on `ips_factor`), and domain/range weights ≤ `1e6` (P86, `src/config.cpp:605-606`).
+The Linux input subsystem uses `__s32 value` (`/usr/include/linux/input.h:44`),
+so `|ev.value| ≤ INT32_MAX = 2,147,483,647`. The daemon batches 32 events
+(`daemon/daemon.cpp:2573`), accumulating `dx`/`dy` up to `32 × INT32_MAX =
+6.87e10`. Clamped `ips_factor ≤ 1e6` and `domain_weights ≤ 1e6` yield:
+`|abs_vel| ≤ 32·INT32_MAX × IPS_FACTOR_MAX × 1e6 ≈ 6.87e22`. The reference's
 `magnitude(v)` uses `sqrt(x*x + y*y)` which overflows to `inf` at
-`|v| ≳ 1.34e154`. The port uses `std::hypot` (R14) and log-space `lp_distance`
-(ORTA-BUG-MOTION-03), so it **deliberately diverges** from the reference for
-`|v| ≫ 3.3e16` — but this region is **unreachable from any valid config**.
-The oracle's 1407 rows (max speed `1e5`) sit entirely inside the matching
-envelope. If a future change widens the envelope (e.g. raises `IPS_FACTOR_MAX`
-or weight ceilings), the oracle grid must be extended with a dedicated
-boundary case at the production ceiling (`3.3e16` scale) so the gate detects
-divergence before it becomes reachable.
+`|v| ≳ 1.34e154` (`~2^1023`). The port uses `std::hypot` (R14) and log-space
+`lp_distance` (ORTA-BUG-MOTION-03), so it **deliberately diverges** from the
+reference for `|v| ≫ 6.87e22` — but this region is **unreachable from any valid
+config** (margin ≈ 1.95e131×). The oracle's 1408 rows (max speed `1e5`) sit
+entirely inside the matching envelope. If a future change widens the envelope
+(e.g. raises `IPS_FACTOR_MAX` or weight ceilings), the oracle grid must be
+extended with a dedicated boundary case at the production ceiling (`6.87e22`
+scale) so the gate detects divergence before it becomes reachable.
 
 ## Translation Coverage
 
