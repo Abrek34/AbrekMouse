@@ -63,6 +63,62 @@ namespace simd {
 #   define RAWACCEL_HAVE_SSE2 0
 #endif
 
+// ----------------------------------------------------------------------------
+// Why the parity gate does NOT build with the shipping flags
+// ----------------------------------------------------------------------------
+// tests/run_simd_parity.sh compiles this file three times — `-mavx2`,
+// `-mno-avx2`, `-mno-sse2` — and says so out loud: "the flags only select the
+// BACKEND, they are not the shipping flag set".  That is a deliberate
+// separation and it is correct, because the gate's job is to compare three
+// independently hand-written backends against each other.  Comparing two
+// builds of the SAME source is a different question, and nobody was answering
+// it.  Answered 2026-09-28, by compiling tests/simd_parity.cpp four ways and
+// diffing the numeric output:
+//
+//   gate_avx2  -O2 -mavx2                     47 case rows
+//   gate_sse2  -O2 -mno-avx2                   47 case rows
+//   fma        -O2 -mavx2 -mfma                47 case rows
+//   shipping   -O3 -march=native -mfma …       47 case rows   <- what ships
+//
+//   all five pairwise comparisons: BYTE-IDENTICAL, every build `result PASS`.
+//   (The only line that differs at all is the self-declared `backend <NAME>`
+//   header, which is a label, not a number.)
+//
+// So the shipping flag set does NOT change the numeric result of this code.
+// The gap is still large, though, and it is worth recording why that is not a
+// surprise.  `g++ -Q --help=target` on this machine: `-march=native` differs
+// from `-mavx2` in 23 settings — 21 of them ISA instruction-set flags (abm,
+// adx, aes, bmi, bmi2, clflushopt, cx16, f16c, fma, fsgsbase, hle, lzcnt,
+// movbe, pclmul, prfchw, rdrnd, rdseed, sahf, xsavec, xsaveopt, xsaves) plus
+// -march=skylake / -mtune=skylake.  Exactly ONE of those 21 can affect
+// floating-point codegen: FMA.  The other 20 are integer, bitwise, vector-
+// integer, crypto or state-management instructions, none of which this file
+// emits.  The preprocessor-macro subset is 9 (lzcnt, bmi, bmi2, aes, f16c,
+// rdseed, clflushopt, adx, fma).
+//
+// Note also that `-mavx2` already IMPLIES sse3/ssse3/sse4.1/sse4.2/avx, which
+// is why those never show up as a difference — and why the `-msse3` … `-msse4.2`
+// tail of scripts/build.sh's SIMD_FLAGS changes nothing (measured: the whole
+// tree builds with `-mfpmath=sse -msse2` alone, 0 warnings, and the oracle's
+// 17-digit output is byte-identical to the gate's).
+//
+// POSITIVE CONTROL for the "no divergence" result — without it the result
+// above is worthless.  Injecting an X/Y lane swap into v2d_set (the AVX2
+// Y-axis bug this file already carries a BUGFIX note about) turned the same
+// build from `result PASS` into `result FAIL (4)`, with 11 of 47 case rows
+// changing.  Two practical notes for whoever repeats this: (a) the mutated
+// header must be reached through a real copy of the whole include/ directory,
+// because simd_parity.cpp -> rawaccel.hpp includes "simd_math.hpp" by quoted
+// path, which resolves next to the includer and ignores an earlier -I; and
+// (b) confirm the mutation is live before trusting a null result.
+//
+// WHAT THIS DOES NOT LICENCE: the flag sets still live in two places —
+// scripts/build.sh's SIMD_FLAGS and run_simd_parity.sh's BACKENDS — and they
+// can still drift apart silently, which is a real defect class (it produced
+// the ORIGINAL FMA-vs-gate divergence documented at the bottom of
+// run_simd_parity.sh).  This file records that the drift is currently
+// numerically harmless; it does not remove the need for a single source.
+
 // ============================================================================
 // Vector types (2-wide for X/Y processing)
 // ============================================================================
