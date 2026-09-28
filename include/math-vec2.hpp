@@ -63,13 +63,22 @@ inline double lp_distance(vec2d v, double p) {
     // Factor out the larger component so the inner ratio is always ≤ 1,
     // preventing pow overflow for large inputs with high p norms.
     //   ||v||_p = M * (1 + (m/M)^p)^(1/p)   where M = max, m = min.
-    // For p < 1 the outer pow(·, 1/p) can legitimately overflow to Inf
-    // even for bounded inputs (e.g. p=0.1, x=y=1 → 1024).  This is mathematically
-    // correct but impractical for downstream use (acceleration evaluation at 1024 ips
-    // is meaningless on real hardware).  Falling back to M (L∞ norm) is the safest
-    // bounded approximation: M ≤ true Lp for p ≥ 1; M < true Lp for p < 1, but
-    // all practical mice produce speeds within a few × M.  NOTE: an earlier
-    // version of this comment claimed "sanitize clips lp_norm to [1e-9, 16]".
+    // The outer pow(·, 1/p) overflows double far more narrowly than "p < 1"
+    // suggests — the earlier revision of this comment said otherwise and was
+    // MEASURED FALSE.  Ground truth in long double over |v| ≤ 6.87e22 and
+    // 0 < p < 16 (olcum/aj2/lp_yedek_penceresi.cpp, 4 PCs, all PASS):
+    //   p = 1e-4   L∞ fires on 150/165 grid points
+    //   p = 1e-3   L∞ fires on  47/165
+    //   0.01 ≤ p < 1   L∞ fires NOWHERE; worst relative error ~1e-14
+    // So the "p=0.1, x=y=1 → 1024" figure is correct arithmetic that never
+    // reaches this branch — at p=0.1 the norm is simply computed.  Over the
+    // practical mouse range (|v| ≤ 1e4) 90 points exceed 1e-12 and ALL of
+    // them are at p=1e-4.  Falling back to M is therefore not "a few × M"
+    // slop: outside p ≲ 1e-3 it costs nothing, and inside that window the
+    // alternative is ±Inf.  At extreme p the factored form is also MORE
+    // accurate than the reference (p=1e-9: port 0, reference 1.0e-7).  NOTE: an
+    // earlier version of this comment claimed "sanitize clips lp_norm to
+    // [1e-9, 16]".
     // MEASURED FALSE (2026-09-28): src/config.cpp:570-571 only does
     //   if (lp_norm <= 0) lp_norm = 2;
     // — there is no 1e-9 lower bound and no 16 upper bound in sanitize.  The 16
