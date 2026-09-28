@@ -226,26 +226,52 @@ for cpp_file in [local_cpp, reference_cpp]:
     found_calls |= extract_calls(cpp_file, PATTERNS)
 
 # Check for unlisted covered functions
+# FATAL, not a warning: the run below ends in "RESULT: OK — local port matches
+# official reference ... on every row", and that claim is an attribution claim.
+# A production function the oracle actually called but never declared makes the
+# grid's coverage unstated, so OK would be printed for a scope nobody wrote down.
+# A warning here left the gate green while saying the same thing (measured).
 unlisted_covered = found_calls - ORACLE_COVERED
 if unlisted_covered:
-    print(f"⚠️  ORACLE COVERAGE WARNING: Found unlisted production function calls:")
+    print(f"ERROR: {len(unlisted_covered)} unlisted production function call(s):")
     for fn in sorted(unlisted_covered):
-        print(f"  {fn}")
-    print("  Add these to ORACLE_COVERED in run_oracle.sh if intentional.")
+        print(f"  unlisted  {fn}")
+    print("  The oracle called these but ORACLE_COVERED does not declare them, so")
+    print("  the coverage behind 'RESULT: OK' is unaccounted for. Add them to")
+    print("  ORACLE_COVERED if intentional (then re-run) — do not ignore.")
+    sys.exit(1)
 
-# Check for production functions used in oracle but not declared as covered
-undeclared_used = set()
-for key in ORACLE_NOT_COVERED:
-    if key in found_calls:
-        # This would be a problem — a supposedly uncovered function is being called
-        pass  # Currently none expected
+# Check for a self-contradictory coverage declaration.
+# This was `pass` — the loop body computed nothing and the set stayed empty, so
+# the branch was unreachable dead code.  The condition that is actually
+# reachable here is the OVERLAP: a name in both lists is by definition not
+# "unlisted", so the check above cannot see it, and it makes one name both
+# covered and not covered.  Fatal.
+#
+# Note on the original "called but declared NOT covered" formulation: it is
+# strictly subsumed.  If a name is called and declared NOT covered, it is
+# caught by the unlisted check above unless it is also in ORACLE_COVERED — and
+# then it is an overlap, which is this check.  So it is reported here as extra
+# detail on the overlapping names, not as a second independent guard.
+both_lists = ORACLE_COVERED & ORACLE_NOT_COVERED
+if both_lists:
+    print(f"ERROR: {len(both_lists)} name(s) declared COVERED *and* NOT COVERED:")
+    for fn in sorted(both_lists):
+        tag = " (and the grid calls it)" if fn in found_calls else " (not called)"
+        print(f"  contradicted  {fn}{tag}")
+    print("  ORACLE_COVERED and ORACLE_NOT_COVERED must be disjoint; a name in")
+    print("  both makes the coverage declaration self-contradictory. Move it to")
+    print("  one list, then re-run.")
+    sys.exit(1)
 
 # Report coverage summary
 if verbose:
-    print(f"  Oracle coverage scan: found {len(found_calls)} production function patterns")
+    # found_calls ⊆ ORACLE_COVERED is guaranteed by the fatal check above, so
+    # this prints the verified fact rather than a re-derived guess.
+    print(f"  Oracle coverage scan: found {len(found_calls)} production function "
+          f"patterns, all declared in ORACLE_COVERED")
     for fn in sorted(found_calls):
-        status = "COVERED" if fn in ORACLE_COVERED else "NOT COVERED (expected)"
-        print(f"  {fn}: {status}")
+        print(f"  {fn}: COVERED")
 
 # ===== END ORACLE COVERAGE CHECK =====
 
