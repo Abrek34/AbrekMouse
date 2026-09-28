@@ -181,15 +181,17 @@ ORACLE_NOT_COVERED = {
 }
 
 def extract_calls(source_path, patterns):
-    """Scan a C++ source file for calls to production functions."""
+    """Scan a C++ source file for calls to production functions.
+    Returns a set of function NAMES (keys from PATTERNS) that were found.
+    """
     import re
     found = set()
     try:
         with open(source_path, 'r') as f:
             content = f.read()
-        for pattern in patterns:
+        for key, pattern in patterns.items():
             if re.search(pattern, content):
-                found.add(pattern.replace(r'\(', '').replace(r'\)', ''))
+                found.add(key)  # Add the function NAME (key), not the regex pattern
     except FileNotFoundError:
         pass
     return found
