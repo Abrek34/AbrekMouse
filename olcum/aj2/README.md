@@ -20,6 +20,55 @@ python3 olcum/aj2/prove_kod_ayni.py --pc include/math-vec2.hpp    # ZORUNLU
 `--pc` bilinen bir mutasyonla sayının değiştiğini gösterir. **Bunu
 atlamadan "AYNI" sonucu kanıt değildir** — alet duyarsızsa daima 0 döner.
 
+### `--dallar` — bir dalın sayacını **ölç**, elle sayaç koyma
+
+```bash
+python3 olcum/aj2/prove_kod_ayni.py --dallar include/math-vec2.hpp \
+    --surucu olcum/aj2/dal_surucu.cpp --arama olcum/aj2/dal_arama.cpp
+```
+
+`--surucu` **zorunludur**: sayacı ölçecek çağrıyı kim yapıyor? Bilinmeden dal
+sayacı boş kalır ve "erişilemez" sanılır — en sık yapılan hatadır.
+
+Sayaç **elle konmaz**, derleyicinin `-fprofile-arcs` sayacı okunur; böylece
+sayac bu dosyadan bağımsız olur. İki PC her çalıştırmada zorunludur:
+
+| PC | ne doğrular | kalmazsa |
+|---|---|---|
+| **PC-1** | sayaç duyarlı mı (dolu dal üretiyor mu) | *hiç dal bulunamadı* → alet hatası, "erişilemez" **değil** |
+| **PC-2** | sayaç doğru mu — her koşul bloğunda **çıkış sayacı = giriş sayacı** | blok veri akışı bozuk → alet hatası |
+
+### ⛔ SIFIR SAYAN DAL **SİLME ÖNERİSİ DEĞİLDİR**
+
+Sıfır, *"bu girdi kümesi o dala hiç girmedi"* demektir. *"bu dal imkânsız"*
+demek için ya **erişilebilir girdi** bulunur, ya da **matematiksel** olarak
+gösterilir. Araç girdi bulamazsa `"erişilebilir girdi bulunamadı"` yazar ve
+**silme önermez** — bulamamak erişilemezliği kanıtlamaz. `--arama` sürücüsü
+sıfırdan hareket eden bir dal bulursa o dal **erişilebilirdir** ve açıkça
+"ERİŞİLEBİLİR" diye raporlanır.
+
+**Bu kural, `math-vec2.hpp`'de bir kez canlı olarak işledi:** temel ızgara 6
+dalı sıfır bıraktı; arama sürücüsü `L62`'nin üç dalını `0 → 972 / 99 592 /
+100 564` ile **erişilebilir** buldu. Yani "sıfır" gerçekten "erişilemez"
+demiyordu. Kalan üç dal (`L131`/`L132`/`L137`) bulunamadı ve **silme önerilmedi**;
+mutasyon `L131`'in eşiğini `1e300` yapınca sayac `0 → 511 500` oldu, yani
+sıfırlar **tutulmuş sayaç** değil, gerçek erişilemezlik ölçümü.
+
+### Tuzaklar (bu modda yaşandı)
+
+* **`gcov --json-format` `-b` olmadan branch YAZMAZ.** `-b` unutulursa her dal
+  `0` görünür ve araç "erişilemez kod" der. PC-1 bunu yakalar — *kanıtı olmayan
+  sıfır, önce alet hatası varsayılır.*
+* **Satırdaki TÜM dallar toplanmaz.** `a && b` **iki** ayrı koşul bloğu
+  üretir; ilk PC denemesi bu yüzden `L20: 392 != 343` ile **kendi kendini
+  kırmış** (PC'nin kendisi yanlıştı). Doğru değişmez blok bazlıdır: satır
+  sayacına girmeyen bloğun çıkış toplamı = satır sayacı, diğerlerinki = o
+  bloğa gelenlerin toplamı.
+* **`include` gölgelemesi:** tırnaklı `include` önce dosyayı **include eden**in
+  dizinini arar; `-I` ile değiştirilemez. `include/` dizininin **tamamı** kopyalanır,
+  ölçüm kopyada yapılır.
+
+
 Bu projede yolun açtığı üç tuzak, aracın docstring'inde ve burada:
 
 1. **grep locale tuzağı.** `LANG=tr_TR.UTF-8` altında `grep -oE "[A-Za-z0-9_]+"`

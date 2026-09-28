@@ -79,8 +79,20 @@ def main() -> int:
     ap.add_argument("b", nargs="?")
     ap.add_argument("--git", metavar="DOSYA")
     ap.add_argument("--pc", metavar="DOSYA")
+    ap.add_argument("--dallar", metavar="BASLIK",
+                    help="dal sayacini olc (-fprofile-arcs, elle sayac YOK)")
+    ap.add_argument("--surucu", metavar="CPP",
+                    help="--dallar icin girdi surucusu (main zorunlu)")
+    ap.add_argument("--arama", metavar="CPP",
+                    help="erisilebilir girdi arayan ikinci surucu")
     args = ap.parse_args()
 
+    if args.dallar:
+        if not args.surucu:
+            sys.exit("--dallar icin --surucu ZORUNLU (sayac olculecek cagriyi "
+                     "kim yapiyor? Bilinmeden dal sayaci bos kalir ve 'erisilemez' "
+                     "sanilir — en sik yapilan hatadir.)")
+        return run_dallar(args.dallar, args.surucu, args.arama)
     if args.pc:
         return run_pc(args.pc)
     if args.git:
@@ -114,6 +126,202 @@ def run_pc(path: str) -> int:
             print("  ⛔ PC KALMADI — yontem duyarsiz, 'AYNI' sonucu gecersiz")
             return 1
     print("  ✔ PC GECTI — yontem fark algiliyor, 'AYNI' sonucu gecerli")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --dallar: bir dalin sayacini OLCE. Elle sayac koymaz; derleyicinin kendi
+# -fprofile-arcs sayacini kullanir, boylece sayim o dosyadan bagimsiz olur.
+#
+# SIFIR SAYAN DAL SILME ONERISI DEGILDIR. Sifir, "bu girdi kumesi bu dala
+# hic girmedi" demektir; "bu dal imkansiz" demek icin ya erisilebilir bir girdi
+# bulunur ya da imkansizlik MATEMATIKSEL olarak gosterilir. Arac girdi
+# bulamazsa "erisilebilir girdi bulunamadi" yazar ve SILME ONERMEZ.
+# ---------------------------------------------------------------------------
+import gzip
+import json
+import shutil
+import subprocess as _sp
+
+
+def _build_run_gcov(work: str, header: str, driver: str):
+    """Surucuyu -fprofile-arcs ile derle, calistir, gcov JSON uret."""
+    obj = _sp.run(["g++", "-std=c++20", "-O0", "--coverage",
+                   "-I", "include", driver, "-o", "drv"],
+                  cwd=work, capture_output=True, text=True)
+    if obj.returncode != 0:
+        return None, f"derleme basarisiz: {obj.stderr.strip()[:300]}"
+    run = _sp.run(["./drv"], cwd=work, capture_output=True, text=True)
+    if run.returncode != 0:
+        return None, f"surucu hata kodu {run.returncode}: {run.stderr.strip()[:300]}"
+    # -b ZORUNLU: gcov JSON formatinda branch verisini YALNIZ -b ile yazar.
+    # -b unutulursa files[*].lines[*].branches hic dolmaz ve her dal "sifir"
+    # gorunur -> alet "erisilemez kod" der. Tuzak, PC-1 ile yakalanir.
+    g = _sp.run(["gcov", "--json-format", "-b", "-o", ".", "drv.gcno"],
+                cwd=work, capture_output=True, text=True)
+    gj = os.path.join(work, "drv.gcov.json.gz")
+    if g.returncode != 0 or not os.path.exists(gj):
+        return None, f"gcov JSON uretilemedi: {g.stderr.strip()[:300]}"
+    with gzip.open(gj, "rt", encoding="utf-8") as fh:
+        return json.load(fh), None
+
+
+def _branches(data, header_rel: str):
+    """(satir, branch_idx, count, throw, fallthrough) listesi."""
+    out = []
+    for f in data.get("files", []):
+        if header_rel not in f["file"]:
+            continue
+        for ln in f["lines"]:
+            for bi, b in enumerate(ln.get("branches") or []):
+                out.append((ln["line_number"], bi, b["count"],
+                            b.get("throw", False), b.get("fallthrough", False)))
+    return out
+
+
+def _src_line(src: str, n: int) -> str:
+    lines = src.splitlines()
+    return lines[n - 1].strip() if 0 < n <= len(lines) else ""
+
+
+def run_dallar(header: str, driver: str, arama: str | None) -> int:
+    header = os.path.abspath(header)
+    hdr_rel = "include/" + os.path.basename(header)
+    inc_root = os.path.dirname(header)          # <...>/include
+    src = read(header)
+
+    print(f"  === --dallar: {hdr_rel} ===")
+    print("  olcum: derleyici sayaci (-fprofile-arcs). Elle sayac YOK,")
+    print("         boylece sayac bu dosyadan bagimsiz.")
+
+    results = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        # include golgelemesi tuzagi: tirmakli include once INCLUDE EDEN dosyanin
+        # dizinini arar, bu yuzden include/ dizininin TAMAMINI kopyalayip
+        # yalnizca kopyada mutasyon/olcum yapar.
+        shutil.copytree(inc_root, os.path.join(tmp, "include"))
+        shutil.copy(driver, os.path.join(tmp, "drv.cpp"))
+        data, err = _build_run_gcov(tmp, hdr_rel, "drv.cpp")
+        if err:
+            print(f"  ⛔ {err}")
+            return 2
+        results["temel"] = _branches(data, hdr_rel)
+
+        # --- PC-1: arac duyarli mi? sayac bos mu, dolu mu? ---
+        br = results["temel"]
+        if not br:
+            print("  ⛔ PC-1 KALMADI — hic dal bulunamadi. Baslik derlenmemis")
+            print("     olabilir ya da -O0 inline atiyor. 'erisilemez' DEGIL,")
+            print("     alet hatasi. Cikis: 2")
+            return 2
+        nonzero = sum(1 for r in br if r[2] > 0)
+        zero = sum(1 for r in br if r[2] == 0)
+        print(f"  PC-1 sayac duyarli mi : {len(br)} dal bulundu, "
+              f"{nonzero} dolu, {zero} sifir")
+        if nonzero == 0:
+            print("  ⛔ PC-1 KALMADI — HICBIR dal sayilmadi. Alet duyarsiz.")
+            return 2
+        print("  PC-1 ✔ gecti (sayac dolu dallar uretiyor)")
+
+        # --- PC-2: sayac DOGRULUGU, BLOK BAZINDA ---
+        # Dogru degismez: bir satirda "a && b" iki AYRI kosul blok uretir.
+        # Satirdaki TUM dallarin toplami satir sayacina esit DEGILDIR — bu
+        # ilk denemede PC-2'nin kendisinin yanlis oldugunu gosterdi (L20'de
+        # 392 != 343). Dogru degismez veri akisidir:
+        #   * satirdaki hicbir blogdan gelmeyen blogun cikis toplami = satir
+        #     sayaci,
+        #   * diger blogun cikis toplami = o bloga gelen dallarin toplami.
+        # Cikan toplam GIRIS toplamindan buyukse sayac bozuktur.
+        mism = []
+        checked = 0
+        for f in data.get("files", []):
+            if hdr_rel not in f["file"]:
+                continue
+            for ln in f["lines"]:
+                bl = ln.get("branches") or []
+                if len(bl) < 2:
+                    continue
+                line_count = ln.get("count", 0)
+                src_blocks = {b["source_block_id"] for b in bl}
+                dst_blocks = {b["destination_block_id"] for b in bl}
+                roots = src_blocks - dst_blocks
+                arrivals = {s: line_count for s in roots}
+                for b in bl:
+                    d = b["destination_block_id"]
+                    arrivals[d] = arrivals.get(d, 0) + b["count"]
+                out = {}
+                for b in bl:
+                    s = b["source_block_id"]
+                    out[s] = out.get(s, 0) + b["count"]
+                for s, tot in out.items():
+                    if len([b for b in bl if b["source_block_id"] == s]) < 2:
+                        continue          # tek cikisli blog kosul degildir
+                    got = arrivals.get(s, 0)
+                    checked += 1
+                    if tot != got:
+                        mism.append((ln["line_number"], s, tot, got))
+        if mism:
+            print(f"  ⛔ PC-2 KALMADI — {len(mism)}/{checked} blogun cikis sayaci "
+                  f"gelis sayacina esit degil -> sayac bozuk")
+            for m in mism[:6]:
+                print(f"     L{m[0]} blok{m[1]}: cikis {m[2]} != gelis {m[3]}")
+            return 2
+        print(f"  ✔ PC-2 gecti ({checked} kosul blogu: cikis sayaci = gelis "
+              f"sayaci)")
+
+        # --- erisilebilir girdi aramasi (varsa) ---
+        if arama:
+            shutil.copy(arama, os.path.join(tmp, "drv.cpp"))
+            for p in ("drv.gcda", "drv.gcno"):
+                fp = os.path.join(tmp, p)
+                if os.path.exists(fp):
+                    os.unlink(fp)
+            data2, err = _build_run_gcov(tmp, hdr_rel, "drv.cpp")
+            if err:
+                print(f"  ⛔ arama surucusu: {err}")
+                return 2
+            results["arama"] = _branches(data2, hdr_rel)
+            print(f"  arama surucusu calisti: {os.path.basename(arama)}")
+
+    # --- rapor ---
+    def show(tag, brs, key):
+        z = [r for r in brs if r[2] == 0]
+        print(f"\n  --- {tag}: sifir sayan {len(z)} / {len(brs)} dal ---")
+        for ln, bi, _c, _t, _f in z:
+            print(f"    L{ln:<4} b{bi}  {_src_line(src, ln)[:64]}")
+        return z
+
+    z_base = show("TEMEL (verilen surucu)", results["temel"], None)
+    found = {}
+    if "arama" in results:
+        # arama surucusu ile ARTAN dallar: erisilebilir girdi BULUNDU
+        before = {(r[0], r[1]): r[2] for r in results["temel"]}
+        gained = [r for r in results["arama"]
+                  if before.get((r[0], r[1]), 0) == 0 and r[2] > 0]
+        print(f"\n  --- ARAMA: erisilebilir girdi BULUNAN dallar ({len(gained)}) ---")
+        for ln, bi, c, _t, _f in gained:
+            found[(ln, bi)] = c
+            print(f"    L{ln:<4} b{bi}  sayim 0 -> {c}   ERISILEBILIR  "
+                  f"{_src_line(src, ln)[:44]}")
+
+    still = [r for r in z_base if (r[0], r[1]) not in found]
+
+    print("\n  === HUKUM ===")
+    if found:
+        print(f"  ⛔ SILME ONERISI YOK. {len(found)} dal icin erisilebilir girdi "
+              f"BULUNDU:")
+        for (ln, bi), c in sorted(found.items()):
+            print(f"     L{ln} b{bi}: erisilebilir ({_src_line(src, ln)[:56]})")
+    if still:
+        print(f"  ⚠ {len(still)} dal icin 'erisilebilir girdi bulunamadi'.")
+        print("    Bu SILME ONERISI DEGILDIR. Sifir sayac yalnizca 'bu girdi")
+        print("    kumesi buraya girmedi' der. Imkansizlik ya erisilebilir girdi")
+        print("    bulmak ya da matematiksel olarak gostermekle kanitlanir:")
+        for ln, bi, _c, _t, _f in still:
+            print(f"     L{ln:<4} b{bi}  {_src_line(src, ln)[:60]}")
+    if not z_base:
+        print("  ✔ Hicbir dal sifir sayilmadi — bu dosyada olcum bu girdi")
+        print("    kumesiyle dal bulamadi, 'erisilemez kod' iddiasi desteklenmez.")
     return 0
 
 
