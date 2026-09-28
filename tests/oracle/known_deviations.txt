@@ -2,10 +2,10 @@
 # RawAccel reference. Rows here are expected to differ; run_oracle.sh treats
 # only rows NOT in this list as drift. Format: <case-name>\t<spd>
 #
-# Deviation classes (four; all documented port conventions with their own tests).
-# The file currently holds 67 rows and they account for exactly:
+# Deviation classes (five; all documented port conventions with their own tests).
+# The file currently holds 79 rows and they account for exactly:
 #   23 classic_gain_exp_le1 | 9 power/sync at spd 0 | 23 power_tinyexp_floor
-#   | 12 p155_io_cap0_legacy
+#   | 12 p155_io_cap0_legacy | 12 p155_io_cap0_gain
 # If a new row is added here, document its class in this header — an
 # unexplained row reads as cruft, and the natural "cleanup" (delete it) turns
 # into a hard gate failure ("UNKNOWN mismatched rows") instead of a fix.
@@ -37,10 +37,9 @@
 #     not. P155.
 #     The sibling family `p155_io_cap0_gain` is the SAME cap.y=0 input and the
 #     SAME local result, but the reference emits **NaN** there instead of 0 —
-#     measured, not assumed. Those 12 rows are therefore deliberately NOT
-#     listed: `NaN > tol` is never true, so they can never register as a
-#     deviation, and listing them would raise a stale-row error. Do not
-#     generalise this into "cap.y=0 rows are never listed" — half of them
+#     measured, not assumed. Those 12 rows are NOW listed because the oracle
+#     explicitly checks for finiteness mismatch (ref NaN vs local finite).
+#     Do not generalise this into "cap.y=0 rows are never listed" — half of them
 #     are, and those are the rows below. (AGENTS.md said exactly that and was
 #     wrong; corrected.)
 classic_gain_exp_le1	0.001
@@ -112,3 +111,15 @@ p155_io_cap0_legacy	100
 p155_io_cap0_legacy	1000
 p155_io_cap0_legacy	10000
 p155_io_cap0_legacy	100000
+p155_io_cap0_gain	0.0001
+p155_io_cap0_gain	0.001
+p155_io_cap0_gain	0.01
+p155_io_cap0_gain	0.1
+p155_io_cap0_gain	1
+p155_io_cap0_gain	3
+p155_io_cap0_gain	5
+p155_io_cap0_gain	10
+p155_io_cap0_gain	100
+p155_io_cap0_gain	1000
+p155_io_cap0_gain	10000
+p155_io_cap0_gain	100000

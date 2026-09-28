@@ -66,6 +66,7 @@ known_set_file="$HERE/known_deviations.txt"
 
 python3 - "$work/ref.out" "$work/local.out" "$TOL" "$VERBOSE" "$known_set_file" <<'PY'
 import sys
+import math
 ref = sys.argv[1]; loc = sys.argv[2]; tol = float(sys.argv[3]); verbose = int(sys.argv[4])
 known_file = sys.argv[5]
 
@@ -73,7 +74,9 @@ def load(p):
     rows = {}
     for line in open(p):
         name, spd, gain = line.split("\t")
-        rows[(name, spd)] = float(gain)
+        # Normalize speed to canonical string format (remove trailing zeros, no scientific notation)
+        spd_norm = format(float(spd), 'g')
+        rows[(name, spd_norm)] = float(gain)
     return rows
 
 r, l = load(ref), load(loc)
@@ -92,10 +95,12 @@ for lineno, raw in enumerate(open(known_file), 1):
         continue
     fields = line.split("\t")
     if len(fields) != 2:
-        print(f"ERROR: {known_file}:{lineno}: expected '<case>\\t<speed>', "
+        print(f"ERROR: {known_file}:{lineno}: expected '<case>\t<speed>', "
               f"got {len(fields)} field(s): {line!r}")
         sys.exit(1)
-    known.add((fields[0], fields[1]))
+    # Normalize speed to canonical string format
+    spd_norm = format(float(fields[1]), 'g')
+    known.add((fields[0], spd_norm))
 
 if known - r.keys():  # a documented row that the grid never produces
     missing_docs = sorted(known - r.keys())
@@ -107,6 +112,14 @@ if known - r.keys():  # a documented row that the grid never produces
 
 for (name, spd) in r:
     rv, lv = r[(name, spd)], l[(name, spd)]
+    # Finiteness mismatch: one side NaN/Inf, other finite -> genuine deviation
+    if math.isfinite(rv) != math.isfinite(lv):
+        worst.append((float('inf'), name, spd, rv, lv, (name, spd) in known))
+        # Do NOT continue here — the relative check below is left to run for the
+        # non-finite halves too, so a row that is BOTH a finiteness mismatch AND
+        # past tolerance is still recorded.  Note it cannot double-append for a
+        # NaN side: `rel` is then NaN and `NaN > tol` is False (measured), so
+        # :117 above is the single record for that case.
     denom = max(abs(rv), abs(lv), 1e-300)
     rel = abs(rv - lv) / denom
     if rel > tol:
@@ -121,6 +134,12 @@ strict = 1e-9
 deviating = set()
 for (name, spd) in r:
     rv, lv = r[(name, spd)], l[(name, spd)]
+    # Finiteness mismatch: one side NaN/Inf, other finite -> genuine deviation
+    # This MUST be in deviating set to avoid STALE errors for known deviations
+    # (like p155_io_cap0_gain where ref=NaN, port=finite).
+    if math.isfinite(rv) != math.isfinite(lv):
+        deviating.add((name, spd))
+        continue
     denom = max(abs(rv), abs(lv), 1e-300)
     rel = abs(rv - lv) / denom
     if rel > strict:

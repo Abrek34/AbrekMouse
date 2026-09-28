@@ -109,6 +109,61 @@ inline std::vector<Case> cases() {
     c.push_back(mknat("natural_legacy_lim15",false,1.5, 0.1, 0.5));
     c.push_back(mknat("natural_legacy_lim05",false,0.5, 0.1, 0.5));
 
+    // G-2 (AJ3) — the limit >= 10 band.  These limits were NOT covered before, and
+    // they are the ones where `natural`'s gain branch is measurably FMA
+    // sensitive: at %.17g the reference drifts from ITSELF between the gate's
+    // -O1 and a shipped -O2 -mfma build on 110 of 288 rows here, worst case
+    // 3.376e-06 relative (natural_gain_lim100_dr1e-4 at spd 0.001) — 3376x
+    // outside the gate's 1e-9 tolerance.  The four cases above cannot see it:
+    // limit 0.5 and 1.5 do not drift at all, and limit 1.3 (game_*_natural)
+    // reaches only 4.867e-11, i.e. 24x INSIDE the tolerance.
+    //
+    // Adding them documents no deviation: the port reproduces the reference
+    // BIT-BIT on 288/288 of these rows at -O1, at -O2 and at -O2 -mfma, so
+    // known_deviations.txt stays at 67.  What they buy is (a) the fidelity of
+    // this band pinned by the gate instead of assumed, and (b) the -mfma
+    // drift class finally inside a measured grid.  See the conditioning note
+    // in include/accel-natural.hpp for the full numbers.
+    c.push_back(mknat("natural_gain_lim10_dr1e-4",   true,   10.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_gain_lim10_dr0.1",    true,   10.0, 0.1,  0.0));
+    c.push_back(mknat("natural_gain_lim100_dr1e-4",  true,  100.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_gain_lim100_dr0.1",   true,  100.0, 0.1,  0.0));
+    // G-3: limit=1000 cases are UNREACHABLE in practice (daemon clamps limit to 100
+    // via src/config.cpp:501 LIMIT_MAX).  Kept for mathematical completeness but
+    // marked unreachable; oracle runs them but they are never exercised by the
+    // daemon or CLI.  See config.hpp:58 LIMIT_MAX and src/config.cpp:501.
+    c.push_back(mknat("natural_gain_lim1e3_dr1e-4_unreachable",  true, 1000.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_gain_lim1e3_dr0.1_unreachable",   true, 1000.0, 0.1,  0.0));
+    c.push_back(mknat("natural_legacy_lim10_dr1e-4",  false,   10.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_legacy_lim10_dr0.1",   false,   10.0, 0.1,  0.0));
+    c.push_back(mknat("natural_legacy_lim100_dr1e-4", false,  100.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_legacy_lim100_dr0.1",  false,  100.0, 0.1,  0.0));
+    // G-3: limit=1000 cases are UNREACHABLE in practice (daemon clamps limit to 100
+    // via src/config.cpp:501 LIMIT_MAX).  Kept for mathematical completeness but
+    // marked unreachable; oracle runs them but they are never exercised by the
+    // daemon or CLI.  See config.hpp:58 LIMIT_MAX and src/config.cpp:501.
+    c.push_back(mknat("natural_legacy_lim1e3_dr1e-4_unreachable", false, 1000.0, 1e-4, 0.0));
+    c.push_back(mknat("natural_legacy_lim1e3_dr0.1_unreachable",  false, 1000.0, 0.1,  0.0));
+
+    // G-4: Boundary case at the production ceiling (3.2767e16).
+    // The oracle grid max speed is 1e5; the production pipeline can reach
+    // |abs_vel| ≤ 3.2767e16. The reference's magnitude() overflows to inf at
+    // ~1.34e154. This case pins the envelope boundary: port and reference
+    // MUST agree on 3.2767e16 (finite, finite) — a divergence here means the
+    // production envelope was widened without updating the oracle grid.
+    // Uses a custom speed list; this case is NOT in known_deviations.txt.
+    {
+        Case x;
+        x.name = "boundary_production_ceiling";
+        x.mode = "natural";
+        x.gain = true;
+        x.limit = 100.0;
+        x.decay_rate = 0.1;
+        x.smooth = 0.0;
+        x.speeds = { 3.2767e16 };
+        c.push_back(x);
+    }
+
     // ── Synchronous (activation_framework) ──────────────────────────────────
     auto mksync = [&](const std::string& n, bool gain, double power, double sync,
                       double smooth) {
