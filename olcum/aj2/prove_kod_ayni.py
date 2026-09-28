@@ -365,6 +365,15 @@ def run_atif(dosya: str) -> int:
             "int a = 1;\n"
             "int b = 2;\n")
 
+    # --atif (satir atfi denetimi) ile --aktif (mutasyon PC'si) tek harf farklidir.
+    # Yanlis kombinasyon --atif 'ESKI::YENI' FileNotFoundError ile PATLAR ve
+    # kullaniciya dogru bayragi soylemez. Bu yakalayici onu eyleme donusturur.
+    if "::" in dosya:
+        print(f"  ⛔ --atif bir DOSYA YOLU bekler, mutasyon metni degil.\n"
+              f"     Mutasyon PC'si icin:  --aktif 'ESKI::YENI'\n"
+              f"     Satir atfi denetimi:   --atif <dosya.hpp>")
+        return 2
+
     def tara(text: str):
         satirlar = text.splitlines()
         kotu = []
