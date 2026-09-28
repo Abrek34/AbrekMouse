@@ -544,3 +544,74 @@ protokolü çalıştı; hata bende, "kilitsiz" demiştim.)
 Doğrulama: build 0 uyarı · unit **34164/34164** (3 backend) · oracle **1407 / 79 / 79 / OK** ·
 simd parity PASS · tr PASS · cli **31/31** · tracker bridge OK. `include/math-vec2.hpp`
 yalnız **yorum** değişti (46 → 46 kod satırı, `prove_kod_ayni.py --git`).
+
+---
+
+## Round 17 — ⛔ R17-INDEX: commit **4 hazır dosyayı süpürdü** (AJ1 hatası) · ⛔ R17-COVER: ölü denetim commit'le girdi · ⛔ R17-SAYI: bu kaydın kendi sayısı bayatladı
+
+### ⛔ R17-INDEX — `git commit`, kirli index'i de birlikte sürükledi
+
+**Belirti:** `9b4776bd` konu satırı yalnız `AGENTS.md`'deki tavan
+düzeltmesini anlatıyordu:
+
+```
+  docs: tavan zinciri dogru — |abs_vel| <= 6.87e22, 5 atif tek tek dogrulandi
+```
+
+Ama o commit **5 dosya / 658 satır** taşıyor:
+
+```
+  AGENTS.md                  |  27 +--
+  scripts/bench_hotpath.sh   | 301 ++++++++++++-------
+  tests/bench_hotpath.cpp    | 403 ++++++++++++++++---------
+  tests/oracle/run_oracle.sh |  98 +++++-
+  tests/perf_baseline.json   |  29 ++--
+```
+
+**Neden:** AJ3 bu dört dosyayı `git add` ile **index'e almış**, commit'lememişti.
+AJ1 `git add AGENTS.md && git commit -F -` çalıştırdığında `git commit` **index'te
+bekleyen her şeyi** sürükledi. `git add -A` kullanılmamıştı — ama **hiçbir şey
+kullanılmamış sayılmaz**: index'in kendisi kirliydi.
+
+> ⭐⭐ **Kural (kalıcı):** *commit öncesi `git diff --cached --stat` çalıştır.
+> Konu satırı **index'teki HER dosyayı** anlatmalı. `git add <dosya>` kullanmak
+> "yalnız bu dosya commit'lenecek" garantisi **değildir** — garanti
+> `git commit <yol>` veya `git commit -a` değil de **`-- <yol>`** ile alınır.*
+> ⭐ Bu, AJ3'e verilen "`git add -A` yasak" uyarısının **eksik yarısıydı**:
+> yasak `add`'e konmuştu, **gerçek risk `commit`'teydi.**
+
+### ⛔ R17-COVER — commit'e **ölü denetim** de girdi
+
+`tests/oracle/run_oracle.sh` +98 satır; bunların içinde **"Oracle Coverage
+Check"** var ve o denetim **yapısal olarak hiçbir şey bulamaz**:
+
+```python
+PATTERNS = { "accel_union_apply": r"au\.apply\(", ... }   # anahtar -> regex
+for pattern in patterns:              # dict → ANAHTARLAR gezilir
+    if re.search(pattern, content):   # regex DEĞERİ hiç kullanılmaz
+```
+
+Ölçüm: `local.cpp` mevcut, `au.apply(` içinde 1 kez geçiyor, aracın çıktısı
+`found 0 production function patterns`, kapı `RESULT: OK · rc=0`.
+
+> ⭐ Rapor bu kalemi **✅** diye listelemişti. ⭐ **§4.0:** *PC yeşil + üründe
+> yok = PC yanlış yerde çalışmış.* Burada **ürünün kendisi denetim** ve
+> denetim boş — dört ayrı kusur (§62.2): anahtar gezme, `FileNotFoundError`'ı
+> yutma, ölümcül olmama, `ORACLE_COVERED` ↔ `PATTERNS` ayrık ad alanları.
+
+### ⛔ R17-SAYI — **bu kaydın kendi sayısı bayatladı**
+
+Round-16 maddesi bu satırı yazıyor:
+
+```
+  oracle **1407 / 79 / 79 / OK**
+```
+
+Gerçek: **1408**. Sebep: 4 vaka `_unreachable` ile **yeniden adlandırıldı** —
+ad değişti, satır sayısı değişmedi. `1407` eski adın sayımıydı.
+
+> ⭐⭐ **Kalıcı gözlem:** `AGENTS.md` için "kendini doğrulayan satır"
+> önerilmişti; **aynı sorun burada da var** — kayıt, ürettiği ölçümü
+> **elle kopyalamış** ve kayma başlamış. ⭐ **Elle kopyalanan sayı, üretildiği
+> yerde yenilenmez.** Sayı **üreten** yerde yaşamalı (kapı çıktısı) ya da
+> **denetleyen** bir satırla karşılaştırılmalı (`1407` yazılıysa `exit 77`).
