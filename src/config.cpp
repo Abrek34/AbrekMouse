@@ -456,8 +456,11 @@ static void sanitize_accel_args(accel_args& a) {
     // input_offset, output_offset: negative offsets are meaningless (speed is always >= 0).
     if (a.input_offset < 0) a.input_offset = 0;
     if (a.output_offset < 0) a.output_offset = 0;
-    // limit: natural/jump subtract 1 → limit < 1 means deceleration.
-    //   Constructors already clamp to max(0, limit-1), but values < 0 are nonsensical.
+    // limit: NATURAL subtracts 1 → limit < 1 means deceleration.  Measured:
+    //   grep '\.limit' include/ → only accel-natural.hpp:18 reads it (the old
+    //   comment also said "jump", and accel-jump.hpp reads limit 0 times), and
+    //   presets.hpp:189 documents the same for classic/power.  The constructor
+    //   already clamps to max(0, limit-1), but values < 0 are nonsensical.
     if (a.limit < 0) a.limit = 0;
     // sync_speed: synchronous/jump mode midpoint.  Zero → division-by-zero.
     if (a.sync_speed < 1e-4) a.sync_speed = 1e-4;
@@ -492,6 +495,22 @@ static void sanitize_accel_args(accel_args& a) {
     if (a.cap.x           > CAP_X_MAX)         a.cap.x          = CAP_X_MAX;
     if (a.cap.y           > CAP_Y_MAX)         a.cap.y          = CAP_Y_MAX;
     if (a.output_offset   > OUTPUT_OFFSET_MAX) a.output_offset  = OUTPUT_OFFSET_MAX;
+    // AJ4-K6: `limit` was the one gain-driving field this block forgot (the
+    // lower floor above predates P120-FAZ2 and no ceiling was ever added).
+    // See config.hpp LIMIT_MAX for why the number is exactly 100.
+    if (a.limit           > LIMIT_MAX)         a.limit          = LIMIT_MAX;
+    // AJ4-K7: the same gauge↔sanitize scan (gauge_scan.py) over the remaining
+    // accel_args fields.  Each ceiling == that field's GUI gauge maximum AND ==
+    // its R15 round-trip boundary value — see config.hpp for the measured
+    // table and the preset headroom.  Without these, a hand-edited value above
+    // the gauge ran in the daemon, rendered clamped in the GUI, and was written
+    // back at the gauge value on the next GUI save.
+    if (a.acceleration    > ACCEL_MAX)         a.acceleration    = ACCEL_MAX;
+    if (a.decay_rate      > DECAY_RATE_MAX)    a.decay_rate      = DECAY_RATE_MAX;
+    if (a.motivity        > MOTIVITY_MAX)      a.motivity        = MOTIVITY_MAX;
+    if (a.gamma           > GAMMA_MAX)         a.gamma           = GAMMA_MAX;
+    if (a.sync_speed      > SYNC_SPEED_MAX)    a.sync_speed      = SYNC_SPEED_MAX;
+    if (a.smooth          > SMOOTH_MAX)        a.smooth          = SMOOTH_MAX;
 }
 
 /// Clamp profile fields to safe ranges.

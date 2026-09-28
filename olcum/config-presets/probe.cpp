@@ -449,6 +449,76 @@ static void case_rt_clamp() {
     report("rt-clamp", idem, d);
 }
 
+// ── 1g) sanitize ÜST sınırı: `limit` (AJ4-K6) ────────────────────────────────
+// `limit`, P120-FAZ2 bloğunun TEK üst sınırsız gain alanıyordu (config.cpp'deki
+// tek sınır `limit < 0 → 0` idi), oysa onu gösteren gauge
+// gui/ui_builder.inl:241 ve :411'de make_spin(0, 100, ...) — yani 1e6 elle
+// girilen bir değer daemon'da 1e6 olarak çalışırken GUI yanında 100 gösteriyordu.
+//
+// Burada ÜÇ şey ölçülür:
+//   (a) 1e6 gerçekten LIMIT_MAX'e iniyor mu            → sınır gerçekten bağlı mı
+//   (b) tam SINIR değeri 100.0 hiç oynamıyor mu        → R15 round-trip testi
+//       (tests/test_accel.cpp:7869/7914) 100.0'ın byte olarak korunmasını
+//       şart koşuyor; sınır bunu kırarsa test kırılır
+//   (c) clamp İDEMPOTANT mı                           → her kayıt/yükleme
+//       döngüsü değeri kaydırmasın
+static void case_lim_oversize() {
+    auto fmt = [](double v) {
+        char b[40];
+        std::snprintf(b, sizeof b, "%.17g", v);
+        return std::string(b);
+    };
+    device_profile dp;
+    dp.name = "lim";
+    dp.prof.accel_x.mode = accel_mode::natural;
+    dp.prof.accel_y = dp.prof.accel_x;
+    dp.prof.accel_x.limit = 1e6;             // gauge'in üstünde
+    dp.prof.accel_y.limit   = 1e6;
+
+    const std::string j1 = profile_to_json(dp);
+    device_profile dp2 = profile_from_json(j1);
+    const std::string j2 = profile_to_json(dp2);
+    device_profile dp3 = profile_from_json(j2);
+    const std::string j3 = profile_to_json(dp3);
+
+    std::string d;
+    bool ok = true;
+
+    // (a) üst sınır gerçekten uygulanıyor mu
+    if (dp2.prof.accel_x.limit != LIMIT_MAX || dp2.prof.accel_y.limit != LIMIT_MAX) {
+        ok = false;
+        d += "(a) 1e6 -> x=" + fmt(dp2.prof.accel_x.limit)
+           + " y=" + fmt(dp2.prof.accel_y.limit)
+           + " (beklenen " + fmt(LIMIT_MAX) + ") | ";
+    } else {
+        d += "(a) 1e6 -> " + fmt(dp2.prof.accel_x.limit) + " | ";
+    }
+
+    // (b) sınır değeri 100.0 KORUNUYOR MU (R15 bayt-sadakat sözü)
+    device_profile bd = dp2;
+    bd.prof.accel_x.limit = LIMIT_MAX;
+    bd.prof.accel_y.limit   = LIMIT_MAX;
+    device_profile bd2 = profile_from_json(profile_to_json(bd));
+    if (bd2.prof.accel_x.limit != LIMIT_MAX || bd2.prof.accel_y.limit != LIMIT_MAX) {
+        ok = false;
+        d += "(b) SINIR " + fmt(LIMIT_MAX) + " -> x=" + fmt(bd2.prof.accel_x.limit)
+           + " y=" + fmt(bd2.prof.accel_y.limit) + " (korunmali) | ";
+    } else {
+        d += "(b) sinir " + fmt(LIMIT_MAX) + " korundu | ";
+    }
+
+    // (c) idempotans
+    std::string dk;
+    if (!byte_diff(j2, j3, dk)) {
+        ok = false;
+        d += "(c) IDEMPOTANS DEGIL: " + dk;
+    } else {
+        d += "(c) idempotans: " + dk;
+    }
+
+    report("lim-oversize", ok, d);
+}
+
 // ── 2b) preset değer tablosu + VAAT TUTARLILIGI ──────────────────────────────
 // Görev sınırı: ivme matematiği AJ2 hattında; buradan cap'in GERÇTEĞEN nerede
 // kırpıldığı ÖLÇÜLEMEZ.  Ölçülebilir olan: preset'in beyan ettiği iki sayının
@@ -759,6 +829,7 @@ static void list_cases() {
         std::printf("values-%s\n", PRESET_NAMES[i]);
     }
     std::printf("rt-app-file\nrt-app-mem\nrt-zero-vs-missing\nrt-lut\nrt-clamp\n");
+    std::printf("lim-oversize\n");
     std::printf("mig-unknown\nmig-missing\nmig-missing-profile\nmig-missing-all\n");
     std::printf("mig-type-limit\nmig-type-cap\nmig-type-mode\nmig-type-gain\n");
     std::printf("mig-type-halflife\nmig-type-raw\nmig-type-dpi\nmig-type-active\n");
@@ -792,6 +863,7 @@ int main(int argc, char** argv) {
     if (c == "rt-zero-vs-missing") { case_rt_zero_vs_missing(); return g_fail ? 1 : 0; }
     if (c == "rt-lut")        { case_rt_lut();        return g_fail ? 1 : 0; }
     if (c == "rt-clamp")      { case_rt_clamp();      return g_fail ? 1 : 0; }
+    if (c == "lim-oversize")  { case_lim_oversize();  return g_fail ? 1 : 0; }
     if (c == "mig-unknown")   { mig_unknown();        return g_fail ? 1 : 0; }
     if (c.rfind("mig-missing", 0) == 0) { mig_missing_case(c); return g_fail ? 1 : 0; }
     if (c.rfind("mig-type-", 0) == 0 ||

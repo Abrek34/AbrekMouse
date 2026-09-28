@@ -1,5 +1,5 @@
-# AJ4 config-presets ölçümü — 2026-09-28 02:06:11
-HEAD: 47be7e6d
+# AJ4 config-presets ölçümü — 2026-09-28 19:19:44
+HEAD: b01342b1
 LANG=tr_TR.UTF-8  LC_ALL=C
 [derleme] exit=0 uyari=0
 
@@ -11,6 +11,10 @@ PC sonucu: 3/3 geçti  → ÖLÇÜM GEÇERLİ
 PC-4 serialize enjeksiyonu: GEÇTİ  (rc=1)
     RESULT rt-preset-gaming FAIL 0 bayt fark | ALAN: accel_x.limit=1.800000->1.500000; accel_y.limit=1.800000->1.500000; 
 PC-4 yapısal denetim enjeksiyonu: GEÇTİ
+PC-5-limit-ust-sinir: GEÇTİ  (guard devre dışı, vaka=lim-oversize, rc=1)
+    RESULT lim-oversize FAIL (a) 1e6 -> x=1000000 y=1000000 (beklenen 100) | (b) sinir 100 korundu | (c) idempotans: 0 bayt fark
+PC-6-k5-kok-guard: GEÇTİ  (guard devre dışı, vaka=mig-root-array-profiles, rc=1)
+    RESULT mig-root-array-profiles FAIL girdi=3 profil, yukleme=0, tekrar yazim=0  ← VERI KAYBI: sonraki kayit dosyayi siler
 
 === YAPISAL DENETIM: struct alani ↔ serialize / deserialize ===
   accel_args: temiz (18 alan)
@@ -52,6 +56,7 @@ OK           rt-app-mem                   RESULT rt-app-mem PASS 0 bayt fark
 OK           rt-zero-vs-missing           RESULT rt-zero-vs-missing PASS 0 bayt fark
 OK           rt-lut                       RESULT rt-lut PASS 0 bayt fark
 OK           rt-clamp                     RESULT rt-clamp PASS idempotans(2. tur vs 3. tur): 0 bayt fark | ilk turda degisen alanlar: dpi=999999->32000; polling_rate=1->125; output_dpi=0.500000->1.000000; lr_output_dpi_ratio=500.000000->100.0
+OK           lim-oversize                 RESULT lim-oversize PASS (a) 1e6 -> 100 | (b) sinir 100 korundu | (c) idempotans: 0 bayt fark
 OK           mig-unknown                  RESULT mig-unknown PASS yuklendi; bilinmeyen alanlar: kok=DUSTU profil=DUSTU accel=DUSTU
 OK           mig-missing                  RESULT mig-missing PASS yüklendi (profiles=0, version='1.2.3')
 OK           mig-missing-profile          RESULT mig-missing-profile PASS yüklendi (profiles=1, version='0.9.0')
@@ -92,8 +97,8 @@ OK           rt-file:settings.json        RESULT rt-file PASS KARARLILIK(A==B): 
 
 === ÖZET ===
   FAIL: 0
-  OK: 66
+  OK: 67
   yapısal sorun: 0
-  PC: 4/4 geçti
+  PC: 6/6 geçti
 
-TOPLAM vaka=66  başarısız=0
+TOPLAM vaka=67  başarısız=0

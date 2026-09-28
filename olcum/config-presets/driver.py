@@ -282,6 +282,59 @@ def yapisal_pc() -> bool:
         (KOK / "build-manual" / "_pc_probe").unlink(missing_ok=True)
 
 
+# ── guard PC'si (AJ1 §5): DENETLEYİCİYİ boz, bağladığını GÖR ─────────────────
+# "Rapora temiz yazmadan önce PC" kuralının guard biçimi: test edilen birim
+# değil, DENETLEYİCİ bozulur.  `if (!j.is_object())` satırını
+# `if (false && !j.is_object())` yapar, o guard'ın bağladığı vakayı çalıştırır
+# ve vakanın BAŞARISIZ olduğunu görmeyi bekler.  Guard hiç bağlamıyorsa
+# (yanlış koşul, yanlış fonksiyon, çağrılmayan yol) bu PC KIRILIR — yani
+# "guard eklendi, testler geçti" demek tek başına YETERLİ DEĞİL.
+#
+# Üretim dosyasına asla dokunulmaz: her şey src/config.cpp'nin kopyası üzerinde.
+def guard_pc(pc_ad: str, hedef: str, devre_disi: str, vaka: str,
+            beklenen: str) -> bool:
+    kaynak = KOK / "src" / "config.cpp"
+    metin = kaynak.read_text(encoding="utf-8")
+    if hedef not in metin:
+        yaz(f"{pc_ad} KIRILDI: enjeksiyon hedefi bulunamadı (kod mu değişti?)")
+        return False
+    if metin.count(hedef) != 1:
+        yaz(f"{pc_ad} KIRILDI: hedef {metin.count(hedef)} kez geçiyor (belirsiz)")
+        return False
+
+    gecici = BUR / f"_pc_kopya_{pc_ad}.cpp"
+    gecici.write_text(metin.replace(hedef, devre_disi, 1), encoding="utf-8")
+    cikti = KOK / "build-manual" / f"_pc_probe_{pc_ad}"
+    try:
+        cmd = [os.environ.get("CXX", "g++"), "-std=c++20", "-O2", "-w",
+               "-I", str(KOK / "include"), "-I", str(KOK / "src"),
+               str(BUR / "probe.cpp"), str(gecici), "-o", str(cikti)]
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           env={**os.environ, "LC_ALL": "C"})
+        if p.returncode != 0:
+            yaz(f"{pc_ad} KIRILDI: bozuk kopya derlenemedi")
+            yaz(p.stderr[:600])
+            return False
+        r = subprocess.run([str(cikti), vaka], capture_output=True, text=True,
+                           timeout=60, env={**os.environ, "LC_ALL": "C"})
+        # guard devre dışıyken vaka BAŞARISIZ olmalı; hem FAIL hem de
+        # spesifik kanıt metni aranır (yanlış FAIL da burada yakalanır).
+        algilandi = ("FAIL" in r.stdout) and (beklenen in r.stdout)
+        yaz(f"{pc_ad}: {'GEÇTİ' if algilandi else 'KIRILDI'}"
+            f"  (guard devre dışı, vaka={vaka}, rc={r.returncode})")
+        for l in r.stdout.splitlines()[:2]:
+            yaz(f"    {l[:220]}")
+        if not algilandi:
+            yaz(f"    beklenen kanıt: {beklenen!r} içeren bir FAIL satırı")
+        return algilandi
+    except subprocess.TimeoutExpired:
+        yaz(f"{pc_ad} KIRILDI: bozuk kopya zaman aşımına uğradı")
+        return False
+    finally:
+        gecici.unlink(missing_ok=True)
+        cikti.unlink(missing_ok=True)
+
+
 # ── ana koşu ──────────────────────────────────────────────────────────────────
 def main() -> int:
     global PC_HATASI
@@ -302,6 +355,30 @@ def main() -> int:
     pc4 = yapisal_pc()
     yaz(f"PC-4 yapısal denetim enjeksiyonu: {'GEÇTİ' if pc4 else 'KIRILDI'}")
     if not pc4:
+        PC_HATASI += 1
+
+    # PC-5: K6 `limit` üst sınırı gerçekten bağlı mı?  Sınırı devre dışı
+    # bırakınca `lim-oversize` artık 1e6'yı olduğu gibi kabul etmeli.
+    pc5 = guard_pc(
+        "PC-5-limit-ust-sinir",
+        hedef="if (a.limit           > LIMIT_MAX)         a.limit          = LIMIT_MAX;",
+        devre_disi="if (false && a.limit > LIMIT_MAX) a.limit = LIMIT_MAX;",
+        vaka="lim-oversize",
+        beklenen="beklenen 100",
+    )
+    if not pc5:
+        PC_HATASI += 1
+
+    # PC-6: AJ1 §5 — K5 kök-tip guard'ı gerçekten bağlı mı?  Guard devre
+    # dışıyken kök-dizi vakası VERİ KAYBI raporlamak ZORUNDA.
+    pc6 = guard_pc(
+        "PC-6-k5-kok-guard",
+        hedef="if (!j.is_object() && !j.is_null())",
+        devre_disi="if (false && !j.is_object() && !j.is_null())",
+        vaka="mig-root-array-profiles",
+        beklenen="VERI KAYBI",
+    )
+    if not pc6:
         PC_HATASI += 1
 
     yapissal = yapisal_denetim()
@@ -351,7 +428,7 @@ def main() -> int:
     for k in sorted(sonuc_say):
         yaz(f"  {k}: {sonuc_say[k]}")
     yaz(f"  yapısal sorun: {yapissal}")
-    yaz(f"  PC: {3 + 1 - PC_HATASI}/4 geçti")
+    yaz(f"  PC: {6 - PC_HATASI}/6 geçti")
 
     # §0.3: /tmp/opencode kalıcı DEĞİL — üretim çıktımız burada değil,
     # olcum/config-presets/sonuc.txt'de. Yine de doğrula.
