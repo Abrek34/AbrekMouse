@@ -4752,6 +4752,80 @@ static void test_lp_distance_zero_vector() {
     EXPECT_NEAR(r, 5.0, 0.01);
 }
 
+// ── R16: lp_distance non-finite component guard (AJ1 §5) ──────────────────────
+//
+// AJ1 §5: "anlaşılamayan bileşen = hareket yok" politikası — hamaccel.hpp:612-613
+// zaten girdinin sonunda `if (!isfinite(in.x)) in.x = 0;` diyor. lp_distance
+// public ve inline; testler doğrudan çağırıyor, dolayısıyla API yüzeyinde
+// erişilebilir.
+//
+// AJ1'in tarifindeki sapma kayıt altında: "M hesaplandıktan hemen sonra
+// !isfinite(M)" denildi, ÖLÇÜMDE İşe YARAMADI — M bir karşılaştırmayla
+// seçiliyor ve NaN her karşılaştırmada false, yani (NaN,3) → M=3 (sonlu!)
+// ve guard hiç devreye girmiyordu; sonuç uydurma bir 3 idi. Guard KAYNAK
+// bileşenlere (ax/ay) kondu. Kanıt: olcum/aj2/run_guard_pc.sh (PC2 kırmızı
+// geldi, düzeltmeden sonra yeşil).
+//
+// Bu blok, o düzeltmenin regresyon kapısıdır. Özellikle ASİMETRİ satırı:
+// (3,NaN) ve (NaN,3) aynı vektördür (bileşen yer değiştirmiş) ve AYNI
+// sonucu vermek zorundadır — guard M üzerinde olsaydı bu iki satır 0 ve 3
+// idi, yani "hata görünmez" halde sınıflandırdığımız ayrışma.
+
+static void test_lp_distance_nonfinite_components() {
+    SECTION("R16 — lp_distance: non-finite bileşen sonlu (0) döner");
+    const double kInf = std::numeric_limits<double>::infinity();
+    const double kNan = std::numeric_limits<double>::quiet_NaN();
+
+    // --- Inf bileşeni: guard öncesi Inf yayıyordu ---
+    EXPECT(std::isfinite(lp_distance({kInf, 3.0}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({3.0, kInf}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({kInf, kInf}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({kInf, 0.0}, 1.0)));
+    EXPECT_NEAR(lp_distance({kInf, 3.0}, 2.0), 0.0, 0.0);
+    EXPECT_NEAR(lp_distance({3.0, kInf}, 2.0), 0.0, 0.0);
+    // negatif yönlü p: guard öncesi L46 koluna giriyordu
+    EXPECT(std::isfinite(lp_distance({kInf, 3.0}, -1.0)));
+    EXPECT(std::isfinite(lp_distance({kInf, 0.0}, -1.0)));
+
+    SECTION("R16 — lp_distance: NaN bileşen de yakalanır (M üzerinde guard YETMEZ)");
+    // AJ1'in tarifindeki tuzak tam olarak burada: M = (ax>ay?ax:ay) ve
+    // NaN her karşılaştırmada false olduğu için M=3 seçilir, guard kaçar.
+    EXPECT(std::isfinite(lp_distance({kNan, 3.0}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({3.0, kNan}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({kNan, kNan}, 2.0)));
+    EXPECT(std::isfinite(lp_distance({kNan, 0.0}, 2.0)));
+
+    SECTION("R16 — ASİMETRİ YOK: iki bileşen yer değiştirince sonuç değişmez");
+    // Bu, guard'ın M üzerinde mi bileşen üzerinde mi konduğunu AYIRAN test.
+    // M-guard'ı: (3,NaN) -> 0 iken (NaN,3) -> 3  → iki farklı HIZ, asimetri.
+    EXPECT_NEAR(lp_distance({3.0, kNan}, 2.0), lp_distance({kNan, 3.0}, 2.0), 0.0);
+    EXPECT_NEAR(lp_distance({3.0, kInf}, 2.0), lp_distance({kInf, 3.0}, 2.0), 0.0);
+    EXPECT_NEAR(lp_distance({2.0, kNan}, 7.0), lp_distance({kNan, 2.0}, 7.0), 0.0);
+    // Bileşen-swap genel invaryantı: sonlu girdilerde de aynı.
+    for (double a : {0.5, 3.0, 1e5}) {
+        for (double b : {0.0, 1.0, 4.0, 1e5}) {
+            for (double p : {1.0, 2.0, 3.0, 0.5}) {
+                EXPECT_NEAR(lp_distance({a, b}, p), lp_distance({b, a}, p), 1e-12);
+            }
+        }
+    }
+
+    SECTION("R16 — duyarlılık: guard SONLU girdilerin sonucunu değiştirmez");
+    // AJ1 PC1'inin üç vakası. Bunlar guard'dan ÖNCE de aynıydı; regresyonda
+    // bozulursa guard yanlış yere konmuş demektir.
+    EXPECT_NEAR(lp_distance({3, 4}, 1e-9),   4.0,          1e-9);
+    EXPECT_NEAR(lp_distance({3, 4}, 1e-320), 4.0,          1e-9);
+    EXPECT_NEAR(lp_distance({3, 4}, -1.0),   1.7142857142857144, 1e-12);
+    // Izgara ici ve alan disi sonlu noktalar da aynı kalmali.
+    EXPECT_NEAR(lp_distance({3, 4}, 2.0), 5.0, 1e-9);
+    EXPECT_NEAR(lp_distance({3, 4}, 1.0), 7.0, 1e-9);
+    EXPECT_NEAR(lp_distance({1e5, 1}, 2.0), 1e5, 1.0);
+    EXPECT_NEAR(lp_distance({1e200, 1e200}, 2.0), 1.4142135623730951e200, 1e190);
+    // hypot tabanli magnitude de ayni politika: tasma yerine sonlu.
+    EXPECT(std::isfinite(magnitude({1e200, 1e200})));
+    EXPECT_NEAR(magnitude({1e200, 1e200}), 1.4142135623730951e200, 1e190);
+}
+
 // ── R7: EMA smoother extreme halflife values ─────────────────────────────────
 
 static void test_ema_extreme_halflife() {
@@ -9869,6 +9943,9 @@ int main(int argc, char** argv) {
     // R6 regression tests
     test_dpi_ratio_zero_guard();
     test_lp_distance_zero_vector();
+
+    // R16 (AJ1 §5): lp_distance non-finite bileşen guard'ı + asimetri kapısı
+    test_lp_distance_nonfinite_components();
 
     // R7 deep-dive tests
     test_ema_extreme_halflife();
