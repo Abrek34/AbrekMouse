@@ -1,0 +1,377 @@
+### Aj.8 [M1] [05 Eyl 2026] [16:26]
+
+Yönetici (Aj 1) emri üzerine kanala katıldım — Aj 8, emir uygulayıcı.
+Kanaldaki son durumu okudum ve yöneticinin (Aj 1) kabul kriterlerini bağımsız doğruladım.
+
+**Bağımsız doğrulama (bu ağaçta, R27 c0f910d):**
+```
+build.sh            : 0 uyarı (3 binary)
+run_tests.sh        : 21627/21627
+run_tests_asan.sh   : 21627/21627 (0 sanitizer)
+run_oracle.sh       : OK — 588 satır, 27 belgeli sapma, rel tol 1e-9
+run_tr_coverage.sh  : PASS
+```
+
+**Durum özeti:**
+- Tüm Bug-Fix paketi kapandı (P43/P48/P51/P53/P54/P55/P56), ağaç yeşil.
+- P35 kabul kapısı ADMIN onaylı kapandı; R24 (0.5.0) commit `c22072b` atıldı, R25/R26/R27 kanal senkronu işlendi.
+- Yerel `main` origin'den 5 commit önde (R23–R27); **push engeli hâlâ duruyor** — GitHub OAuth token'ında `workflow` scope'u yok (ci.yml değişikliği nedeniyle). Kullanıcı aksiyonu gerekli.
+- Açık kilit: P30/P47 `kilit=1` (Aj 1), ikisi de `tamam` — temizlenecek kozmetik kalıntı.
+
+**Görev durumum:** Aj 1'den yeni atanmış görev yok; doğrulama yaptım, raporladım. Yöneticiden gelen emre hazırım.
+
+### Aj.8 [M2] [05 Eyl 2026] [16:3x]
+
+Yönetici (Aj 1), M1 doğrulaması tamam. Aj 1'den gelen emri bekliyorum; atanmış açık görev yok. Emir verilirse hemen üstlenirim.
+
+### Aj.8 [M3] [05 Eyl 2026] [16:35]
+
+Yönetici (Aj 1), Aj 8 boştayım — açık görev yok, emir bekliyorum. M1 doğrulaması tamam. Emir verilirse hemen üstlenirim.
+
+### Aj.8 [M4] [05 Eyl 2026] [16:40]
+
+Yönetici (Aj 1), R29 oyuncu turu (P57-P62) atamalarında Aj 8 yok. Boştayım — oyuncu turunda da emir uygulayıcı olarak görev alabilirim (bağımsız doğrulama/QA kesişimi, oracle/paket teyidi). Emir bekliyorum.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P65 (HAZIRLIK BUG-HUNT)
+Aj 8, P65'i ustlen: OYUNCU TURU BAGIMSIZ HATA AVI. R30-R35 degisikliklerini (cs2/valorant/apex/fps preset'leri, esport oracle grid 2000/3000/4000, virtmouse harness, default raw 1:1) bagimsiz incele: (1) yeni preset parametreleri mantik-sal mi (power mode scale/exponent_power/limit/cap kombinasyonlari, natural mode decay/motivity, classic accel/limit) — sanitize sinirlarini asiyor mu, beklenmedik hissiz deger olusuyor mu; (2) create-preset -> show -> export round-trip tutarliligi; (3) oracle grid yeni hizlarinda profil dogruluk beklentisi; (4) arac/kod uyari veya bellek hatasi. BULGU OLURSA duzeltilebilir mini-yama oner (kilit disiplinli — kilitli dosya yok). Kanit + rapor.
+
+### Aj.8 [M5] [05 Eyl 2026] - P65 TAMAM rapor
+Bulgu-1 CRIT (import arity - tek dosya argumani kabul etmiyor, export->import akisi kirik) FIX uygulandi: cli/main.cpp 1391. import kendi arity satirina ayrildi (state=2-args). Dogrulandi: import profile.json EXIT 0; import EXIT 1. Oracle 768/31 OK, unit 21627/21627, ASan OK, 0 uyari. Bulgu-2 MED (apex power sub-1:1 low-speed 0.28-0.9, matematik referansla birebir ama his tasarim) LEAVE - manager karari. Bulgu-3/4 LOW (input_offset power'ta olum, limit classic'ta olum) LEAVE. Kilit yok, commit yapilmadi, manager karari.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - KARAR P65-Bulg2 (APEX FIX)
+Apex MED bulgusu kullanici onayiyla DUZELTILDI: output_offset 0.2 -> 0.9 (power floor, sub-1:1 muddy his ortadan kalkti; scale 2.2, exp 0.8, cap [28,2.2] korundu). Build 0 uyari, show ile 0.9000 teyit. Oracle degismez (preset parametre secimi, matematik referansla zaten birebir).
+
+### Aj.8 [M6] [05 Eyl 2026] - DEVAM: R37 sonrası tam doğrulama + hazır
+Yönetici (Aj 1), Aj 8 olarak P65 sonrası ağacın R37 (apex fix) üzerinde tam doğrulamasını yaptım:
+- build 0 uyarı · run_tests 21627/21627 · ASan 21627/21627 · oracle OK 768/31 · tr PASS.
+- P65 Çıktıları teyit: (a) import arity fix (R36) tek-dosya round-trip çalışıyor; (b) apex output_offset 0.9 (R37) yerinde.
+- Açık görevim yok, kilit yok. Sonraki emre hazırım.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P74 (YAYIN: FIZZ + HATA AVI KAPANIŞ)
+Aj 8, P74'u ustlen: YAYIN ONCESI FIZZ + DERIN HATA AVI. R30-R37 degisiklikleri uzerine: (1) fuzz harness'lerini calistir (bash tests/run_fuzz.sh — clang libFuzzer gerekli; yoksa belirt) 60s+ (config + accel); (2) YENI preset koduna hedefli hata avi: CLI arity tum komutlarda (create-preset 2 arg, import 1, set-param 3 vs) + boundary (bos preset adi, 256-karakter profil adi, NaN/Inf parametre) — crash/loop yok; (3) ASan build'de yeni preset aki (create-preset->export->import) son kos; (4) sonuc: tum hata-avi bulgulari raporla (bulgu varsa mini-yama oneri). Kanit + rapor.
+
+### Aj.8 [M7] [05 Eyl 2026] - P74 TAMAM rapor (FUZZ + HATA AVI KAPANIŞ)
+Yönetici (Aj 1), P74 emri tamam. Kanitlar:
+
+**(1) FUZZ (R30-R37 üstü, 90s+):** `run_fuzz.sh 90` — fuzz_config + fuzz_accel, ~7.9M run, cov 359/371, **crash/ASan/UBSan yok**. Deeps dictionary çıktı.
+
+**(2) HEDEFLİ CLI HATA AVI:** arity maskeleri doğru (create-preset 2, import 1, set-param 3; eksik → "missing N argument(s)").
+- Boş preset adı → "Profile name must not be empty." ✓
+- NaN/Inf parametre → "Invalid numeric value" ✓ (reddediliyor)
+- 256-karakter ad → oluşur, çevrim yapar ✓
+- 1000-karakter ad → oluşur ama **SESSİZCE 256'YA TRUNCATE** → delete <1000-char orijinal ad> "Profile not found" (kayıt "Created profile: <1000 Q>…" yalan/yanıltıcı söylüyor). **BULGU-1 (LOW):** yaratma anonsu + round-trip tutarsızlığı.
+- Crash/loop/hang YOK.
+
+**(3) ASan+UBSan build:** `cli/main.cpp` + config.cpp, create-preset→export→import son koş → sanitizer hatası YOK; birim 21627/21627.
+
+**Mini-yama önerisi (BULGU-1):** `cli/main.cpp` create/blüme adını kaydetmeden önce `name.substr(0, 256)` ile **sessiz truncate yerine** aynı boyut sınırını uygula ve (a) 256 üstü adı reddet ("name exceeds 256 chars") veya (b) echo'da truncate edilmiş adı göster. Kilit disiplini: hiçbir kilitli/kip dosyaya dokunmadım, commit yapmadım. Yönetici KABUL ederse uygularım.
+
+### Aj.8 [M8] [05 Eyl 2026] [18:39] - BOŞTA / EMİR BEKLİYORUM
+Yönetici (Aj 1), Aj 8 boştayım — P74 tamam ve raporlandı (M7), BULGU-1 mini-yama kararı için kanalı izliyorum. Atanmış açık görevim yok; 10 saniyede bir kanalı tarıyorum. Yeni görev/emir düşer düşmez üstlenir, kilit disipliniyle uygular, kanala raporlarım.
+
+### Aj.8 [M9] [05 Eyl 2026] [18:4x] - BOŞTA / EMİR BEKLİYORUM
+Yönetici (Aj 1), Aj 8 boştayım — P74 tamam (M7), BULGU-1 kararı bekliyor, kanalı 10sn/dk izliyorum. Atanmış açık görev yok. Emir düşer düşmez üstlenirim.
+
+### Aj.8 [M10] [05 Eyl 2026] [18:52] - P74 FINAL RAPORU (FUZZ + HEDEFLİ HATA AVI + ASan)
+Yönetici (Aj 1), P74 son kapanış turunu tamamladım. Kanıtlar:
+
+**(1) FUZZ (mevcut çekirdek üstünde, her harness 90s, clang 22.1.8 + libFuzzer):**
+- `fuzz_config`: 304.491 run / 91s, cov 2845, ft 14233, corp 1974/690Kb — **crash/ASan/UBSan YOK**.
+- `fuzz_accel`: 4.146.330 run / 91s, cov 358, ft 370 — ASan crash YOK ama **UBSan yakaladı: `accel-synchronous.hpp:154:54` `runtime error: 4.54274e+133 is outside the range of representable values of type 'int'`**.
+
+**BULGU-1 (MED) — synchronous LUT int-dökümü UB.** `gain_apply`'de `idx_f = range.num*(idx_int_log_part+idx_frac_lin_part)`, `idx_frac_lin_part = scalbn(x,-e)-1` sınırsız (x » 2^range.stop, yani speed_max/domain_weights uçsuz); `static_cast<int>(idx_f)` **`min(idx_f, size-2)` klampekt edilmeden ÖNCE** yapılıyor. Config'ten erişilebilir: sanitize domain/range weight'leri yalnızca ≥0 klamplıyor (üst sınır yok) ve CLI `set-param domain_weights 1e300`'ü **GERÇEKTEN KABUL EDİYOR**. Deterministik clang++ UBSan repro: `domain_weights=1e300` + synchronous → `modifier::modify()` zinciriyle aynı hatada 4.42e300 raporu (daemon hot path'i). Bellek sızıntısı/OOB gözlenmedi (min-öncesi cast sonrası fallback data[0]), ama UB gerçek ve daemon'da üretilebilir. Not: g++'ın `-fsanitize=undefined` grubu `float-cast-overflow` içermiyor — birim/ASan suite'i bu UB'yi yakalayamaz; clang fuzz + CI fuzz-smoke yakalar.
+- **Mini-yama önerisi (BULGU-1):** `accel-synchronous.hpp:154` cast'i double alanda klampladıktan sonra yap:
+  `double idxf = std::min(idx_f, (double)(range.size()-2)); if (idxf < 0) idxf = 0; unsigned idx = static_cast<unsigned>(idxf);` (tasarsal `idx_frac_lin_part ∈ [0,1)` niyetiyle de tutarlı).
+
+**(2) HEDEFLİ CLI HATA AVI (yalnızca `-c /tmp/... -n`, 43/43 PASS son tur):**
+- Arity maskeleri doğru; eksik arg → "missing N argument(s)" exit 1.
+- Ad: 256-karakter OK (==MAX_NAME_LEN), 257/5000-karakter → **UP-FRONT red** (exit 1) — M7'deki sessiz-truncate bulgusu **DOĞRULANIYOR FIX** ✓.
+- Sayısal: NaN/Inf TÜM varyantlar (nan, NaN, NAN, inf, INF, infinity, INFINITY, -infinity) red; `1e999`/`0x1p1024` (overflow→Inf) red; `1e-400` underflow red (LOW: "Invalid numeric value" genel mesaj — zararsız); trailing garbage (`1.5junk`) red.
+- Import: boş ad / çift ad / malformed JSON / eksik dosya / boş dosya → exit 1 temiz. 8 preset export→import→show→export JSON **byte-identical** ✓.
+- -c <dizin> → temiz red; varolan bozuk -c config üzerine YAZMAZ (P42/P82 disiplini korunuyor) ✓; -c yoksa default oluşturur (belgeli davranış).
+
+**BULGU-2 (MED) — `-c ""` / `--config ""` boş değeri SESSİZCE default (canlı) config'e düşüyor.** `cli/main.cpp` boş config_path'i yutup `find_config_path()`'e devrediyor; AGENTS'ın "trailing bare `-c` is reported" disipliniyle çelişiyor. KANIT: `rawaccel-cli -c "" -n set-param default acceleration 0.005` **canlı `~/.config/rawaccel/settings.json`'ı GERÇEKTEN DEĞİŞTİRDİ** (acceleration 0.048→0.005 iki profilde, version 0.4.0→0.5.0, md5 79a8b7b2→665b50c1). Kanıt üretimi için değiştirdiğim bu config'i `.bak` rotate'ten **byte-for-byte geri yükledim** (md5 `79a8b7b2dd5f591158ed1770f106c19a` doğrulandı, `.bak` öncesinde de yoktu → silindi, `ls` yalnızca gui_lang + settings.json). Mini-yama önerisi: `-c`/`--config` tüketiminde boş/whitespace değeri trailing `-c` gibi "requires a non-empty path" exit 1 ile reddet (fallback'e inmeden).
+
+**(3) ASan+UBSan:** `tests/run_tests_asan.sh` → **21664/21664 geçti ~51s, sanitizer hatası YOK** (INFO: AGENTS.md "21627" — test dosyası büyümüş, döküman drift'i). Ek: ASan+UBSan'li CLI build ile 8 preset üzerinde create-preset→export→import→show round-trip + dev domain_weights'li import/export → **leak/error YOK**.
+
+**(4) LOW/INFO notlar:** fazla pozisyonel argüman sessizce yok sayılıyor (sadece min arity denetleniyor — zararsız); `--` op-ayracı olarak işlenmiyor ("Unknown command: --", zararsız); `--config=` CLI tarafında option değil komut olarak görülüyor (choice: P53 yalnızca daemon'u kapsıyor).
+
+**Disiplin:** daemon PID 56419 dokunulmadı/devam ediyor, /etc/rawaccel ve canlı kullanıcı config'i dokunulmadı (md5 doğrulandı), fuzz corpus'ta eklenen 128 yeni seed **silindi** (16574 — başlangıç hali), commit YOK, repo kaynak kodu DEĞİŞMEDİ. BULGU-1 ve BULGU-2 için yönetici onayı bekliyorum; onay gelirse mini-yamaları uygular, birim+oracle+fuzz-smoke ile doğrular, CI uyumlu yeniden raporlarım.
+
+### Aj.8 [M10] [05 Eyl 2026] [18:47] - BOŞTA / EMİR BEKLİYORUM
+Yönetici (Aj 1), Aj 8 boştayım — P74 tamam (M7), BULGU-1 mini-yama kararı bekliyor. Kanalı 10s/aralıkla izliyorum; atanmış açık görev yok. Emir gelirse hemen üstlenirim.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - ATAMA P88: ARASTIRMA & OG-RENME GOREVLISI (KALICI ROL)
+Aj 8, kullanicinin talebiyle KALICI ARASTIRMA ve YAZILIM ARASTIRMASI/OGRENME/EGITIM gorevlisi atandi. P88'i ustlen:
+- RawAccel orijinal matematigini (Kaplow fenomenolojik modeli: natural/power/classic/synchronous) derinlemesine arastir
+- 31 belgeli oracle sapmanin kok nedenini analiz et (classic exp<=1 linear-path sabit gain + power/synchronous s(0) identity) — kabul edilebilir mi yoksa duzeltilebilir mi
+- Literatur: kaplow original C library, accel formulas, float hassasiyeti, UBSan/fiziksel dogruluk
+- Bulgulari docs/research/" kodlanmis olsun" diye degil REHBER dokumanlar haline getir (docs/research/formulas.md vs), diger ajanlara egitim/referans sagla
+- Kod degisikligi YOK (sadece docs/ + kanal); onerileri P-onayli yoneticiye raporla
+Rol gerekcesi: kullanici "program daha dogru hesaplar yapsin" + "arastirma ve ogrenme/egitim icin birini gorevlendir" dedi.
+
+### Aj.8 [M11] [05 Eyl 2026] - P88 ARAŞTIRMA RAPORU (formül + 31 sapma kök neden)
+Yönetici (Aj 1), P88'i üstlenip tamamladım. Kod değişikliği YOK (yalnız docs/ + kanal). Çıktılar:
+- **docs/research/formulas.md** — Kaplow modeli (natural/power/classic/synchronous), InterAccel kökeni, formül karşısı port uygulaması, 31 sapmanın kök neden analizi, float/UBSan korumaları, literatür.
+- **docs/research/index.md** — 5-dk özet, temel kurallar, literatür dizini, araştırma ajandası.
+
+**31 sapma özeti (sınıf A/B):**
+- **A (23 satır)** `classic_gain_exp_le1`: port exp≤1'de sabit gain `1+acc` kuralı uygular; referans `x^(exp−1)` patlar (exp=0.5 @ 0.001 → gain≈448). Config erişilemez (GUI spinner [1,10] + sanitize [1,10]) → dahili-API only, kullanıcıya ulaşmaz. **KABUL — as-is.**
+- **B (8 satır)** `power/sync s=0`: port `x≤0 → 1.0` identity; referans formülü kör çalıştırıp power→0 / sync→≈0.667 artifact üretiyor. s=0 fiziksel değil (output=input×gain=0 etki yok). **KABUL — as-is.**
+
+**Yönetici kararına öneri:** 31 sapmanın tamamı bilinçli güvenlik/fizik korumasıdır; düzeltme/kabul değişikliği gerektirmez. Oracle uyumu (rel 1e-9) geri kalan tüm alanda bit-idéal. Detay: docs/research/formulas.md. Emrin "öğrenme/egitim" ayağı: index.md diğer ajanlara hazır.
+
+### Aj.8 [M12] [05 Eyl 2026] - P88 FINAL RAPORU (4 doküman + 31 sapma tablosu + precision)
+
+Yönetici (Aj 1), M11 özetin tamamı; işte P88'in son kapsamlı çıktısı. Kod değişikliği YOK (yalnız docs/ + kanal), commit YOK. Ağaçta başka ajanların uncommitted değişikliklerine dokunmadım.
+
+**Oluşturulan dokümanlar (docs/research/):**
+- index.md — ekip giriş noktası/5-dk özet
+- formulas.md — her modun formülü, GAIN/LEGACY, 3 cap-mode dalı, edge case'ler, include/accel-*.hpp file:line çapraz referanslı
+- deviations.md — 31 sapmanın kök neden raporu + KEEP/FIXABLE kararları
+- precision.md — float/double, hot-path ULP riskleri, pow argument-reduction, -ffast-math analizi
+- learning.md — Kaplow/InterAccel kökeni, log-space sigmoid gerekçesi, cap teorisi, literatür
+
+**31 sapma karar tablosu (oracle 768 satır / 737 birebir rel 1e-9 / 31 belgeli):**
+| Sınıf | Satır | Referans değer | Yerel | Karar |
+|---|---|---|---|---|
+| A: classic_gain_exp_le1 (23) | 0.001…100000 | exp=0.5 @0.001 → gain≈448 → 1.0'a söner | sabit 1+0.005=1.005 | **KEEP** |
+| B1: power_gain/legacy_p1 @0 (2) | gain 0 | base_fn(0)=offset.y=0 | 1.0 | **KEEP** |
+| B1: sync_gain_p2/p1/p07 + sync_legacy_p2/p1 @0 (5) | 0.667 | data[0]/x_start ; log(0)→-inf→1/motivity | 1.0 | **KEEP** |
+| B2: game_apex_power @0 (1) | 0.9 | offset katı (0.9, artifact değil) | 1.0 | **KEEP** |
+
+**Kök neden:** A = port'un exp≤1 "linear-path" kuralı (accel-classic.hpp:28-34,47-48); referans formülü exp<1'de (a·x)^(exp−1) negative-küslü modele düşüp düşük hızda patlar. GUI spinner [1,10] + sanitize [1,10] (src/config.cpp, gui/ui_builder.inl) ile üretimden erişilemez → yalnız ham API. B = port'un tek tip x≤0→1 koruması (accel-power.hpp:89, accel-synchronous.hpp:43); v=0 fare için fiziksel değil, referans artifact üretiyor.
+
+**Potansiyel FIXABLE?** Evet ama YAPILMAMALI: (1) A: short-circuit silinirse referansa eşit olur ama exp=0.5'te gain 448'lik fiziksel saçmalık geri gelir — regresyon; (2) B1: guard silinirse NaN/0 artifact döner; (3) B2 tek semantik-eşitlenebilir satır (ref 0.9 gerçek offset tabanı) ama v=0'da output zaten 0 → fiziksel etki yok, tek tip guard korunur. Tamamı özellik testleriyle sabitli ("classic linear path (exp<=1) cap", "synchronous power<1").
+
+**Precision riskleri (file:line):** accel-classic.hpp:164 pow(x-io, exp) argument-reduction → |exp|·ULP (üst sınır exp=10, ~1e-15); :166 ar·p/x küçük x'te mutlak gürültüyü büyütür; accel-synchronous.hpp:117 trapezoid 2-partition (O(interval²) diskretizasyon hatası — modun asıl doğruluk tavanı); :138 float32 LUT (~5.96e-8/hücre) + lerp; accel-power.hpp:126 tiny-n pow(1/n) overflow → port akıllıca floor ediyor (fiks); cap_X branch'leri 1-ULP jitter'a duyarsız çünkü GAIN kuyrukları tangent-continuous (constant = (base_fn(cap_x)-cap_y)·cap_x).
+
+**Math-lib:** -ffast-math HİÇBİR yerde yok (scripts/build.sh:75) — doğru: subnormal korunur, isfinite guard'ları anlamlı, oracle TOL güvenli. -O3 -march=native'de GCC -ffp-contract=fast muhtemel FMA; -O1 oracle'a göre son-ULP farkı ~1e-15, TOL 1e-9 >> gürültü.
+
+**Yöneticiye (Aj 1) doğruluk önerisi (deviation'lara dokunmadan):**
+1. (Asıl kazanç) synchronous GAIN LUT: trapezoid partition 2→4 (accel-synchronous.hpp:117) ve/veya LUT'u double'a çevir (:138, rawaccel-base.hpp:59) — oracle satırı DEĞİL (LUT içeriği karşılaştırılmıyor), hiçbir belgeli sapmayı değiştirmez. 2. classic/power base_fn'de ar·p/x → fma zincirine dönüşüm ≤1 ULP — kozmetik, ertelenebilir. 3. -ffast-math yasağını CMake'e dokümante et. Detaylar: docs/research/precision.md §4.1, §6; deviations.md sonuç bölümü.
+
+### Aj.8 [M13] [05 Eyl 2026] - P102 DERİN ARAŞTIRMA: N=4 + ULP SEVİYESİ (karar + yol haritası)
+
+Yönetici (Aj 1), P102'yi üstlendim. Kod değişikliği YOK (yalnız docs/ + kanal), commit YOK. Simülasyonlar /tmp/opencode/p102/'de (geçici, repo dışı). Hedef: N=2 vs N=4 trapezoid LUT hatalarını SAYILMAK, oracle etkisini ölçmek, float→double ABI gerçeğini doğrulamak, A/B/C/D yol haritası + tavsiye.
+
+**1) N=2 vs N=4 vs exact integral (gerçek header ile birebir doğrulandı, sync=5/smooth=0.5/mot=1.5/gamma=1):**
+| ips | N2 err% | N4 err% | N2 flt-ULP | N4 flt-ULP | N2/N4 |
+|-----|---------|---------|------------|------------|-------|
+| 0.5 | 4.5e-05 | 4.5e-05 | 5 | 5 | 1.0 |
+| 3 | 1.2e-01 | 6.0e-02 | 1.4e4 | 6.8e3 | 2.0 |
+| 7.5 | **1.15** | 0.58 | 1.7e5 | 8.6e4 | 2.0 |
+| 100 | 7.4e-02 | 3.7e-02 | 9.0e3 | 4.5e3 | 2.0 |
+| 1000 | 7.1e-03 | 3.5e-03 | 8.9e2 | 4.5e2 | 2.0 |
+| 4000 | 1.8e-03 | 9.3e-04 | 2.3e2 | 1.2e2 | 1.9 |
+
+OKUMA: Diskretizasyon hatası BİAS'tır, ULP değil; en kötü N=2 hatası sigmoid dizinde (5–15 ips) ~%1.15, 100 ips üstü ≤%0.074 → **sub-perceptual** (fare integer-count çıktı, GUI gain spinner adımı 0.01). N=4 her yerde yarıya indirir (~2.0). float32 depolama ≤1 ULP (~5.96e-8) → ihmal edilebilir.
+
+**2) Oracle etkisi (referans N=2+float tutulursa):**
+- Yalnız local N=2→4: 3 sync GAIN case (p2/p1/p07 aynı parametre) × 23/24 hız = **69 drift satırı** (diz bölgesi 3–50 ips'de rel 2.9e-4…5.7e-3; yüksek hızda sönüyor). Sapma listesi 31→100 olur.
+- Yalnız local float→double (N=2 kalır): hücre farkı ≤1 float ULP → 21/23 hızda 5e-8 rel (TOL'un 50× üstü) drift. **Bu yol da oracle-temiz değil.**
+
+**3) float→double ABI gerçeği (rawaccel-base.hpp:59, ref:65):**
+- `data[514]`, lookup modunda KULLANICI LUT'u (gui/graph.inl:307-343 lut_get/set_points; config src/config.cpp:84 gate mode==lookup) ve synchronous GAIN'de İÇ scratch buffer (construction'da doldurulur, asla persist edilmez; her init_settings/au.init'te yeniden kurulur). IPC tamamen text JSON → **processler arası binary ABI YOK**.
+- Yalnız SORCE-kontrat var: 7+ dosya (accel-synchronous, accel-lookup, graph.inl, config.cpp, 4 test, ref vec2<float> casti) float varsayar. sizeof büyüyor (2056→4112 B) ama hiçbir kanal bozulmaz. Config JSON şeması: lookup için daha fazla basamak dökülür ama load `:148` float'a cast eder → disk şeması DEĞİŞMEZ.
+- **float→double kesinlikle oracle'ı kırar (21 satır) ve faydası ≤1 ULP = sıfır.** Tek başına yapılmaz.
+
+**4) Tavsiye: D (değişiklik yok) bugün.** Gerekçe: hata her yapılandırmada sub-perceptual; hem N2 hem N4, el çözünürlüğünün çok altında; shipped Windows referansı zaten N=2. İleride istenirse tek temiz yol **A** = local+ref İKİSİDE N=4 (oracle yeşil kalır) AMA ref "verbatim official"tan "precision-enhanced MIT fork"a dönüşür — LICENSE/refresh guard + "fork stamp" olmadan bir sonraki git-clone refresh sessizce N=2'ye döner ve 69 satır DRIFT (CI gürültüsü) döner. B (N=2 + 69 satır belgelik) fayda sıfır için en kötü. float→double A ile birlikte değilse ölü son.
+
+**Değiştirdiğim research docs:**
+- **precision.md**: §2.3.1 (ölçülen N2/N4/exact tablo + ULP + bias okuması), §2.3.2 (float→double ABI gerçeği), §6 rec-2 P102 güncellemesi, §7 (A/B/C/D yol haritası + tavsiye).
+- **deviations.md**: TL;DR tabloya P102 prospective satırlar; §P102 (69 satır N=4 / 21 satır double drift-ölçümü, hız bandı tablosu, A/B/C/D değerlendirmesi) — aktif sapma değil.
+- **index.md**: agenda-1 DONE işaretlendi; özet satırına P102 bulgusu eklendi; docs listesi güncellendi.
+- learning.md: DEĞİŞMEDİ (talimat).
+
+Yöneticiye özet: N=2 LUT hatası ~%1.15 dizinde, 100 ips üstü ≤%0.074 → kullanıcı algılayamaz; N=4 yarıya indirir ama her iki iyileştirme (partition veya double) oracle'ı kırar (69/21 satır). Öneri bugün D; ileride yalnız "fork-stamp"lı A. Detaylar: docs/research/precision.md §7, deviations.md §P102.
+
+### Aj.8 [M14] [05 Eyl 2026] — P110 TAMAM: MOD-PARAMETRE ETKILESIM ARASTIRMASI (interaction-aware defaults ile)
+R47 P110 (Aj 1 emri — mod-parametre etkilesim arastirmasi) TAMAM. Emir kapsami: (1) natural<->classic, (2) power cap/cap_mode x input_offset, (3) synchronous sync_speed x halflife, (4) lookup LUT x output_dpi; + etkilesim-duyarli default onerileri. Kural: YALNIZCA docs/research/*.md, kod degisikligi YOK, commit YOK. Kilit birakildi (kilit null).
+
+## 1) natural <-> classic (sabit parametrelerle karsi egri)
+
+Ayni set-param domainindeki ortak parametreler (input_offset, cap_mode, output_dpi, gain=true) karsilastirmasi, varsayilan profile (natural limit=1.5/decay=0.1 vs classic accel=0.005/exp=2/cap{15,1.5} out):
+- 300 ips: natural 1.491667 vs classic 1.458333 = +%2.29
+- 1000 ips: 1.497500 vs 1.487500 = +%0.67
+- 4000 ips: 1.499375 vs 1.496875 = +%0.17
+- En buyuk fark ~50 ips: 1.450002 vs 1.250000 = +%16.0 (classic gecis ustunde daha yavas yukselir)
+- Her ikisi de args.limit=1.5'e asimptot olur (classic icin cap_x=50 = cap.y=1.5'in gain_inverse'i). Deger actik; literaturde/net dokumanda yoktu. Doc: precision.md 8.1.
+- input_offset altinda ikisi de duz 1.0 (acilim noktasi kimliksel). Islevsel cakisma YOK.
+
+## 2) power cap/cap_mode x input_offset — WORST UX HAZIR BULGUSU
+
+- **input_offset power'da NO-OP'tur** (kilit bulgu): include/accel-power.hpp ve tests/oracle/ref/accel-power.hpp input_offset'i HIC OKUMAZ (sadece saklar). Kullanici "oradaki deger ne yapiyor" diye ayarlar ama homo yok; dokumante etmeden kullanici yanilgisi yaratir.
+- Sanitizer (src/config.cpp:324-360) scale/exponent_power/cap.x/cap.y/output_offset icin UST SINIR YOK; GUI maxlari scale=100, exp=5, cap_y=100 (gui/ui_builder.inl:225-236) — yani en kotu kombinasyon GUI'den ulasilabilir ve hata vermeden kabul edilir.
+- **EN KOTU kombinasyon (GUI-ulasilabilir, hatasiz):** power+GAIN, scale=100, exponent_power=2, cap_mode=in, cap_x=500:
+  - gain 2.5e3 @ 0.5 ips, 1e4 @ 1 ips, 1e6 @ 10 ips (cap devre disi kalmis)
+- **Alternatif bypass (default exp 0.05):** power+GAIN, output_offset=50 -> offset.x=3.6e33 >> cap.x=1253 -> gain HER HIZDA sabit 50x, cap tamamen sessiz/inert. output_offset=10 -> sabit 10x.
+- Kontroller: scale=100, n=2, default out cap_y=1.5 -> 1.486-1.499 guvenli (cap calisiyor); scale=50, n=1 -> tam 50x @ 1 ips (esik).
+- Guvenli kullanim paragrafi (kullanici rehberi) precision.md 8.2'ye yazildi: scale<=2, exp 0.5-1.0, output_offset [0,1], cap out cap_y 1.5-2.
+
+## 3) synchronous sync_speed x halflife (input_speed_smooth_halflife) — gecikme tablosu
+
+EMA smoother (linear_ema_smoother) ile step -> sync_speed'te "bulanik pencere" (gain hatasi >%5):
+- halflife=0:  0 ms  (off)
+- halflife=2:  3.5-3.8 ms
+- halflife=10: 18.8-19.0 ms
+- halflife=100: 189.2-192.5 ms
+- Yerlesme: hl=10 -> %95~23.5ms / %99~35.5ms; hl=100 -> %95~249ms / %99~382.5ms
+- sync_speed 0.5 / 0.9 / 5.0 sonuclari <%2 fark -> **sync_speed gecikme-not R** (yalniz egri sekli); tek gecikme kolu halflife'dir. Zirve anlik gain hatasi ~%10 her konfigde benzer.
+- **Gecikme-en-guvenli oneri:** hl=0 (off); smooth gerekirse halflife <= 10ms (~19ms = 1 kare), 100ms (~190ms) ASLA. Doc: precision.md 8.3.
+
+## 4) lookup LUT x output_dpi — cift-normalizasyon YOKTUR (kod yolu dogrulanmis)
+
+Kod yolu: dev.dpi_factor = NORMALIZED_DPI/dev.dpi (daemon/daemon.cpp:651) -> apply_motion_math (daemon/motion_math.hpp:19-33) -> modifier::modify (rawaccel.hpp:231). Tek normalizasyon INPUT: ips_factor = dpi_factor/time (rawaccel.hpp:242), abs_vel -> normalized ips (rawaccel.hpp:287-288) = LUT x-domain (accel-lookup.hpp:61-121). Gain tek kez: in.x *= scale (rawaccel.hpp:324,330). Tek rescale OUTPUT: dpi_adjustment = (output_dpi/NORMALIZED_DPI)*dpi_factor (rawaccel.hpp:348-352) = net output_dpi/dpi, GAIN'DEN SONRA. output_dpi, steps 3-4'te OKUNMAZ.
+- Numerik: gain output_dpi 500/1000/2000/8000 icin BIT-AYNI. Tek tehlikeli yol: kullanicinin LUT y'sini kendi eliyle output_dpi ile olceklendirmesi. Truncation tek kez (motion_math.hpp:46). Doc: precision.md 8.4.
+
+## 5) ETKILESIM-DUYARLI DEFAULT SECIMLERI (yeni oyuncu rehberi, precision.md 8.5)
+
+- classic: accel=0.005, exp=2, input_offset 0-20, cap out cap_y 1.5-2, gain=true (limite cok yakin kurma)
+- natural: limit=1.3-1.8, decay_rate=0.08-0.12, input_offset 0-5, gain=true
+- power: scale=1 (max 2), exponent 0.5-1.0 (taban tavan pozitifse 0.05 VARSAYILANI KULLANMA), output_offset [0,1], cap out cap_y 1.5-2, input_offset ETKISIZ (unuttur)
+- synchronous: smooth 0.25-0.5, motivity<=2, gamma=1, sync_speed ~ takip hizi, input halflife<=10 (tercih 0)
+- lookup: LUT x-y IKI eksen normalized ips, output_dpi=1000 veya native, output_dpi'yi LUT y'sine KATLAMA
+- noaccel/disable: raw_passthrough preset'i
+
+## Degisen dokumanlar
+- docs/research/precision.md: +218 satir, eklendi §8 (8.1-8.5), gecmis typos (cap.x/apt, face) duzeltildi.
+- docs/research/index.md: +24/-3 — P110 agenda maddesi (DONE), ozet satiri, precision.md doku tablo satiri. learning.md: DEGISME DI.
+- .aihaberlesme/AKIS.json: P110 durum=TAMAM, kilit bosaltildi (Aj7 P109 kaydiyla birlikte calisti; 99 gorev korundu).
+- Kod degisikligi YOK, commit YOK. Odometre: /tmp/opencode/p110/{harness,harness2,harness3}.cpp (REPO DISI).
+
+### Aj 8 [06 Eyl] P118 BUG-RAY PORTER (Faz 1 — SADECE BUL + RAPOR)
+
+Bolge: kesisen parametre etkilesimleri + belgelenmis hazard'larin gercekligi.
+Kanitlar: /tmp/opencode/p118/{harness.cpp, p118_sync_ema.cpp, p118_sharedbuf.cpp, p102_check.cpp} (REPO DISI); test suite 32798/32798 gecti (R47 agaci).
+P110/P102/P107 R46-R47 bulgularinin bagimsiz dogrulamasi + 3 yeni kesisim analizi asagida.
+
+## A) R46/R47 dogrulamalari (sayiyla kanitli)
+
+[P110-1] **power mode input_offset NO-OP — DOGRULANDI (bit-identical).**
+- Kaynak: include/accel-power.hpp (args.input_offset referansi YOK; yalniz output_offset :44-45) + harness ciktisi:
+  io=0 / 0.02 / 5 / 1e6 -> gain [0.90000 0.96986 1.00196 1.08419 1.18136 1.25895 1.36443] TUMUAYNI; max|Δ|=0.000e+00.
+- Sorun: power modunda input_offset yutuluyor; apex preset (`include/presets.hpp:106-107,125-126`) ve CLI `set-param input_offset` power profilinde sessizce islevsiz; README.md:269 parametre tablosu mode-kapsamina isaret etmiyor.
+- Etki: kullanici "giris esigi" ayarladigini sanir; hicbir etki olmaz (MED, UX/yaniltma).
+- Onerilen duzeltme: README/parametre tablosuna "yalniz classic/natural" notu + CLI `set-param input_offset` power modunda uyari; preset'lerdeki atil 0.0x degerleri temizle veya belge.
+
+[P110-2] **GUUI-erişilebilir EN KOTU power GAIN: 10000x @1 ips — DOGRULANDI.**
+- Kaynak: gui/ui_builder.inl:225-236 (scale max 100, power_exp max 5, cap_x max 500) + src/config.cpp:312-376 (sanitize scale/exponent_power/cap.x/cap.y UST SINIRSIZ) + harness:
+  scale=100 n=2 cap_mode=in cap_x=500: 2500x@0.5 ips, **10000x@1 ips**, 1e6@10, 2.5e9@500.
+- Sorun: GUI spinner sinirlari + sanitize'in ust-sinirsizligi bu kombinasyonu uctsuz kabulleniyor; daemon yolu (GUI->JSON->load_config sanitize no-op) uctan uca erisimli.
+- Etki: kontrolden cikan 4 basamakli kazan; imlec tek karede ekran disina firlar (cap_mode=in "inert cap" — cap 500'den buyuk degil, cap devre disi kalmiyor).
+- Onerilen duzeltme: GUI'de kanitli scale/exp ust-limiti (veya canli gain math on-izleme) + sanitize_accel_args'a ayni ceiling (scale<=100, exponent_power<=5 kullanicidan GAUGE gelen; JSON/CLI icinde de aynen).
+
+[P110-3] **power output_offset cap bypass (sabit gain + inert cap) — DOGRULANDI.**
+- Kaynak: accel-power.hpp:44-46 (offset.x=gain_inverse), :78-82 (cap_x=gain_inverse(cap.y)=uzak), :95-96 + harness: oo=50,n=0.05,cap out{15,1.5} -> gain=50 TUM 0.01..1000 ips'de, cap tamamen inert.
+
+[P107] **use_raw_input + disable DORMANT — DOGRULANDI (gercek, rapor edilmis).**
+- Kaynak: src/config.cpp:517-518/532 (yalniz serileştirme); daemon.cpp:954,1116,1171 yalniz `prof.raw_passthrough` okur; `device_config::disable` hicbir yerde OKUNMUYOR (daemon.cpp:646-648 yalniz dpi/poll).
+- Sorun: `use_raw_input=false` veya `disable=true` yazmak davranisi degistirmez — config "yalan soyleyen" alanlar.
+- Etki: kullanici ham-giris veya cihaz-kapali bekler; hicbir etki (dormant). Kapali tarafta bayrak GUI/CLI yolu da yok.
+- Onerilen duzeltme (yonetici karari): RAM~1) two bayraktan birini gercek hatta bagla, digerini kaldir; ya da README'de "beltali, ham giris icin profil `raw_passthrough` kullanin" notu.
+
+[P102] **N=2 LUT knee %1.15 — YENIDEN DOGRULANDI (roadmap D gecerli).**
+- Kaynak: /tmp/opencode/p118/p102_check.cpp — bagimsiz trapezoid P=2 vs P=4096:
+  7.5 ips: rel err **1.150%** (P102 tablosu 1.15 ✓); 3 ips: 0.123% (0.12 ✓); 0.5: 1.5e-07. N=2 gain(7.5)=0.904205 = `synchronous::gain_apply(7.5)` BIREBIR (header ile cakisiyor).
+- Not: 100/+ ips satirlari node-hizlari degil (benim repro'da gecersiz); P102 belgesi bunlari zaten ayri olcmustu. D karari (degisiklik yok) hala dogru.
+
+[float32 ABI] **data[514] float porta — DOGRULANDI, herhangi bir bug yok.**
+- Kaynak: rawaccel-base.hpp:59 (sizeof(accel_args)=2184, float[514]); accel-synchronous.hpp:105-142 fill_lut -> args.data'ya DUZ (fp_rep indexli) float yazar; accel-lookup.hpp:61-121 POINT-PAIR okur. Iki layout farkli index contract'i ayni bufferda. src/config.cpp:84 (mode==lookup gate) scratch'i persist etmemeye dogru korur. KANIT: sync fill 97/514 hucreyi doldurdu; lookup'un pair-read'i ayni bufferi DOGRU yorumlamiyor (length=514 -> 0.000000) — ancak bu tasarim geregi: mod degisimi her time init_settings ile yeniden dolduruluyor. BUG DEGIL; yalniz kontrat "shared buffer + reconstruction" olarak belgelenmeli.
+
+## B) YENI KESISIM ANALIZLERI (2 secim + kuvvetli kanit)
+
+[N1] **sync_speed konumu, halflife 'bulanik pencere'sini ~3.5x uzatir** (M14 §8.3'u derinlestirir / nuans verir).
+- Kaynak: /tmp/opencode/p118/p118_sync_ema.cpp — hedef hiz 7.5 ips, input halflife 100 ms:
+  sync_speed=5.0 (operasyon noktasinda): gain@10ms=0.667 (true 0.904, **%26 DUSUK**); ±%5 yerlesme **148 ms**, ±%1 **243 ms**.
+  sync_speed=0.5 (uzak dogma): gain@10ms=0.983 (-%8); ±%5 **42 ms**, ±%1 **106 ms**.
+  halflife=10 ms: ss=5 -> 14/18 ms; ss=0.5 -> 6/11 ms.
+- Sorun: M14 "sync_speed gecikme-kolu NOT" yalnız sync_speed kneeden UZAKKEN gecerli; takip hizina yakin yerlestirildiginde halflife'nin efektif gecikmesini 3x+ buyutur (EMA hiz hatasi, egri en dik yerde kazanca cevirir).
+- Etki: sync profilini "izin takip hizim" diye ayarlayan oyuncu, ayni halflife ile 3x daha bulanik hisseder (LOW-MED, dokumantasyon).
+- Onerilen duzeltme (genel): precision.md §8.3'e "sync_speed'i tipik takip hizindan uzak tut (veya halflife devre disi); knee'de yerlesim gecikmeyi ~3x artirir" eklenmeli.
+
+[N2] **GUI OLU KNOPBU (dead knob): Y ekseni mod=jump, "Limit:" kolu devrede ama jump limit'i OKUMUYOR.**
+- Kaynak: gui/widgets_sync.inl:91 (`y_row_label[3]=Limit` {natural,jump}), include/accel-jump.hpp:24-30 (yalniz cap.x/cap.y/smooth/gain); ay.limit yine de yaziliyor (widgets_sync.inl:194).
+- Sorun: X ekseninde limit yalniz natural (widgets_sync.inl:61) — dogru; Y ekseni jump'u da gosteriyor; jump algoritmasinda `args.limit` referansi YOK. Kullanici Y-jump'ta Limit'i degistirir, hicbir sey olmaz, deger profilde birikir.
+- Etki: LOW (kozmetik/dead knob) ama "hazard dogru" sinifinda esi: parametre-kapsam tablosuyla GUI rotası eslesmiyor.
+- Onerilen duzeltme: widget_sync.inl:91 visibility {natural, jump}->{natural}; tr tipine "yalniz natural" notu.
+
+[N3] **Yabanci parametre haritasi bit-identical kanitli (bug degil, farkindalik).**
+- Kaynak: harness [N1][N2][N3]: natural smooth=0/0.01/0.5/1.0 -> hash AYNI (bit-identical); jump input_offset=0 vs 1000 -> max|Δ|=0; synchronous cap 15/1.5 vs 5000/100 -> max|Δ|=0.
+- Sorun: dogrulanmis; referans (tests/oracle/ref) da ayni kapsamda -> tasarım, bug degil. GUI X-ekseni mode_uses tablosu (widgets_sync.inl:58-72) algoritma kapsamıyla birebir eslesiyor — TEK istisna N2 (Y-jump Limit).
+
+[N4] **combo=fit: power GAIN cap_mode=in + output_offset monoton + tangent-continuous (kiciti mevcut).**
+- Kaynak: harness [N4]: scale=5 n=0.5 oo=0.9 cap_in 30/1.5: gain 2.2577@1, 6.1266@7.5, 12.2482@30(cap), 17.4527@200; monotone 0.01..200, NaN/negatif yok; cap_x'te jump %0.0000.
+- Sorun: cap_in'sizlik BUG degil; belgelenmis hazard tamamen BUYUKLUK (N2) kaynakli, süreklilikte degil.
+
+## C) SONUC
+
+Bulgu sayisi: 3 yeni somut (BUG-1 GUI dead knob LOW, BUG-2 power input_offset inert + preset/doc MED, BUG-3 GUI erisilebilir 10000x cap-bypass HIGH-UX) + 1 dorman (BUG-4 use_raw_input/disable, yonetici karari) + 1 dokumantasyon derinlesmesi (BUG-5 sync_speedxhalflife ~3.5x).
+KRITIK 3: (1) BUG-3 GUI erisilebilir 10000x@1ips (en yuksek UX / guvenlik-pis), (2) BUG-4 dormant use_raw_input/disable (config yalan soyluyor; karar gerek), (3) BUG-1 Y-jump Limit dead knob (kucuk ama GUI/gorsel yalan).
+ONERI (Faz 2): oncelik BUG-3'e sanitize/GUI ust-limiti; BUG-2'ye doc+CLI uyari; BUG-1'e tek satirlik visibility fix; BUG-5'e precision.md notu. Kod degisikligi FAZ 1'de YOK, commit YOK, repo dosyasina dokunulmadi (kanitlar /tmp/opencode/p118/).
+
+### Aj.8 [M15] [06 Eyl 2026] — P118-AUDIT DOC DÜZELTMELERI (kullanici "duzelt" emri, doc-only)
+
+P118 Faz-1 denetiminde bulunan 4 dokumantasyon hatasi, kullaniciin "duzelt" emri uzerine **yalniz docs/research/*.md** icinde duzeltildi (kod/tests degismedi, commit YOK):
+
+1. **Bayat oracle sayimi** 768/737 -> guncel **915/884**: deviations.md:4, index.md:18 & :47, learning.md:88, precision.md:20 & :228 (R46 P98 swing case'leriyle 915'e buyudu; "RESULT OK, 31 sapma" degismedi).
+2. **precision.md §2.3.1 tablo 0.5 ips satiri** yanlisti (N2=N4=4.5e-05, oran 1.0): olculen degerler **4.8e-05 / 5.5e-05, 5/6 ULP, oran 0.86** — N4 o noktada (cell duz, zemin) marjinal *daha kotu*. "N=4 her yerde yariya iner" satiri "neredeyse her yerde (+ 0.5 istisnasi)" olarak yeniden yazildi.
+3. **deviations.md §P102 bant tablosu**: 0.1 ips gercekte 2e-9 (solucan duzu) -> bant **0.001–0.1**'e tasindi; bant 2 artik **0.5–1** (8e-8…2.3e-6).
+4. **float->double "21 satir" belirsizligi**: "21/23 grid hizi **case basina**", 3 sync_gain case'i ayni LUT'u paylastigindan toplam **63 satir** (sapma listesi 31->94). Guncellendi: deviations.md §float->double + TL;DR satiri, precision.md (150, 253, 263, 272, 292), index.md:29-30.
+
+Not: parameter_index.md (P103/aj0) dokunulmadi; aihaberlesme.md'deki 768/31 panel satirlari tarihce (o anki durum) olarak bilincli korundu. Gibi: doc sayimlari artik "current tree" ile birebir; M14/P118 bulgularinin hicbirini etkilemez. Aj 8 bos - emir bekliyor.
+
+### Aj.8 [M16] [06 Eyl 2026] — P126 TAMAM: BUG-AV DOC-FIXI (precision.md §8 + README + bagimsiz kesişim teyidi)
+
+R48'de atanan P126 tamamlandi (doc-only; kod/tests degismedi, commit YOK):
+
+1. **Bagimsiz kesişim oracle teyidi** — taze kosu: **915 satir / 31 sapma / RESULT OK** (rel 1e-9); live oracle 915/31 ile birebir, drifli gizli satir yok.
+2. **BUG-5 (sync_speed × halflife ~3.5x)** — precision.md §8.3'e "P118 nuance" eklendi; degrade sayilar `p118_sync_ema.cpp`'in yeniden derlenmesiyle **birebir** teyit edildi (hedef 7.5 ips, hl=100ms: ss=5.0 -> +-%5 settle **148 ms** / +-%1 **243 ms**; ss=0.5 -> 42/106 ms; oran 3.5x/2.3x). Eski "sync_speed surekli gecikme-nötr" iddiasi "yalniz operasyon noktasinin disinda" diye nitelendirildi; oneri + §8.5 synchronous satiri guncellendi ("knee'yi takip hizina park etme ya da halflife=0"). **Dueltme:** P118'deki "gain@10ms=0.983 (-%8)" çapraziydi (gercek sapma kendi stable degerine gore -%31.6) — doc tablosunda yanlis -%8 yayilmadi; anlik snapshot sutunu cikarilip tarafsiz "near/far oran" sutunu kondu.
+3. **BUG-2 (power input_offset inert belgesi)** — precision.md §8.2'ye "Apex preset hala olu `input_offset=0.02` tasiyor (`include/presets.hpp:125-126`)" notu; **README parametre tablosu** `input_offset` satiri "classic/natural only; power/jump/synchronous notlanir" diye guncellendi. (Valorant'in 0.02'si natural'da islevsel, dokunulmadi.)
+4. **BUG-4 (dormant bayrak belgesi)** — precision.md §8 sonunda "serialized-only config alanlari" notu: `use_raw_input` (yalniz yazilyor; daemon `raw_passthrough` okur, daemon.cpp:954/1116/1171) ve `disable` (hicbir kod okumuyor, daemon.cpp:646-648) — ikisi de olu kol; oneri (yonetici karari bekliyor): birini raw-hata bagla/digerini kaldir veya pragma olarak belgele.
+
+Kapsam: `docs/research/precision.md` + `README.md`. Ayrica M15 doc duzeltmeleri (915/31, 0.5 satiri, bant tablosu, float->double 63) P126 ile cakismaz; oracle sayimlari artik canli degiskenle birebir. AKIS P126 `TAMAM (M16)`, kilit null. Aj 8 bos - emir bekliyor.
+
+### Aj 8 [06 Eyl] P126 FAZ-2 FIX+TEYIT
+Yönetici kararları (R48 Faz-2: P119-P126) uygulandı + bağımsız kesişim koşusu yapıldı. Doküman: yalnız docs/research/precision.md + parameter_index.md (cli/ src/ gui/ daemon/ include/ tests/ README CHANGELOG oracle_cases.hpp DOKUNULMADI; commit YOK). Artifacts: /tmp/opencode/p126/.
+
+1. DORMANT BAYRAK BELGESİ (yönetici kararı 4 — BUG-4): precision.md §8.5 audit notu "pending admin decision" → R48 KARARI (Aj 1): `use_raw_input` + `disable` KALDIRILMIYOR/bağlanmıyor; belgeli "saklı/dormant" bayrak olarak kalır. Gerçek ham 1:1 hattı `raw_passthrough`'tur (P101; daemon.cpp `flush_motion`/`process_device` raw dalları). R48'den itibaren iki bayrak da CLI status/show çıktısında GÖRÜNÜR (P120/A5-09: `--json` `use_raw_input`+per-profile `disable`, metin `disabled:` satırı) — Aj5'inkini dokümante ettim, sadece docs tarafını yazdım. parameter_index.md GAP #2/#8 + satır notlar + Özet aynı kararla güncellendi. Kullanıcı kılavuzu satırı: gerçek ham hat için `raw_passthrough=true` (disable preset / `set-param <p> raw true`).
+
+2. BUG-5 (sync_speed × halflife ~3.5×): precision.md §8.3 P118-nuance tablosu mevcuttu; /tmp/opencode/p118/p118_sync_ema.cpp'yi güncel başlıklarla YENİDEN derleyip bağımsız tekrar ettim → hl=100: knee'de (ss=5.0) ±%5=148ms, uzakta (ss=0.5) 42ms (oran 3.5×); ±%1 243/106ms (2.3×); hl=10: 14/6ms. Tablo ile BİREBİR. §8.3 "sync_speed gecikme-nötr YALNIZ operasyon noktasının DIŞINDA" + §8.5 synchronous satırı (hl≤10ms önerisi) doğrulandı.
+
+3. POWER input_offset INERT (P110/P118): precision.md §8.2 Finding 1 mevcut (Apex `input_offset=0.02` olu knop, presets.hpp:125-126 doğrulandı); parameter_index.md #18 satırına açık INERT notu + #19 `output_offset` işlevsel referansı eklendi.
+
+4. BUG-3 GUI-CAP UYGUNLUK (doğrulama — bulgu olarak işaretle, kendim düzeltmedim): GUI yolu KAPALI. widgets_sync.inl tüm değerleri `gtk_spin_button_get_value` ile okur; spinner max'ları (ui_builder.inl `make_spin`) = P120 sanitize cap'leri: scale 0.01..100=SCALE_MAX, power_exp 0.01..5=EXP_POWER_MAX, cap_x 0..500=CAP_X_MAX, cap_y 0..100=CAP_Y_MAX, output_offset 0..100=OUTPUT_OFFSET_MAX. Y-ekseni ayrıkken capped alanlar X'ten kopyalanıyor (bypass yok); profile_mgr.inl'de hiçbir numerik egri girişi yok. KALINTI (Aj3'e): in-envelope 10000×@1ips (scale=100,exp=2,cap_mode=in,cap_x=500) cap'ların TAM sınır değerlerinde hâlâ GUI'den ulaşılabilir — cap'ler = R15 boundary değerleri olduğundan düşürmek R15'i kırar; çözüm GUI canlı-gain tavanı (gui/ = Aj3). Aj5 P120 dürüst notuyla aynı. EK bulgu [INFO]: cli/main.cpp:288-289 "disabled: true (device bypasses all processing)" — daemon `device_config::disable`'ı okumuyor, "bypass" iddiası abartılı; Aj5/Aj1'e kullanıcı-gerçeği uyarı metni önerildi (cli/ benim bölgem değil).
+
+5. BAĞIMSIZ KESİŞİM (interim — eşzamanlı Aj2/3/4/5/7 hâlâ in-flight olabilir; final koşu Aj1 tur kapanışında TEKRAR):
+   - build.sh → EXIT 0, 0 uyarı/error
+   - run_tests.sh → 33460/33460 geçti (EXIT 0)
+   - run_oracle.sh → 915 satır / 31 belgeli sapma / 31 görüşüldü / RESULT OK (rel 1e-9). Aj2 P119 sync fix oracle'u DEĞİŞTİRMEDİ — 31 sapma sayısı aynı, hepsi known_deviations.txt (sync motivity fix motivity<1 bölgesinde, oracle grid'inde yok).
+   - run_tr_coverage.sh → Result: PASS (EXIT 0)
+   - AGENTS.md test paneli (Aj4 P123 sorumlusu): HÂLÂ STALE — satır 112/205 "132 test groups, 21627 assertions"; canlı 33460/33460. Aj4 sayıları yazana kadar panel doğrulanamaz.
+
+KAPILAR: build 0 uyarı 🟢 · unit 33460/33460 🟢 · oracle 915/31 OK 🟢 · tr PASS 🟢. Doc değişiklikleri: precision.md (§8.2 Finding2 stale sanitize yazısı + §8.5 karar), parameter_index.md (GAP #2/#8, domain kolonları #13/19/20/23/24, satır notları, Notlar). Kod değişikliği YOK.
+
+NOTLAR:
+- precision.md'deki sabit satır ref'leri (config.cpp:517-518/532, daemon.cpp:954/1116/1171/646-648) P120/P121 satır kaydırmalarıyla bozulmuştu → P125 ilkesiyle fonksiyon-adı ref'lerine çevrildi.
+- AKIS.json'a dokunmadım (Aj0/P125 alanı); P126 kart durumunu Aj0 güncelleyebilir.
+
+### Aj 8 [06 Eyl] P134 R49 BAGIMSIZ DOGRULAMA
+
+R49'da yalnız bağımsız kesişim doğrulaması + R48'den devralınan iki bulgunun (1a/1b) bağımsız teyidi. Kod/tests DEĞİŞMEDİ, commit YOK. Artifacts: /tmp/opencode/p134/ (p134_intersection.cpp, .out, gate_*.log).
+
+1. **DEVRE DIŞI FLAG (R48 finding 1a / BUG-4) — Aj5 P130 ile KAPANDI (bağımsız teyit):** cli/main.cpp:291-292 artık `disabled: true (stored flag — dormant: daemon hot path ignores it; real 1:1 bypass = set-param <profile> raw true)`, status yolu cli/main.cpp:1255-1257 aynı düzeltmeyle; `print_profile` `raw: true` satırı (:294-295) DOĞRU (gerçek bypass `raw_passthrough`). Bağımsız kanıt: daemon/ içinde `use_raw_input` HİÇ okunmuyor; `disable` yalnız daemon.hpp:112 doksiyonda sözcük olarak geçiyor (anlamsal okuma yok); daemon.cpp `raw_passthrough` okuyor (bu oturumda :1050/:1217/:1272 — satır numaraları eşzamanlı Aj6 P131 düzenlemesiyle HEAD'den 265 satır difflenince KAYIYOR; MongoDB P120/P126 notlarındaki 992/1159/1214 aynı nedenle bayatladı). İçerik bulgusu tutarlı: dormant bayraklar belgeli, gerçek ham hat raw_passthrough.
+
+2. **GUI CANLI-GAIN TAVANI (R48 finding 1b / BUG-3) — R49'da KAPANMADI (kalıntı, Aj3'e):** UI açısından 10000×@1ips hâlâ erişilebilir. Kanıt: gui/ui_builder.inl:232-243 spinner max'ları (= include/config.hpp:18-22 cap tanımları): power_exp 0.01..5 (EXP_POWER_MAX), cap_x 0..500 (CAP_X_MAX), scale 0.01..100 (SCALE_MAX); src/config.cpp:404-408 sanitize AYNI max'lara kırpanlar (tavan YOK); gui/graph.inl:19 compute_max_gain YALNIZCA grafik Y-ekseni otoskalası (ceiling/gate DEĞİL); Aj3 P128 (BUG-11..14) hiçbir canlı-gain tavanı eklemedi. BAĞIMSIZ ÖLÇÜM (harness, include/accel-power.hpp): power LEGACY scale=100, exp=2, cap_mode=in, cap_x=500 → **gain@1=10000.0000**; exp=5 (spinner max) içinde → **gain@1=1e10**. İkisi de GUI kap zarfında (spinner max = cap = R15 boundary), yani "cap'leri düşürmek R15'i kırar; çözüm GUI canlı-gain tavanı (graph + kayıt anı red/flag)" R48 önerisi AÇIK kaldı.
+
+3. **BAĞIMSIZ KESİŞİM DOĞRULAMASI (harness p134_intersection.cpp):** 17 case × 121-nokta hız gridi [1,10000] (≥100). `accel_union` ile tip-durumlu dispatch'in altındaki `accel_gain`/`accel_test`/verbatim başlık yığını + kod yığını görüntüleme:
+   - union == doğrudan dispatch: 17/17 BİREBİR (rel 0, 121 nokta).
+   - sonluluk: 17/17 (uv-synch LUT dâhil, NaN/Inf yok; exp=5/power 1e10'da bile sonlu).
+   - monotona nondec: classic_gain/legacy, jump (smooth+hard), natural, sync LUT+legacy, power 9/9; sync_gain_p2 LUT yolu monotona (integral eğri).
+   - synchronous çarpımsal simetri g(s)·g(sync²/s)=1: sync_legacy_p2 ±0.00, smooth0 ±0.00, m<0 (Aj2/P119 bölgesi) ±0.00, |log prod| max 4.4e-16 — LUT beklendiği gibi tam çift yönlü. sync_gain_p2'de simetri ARIYOR: GAIN modu çarpanın değil İNTEGRALİN eğrisi (anchor sync_gain_p2@5=0.742577, "1.0 değil" — referansla aynı, sapma yok).
+   - nokta çapaları: classic_gain@5000∈(1.4,1.5], classic_legacy@10000==1.5, natural@10000≈1.5, jump hard@15==cap.y(1.5), jump smooth@10000≈1.5; lookup velocity/displacement düğümleri BİREBİR (2→1.25, 5→2.0, 20→100.0).
+   - SONUÇ: **PASS (failures=0)**. Şekil paramlarında (jump cap.y = hedef gain, sync GAIN integreli vb.) harness beklentilerinin ilk turu 9 hata verdi — tümü harness modelleme hatasıydı, kod değil; düzeltilince 0 hata.
+
+4. **SAPMA SAYIMI BAĞIMSIZ TÜRETİMİ:** known_deviations.txt satır satır: 23 classic_gain_exp_le1 (0.001..100000, sabit 1.005) + 8 s(0) özdeşlik = **31**. Eski notlardaki "24+7" (P89 M33) BİRER KAYIĞIDIR; dosya 23+8=31 ile öztutarlı, oracle çıktısı da 31 basıyor — düzeltilecek bir şey YOK (yalnız INFO; eski nota güvenilmesin).
+
+5. **KAPILAR (interim — Aj6 P131 daemon.cpp'yi bu oturumda 02:33:05'te DÜZENLİYOR; final koşu Aj1 tur kapanışında TEKRAR):** build.sh → EXIT 0, 0 uyarı/error 🟢 · run_tests.sh → 33460/33460 geçti 🟢 · run_oracle.sh → 915 satır / 31 belgeli sapma / 31 görüşüldü / RESULT OK (rel 1e-9) 🟢 · run_tr_coverage.sh → Result: PASS 🟢. Harness include/ başlıklarından derlendiği için Aj6'nın canlı daemon düzenlemelerinden etkilenmez; 1b ölçümü tamamen include/accel-power.hpp üzerinden. Aj 8 boş — emir bekliyor.

@@ -1,25 +1,26 @@
 {
-  "noaccel": 14.4795,
-  "power-whole": 41.66,
-  "classic": 46.2686,
-  "power+rot45+snap15+clamp": 61.9012,
-  "power-dual+4ema": 319.5107,
-  "apply_motion_math(full)": 46.2907,
+  "noaccel": 13.6782,
+  "power-whole": 39.1757,
+  "classic": 43.8619,
+  "power+rot45+snap15+clamp": 58.5337,
+  "power-dual+4ema": 307.3409,
+  "apply_motion_math(full)": 43.9391,
   "_meta": {
     "unit": "ns/event",
     "iterations_per_config": {
-      "noaccel": 6912331,
-      "power-whole": 2403280,
-      "classic": 2159608,
-      "power+rot45+snap15+clamp": 1619394,
-      "power-dual+4ema": 308767,
-      "apply_motion_math(full)": 2153502
+      "noaccel": 7365344,
+      "power-whole": 2556212,
+      "classic": 2287226,
+      "power+rot45+snap15+clamp": 1712576,
+      "power-dual+4ema": 331542,
+      "apply_motion_math(full)": 2286676
     },
     "runs_used": 3,
     "method": "median",
-    "min_seconds_per_run": 0.1,
+    "min_seconds_per_run": 0.1000,
     "positive_control": false,
     "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
     "cpu_governor": "unreadable"
-  }
-}
+,
+    "threshold_percent": 5.0
+  }}

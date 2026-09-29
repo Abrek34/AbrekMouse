@@ -5,10 +5,70 @@ set -o pipefail   # L-2: a forgotten gate in a pipeline must not pass silently
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
-BIN="$ROOT/build-manual/test_accel"
+# P106 madde 3 (AJ1): test ikilisi KOŞUYA ÖZEL bir yere yazılır, paylaşılan
+# `build-manual/`'a DEĞİL. Ölçüldü: iki ajan aynı anda 2. kapıyı koşunca ikisi
+# de `build-manual/test_accel` derliyor, yürütülme sırasında biri diğerinin
+# üzerine yazıyor → `ETXTBSY` ("Metin dosyası meşgul") → **rc=126**.
+#   ölçülen imzalar ayrı: 134 = SIGABRT (paylaşılan geçici dosya), 1 = parse,
+#   126 = ETXTBSY (paylaşılan ikili). Üçü tek bir "ortam meşgul" koduna
+#   sığmaz — kök nedenler farklı.
+# Yer `$TMPDIR` (aşağıda `mktemp -d` ile üretilir, EXIT trap'inde silinir), yani
+# ek `mkdir -p` gerekmez ve koşu bittiğinde ikili de yok olur.
+# NOT: `$BIN` aşağıda, `TMPDIR` kurulduktan SONRA atanır; buradaki yer tutucu
+# `build-manual/`a yazmayı bilerek yapmaz.
+BIN=""
 
 CXX="${CXX:-g++}"
 CXXFLAGS="-std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -I$ROOT/include -I$ROOT/src"
+
+# ── T5: koşu başına ayrı geçici dizin ─────────────────────────────────────────
+# İki `run_tests.sh` kopyası eşzamanlı koşunca SABİT /tmp yolları çarpışıyordu:
+# biri diğerinin dosyasını `std::remove()` ile siliyor, öteki guardsız
+# `load_config` çağrısında "Cannot open config file" alıp SIGABRT ile düşüyordu
+# (ölçüldü: 3 kopya × 3 denemede 6/9 koşu rc≠0).  İki ayrı yönlendirme var:
+#   · `mktemp` TMPDIR'a baktığı için aşağıdaki 14 `mktemp` çağrısı koşuya özel
+#     dizine düşer — ek kod gerekmez;
+#   · `tests/test_accel.cpp` içindeki 42 sabit yol `tmp_path()` ile aynı dizini
+#     okur.
+# KAPSAM NOTU (AJ3, 30 Eyl 2026) — bu not ÖNCEKİ hâlinde YANLIŞTI, düzeltildi.
+# Önceki metin "build-manual/ ve /dev/shm hâlâ paylaşılmaktadır, iki kopya
+# eşzamanlı koştuğunda kapı yine de çakışabilir" diyordu.  Ölçüm bunu çürüttü:
+# `BIN` artık `$TMPDIR/test_accel` olduğu için (madde 3, AJ1) test ikilisi
+# build-manual'a HİÇ yazılmıyor.  Doğrulama, sil-koş-yeniden-oluştu-mu:
+#   rm -f build-manual/test_accel && bash tests/run_tests.sh
+#   → rc=0, 34164/34164, build-manual/test_accel YENİDEN OLUŞMADI.
+# Eşzamanlılık, doğrudan bu depodan (sembolik çift değil), her denemede
+# run_tests.sh'in karması alınıp değişmediği doğrulanarak:
+#   3 kopya × 3 deneme =  9/9   ·  4 kopya × 3 = 12/12   ·  5 kopya × 3 = 15/15
+#   → 36/36 rc=0, 0 geçersiz deneme.  (T4+T5 TEK BAŞINA 6/9 idi, hatalar
+#   rc=126 "Metin dosyası meşgul" = ETXTBSY; o imza artık yok.)
+#
+# HÂLÂ PAYLAŞILAN (yani bu notun kapsamı DIŞINDA, ve ölçülmüş bir eksiklik):
+#   · `build-manual/rawaccel-cli` ve `rawaccel-daemon` (aşağıdaki CLI/DAEMON).
+#     Bu kapı onları ÇALIŞTIRIR ama DERLEMEZ; yani 2. kapı kendi başına
+#     ETXTBSY üretemez.  Eşzamanlı bir `scripts/build.sh` üretebilir.
+#   · `/dev/shm` — SEC-2 bloğundaki sabit yollar.
+#   · `XDG_RUNTIME_DIR` — PID dosyası.
+#   · `run_tests_asan.sh` — 0 adet `export TMPDIR`, yani ASAN modu izole
+#     DEĞİL.  Ölçüldü: aynı ASan ikilisi 2 kopya, TMPDIR verilmezken
+#     3/6 rc=0 (3× rc=134 SIGABRT, "Cannot open config file"), ayrı TMPDIR
+#     verilirken 6/6 rc=0.  Düzeltmesi T5'in aynısı (1 satır) ama o dosya
+#     bu turda yetki kapsamı dışındaydı.
+export TMPDIR="$(mktemp -d)"
+RA_TMPDIR="$TMPDIR"
+# P106 madde 3 (AJ1): ikili artık koşuya özel. `TMPDIR` C++17'de de görünür
+# (`std::getenv("TMPDIR")`) — `test_accel.cpp`in `tmp_dir()`ı okuyor.
+BIN="$TMPDIR/test_accel"
+
+TMP_FILES=()
+cleanup_tmp() {
+    rm -f "${TMP_FILES[@]}"
+    if [ -n "${RA_TMPDIR:-}" ] && [ -d "$RA_TMPDIR" ]; then
+        rm -rf "$RA_TMPDIR"
+    fi
+    return 0   # EXIT trap'inin dönüş değeri çıkış kodunu bozmasın
+}
+trap cleanup_tmp EXIT   # P114 BUG-H: hiçbir fail-erken çıkışta /tmp kalmasın
 
 echo "=== RawAccel Linux Birim Testleri ==="
 echo "Derleniyor..."
@@ -29,11 +89,7 @@ echo ""
 # ── CLI davranış kapıları (P83: create-preset 256-char senkronu) ──────────────
 CLI="$ROOT/build-manual/rawaccel-cli"
 DAEMON="$ROOT/build-manual/rawaccel-daemon"
-TMP_FILES=()
-cleanup_tmp() {
-    rm -f "${TMP_FILES[@]}"
-}
-trap cleanup_tmp EXIT   # P114 BUG-H: hiçbir fail-erken çıkışta /tmp kalmasın
+
 die() { echo "Hata: $*" >&2; exit 1; }   # L-BUG-41: unhelpful chatter→açıklayıcı hata
 
 if [ ! -x "$CLI" ]; then
@@ -306,7 +362,21 @@ PY
     # Traversal'ı: gerekli ".." sayısını HESAPLA ve çözümlemeyi
     # DOĞRULA — derinlik yanlışsa kapı yanlış sebeple kırılıp yeşil görünebilir.
     SECD4="$SECD/a/b/c/d"
-    mkdir -p "$SECD4" /dev/shm/rawaccel-secdir
+    # P106 (AJ1): bu blok "disallowed directory" özelliğini sınar, yani testin
+    # anlamı **/dev/shm ALTINDA OLMAK**. Sabit bir isim iki eşzamanlı koşuda
+    # çakışıp diğerinin fixture'ını siliyordu (ölçüldü: A rc=0, B rc=1, B'nin
+    # 34164/34164'ü geçti — yalnız SEC-2 kırıldı). Benzersiz ad aynı özelliği
+    # korur, çakışmayı kaldırır. `mktemp -d -p /dev/shm` -> /dev/shm/rawaccel-secdir.XXXXXX
+    SECD_SHM="$(mktemp -d -p /dev/shm rawaccel-secdir.XXXXXX)"
+    TMP_FILES+=( "$SECD_SHM" )
+    # Aynı sebeple PID dosyası: daemon $XDG_RUNTIME_DIR → /run → /tmp sırasıyla
+    # dener (daemon/main.cpp:466-468). Blok başına özel bir XDG_RUNTIME_DIR verilir,
+    # yazma oraya düşer ve GLOBAL yollara hiç dokunulmaz. XDG_CONFIG_HOME'A DOKUNMA —
+    # :488'in varsayılan-yol reddi testi onu bilerek /dev/shm'a yönlendiriyor.
+    SECD_RT="$(mktemp -d)"
+    TMP_FILES+=( "$SECD_RT" )
+    export XDG_RUNTIME_DIR="$SECD_RT"
+    mkdir -p "$SECD4"
     UP=""
     probe="$SECD4"
     while [ "$probe" != "/" ]; do
@@ -353,9 +423,9 @@ PY
     }
 
     # (1) doğrudan yasak önek — düzeltme öncesi de reddediliyordu (kontrol)
-    secd_reject "doğrudan /dev/shm" "/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    secd_reject "doğrudan /dev/shm" "$SECD_SHM/a.json" "disallowed directory"
     # (2) ATLATMA: çözülen yol /dev/shm — düzeltme öncesi KABUL ediliyordu
-    secd_reject "traversal → /dev/shm" "$SECD4/$UP/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    secd_reject "traversal → /dev/shm" "$SECD4/$UP$SECD_SHM/a.json" "disallowed directory"
     # (3) aynı atlatma /proc ve /sys için
     secd_reject "traversal → /proc" "$SECD4/$UP/proc/a.json" "disallowed directory"
     secd_reject "traversal → /sys"  "$SECD4/$UP/sys/a.json"  "disallowed directory"
@@ -376,7 +446,7 @@ PY
     #     türetiyor ve o yol düzeltme öncesi HİÇ doğrulanmıyordu — aynı hedef
     #     -c ile verilince reddedilirken burada KABUL ediliyordu.
     set +e
-    OUT=$(XDG_CONFIG_HOME=/dev/shm/rawaccel-secdir "$CLI" list 2>&1)
+    OUT=$(XDG_CONFIG_HOME="$SECD_SHM" "$CLI" list 2>&1)
     RC=$?
     set -e
     if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "disallowed directory"; then
@@ -477,15 +547,15 @@ PY4
             exit 1
         fi
     }
-    secd_daemon_reject "doğrudan /dev/shm" "/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
-    secd_daemon_reject "traversal → /dev/shm" "$SECD4/$UP/dev/shm/rawaccel-secdir/a.json" "disallowed directory"
+    secd_daemon_reject "doğrudan /dev/shm" "$SECD_SHM/a.json" "disallowed directory"
+    secd_daemon_reject "traversal → /dev/shm" "$SECD4/$UP$SECD_SHM/a.json" "disallowed directory"
     secd_daemon_reject "traversal → /proc" "$SECD4/$UP/proc/a.json" "disallowed directory"
     secd_daemon_reject "uzantısız, meşru dizin" "$SECD4/a.txt" "does not have a .json extension"
     secd_daemon_reject "sembolik bağ → /dev/shm" "$SECD/badlink/a.json" "disallowed directory"
     secd_daemon_accept "meşru yeni dosya" "$SECD4/yeni.json"
     # daemon'ın varsayılan yolu da doğrulanmalı (bu kopyada düzeltilen boşluk)
     set +e
-    OUT=$(XDG_CONFIG_HOME=/dev/shm/rawaccel-secdir timeout 5 "$DAEMON" 2>&1)
+    OUT=$(XDG_CONFIG_HOME="$SECD_SHM" timeout 5 "$DAEMON" 2>&1)
     RC=$?
     set -e
     if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "disallowed directory"; then
@@ -495,7 +565,10 @@ PY4
     # ilk çalıştırma: config dizini YOK — doğrulama bunu kırmamalı
     secd_daemon_accept "ilk çalıştırma (dizin yok)" "$SECD4/yeni.json"
     echo "SEC-2 config-yolu kapısı (daemon): atlatma/sembolik bağ/varsayılan yol ✓"
-    rm -rf "$SECD" /dev/shm/rawaccel-secdir
+    # P106 (AJ1): yalnız KENDİ fixture'ını sil. Sabit isimli paylaşılan dizini
+    # `rm -rf` etmek, eşzamanlı koşan başka bir ajanın dizinini de siliyordu.
+    rm -rf "$SECD" "$SECD_SHM" "$SECD_RT"
+    unset XDG_RUNTIME_DIR
 
     # ── monitor: arity + aralık kapıları (daemon yoksa çalışmaz — kapı değil) ─
     # Monitor, daemon gerektirir; testte sadece argüman doğrulama + (daemon

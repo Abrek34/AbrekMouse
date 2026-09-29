@@ -40,7 +40,11 @@ inline double lp_distance(vec2d v, double p) {
     //      opens at 2352 and RETURNS at 2383.  The accel path never runs it —
     //      it continues to apply_motion_math() at 2510.
     //   2. modifier::modify() has no input-side guard either: 612-613 runs at
-    //      the END, whereas calc_speed_whole() → lp_distance() is called at 555.
+    //      the END, whereas calc_speed_whole() is called at 557 — i.e. BEFORE
+    //      it, and calc_speed_whole's body is where lp_distance() is called
+    //      (:261 definition, :266 the lp_distance call inside it).  An earlier
+    //      revision said "555", which is neither: it is the `} else {` that
+    //      opens the whole-combined branch, two lines above the real call.
     // The real reason is the CEILING.  dx/dy sums the kernel's int32 ev.value
     // (daemon.cpp:2808/2810, __s32 at linux/input.h:44) into a double over a
     // 32-event read_batch (daemon.cpp:2573), so |dx| <= 32*INT32_MAX = 6.87e10.

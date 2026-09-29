@@ -3,7 +3,7 @@
 # Measures ns/event per configuration using C++ clock_gettime(CLOCK_MONOTONIC) median-of-N.
 # Adaptive iterations per config to achieve >=100ms measurement region.
 # No external tools required (perf, bc, /usr/bin/time are optional).
-# Usage: ./scripts/bench_hotpath.sh [runs] [output-file] [--json] [--min-seconds N]
+# Usage: ./scripts/bench_hotpath.sh [--runs N] [--output FILE] [--json] [--min-seconds N] [--threshold PCT] [--update-baseline]
 # Env: BENCH_POSITIVE_CONTROL=1  -- inject busy-loop to verify gate detects regression
 #      BENCH_UPDATE_BASELINE=1   -- update perf_baseline.json with current results
 
@@ -16,34 +16,70 @@ BENCH_BIN="$BUILD_DIR/bench_hotpath"
 BASELINE_FILE="$PROJECT_ROOT/tests/perf_baseline.json"
 CXX="${CXX:-g++}"
 JSON_OUTPUT=false
+UPDATE_BASELINE=false
 
 # Default values
 RUNS=3
 MIN_SECONDS=0.1
+THRESHOLD_PCT_OVERRIDE=""
 
-# Parse flags first, then positional args
-POSITIONAL_ARGS=()
-for arg in "$@"; do
-    if [[ "$arg" == "--json" ]]; then
-        JSON_OUTPUT=true
-    elif [[ "$arg" == "--positive-control" ]]; then
-        # Handled by benchmark binary via env var
-        :
-    elif [[ "$arg" == "--min-seconds" ]]; then
-        # Next positional arg will be the value
-        MIN_SECONDS_FLAG=true
-    else
-        if [[ "${MIN_SECONDS_FLAG:-false}" == "true" ]]; then
-            MIN_SECONDS="$arg"
-            MIN_SECONDS_FLAG=false
-        else
-            POSITIONAL_ARGS+=("$arg")
-        fi
-    fi
+# Parse flags first
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        --positive-control)
+            # Handled by benchmark binary via env var
+            shift
+            ;;
+        --min-seconds)
+            MIN_SECONDS="$2"
+            shift 2
+            ;;
+        --runs)
+            RUNS="$2"
+            shift 2
+            ;;
+        --output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        --threshold)
+            THRESHOLD_PCT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --update-baseline)
+            UPDATE_BASELINE=true
+            shift
+            ;;
+        -*)
+            echo "ERROR: Unknown option: $1" >&2
+            echo "Usage: $0 [--runs N] [--output FILE] [--json] [--min-seconds N] [--threshold PCT] [--update-baseline]" >&2
+            exit 1
+            ;;
+        *)
+            # Legacy positional args for backward compatibility (ci.yml calls with: iterations output-file)
+            echo "WARNING: Positional arguments are deprecated. Use --runs and --output flags." >&2
+            if [[ -z "${POS_RUNS:-}" ]]; then
+                POS_RUNS="$1"
+            elif [[ -z "${POS_OUTPUT:-}" ]]; then
+                POS_OUTPUT="$1"
+            else
+                echo "ERROR: Too many positional arguments" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
 done
 
-RUNS="${POSITIONAL_ARGS[0]:-3}"
-OUTPUT_FILE="${POSITIONAL_ARGS[1]:-$PROJECT_ROOT/bench_hotpath_results.txt}"
+# Apply legacy positional args if provided (backward compat)
+if [[ -n "${POS_RUNS:-}" ]]; then
+    RUNS="${POS_RUNS}"
+fi
+OUTPUT_FILE="${POS_OUTPUT:-$PROJECT_ROOT/bench_hotpath_results.txt}"
 
 # Build benchmark if needed
 if [[ ! -f "$BENCH_BIN" ]]; then
@@ -84,8 +120,11 @@ if [[ ! -f "$BENCH_BIN" ]]; then
     exit 1
 fi
 
-# Handle BENCH_UPDATE_BASELINE early
-if [[ "${BENCH_UPDATE_BASELINE:-0}" == "1" ]]; then
+# Default threshold for BENCH_UPDATE_BASELINE (before baseline is read)
+THRESHOLD_PCT=5.0
+
+# Handle BENCH_UPDATE_BASELINE early (env var takes precedence over flag)
+if [[ "${BENCH_UPDATE_BASELINE:-0}" == "1" ]] || [[ "$UPDATE_BASELINE" == "true" ]]; then
     echo "=== Updating baseline ==="
     BENCH_OUTPUT="$("$BENCH_BIN" "$RUNS" --json --min-seconds $MIN_SECONDS)"
     BENCH_EXIT=$?
@@ -93,6 +132,17 @@ if [[ "${BENCH_UPDATE_BASELINE:-0}" == "1" ]]; then
         echo "ERROR: Benchmark binary failed" >&2
         exit 1
     fi
+    # Insert threshold_percent into _meta section
+    BENCH_OUTPUT=$(echo "$BENCH_OUTPUT" | awk -v thresh="$THRESHOLD_PCT" '
+        /^  "_meta":/ { in_meta = 1; print; next }
+        in_meta && /^  }$/ {
+            # Add comma to previous line and insert threshold_percent
+            printf ",\n    \"threshold_percent\": %s\n  }", thresh
+            in_meta = 0
+            next
+        }
+        { print }
+    ')
     echo "$BENCH_OUTPUT" > "$BASELINE_FILE"
     echo "Baseline updated: $BASELINE_FILE"
     cat "$BASELINE_FILE"
@@ -144,12 +194,14 @@ if [[ ! -f "$BASELINE_FILE" ]]; then
     exit 77
 fi
 
-# Parse baseline using awk
+# Parse baseline using awk — WITH in_meta GUARD (fixes B-1)
 parse_baseline_json() {
     local json="$1"
     local key="$2"
     echo "$json" | awk -v key="\"$key\"" '
-        index($0, key) {
+        /^  "_meta":/ { in_meta = 1 }
+        in_meta && /^  }$/ { in_meta = 0 }
+        !in_meta && index($0, key) {
             # Match either number or quoted string
             match($0, /: *([0-9]+\.?[0-9]*|"[^"]*")/, arr)
             if (arr[1] != "") {
@@ -163,9 +215,15 @@ parse_baseline_json() {
 }
 
 BASELINE_JSON="$(cat "$BASELINE_FILE")"
-THRESHOLD_PCT=$(parse_baseline_json "$BASELINE_JSON" "threshold_percent")
-if [[ -z "$THRESHOLD_PCT" ]]; then
-    THRESHOLD_PCT=5.0
+
+# Threshold: flag override > baseline > default 5.0
+if [[ -n "$THRESHOLD_PCT_OVERRIDE" ]]; then
+    THRESHOLD_PCT="$THRESHOLD_PCT_OVERRIDE"
+else
+    THRESHOLD_PCT=$(parse_baseline_json "$BASELINE_JSON" "threshold_percent")
+    if [[ -z "$THRESHOLD_PCT" ]]; then
+        THRESHOLD_PCT=5.0
+    fi
 fi
 
 declare -A BASELINE
@@ -190,7 +248,7 @@ if [[ -n "$BASELINE_CPU_MODEL" && "$BASELINE_CPU_MODEL" != "unknown" && "$CURREN
     echo "⚠️  CPU MODEL MISMATCH: baseline='$BASELINE_CPU_MODEL', current='$CURRENT_CPU_MODEL'" >&2
     echo "Performance regression gate is not valid on different hardware." >&2
     echo "To create a baseline for this hardware, run:" >&2
-    echo "  BENCH_UPDATE_BASELINE=1 $0 $RUNS" >&2
+    echo "  BENCH_UPDATE_BASELINE=1 $0 --runs $RUNS" >&2
     exit 77
 fi
 
@@ -203,7 +261,7 @@ if [[ "$BASELINE_CPU_GOVERNOR" != "unknown" && "$BASELINE_CPU_GOVERNOR" != "unre
         echo "⚠️  CPU GOVERNOR MISMATCH: baseline='$BASELINE_CPU_GOVERNOR', current='$CURRENT_CPU_GOVERNOR'" >&2
         echo "Performance characteristics may differ (powersave vs performance vs ondemand)." >&2
         echo "To create a baseline for this governor, run:" >&2
-        echo "  BENCH_UPDATE_BASELINE=1 $0 $RUNS" >&2
+        echo "  BENCH_UPDATE_BASELINE=1 $0 --runs $RUNS" >&2
         exit 77
     fi
 fi
@@ -265,7 +323,7 @@ if [[ $FAILED -eq 1 ]]; then
     done
     echo ""
     echo "To update baseline (after verifying the change is intentional):"
-    echo "  BENCH_UPDATE_BASELINE=1 $0 $RUNS"
+    echo "  BENCH_UPDATE_BASELINE=1 $0 --runs $RUNS"
     exit 1
 else
     echo "=== ALL CONFIGURATIONS WITHIN THRESHOLD ==="

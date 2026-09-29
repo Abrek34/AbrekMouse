@@ -96,10 +96,79 @@ struct app_config {
     std::string                 version;  // config schema version (e.g. "0.3.0")
 };
 
-/// Load config from a JSON file. Throws on parse error.
+/// Load config from a JSON file.  **Throws on far more than a parse error** —
+/// "throws on parse error" (the wording until Aj.3 P103) covered 1 of the 8
+/// measured throw categories, and the 7 it omitted are the ones that a
+/// hand-edited or generated file actually triggers.  Callers MUST be inside a
+/// try/catch for ALL of them:  a malformed number is the cheapest way to reach
+/// one, and an unguarded call does not return — it aborts.  Measured: a config
+/// carrying `"output_dpi": 1e400` aborts the process with SIGABRT, exit 134
+/// (positive control for this note: the same call inside try/catch returns 3
+/// and the caller logs and falls back).
+///
+///   1. `json::parse_error`          — syntactically malformed JSON.
+///   2. `json::out_of_range`         — number overflow (`1e400`)  ← NOT a parse
+///      error, despite arriving from inside `json::parse`; the parser rejects
+///      the literal before the value ever reaches sanitization, so the
+///      `finite_or()` NaN/Inf pass in `sanitize_profile` never sees it.
+///   3. `runtime_error`              — file cannot be opened (`config.cpp:820`).
+///   4. `runtime_error`              — root is not an object/null (`:714`).
+///   5. `runtime_error`              — `profiles` is not an array (`:756`).
+///   6. `runtime_error`              — `profiles[i]` is not an object (`:773`).
+///   7. `runtime_error`              — an accel_args scalar has the wrong JSON
+///      type, `"config field 'X' must be a number, got <type>"` (`:149`).
+///   8. `runtime_error`              — …or is non-finite, `"must be finite"`
+///      (`:153`).  Both from `require_number` (`:145-156`), applied to the 12
+///      P120-FAZ2 scalars: absent key = "use default" and is silent, but a key
+///      that is PRESENT and wrong type refuses the whole config — deliberate,
+///      so a schema-mismatched file cannot load half-correct acceleration math.
+///
+/// Note the asymmetry, which is policy and not an oversight: the scalar
+/// accel_args fields (7, 8) throw, while `cap` (`:169-178`), `mode` and the
+/// scalar/string device fields degrade to defaults.  Sanitization never runs
+/// on a config that threw, so "sanitize clamps this" is not a safety argument
+/// for a rejected file.  All 7 production call sites are inside try/catch —
+/// `daemon/daemon.cpp:471,2029`, `cli/main.cpp:770,2053,2111,3184`,
+/// `gui/main.cpp:185` — and the GUI path (`:184-186`) additionally stashes the
+/// file as `.corrupt-<unixtime>` before falling back, so a rejected config is
+/// recoverable rather than merely survivable.
 app_config load_config(const std::string& path);
 
-/// Save config to a JSON file.
+/// Save config to a JSON file.  **Throws on every I/O failure** — the wording
+/// here was one line with no contract at all (Aj.3 P106), which is the same gap
+/// `load_config` had and worse: `load_config` at least said "throws on parse
+/// error" (1 of its 8 measured categories), `save_config` said nothing while
+/// throwing on all of its own.  Callers MUST be inside a try/catch.  An
+/// unguarded call does not return — it aborts, and the config the caller
+/// believed it had persisted is the OLD one on disk, because the write is
+/// atomic and only the `rename()` publishes it.
+///
+/// `save_config` is `config.cpp:832-1013` (182 lines) and has 4 explicit throws
+/// plus 1 implicit one:
+///   1. `std::runtime_error` — cannot open/write the temp file (`:911`).
+///   2. `std::runtime_error` — write error on the temp file (`:938`).
+///   3. `std::runtime_error` — `fsync()` on the temp file failed (`:946`).
+///   4. `std::runtime_error` — `rename()` temp → target failed (`:996`).
+///   5. `std::filesystem::filesystem_error` — implicit, from
+///      `fs::create_directories(parent_path)` (`:848`) when the parent cannot
+///      be created.
+///
+/// The 4 explicit ones are the durability contract made visible: a throw means
+/// the target file still holds the previous, valid config — the temp file is
+/// pid-suffixed and `O_NOFOLLOW|O_EXCL`, so no half-written JSON is ever
+/// published and no symlink can be clobbered.  That safety is why the throws
+/// are not swallowed inside the function: a caller that catches learns the save
+/// did NOT happen, and `cli/main.cpp`'s `safe_save` turns that into a clean exit
+/// with a `.bak` rotation rather than a SIGABRT.
+///
+/// All 5 production call sites are inside try/catch — `cli/main.cpp:428` (in
+/// `safe_save`, whose `try` is at `:427`), `cli/main.cpp:3172`, `:3235`,
+/// `daemon/daemon.cpp:681` (`try` at `:677`, with both `catch (const
+/// std::exception&)` and `catch (...)`), `gui/main.cpp:46` (in
+/// `save_config_now`, `try` at `:45`).  Measured 5/5, the same coverage level
+/// as `load_config`'s 7/7 — but note it is a *convention*, not a type
+/// guarantee: nothing in the signature forces a 6th call site to catch, which
+/// is the trap this note exists to close.
 void save_config(const app_config& cfg, const std::string& path);
 
 /// Convert a profile to/from JSON string (for IPC).

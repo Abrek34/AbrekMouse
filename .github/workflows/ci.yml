@@ -181,64 +181,24 @@ jobs:
             echo "Perf gate SKIP: tests/perf_baseline.json (P137) henüz yok."
             exit 0
           fi
-          # R53 (Aj7): tek-koşum gürültüsü sahte FAIL üretebildigi icin 3 kosum
-          # yapilip her config iin MEDYAN baseline ile karsilastirilir.
-          # Iterasyon sayisi baseline metodolojisinden (_meta.iterations) okunur
-          # ki kosum kosulu baseline uretiminden sapmasin (R53 duzeltmesi).
-          ITER=$(python3 -c 'import json;print(json.load(open("tests/perf_baseline.json"))["_meta"]["iterations"])')
-          echo "perf-gate: iterations=$ITER (baseline _meta), median-of-3 koşum"
-          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out1 2>&1
-          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out2 2>&1
-          bash scripts/bench_hotpath.sh "$ITER" 1 > bench_hotpath.out3 2>&1
-          python3 - <<'PY'
-          import json, re, sys, statistics
-
-          baseline = json.load(open("tests/perf_baseline.json"))
-
-          runs = []
-          for f in ("bench_hotpath.out1", "bench_hotpath.out2", "bench_hotpath.out3"):
-              run = {}
-              for ln in open(f).read().splitlines():
-                  m = re.match(r"^([a-z][a-z0-9+./()_ -]*?):\s*([0-9.]+)\s*ns/event$", ln)
-                  if m:
-                      run[m.group(1).strip()] = float(m.group(2))
-              runs.append(run)
-
-          if not any(runs):
-              print("::error::bench_hotpath SUMMARY parse edilemedi (3 kosum da bos)")
-              sys.exit(1)
-
-          got = {}
-          for name in {n for r in runs for n in r}:
-              vals = [r[name] for r in runs if name in r]
-              got[name] = statistics.median(vals)
-
-          threshold = baseline.get("_meta", {}).get("threshold_percent", 5.0)
-          failures = []
-          print("config | baseline | median | delta%")
-
-          for name, base in baseline.items():
-              if name == "_meta":
-                  continue
-              if name not in got:
-                  # N-14: a baseline config that vanishes from the output is a
-                  # real regression signal (config disabled/renamed) — fail the
-                  # gate instead of silently passing with a warning.
-                  print("::error::baseline'da var ama ciktida yok (perf gate FAIL): %s" % name)
-                  failures.append("%s (baseline'da var, ciktida yok)" % name)
-                  continue
-              now = got[name]
-              delta = (now - base) / base * 100.0
-              flag = "FAIL" if delta > threshold else "ok"
-              print("%-32s | %8s | %8s | %+5.2f%% %s" % (name, base, now, delta, flag))
-              if delta > threshold:
-                  failures.append("%s %+.2f%% (%s -> %s ns/event)" % (name, delta, base, now))
-
-          if failures:
-              print("::error::Perf gate FAIL (%d config +%%%s ustu):" % (len(failures), threshold))
-              for f in failures:
-                  print("::error::  " + f)
-              sys.exit(1)
-
-          print("Perf gate OK — hicbir config baseline'i +%%%s asmadi (median-of-3)." % threshold)
-PY
+          # P109 (Aj5): bayat Python kopyası silindi. bench_hotpath.sh kendi
+          # gate'ini yapıyor (median-of-3, threshold, CPU model/governor kontrolü).
+          # exit 77 = ortam geçersiz (CPU model/governor uyuşmazlığı) → SKIP
+          # exit 126 = ETXTBSY (binary başka bir işlem tarafından kullanımda) → SKIP
+          # exit 1 = performans regresyonu → FAIL
+          set +e
+          bash scripts/bench_hotpath.sh
+          BENCH_RC=$?
+          set -e
+          if [ $BENCH_RC -eq 77 ]; then
+            echo "Perf gate SKIP: ortam geçersiz (CPU model/governor uyuşmazlığı)"
+            exit 0
+          fi
+          if [ $BENCH_RC -eq 126 ]; then
+            echo "Perf gate SKIP: benchmark binary kullanımda (ETXTBSY)"
+            exit 0
+          fi
+          if [ $BENCH_RC -ne 0 ]; then
+            echo "::error::Perf gate FAIL (exit $BENCH_RC)"
+            exit $BENCH_RC
+          fi

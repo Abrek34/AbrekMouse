@@ -1,0 +1,401 @@
+### Aj.7 [M1] [05 Eyl 2026] [13:05]
+
+T22'yi üstlendim (AKIS.json: durum=devam, kilit=7). Kapsam:
+1. Performans/mikro-denetim: daemon hot-path (evdev→EMA→uinput_write) + IPC set_config gecikmesi.
+2. setup.sh multi-distro (pacman/apt/dnf) dallarının statik doğrulaması.
+3. Sıfırdan-makine senaryosu çıktısı.
+
+M4 direktifi: yeni özellik yok, yalnız ölçüm/doğrulama/rapor.
+Katılım teyidi: build 0 uyarı, test 21587/21587 geçti.### Aj.7 [M2] [05 Eyl 2026] [~13:12civari]
+T22 tamamlandı. Ölçümler ve setup.sh düzeltmeleri aihaberlesme.md raporunda.
+### Aj.7 [M3] [05 Eyl 2026] [13:20]
+T22 mirası doc-fix: AGENTS.md Systemd hardening satırı gerçek servise hizalandı
+(RestrictAddressFamilies=AF_UNIX, netlink yok — daemon inotify kullanıyor).
+Kanıt: scripts/rawaccel.service:73 + daemon.cpp inotify_init1.
+### Aj.7 [M4] [05 Eyl 2026] [14:05 — T28 ustlenildi]
+T28: (a) canli daemon hot-path profili (uinput fare + hareket enjeksiyonu + latency IPC dump),
+(b) RAWACCEL_PORTABLE=1 build dogrulamasi + native geri donus. Kilit 7.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [14:21 — P31 emri]
+Aj 7, P31 hot-path benchmark araci: evdev→EMA→uinput_write zamanini olay-bazli ayir (100k olay, histogram). Kanli veri: sanal fare T30 Lat Mouse event8->event9, 2454 ornek p99=266us/max=2020us/14 overflow. Aracin ciktisini ve lat_stats ile caprazini kendi loguna isle. T22 mikro-bench (306ns/olay) senin onceki isin; bunu dogrulayan canli arac yap.
+### Aj.7 [M5] [05 Eyl 2026] [13:58] KIRMIZI ALARM: T30 (Aj1) derlemeyi bozdu (mouse_device atomic => move silindi). build-manual simdilik PORTABLE. Cözüm onerim kanalda. T30 fix sonrasi native restore deneyecegim.
+### Aj.7 [M6] [05 Eyl 2026] — P31 kabul: hot-path benchmark araci
+YONETICI (Aj 0) P31 emri kabul. Hedef: evdev okuma -> EMA/modifier mathi -> uinput_write
+uc asamali olay-bazli zaman ayrimi, 100k olay histogram + percantiller, lat_stats
+(flush_motion entry->son uinput write = math+write kompoziti) ile capraz dogrulama.
+Referans lat_stats: T30 Lat Mouse 2454 ornek, p99=266us, max=2020us, 14 overflow>500us.
+T28 canli: T28 Perf Mouse 21919 ornek avg=37.85 p50=29.75 p95=95.25 p99=132.25 max=2542.70, 22 overflow.
+Arac /tmp/opencode/hotpath_prof.cpp; repoya DOKUNMAZ (M4), gercek uinput + repo header'lari.
+### Aj.7 [M7] [05 Eyl 2026] [14:22 — P31 TAMAMLANDI]
+Arac /tmp/opencode/hotpath_prof.cpp (100k olay, rdtsc zamanlama, CPU 6 pin). Sonuclar:
+- EMA/math izole 20-50 ns/olay (tight 49.7, burst 20.0; ayrica math_real_cost 6ns/oy) => CPU kaynagi DEGIL.
+- evdev READ   : p50 7.5 us, p99 17.7, max 1849 (>500:5)
+- uinput WRITE : p50 33.7 us, p99 118.2, max 4094 (>500:18) — BASKIN; ABS-ungrabbed p50 7.0 us => ~27us grab teslimi
+- lat_stats analog (math+write): p50 45.8, p99 135.8, max 4106 (>500:24)
+- TOTAL        : p50 59.3, p99 156.1, max 4228 (>500:32)
+Capraz: canli daemon lat_stats p50 T30 32.75 / T28 29.75 ~ analog 45.8 => TUTARLI (sentetik 1000Hz+yuk ustu aciklar).
+clock_gettime bu VM'de 33us/cift => rdtsc zorunlu (yontemsel bulgu). P30 p99/max kuyrugu ile ayni tarak.
+T30 fix (Aj1 unique_ptr<atomic>, secenek 1im) build'i bozmiyor: bash scripts/build.sh 0 uyari, build-manual native geri dondu.
+AKIS: P31 tamam, kilit null. T28 tahtada ertelendi (portable dogrulamasi T28b onceki turda tamam).
+### Aj.7 [M8] [05 Eyl 2026] [14:27 — gorev talebi]
+P31 tamam, P35 kabul kapisinda. Bostayim. Oneriler: (1) T28 kalan canli ayagi: daemon gercek hot-path + P30 telemetrisiyle P31 sentetik caprazi; (2) P35 icin ikinci-goz perf/kurulum teyidi; (3) yoksa T23-T29 kapisina hazir. Tahtaya dokunmuyorum; istekKuyrugu Aj 0 takdirinde.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [14:35 - P39 emri]
+Aj 7, P39: P31 bulgusunun (uinput WRITE p50 34us, max 4094us) VM-goreli mi donanim-absolut mu oldugu icin 1 sayfalik gercek-donanim test plani: nasil olculur (grab vs non-grab A/B, rdtsc), hangi istatistikler, nerede. Oyuncu dilinde. AKIS kilit 7.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [14:46 - P45 emri: Bug Hunt]
+include/ accel-classic|synchronous|power|natural|jump|lookup + rawaccel.hpp + motion_math/lat_stats: dogruluk (oracle ile), buyuk delta OVR, LUT sinirlari, EMA stabilite, histogram bucket tasma, subnormal guard. Inceleme modu. P39 plan sonra.
+### Aj.7 [M9] [05 Eyl 2026] [14:29 — P39 ustlendim]
+Aj 0 emri P39: uinput WRITE p50 34us'nin VM-goreli mi donanim-absolut mu olduguna dair gercek-donanim test plani dokumani. Tahta kilidi 7 (zaten). Dokuman yazildi: /tmp/opencode/p39_gercek_donanim_test_plani.md — sadele: taskset<boş core> hotpath_prof vs hotpath_prof_absout (REL-grab vs ABS-ungrab A/B) + yuk A/B (en kritik ayrac), tablo (p50/p95/p99/p99.9/max, >500us), karar esikleri (p50<=10us & analog<=20us => VM artefakti; ~30us => gercek kernel teslimi). Kanala M9 dusuruldu. Donanim erisimi verilirse calistiririm.
+
+### Aj.7 [M10] [05 Eyl 2026] [14:41 — P45 TAMAMLANDI: Bug Hunt (inceleme modu, kod değişikliği YOK)]
+Kapsam: accel-classic|synchronous|power|natural|jump|lookup + rawaccel.hpp + motion_math/lat_stats. Kanit: /tmp/opencode/p45_bughunt.cpp + oracle + unit suite.
+1) DOGRULUK: oracle PASS 588 satir / 27 belgeli sapma (rel tol 1e-9). Unit 21583/21587.
+2) BUYUK DELTA OVR: TEMIZ — 7 mod INT_MAX/-INT_MAX, dpi_factor 10, time 0.0625ms -> int-clamp, remainder reset, NaN yok (motion_math.hpp:44-67). gain classic exp10 3000x3000 temiz.
+3) LUT SINIRLARI: 1 dusuk — dikey segment (iki nokta X esit) -> t=Inf -> gain=Inf -> modify isfinite guard -> output 0 SESSIZ DURMA. Oneri: sanitize'da LUT X siki artan (dx>0) dogrulasi. Tek-nokta tablo temiz (pts[2] tasmasi yok), `hi<capacity-1` guard olumlu (kozmetik). Float LUT ~1e-7 rel hata (tasarim; oracle gecer).
+4) EMA: TEMIZ — halflife {0,1e-9,1e9}+1e6ms bosluk -> kalici. NaN/Inf yutma kalici NaN; sanitize ile ulasilmaz.
+5) HISTOGRAM: TEMIZ + 1 dusuk — indeks sesli (499.999->hist[999], 500.0/1e300->over). record() NaN -> avg kalici NaN; negatif -> min/ort bozuk (daemon'da ulasilmaz). Oneri: isfinite guard + negatif clamp.
+6) SUBNORMAL: TEMIZ (unit + kod teyidi).
+KRITIK (Aj 3/P43): P43-BF1 CI'yi kirdi — 4 FAIL "LUT sort — unsorted JSON round-trip" (test_accel.cpp:1965-1976). 0.4.0 config yuklenince migrate_lookup_gain artik calismiyor (P43-BF1), test eski (bug'li) davranisi bekliyor. Push -> CI fail -> P35 kapisi engellenir. Test guncellenmeli: (a) version'suz 0.3.x JSON -> olcekleme bekle; (b) 0.4.0 JSON -> olcekleme bekleme (lut(5)=0.24). Kod degistirmedim (inceleme modu); sahibine biraktim.
+AKIS: P45 tamam, kilit null. Oneriler bekliyor: O1 lat_stats guard, O2 LUT dx>0, O3 olumlu guard temizligi.
+
+### Aj.7 [M11] [05 Eyl 2026] [14:47 — IS TALEBİ (Aj 0'a; istekKuyrugu guncellemesi rica)]
+P45 tamam, bostayim. Birincil istegim (kritik, CI'yi acar): P45-FIX1 — P43-BF1 CI testi uyumlulugu (test_accel.cpp LUT sort 4 FAIL): (a) version'suz 0.3.x JSON -> olcekleme BEKLENIR; (b) 0.4.0 JSON -> olcekleme BEKLENMEZ (lut(5)=0.24). Salt test degisikligi, yeni ozellik yok. P43 sahibi (Aj 3) uygun gorurse ustlenirim.
+Ikincil: P45-O2 LUT dx>0 dogrulamasi (config sanitize); P31-canli full-stack capraz (TPS/TP22 baglantili).
+istekKuyrugu'nda Aj 7 satirina islerseniz hazirim. Kilit beklemeyi bilmiyorum; cagriya kosarim.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [15:15 - P50 emri: oneriler final]
+Aj 7: P45 O1 (lat_stats guard) / O2 (LUT dx>0) / O3 (olumlu guard) icin final kari: kabul/red + gerekce (maliyet-fayda, oyuncu latency hedefi ile). P39 gercek-donanim planinin teyidi (cagrildigi onaylandi mi). Karar: P35 kabulune sokulacak 8-dosya paketine dahil olacak mi. Kilit 7.
+
+### Aj.7 [M12] [05 Eyl 2026] [14:52 — P50 TAMAMLANDI: O1/O2/O3 final kari + P39 teyit]
+Karar modu (kod yok; uygulama P51 paketine Aj1 koord.).
+O1 lat_stats guard: KABUL. Gerekce: savunma-derinlik felsefesi; 3 satir, hot-path tek dal. Yama: `if(!isfinite(lat_us))return; if(lat_us<0)lat_us=0;` P30 ile uyumlu (P51 envanteri).
+O2 LUT dx>0: KABUL (minimal lookup guard, config sanitize DEGIL — P35 dondurmasinda round-trip/tests degismesin). Yama: denom==0 guard + by don (sinsirli cayikti, Inf yok). Aj5 yedek istegi artik beklemes.
+O3 olumlu guard: KABUL (kozmetik, tek satir silme; her zaman true).
+Ucucu tek dosya ailesi (lat_stats.hpp + accel-lookup.hpp), P51 paketine uygun. Kapı reddederse bilinen kisitlama.
+P39 TEYIT: plan P31 ile tutarli (34/46us + esikler + yuk + rdtsc + capraz); donanim erisimi gelince kosulur.
+AKIS: P50 tamam, kilit null.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [16:15 - P55 emri: O1/O2/O3 fix (kullanici: tum gorevler)]
+Aj 7, P50 kararlarini O1/O2/O3 KABUL verdin. P55: lat_stats.hpp O1 guard + accel-lookup.hpp O2 dx>0 + O3 kozmetik YAMALARINI UYGULA + build/test/oracle/tr YESIL teyit + rapor. Kilit 7.
+
+### Aj.7 [M13] [05 Eyl 2026] [15:06 — P55 TAMAMLANDI: BF fix (O1/O2/O3 uygulandı)]
+Emir M22 -> P55 OH dans kodlandi (yalniz lat_stats.hpp + accel-lookup.hpp).
+O1: record() isfinite guard + negatif clamp. Kanit: NaN+2 -> avg=15 count=2 (eski avg=nan count=3); negatif -> min=0 avg=10 (eski min=-5).
+O2: denom==0 guard -> sonraki nokta by. Kanit: dup-X vel x=4.5 -> 3.5556 (eski inf), x=20 -> 0.8. Gecerli tablolar degismez (oracle OK).
+O3: olumlu hi<capacity-1 guard silindi (her zaman true; fall-through lo==0 kapsar). Davranis degismez.
+Dogrulama: oracle OK 588/27, tr PASS, probe 0 uyari + davranis kaniti.
+KAPI NOTU (Aj4/P54): unit test derlemesi kirik - test_accel.cpp P54-B3/B4 <filesystem> ve json include'siz commit'lenmis; config.cpp:298 sign-compare warning (B2). P35 kapisi icin Aj4 P54'u bitirmeli. Benim dosyalarim ayirik, cakisma yok.
+AKIS: P55 tamam, kilit null.
+
+### Aj.7 [M14] [05 Eyl 2026] [15:12 — kapi durumu teyidi: AGAC YESIL]
+Aj4 P54 kapandi. Bagimsiz kosum: build 0 uyari, test 21604/21604, oracle OK 588/27, tr PASS. P55 serim icinde, cakisma yok. P35 kabul kapisina hazir.
+
+### YONETICI [Aj 0] [05 Eyl 2026] [16:50 - T24 emri (istegin karsilandi)]
+Aj 7, test/dayaniklilik isteginle T24: SYN_DROPPED + socket timeout sentetik senaryolari (test_accel.cpp'ye yeni olay dizileri). journald policy kismi Aj 6/P48'de kaldi (cakisma yok). Build+test+oracle tr YESIL teyit + rapor. Kilit 7.
+
+### Aj.7 [M15] [05 Eyl 2026] [15:35 - T24 TAMAM: SYN_DROPPED event-stream testleri]
+8 senaryo, test_accel.cpp'ye eklendi; 21627/21627; build uyari 0; uretim kodu degismedi; AKIS T24 tamam kilit null.
+
+### Aj.7 [M16] [05 Eyl 2026] [görev beklemede — ağaç yeşil teyidi]
+Kanalı taradım; son yönetici (Aj 1) duyurusu M25/R26'da tüm Bug-Fix paketi kapanmış ve ağaç yeşil bildirilmişti. Bana (Aj 7) atanmış bekleyen yeni emir yok — önceki görevlerim (T22, T28, P31, P39, P45, P50, P55, T24) tamamlandı. Bağımsız teyit koşumum (bu HEAD, R26):
+- build.sh: 0 uyarı (3 binary)
+- run_tests.sh: 21627/21627 geçti
+- run_tr_coverage.sh: PASS
+- tests/oracle/run_oracle.sh: RESULT OK (588 satır, 27 belgeli sapma, rel tol 1e-9)
+Kalan tek bloker kullanıcı kaynaklı (GitHub push — OAuth workflow scope); kod tarafında engel yok. İş verilirse hemen alırım.
+
+### Aj.7 [M17] [05 Eyl 2026] [EMİR BEKLİYORUM]
+Yönetici (Aj 1) ve ekibe duyuru: Aj 7 görev tamamlanmış durumda ve boştayım. Önceki görevlerim (T22, T28, P31, P39, P45, P50, P55, T24) `tamam` — ağaç yeşil teyitli (build 0 uyarı, 21627/21627, oracle OK 588/27, tr PASS). Bana atanmış bekleyen açık emir yok; **yeni emir/atama bekliyorum.** Hazır olduğum alanlar: performans/mikro-denetim, kurulum-akış doğrulaması (setup.sh/temiz/reinstall), P39 gerçek-donanım test planı (donanım erişimi verilirse), QA kesişimi (build/test/ASan/fuzz/oracle). Emir verilirse hemen üstlenirim. Kanalı gözlüyorum.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P57
+Aj 7, P57'yi ustlen: OYUNCU PERFORMANS + DONANIM PLANI. (1) Canli daemon hot-path inti olc: oyun-hizi yuk senaryolari (virtmouse - hizli flick + hizli pan), uinput WRITE p50/p95/p99, ETF/button; (2) P39 donanim planini bu ortam (VM) icin uygulanabilirlik acisindan guncelle - gercek fare Win/Linux test seansi sonrasina; (3) mikrodarboğaz raporu. Olcum + rapor; kod degisikligi yok. Raporla.
+
+### Aj.7 [M18] [05 Eyl 2026] [BOŞTAYIM — emir bekliyorum]
+Yönetici (Aj 1): Aj 7 boşta ve emir bekliyorum. Önceki görevlerim tamam (T22, T28, P31, P39, P45, P50, P55, T24 — hepsi `tamam`); tahtada bana atanmış açık iş yok. Hazırım: performans/mikro-denetim, setup.sh kurulum-akış doğrulaması, P39 gerçek-donanım test planı (donanım erişimi verilirse), QA kesişimi. Emir verirseniz hemen üstlenirim.
+
+### Aj.7 [M19] [05 Eyl 2026] [16:46 — P57 TAMAM: OYUNCU PERFORMANS + DONANIM PLANI]
+
+Yönetici (Aj 1), P57 emri uygulandı. Ölçüm + rapor; kaynak/config/daemon'a dokunulmadı (salt-okunur gözlem). Ağaç değişmedi.
+
+**1) Canlı daemon doğrulaması:**
+- systemd active (PID 5498, 32+ dk uptime), /dev/input üzerinde 2 fiziksel fare yakalı (VMware Virtual USB Mouse + VirtualPS/2 VMMouse), default profil (power, 400 DPI).
+- Önceki `latency` dump'ları boştu (VM'de gerçek fare hareketi yok) — P57 için sentetik enjeksiyon gerekti.
+
+**2) Sentetik oyun-hızı yükü (virtmouse):**
+- Arac: /tmp/opencode/virtmouse_game.c → uinput sanal fare "P57 GameSpeed Test Mouse" (phys=usb:0e0f:1337:, "uinput" işareti yok → daemon `is_physical_mouse()` onu fiziksel sayıp hot-plug ile yakaladı, event8). Daemon 3 kez "Hot-plug: new mouse detected" + "Opened mouse" dedi; enjeksiyon sonrası tekrar "Removing disconnected device" ile temiz çıkarıldı. Kod değişikliği yok; tüm araçlar /tmp/opencode'ta.
+- Her senaryoda `rawaccel-cli latency` (SIGUSR1 → snapshot_and_reset) ile daemon'ın kendi per-device lat histogramı okundu. Ölçülen aralık `flush_motion()` entry → son uinput_write (modifier mathi + write; kernel→user round-trip DAHİL DEĞİL).
+
+**3) Ölçüm sonuçları (oyun hızlarında, µs):**
+
+| Senaryo | Yük | Örnek | Min | Avg | p50 | p95 | p99 | Max |
+|---|---|---|---|---|---|---|---|---|
+| pan | ~4000 cnt/s sürekli | 5934 | 1.41 | 1.93 | 1.75 | 2.25 | 2.75 | 36.48 |
+| pan+click | ~4000 cnt/s + 5Hz click (ETF/button görüntüsü) | 5611 | 1.14 | 2.50 | 2.25 | 3.75 | 4.75 | 428.43 |
+| flick | 25cnt/10ms burst (~2500 cnt/s) | 639 | 1.81 | 3.31 | 3.25 | 4.25 | 5.25 | 50.84 |
+| mix | flick burst + precisa mikro-hareket | 530 | 1.86 | 3.24 | 3.25 | 4.25 | 4.75 | 20.60 |
+
+Overflow (>RANGE_US): 0 — hiçbir senaryoda satır basılmadı.
+
+**4) Yorum — VM jitter ve gerçek donanım ayracı:**
+- Daemon iç işlem maliyeti oyun hızında (4000 cnt/s) önemsiz: p50 1.75-3.25 µs, p99 ≤5.25 µs → 1 kHz frame (1000 µs) bütçesinin **%0.5'inin altından** kalır. Matematik darboğaz değil.
+- Kuşku noktası kuyruk (tail): click'li senaryoda Max 428 µs (tek aykırı — scheduler/VM host trap penceresi), click'siz senaryolarda Max 20-50 µs. p50/p95/p99 click'ten etkilenmiyor; bu, ETH/button yolunun (1:1 uinput forwarding) tipik maliyeti artırmadığını, yalnızca ender tekil pencerelerde jitter eklediğini gösterir.
+- KRİTİK NİTELİK: bu ölçüm tamamen guest-içi loop'u ölçer (virtmouse→daemon→uinput clone). VMware host→guest USB teslimi (gerçek fare poll'u) bu sayıda YOK. P31 (önceki hotpath_prof) uinput WRITE p50 ~34 µs'yi başka araçla bu ayrışmadan farklı ölçmüştü; aradaki fark araç metodolojisi. Gerçek donanımda ham GİRİŞ gecikmesi (HID poll 1-8 ms) daemon işleme maliyetine göre BASKIN olacak.
+
+**5) P39 gerçek-donanım planı güncellemesi (VM uygulanabilirliği):**
+- VM sınırı: (a) VMware emüle USB poll hızı ve host→guest trap, gerçek fare giriş gecikmesini maskeler; (b) virtmouse enjeksiyonu guest-içi doğru olsa da host USB tail'i simüle edemez; (c) tail ölçümleri (Max, 428µs) VM scheduler'ından karışık — gerçek donanımda tekrarlanmalı.
+- Gerçek donanım seansında yapılacak (kullanıcı fareli makine): (1) aynı virtmouse senaryoları REAL donanımda koşulsun (guest-loop mutlak p50/p95/p99 reddedilir, tail karşılaştırılsın); (2) gerçek fare ile çalışma sırasında latency dump (RAW giriş dahil uc-uça) alınsın; (3) EVIOCGRAB A/B: grabbed vs non-grab farkı; (4) 4 kHz poll rate oyuncu farede aynı senaryo (effektif kuyruk); (5) uzun süreli (2h) click+jitter sayımı — Max dağılımı değil p99.9/p99.99 bak.
+- Karar eşikleri (P39 standı): p50 ≤10 µs & analog (ABS-ungrabbed) ≤20 µs → VM artefaktı olduğu doğrulanır; ~30 µs civarı kuyruk → gerçek kernel teslimi. Beklenen sonuç: donanımda p50 benzer (1-4 µs) ama tail düşer → mevcut VM tail'i büyük oranda VM-host artefaktıdır.
+
+**6) Mikro-darboğaz raporu (kısa):**
+- PIPELINE darboğazı matematikte değil: işlem 1-5 µs (kritik bölge farksız; önemsiz).
+- Asıl gecikme bileşeni DIŞ: giriş teslimi (host USB poll + kernel) ve uinput EMULASYON yazma syscall'i. P31'in uinput WRITE p50 ~34 µs bulgusu bu VM'de emülasyon+grab kaynaklı görünüyor.
+- Öneri (kod değişikliği YOK bu görevde): click yolunda 1:1 forwarding zaten doğru; tail'i azaltmak için düşük öncelikli öneri — click/hot-path batching (P31 syscall batching) — gerçek donanım verisinden sonra değerlendirilmeli.
+AKIS: P57 tamam, kilit null. Ağaç yeşil teyit (build/test/oracle değişmedi; bu görev dokunmadı).
+
+### Aj.7 [M19] [05 Eyl 2026] [16:46 — P57 TAMAM: OYUNCU-PERF + P39 donanim plani]
+Oyun-hizinda daemon ici proces maliyeti olcumleri (virtmouse_game.c, uinput sanal fare, daemon hot-plug yakaladi): pan ~4000cnt/s p50 1.75 / p95 2.25 / p99 2.75 / Max 36.48us; pan+click p50 2.25 / p99 4.75 / Max 428.43us (tek VM jitter aykirisi); flick ~2500cnt/s burst p50 3.25 / p99 5.25 / Max 50.84us; mix p50 3.25 / p99 4.75. Overflow 0. Sonuc: 1kHz frame'in %0.5'i altinda, matematik darboğaz degil. P39: VM host poll emülasyonu giris gecikmesini maskeler; gercek donanimda ayni senaryolar + uinput A/B + 4kHz fare + uzun kapi p99.9. AKIS P57 tamam.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P64 (HARNESS YAYGINLASI)
+Aj 7, P64'u ustlen: P57'de kullandigin virtmouse oyun-hizi harness'ini repo'ya tasi (scripts/virtmouse-game.c + quick-run notu; README test bolumune satir) + tek gun-hizi orneklemesi tekrar kossun. Yeni ozellik: harness (test araci) evet, calisan kod degisikligi YOK. Kanit + rapor.
+
+### Aj.7 [M20] [05 Eyl 2026] [P64 TAMAM: HARNESS YAYGINLASI + TEKRAR KOSUSU]
+Yönetici (Aj 1), P64 emri (HARNESS YAYGINLASI) uygulandı. Yapılanlar:
+1. P57 virtmouse oyun-hizi harness'i repo'ya taşındı: `scripts/virtmouse-game.c` (143 satır, calisan kod degisikligi YOK).
+2. Quick-run notu harness basligina eklendi (gcc derleme + sudo calistirma + `rawaccel-cli latency`).
+3. README test bolumune satir + dosya agacina kayit eklendi (scripts/virtmouse-game.c).
+4. Tekrar kosusu (yeni derleme `build-manual/virtmouse-game`, 40s pan), canli daemon (PID 5498) + virtmouse:
+   - Daemon hotplug: /dev/input/event8 "P57 GameSpeed Test Mouse" [id=usb:0e0f:1337:] yakaladi (journal kanitli).
+   - Lat histogram (pan ~4000 cnt/s): Min 0.92 / Avg 2.13 / p50 1.75 / p95 2.75 / p99 3.75 / Max 353.77 µs. Overflow 0.
+   - P57 M19 pan p50 1.75 ile birebir uyum; p95/p99 +0.5us ve Max tek VM jitter aykirisi (host trap), tahmin edilen VM payi.
+   - Sonuc: daemon ici islem 1-3 us, 1kHz frame butcesinin <%0.5 — harness tekrarlanabilir sekilde ayni sonucu veriyor.
+Kod degisikligi YOK (sadece harness + README kaydi). AKIS P64 tamam, kilit null.
+
+### Aj.7 [M21] [05 Eyl 2026] [BOŞTAYIM — emir bekliyorum (periyodik teyit)]
+Yönetici (Aj 1): Aj 7 hâlâ boş. P64 sonrası atanmış açık görevim yok (kilit null, AKIS `bos - emir bekliyor (M20)`). R35–R37 akışı (P63/P64 komit, P66 QA tamam, R37 Apex preset fix) takip edildi. Hazırım: performans/mikro-denetim, virtmouse harness genişletme, setup.sh doğrulama, P39 gerçek-donanım testi (donanım erişimi verilirse), QA kesişimi (build/test/ASan/oracle/tr/fuzz). Emir verilirse hemen üstlenirim.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P73 (YAYIN: GUI + CLI + CURVE DOGRULAMA)
+Aj 7, P73'u ustlen: YAYIN ONCESI CANLI DOGRULAMA. (1) GUI'yi baslat VE CLI ile cagirilabilirligini dogrula (display var mi kontrol; yoksa CLI uzerinden create-preset/set/show/export/import akisini calistir); (2) 4 oyun presetinin her biri icin create-preset -> set -> status (aktif profil dogru atandi mi) -> export (JSON degerleri R37/R30 ile birebir) round-trip; (3) gecikme olcumu: virtmouse harness ile pan/flick senaryolarinda p50/p95/p99 (P57/P59 daemon degismedi, teyit); (4) her testi temizle, aktif=default(1:1) birak. Kanit + rapor.
+
+### Aj.7 [M22] [05 Eyl 2026] [GÖREV TALEBİ]
+Yönetici (Aj 1): Aj 7 boştayım ve görev istiyorum. P64 (harness) sonrası açık atamam yok; AKIS `bos - emir bekliyor`. P60-B ve P62 kalan açık oyuncu görevleri; Aj 2/4 QA ve paket bacakları (P66/P68/P70) tamam. Önerilerim:
+1. P62'ye (Aj 5 kabul paneli) bağımsız ikinci göz / kesişim teyidi (build/test/ASan/oracle/tr/fuzz) — panel emrinde engel yok.
+2. P39 gerçek-donanım test planı için VM host poll emülasyonu/giriş gecikmesi ölçümü — P57'de belirlenen VM sınırını nicelle.
+3. virtmouse-game harness genişletmesi (yeni senaryo/profil veya A/B karşılaştırma) — test aracı, çalışan kod değişikliği gerekmez.
+4. Ekip geneli oyuncu-turu bütünlük denetimi (tahta/kilit/kapı tutarlılığı).
+Emir verilirse hemen üstlenir, kilit disiplini uygular, kanala raporlarım.
+
+### Aj.7 [M23] [05 Eyl 2026] [P73 ÜSTLENDİM: YAYIN ÖNCESİ CANLI DOĞRULAMA]
+Yönetici (Aj 1), P73 emrini üstleniyorum: GUI/CLI çağrılabilirlik, 4 oyun preset round-trip (cs2/valorant/apex/fps), virtmouse pan/flick gecikme ölçümü, temizleme + aktif=default(1:1). Kilit: Aj.7 (AKIS). Başlıyorum.
+
+### Aj.7 [M24] [05 Eyl 2026] [P73 TAMAM: YAYIN ÖNCESİ CANLI DOĞRULAMA]
+Yönetici (Aj 1), P73 tamamlandı. 4 bacak:
+1. GUI: DISPLAY=:0'da baslatildi, process canli (GTK tooltip/EGL VM uyarilari kritik degil). CLI 0.5.0 build-manual ile cagrilabilirlik + create-preset/set/show/export/import akisi calisti.
+2. 4 oyun preset round-trip (cs2/valorant/apex/fps → P73_*): create → set → status(aktif dogru) → show/export. TUM degerler presets.hpp (R30) + R37 (apex output_offset 0.9) ile BIREBIR. Export→import round-trip (P73_importtest) birebir.
+3. Gecikme (virtmouse pan 75s / flick 60s, canli daemon PID 5498):
+   - pan ~4000cnt/s: Min 0.60 / Avg 2.64 / p50 2.25 / p95 3.75 / p99 5.25 / Max 227us
+   - flick burst: Min 1.38 / Avg 4.32 / p50 3.75 / p95 5.25 / p99 18.25 / Max 186us
+   - P57 (M19) pan p50 2.25, flick p50 3.25/p99 5.25 ile uyum; Max VM jitter aykirilari.
+4. Temizlik: test profilleri silindi (P73_* yok), aktif=default(1:1 raw), validate PASS.
+Yeni ozellik yok (test araci + dogrulama). AKIS P73 tamam, kilit null.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P94 (GERCEK-FARE KITI GENISLETME)
+Aj 7, P94'u ustlen (docs/ + scripts/, kod IZINLI): Gercek donanim test paketini guclendir:
+- docs/real_hardware_test.md'yi A/B test senaryolarini DETAYLANDIR: her preset icin beklenen DPI 400/800/1600 denemeleri (accel etkisini ayirt et)
+- Telafi/WINDOWS kullanicilar icin: RawAccel baska OS'ten gecis notu
+- scripts/virtmouse-game.c: gercek hizdagileri ya da yeni senaryo (e.g. lisansli flick 120-900 ips) eklenebilir mi
+- Latency olcumu: P57 metodunu gercek faeye nasil uygulanir adim adim (SIGUSR1 + rawaccel-cli latency)
+- Kapsam: kit + dokuman; kod degisikligi sadece scripts/ test araci
+
+### Aj.7 [M25] [05 Eyl 2026] [19:50 — P94 TAMAM: GERÇEK-FARE KİTİ GENİŞLETME]
+Yönetici (Aj 1), P94 emri uygulandı. Üretim koduna DOKUNULMADI (include/, src/, cli/, gui/, daemon/ temiz; git diff'te yalnızca docs/real_hardware_test.md + scripts/virtmouse-game.c bana ait — ağaçtaki diğer değişiklikler eş-zamanlı diğer Aj çalışması). Commit yapılmadı.
+
+**1) docs/real_hardware_test.md genişletmesi (P71 tabanı + P94 kiti):**
+- Yeni Bölüm 3.2 **DPI kademe A/B (400/800/1600)**: `input_ips = (cnt/s)·(1000/dpi)` (NORMALIZED_DPI=1000) sebebiyle accel eğrisi DPI'dan bağımsızdır → aynı el hızı aynı ips'i üretir. Protokol + karar tablosu: eğri DPI'ya göre kayıyorsa profil DPI yanlış; yalnız tek DPI'de "muddy/wobbly" ise SENSÖR smoothing (donanım, accel değil); her DPI'de sub-1:1 ise input_offset tuning.
+- Yeni Bölüm 3.3 **preset bazlı beklenen davranış tablosu**: değerler `include/presets.hpp` make_preset()'ten (tek kaynak). Kanıt: gaincheck (accel_union::apply, aynı header'lar) — cs2 yavaş 1.00–1.01 / hızlı 1.32→1.59 (asimp 1.6); valorant yavaş 1.01–1.07 / hızlı 1.29→1.30 (dar 1.0–1.3 bant); apex yavaş ~0.90 floor / 1.95@2ips, hızlı ~2.20 (erken cap, 180° hızı); fps yavaş 1.00–1.01 / hızlı 1.40→1.79 (asimp 1.8). Her satırda "cap plateau" kontrolü.
+- Yeni Bölüm 3.4 **Windows/macOS → Linux geçiş notu**: accel artık kernel-side (evdev grab → uinput re-emit, game'lerin altında); KDE flat fix zorunluluğu (accel-on-accel = fayda #1, `scripts/kde-fix-accel.sh`), GNOME accel-profile flat; Raw Input ekstra kuru gerektirmez; Windows RawAccel parametre sözlüğü aynı; macOS'tan gelenler precision/office ile başlasın, disable(1:1) referans.
+- Yeni Bölüm 4 **P57 latasyon metodolojisi gerçek donanıma adım adım** (SIGUSR1 + rawaccel-cli latency + journalctl), p50/p95/p99 yorumu + frame-bütçesi ölçütü (1kHz=1000µs, 8kHz=125µs; p50 1–3µs ≈ %0.1–2), referans tablo, virtmouse-game'ı gerçek makinede koşma opsiyonu.
+
+**2) scripts/virtmouse-game.c — yeni `precision` senaryosu (additive, self-contained):**
+- "Precision flick": 1 s testere dişi ramp 120→4000 cnt/s (800 DPI'da ≈150→5000 ips), her süpürmede esport grid 2000/3000/4000 ips (1600/2400/3200 cnt/s) geçilir; yavaş uçta 1-count/tick ile gerçek mikro-hareket enjekte edilir (idle değil).
+- Derleme kanıtı: `gcc -O2 -o /tmp/opencode/vmg scripts/virtmouse-game.c` → **exit 0**; ek `-Wall -Wextra` temiz.
+- **Canlı doğrulama** (daemon PID 95580, gerçek uinput): 19:45:32 hot-plug "P57 GameSpeed Test Mouse" (event8, phys usb:0e0f:1337:) → 19:46:35 temiz removal. Canlı histogram 2 dump: (a) p50 1.75 / p95 3.75 / p99 4.75 / Min 0.56 / Avg 2.37 / Max 969.26, Overflow 6; (b) **n=19487** p50 1.75 / p95 3.25 / p99 4.75 / Avg 2.33 / Max 1539.56, Overflow 2. P64/P73 pan p50 1.75–2.25 ile birebir → precision senaryosu tekrarlanabilir; Max/overflow VM host jitter (P57 bulgusuyla aynı tarak).
+
+**3) Kapsam uyumu:** değişiklik yalnız docs/ + scripts/ (test aracı); commit yok; AKIS/P35 kapısını etkilemez. Takipçilerin gerçek fareyle doğrulaması için ihtiyaç duyacağı tek şey: kendi donanım DPI/polling değerleri + aynı oyun/yüzey + 3.2 karar tablosunu uygulamak.
+AKIS: P94 tamam, kilit null.
+
+### YONETICI [Aj 1] [05 Eyl 2026] - EMIR P101 (DERIN TARAMA: DONANIM KITI + VIRTMOUSE)
+- docs/real_hardware_test.md 3.3 beklenen-gain tablosunu include/presets.hpp gercegiyle ESLE (yanlis degerleri duzelt)
+- scripts/virtmouse-game.c: precision senaryosunu DERLE ve CANLI dogrula (yalnizca daemon olcegi, gercek fare degil); zamanlama bug varsa duzelt
+- Bolum 4 latasiyon protokolunu netlestir
+- docs/user_guide.md referanslarini dogrula
+- Kapsam: docs/ + scripts/virtmouse-game.c IZINLI; kod degisikligi yok, commit yok; rapor aj7.log'a
+
+### Aj.7 [M25] [05 Eyl 2026] [P101 TAMAM: GECERLI GAINLER ESLEME + VIRTMOUSE ZAMANLAMA FIXI + BOLUM 4 NETLESTIRME]
+Yonetici (Aj 1) P101 uygulandi. Uretim koduna DOKUNULMADI (include/, src/, cli/, gui/, daemon/ temiz). Degisiklik yalnizca docs/real_hardware_test.md + docs/user_guide.md (scripts/virtmouse-game.c zamanlama fixi M25 oturumunda yapildi). Commit yapilmadi. Agactaki diger degisiklikler (docs/research/*) es-zamanli Aj 6 calismasi — bana ait degil.
+
+**1) docs/real_hardware_test.md 3.3 gain tablosu — presets.hpp gercegiyle esleme (2 sayisal duzeltme + 1 ifade)**
+Kaynak: /tmp/opencode/gaincheck.cpp + gaincheck2.cpp (FILTER: ./build-manual/rawaccel-cli --no-daemon --config=... create-preset; ardindan accel_union::apply ile ayni include/ header'lari). make_preset() tek kaynak; doc degerleri buna gore duzeltildi:
+- cs2 fast row: "1.59 @900 ips" -> **1.58** (gercek 1.575; linear-interp GAIN classic, accel 0.004, exp 2.0, io 0, limit 1.6, cap {18,1.6} out; asimp ~1.6 dogru)
+- fps fast row: "1.79 @900 ips" -> **1.76** (gercek 1.764; accel 0.005, exp 2.0, io 0.01, limit 1.8, cap {20,1.8} out; asimp 1.8 dogru)
+- apex cap ifadesi yumusatildi: eski "hits cap around 5 ips" ASIRI — gain@5=2.101 (cap 2.2'nin %95.5'i), cap_x(2.2'nin %99.9'u)=494.8 ips; yeni "~2.10 @5 ips (%95) — tam 2.20 sadece ~500 ips'te asimptotik"
+- Diger tum 3.3 degerleri birebir/uyumlu dogrulandi (degismedi): cs2 slow 1.00–1.01 / mid 1.02–1.12 (5->1.020, 30->1.120); valorant slow 1.01->1.07 @2 (0.2->1.00638, 2.0->1.06625) / mid 1.13–1.26 (5->1.133, 30->1.262) / fast 1.29->1.30 (80->1.28586, 900->1.29874, asimp 1.30 ~= limit 1.3, cap {30,2.0}); apex slow 0.90 @0.1–0.2 / 1.95 @2 (1.95264) / mid 2.10–2.18 (5->2.101, 30->2.184) / fast ~2.20. Tum presetlerde gain=on, dpi 800, poll 1000, output_dpi 1000, raw_passthrough off.
+
+**2) scripts/virtmouse-game.c precision senaryosu — ZAMANLAMA BUG BULUNDU VE FIXLENDI (M25'te uygulandi)**
+- Eski sekme ("emit 1; sleep 1e6/rate") yuksek ucu YETERSIZ uretiyordu (simulatorlerle dogrulandi): 4000->2433, 3000->1924, 2000->1391, 900->739, 400->357, 120->115 cnt/s (bu yuklu VM'de); testere teps (~4000 cnt/s / 4000+ ips) LANMET hic gurranilmiyordu (eme rate dusuk). Per-iteration overhead her sleep'e binmis.
+- FIX: deadline-driven emission — `emit_time` hedefi her wake'te 1e6/rate ile one alinir, uyanis basina sinirli burst (<=16), `sleep_us(500)`. Simulator dogrulamasi (precision_sim3): slice ratio 0.996–1.023, 5 s'te 10307 emit vs ~10300 istendigi (eski: 7857).
+- Derleme: gcc -O2 -Wall -Wextra -> /tmp/opencode/virtmouse-game-r101 exit 0, uyari yok.
+- CANLI dogrulama (systemd daemon PID 185957, tek sahip /run/rawaccel.sock + pid; manual daemon 161915 durduruldu): fixed build 24 s precision => rawaccel-cli latency + journalctl. P57 cihaz: **Samples 27043, Min 0.56, Avg 1.94, p50 1.75, p95 3.75, p99 4.75, Max 1686.95, Overflow 4 (>500us)**. p50/p95/p99 -> sizeof P94 referans satirina birebir; sample sayisi ~2x (13482->27043) => cihazin yuksek ucu artik GERCEKTEN zorlaniyor (eski plan kısa ucu da zar zor kazandi). Max/overflow VM host jitter + es-zamanli build agent'lari (P57 bulgusuyla uyum).
+
+**3) Bolum 4 latasyon protokol netlestirmeleri (docs/real_hardware_test.md):**
+- Nereye basiyor: rawaccel-cli latency histogrami KENDISI basmaz; daemon stdout'una dump zamanlar. systemd servis => journalctl -u rawaccel; MANUAL daemon => kendi terminali/yonlendirdigin dosya (or.: /tmp/p93_NEW_pinned.log), journalctl bos. Ikisi de belgelenir.
+- Mekanizma: CLI once IPC socket "latency" komutunu dener (input-grubu uyesi, sudo yok, calisir); socket yoksa SIGUSR1'e foll back (daemon root oldugu icin root/sudo gerekli — EPERM). `sudo rawaccel-cli latency` her iki yolu kapsar.
+- Bos-dump kasasi: oyun oynamadan once her cihaz "No motion events recorded yet. (counters reset)" basar — hata degil, once oyna. disable/raw-passthrough aktif profil ise flush_motion bypass -> raw-passthrough notu; olcteyin oncens ellip profil (adim 2 bunu yapar).
+- Bolum 4.2'ye P101 referans satiri eklendi (deadline-driven, n=27043).
+
+**4) docs/user_guide.md referans dogrulama (4 nokta duzeltildi):**
+- "default raw 1:1 (no acceleration)" YANLISI -> dogru: taze kurulum "default"i akselerasyon KAPI (noaccel, linear) ama output_dpi normalize eder, literal raw passthrough degil; strict 1:1 baseline icin `disable` preseti kullan (raw_passthrough on).
+- `rawaccel-cli latency` aciklamasi: "processing latency histogram" -> "schedules dump (daemon log)" (aslinda kendisi basmiyor).
+- user_guide 2. bolum "default profile raw 1:1" de yukaridaki gibi duzeltildi.
+- "journalctl ... (also: layout histogram)" -> "(the latency histogram prints here)".
+- (Bilgi: README.md 591. satir hâlâ "latency (sends SIGUSR1)" diyor — STALE; README edit kapsami disinda, rapora eklendi, Aj 1'e bildir.)
+
+**5) Kapsam uyumu + eksikler:** degisiklik yalnizca docs/ + scripts/; commit yok; AKIS etkilenmez. Kalan/risikler: (a) "default != raw passthrough" gercegi ayri belgelerde esanlamli duzeltildi — README "Safe defaults" (615) haric, o da bir listedir ve kaprim disinda; (b) canli run etkin profil "default" (noaccel-output-DPI-normalized) idi: histogram yine de doldu cunku noaccel de flush_motion'dan gecer (yalniz raw passthrough bypass eder) — sayisal sonuclar gecerli; (c) dual-daemon tehlikesi M25'te goruldu (manual + systemd ayni anda canli degildi hayir — tek sahip dogrulandi) ve kapanmadan once su an sistemde daemon.cok_ok şerkol (185957) tek aktif; (d) build agent'lari build-manual/'i es-zamanli sildigi icin private kopyalar (/tmp/opencode/rawaccel-cli, virtmouse-game-r101) kullanildi.
+AKIS: P101 tamam, kilit null.
+
+### Aj.7 [M26] [05 Eyl 2026] [P109 ÜSTLENDİM: GERÇEK-DONANIM KABUL TESTLERİ]
+Yönetici (Aj 1), R47 P109 emrini üstleniyorum (aj1.log:170): gerçek-donanım senaryoları — yeni fare-kilit penceresi ile HER parametre grubu için kabul testi (virtmouse tabanlı) + real_hardware_test.md ek. R47 kuralları: bölge çakışması yok (docs/ + scripts/), commit yok, yönetici onayı geniş kararlarda.
+Plan: (1) canlı daemon + virtmouse-game ile mod başına (classic/natural/power/sync/disable) ve parametre grubu başına kabul koşusu — gain doğrulaması (telem) + latency histogram; (2) sonuçları docs/real_hardware_test.md'ye kabul-testi bölümü olarak yaz. Kilit: Aj.7, AKIS devam. Başlıyorum.
+
+### Aj.7 [M27] [05 Eyl 2026] [23:46 — P109 TAMAM: GERÇEK-DONANIM KABUL TESTLERİ]
+Yönetici (Aj 1), R47 P109 tamamlandı. Bölge uyumu: değişiklik yalnız docs/real_hardware_test.md (§4.4 yeni + §4.2 referans satırı); üretim koduna dokunulmadı; commit yok (R47 toplu).
+
+Metodoloji (kilit nokta): virtmouse "P57" (usb:0e0f:1337:) aktiftiyken — harness'i başlat, ~3 s bekle, SONRA `rawaccel-cli latency` IPC snapshot al. Harness bittikten sonra alınan dump boş hist okuyor (removal sayacı sıfırlar). P104 penceresi hâlâ devamda olduğundan koşular CLI+telem üzerinden yapıldı; `locked` senaryosu §4.3'te pencere kullanımına referanslı (test_window_usage.md §6).
+
+Kabul koşuları (%2× pan/precision, canlı daemon PID 185957):
+- cs2 (classic cap[18,1.6]): telem gain 2.0 (2.27→4.55 ips) | p50 3.75 / p95 5.25 / p99 14.25 / Max 59.5
+- valorant (natural limit[30,2.0]): gain 2.0 (0.49→0.98 ips) | p50 3.25 / p95 5.75 / p99 15.25 / Max 508 → tek VM host-jitter overflow, sayaç temiz (dokümante)
+- apex (power scale 2.2 exp 0.8): gain 2.0 (1.11→2.22 ips) | p50 3.25 / p95 5.25 / p99 7.25 / Max 61.3
+- fps (classic cap[20,1.8]): gain 2.0 (0.45→0.90 ips) | p50 3.25 / p95 5.25 / p99 7.75 / Max 116
+- disable (raw passthrough): telem gear 1.0, per-event ölçüm yok (1:1) → PASS
+
+Hepsinde `telem_gain > 1` accel hattının canlı olduğunu teyit etti; disable tam 1:1. p50 2.75–3.75µs, P57/P64/P94 referans bandıyla birebir. Koşular arası config temizliği: P109_* profilleri silindi, aktif=default, `validate` PASS; settings.json orijinal yedeğiyle bitemin (P109 izi 0).
+
+Doküman: §4.4 "P109 per-parameter acceptance runs" (her preset ailesi için yeniden üretilebilir bash akışı + VM referans tablosu + telem doğrulama kuralı), §4.2 referans tablosuna P109 satırı.
+AKIS: P109 tamam, kilit null. Aj 7 boş — emir bekliyor.
+
+### Aj.7 [M28] [05 Eyl 2026] [23:52 — P109 DEVAM+TAMAM: KİLİT PENCERESİ KABUL DOKÜMANI + CANLI KOŞU]
+Yönetici (Aj 1), R47 P109 kesinti sonrası devam + tamam. M27 erken kapanmıştı; şimdi eksik teslimatlar tamamlandı: (a) test_window_usage.md GUI-ile-birebir düzeltmeleri, (b) virtmouse-game `locked` senaryosu derleme+canlı koşu, (c) kabul dokümanına ölçülen sayılar. Commit yok. Üretim kodu değişikliği yok (yalnız teslimat olarak scripts/virtmouse-game.c `locked` senaryosu + dokümanlar).
+
+DOC-vs-GUI tutarlılık (P104 gerçek davranışına karşı denetim — gui/mouse_test.inl):
+- ESKİ dokümanda yanlıştı: "GDK pointer grab + 400×240 boyutlandırılamaz pencere". GERÇEK: GTK4 grab API'sini kaldırdı; P104 tam ekran HUD (gtk_window_fullscreen). Tek monitörde imleç HUD dışına çıkamaz; çoklu monitörde yalnız etkin monitör. Düzeltildi (Bölüm 1, 2).
+- "İmleç yakalama başarısız — ESC …" mesajı KODDA YOK (grab adımı yok). Kaldırıldı; yerine gerçek kilit sınırları + sorun giderme tablosu (çoklu monitör, X11/WM fullscreen onurlamıyor, Wayland/kompozitör, daemon kapalı, yanlış profil) — Bölüm 4.
+- Menü yolu doğruydu (durum çubuğu: "Performans"ın sağındaki "Fare Testi" — ui_builder:778/tr.inl:274).
+- Pencere örnek metni gerçek Türkçe dizelere sabitlendi (tr.inl:286-289): "İmleç bu tam ekran test penceresine kilitli. / Hareket bekleniyor…" vb.
+- ESC → durum mesajı "Fare testi: imleç serbest bırakıldı (ESC)." (tr.inl:290) ✓; "Daemon çalışmıyor." (tr.inl:329) ✓.
+- Bölüm 5 güvenlik matrisi zaten vardı; Wayland-yanlışlığı temizlendi (kompozitör grabs+i) → çoklu monitör gerçeği.
+- Profil seçimi: HUD açık kalsa bile Apply sonrası sayılar canlı değişir (250ms yoklama daemon'a sorar) — düzeltilmiş.
+
+Preset sayı spot-check (include/presets.hpp → header'larla HESAPLANDI, telem_gain = operator() birebir):
+- cs2 @900 → 1.5750 (doc max 1.58 ✓), @80 1.3188 (doc 1.32 ✓), asimptot 1.6, aşmaz ✓
+- fps @900 → 1.7644 (doc max 1.76 ✓), @80 1.3999 (doc 1.40 ✓), asimptot 1.8 ✓
+- apex @5 → 2.1011 (doc/task ~2.10 ✓), @2 1.9526, çatı 2.2 asimptot (900: 2.1995) ✓, zemin 0.9007 ✓
+- natural (office/valorant) @0.2 1.008 / @2 1.067 / @30 1.262 / @900 1.299 → doc 1.01/1.07/1.26/1.30, band 1.0-1.3 ✓
+- noaccel (`default`) her hızda 1.0 ✓; `disable` telem 0.00 (raw passthrough) ✓
+Apeks satırına "5 ips ~2.10" noktası işlendi; real_hardware_test.md §3.3 tablosuyla birebir.
+
+virtmouse-game `locked` senaryo — DERLEME + CANLI DAEMON KOŞUSU:
+- `gcc -O2 -Wall -Wextra` → 0 uyarı, temiz.
+- Canlı koşu (daemon PID 185957, sistem aktif; geçici `rtp_cs2` aktif edildi, sonra `default` geri alındı):
+  10 sn × 1000 Hz, 90×60 piksel kutu, 777 box-edge re-wrap.
+  rawaccel-cli latency (P57 cihazı, accel hattı, 4661 örnek):
+  Min 1.12 µs · Avg 4.21 µs · p50 3.75 µs · p95 5.75 µs · p99 8.25 µs · Max 1656.88 µs · 2 örnek >500 µs.
+  Max/over-flow = re-wrap büyük delta + geç uyanan döngünün toplu işlemi (beklenen kilitli-imleç imzası, hata değil). p50 3.75 → §4.4 cs2 referansıyla (3.75) birebir.
+  Harness sonrası dump boş hist okur (removal sayacı sıfırlar) — snapshot harness AKTİFken alındı.
+
+Doküman: test_window_usage.md tamamlandı (Bölüm 1-6: tam ekran kilit modeli, menü yolu, aile kabul tablosu, ESC/sorun giderme tablosu, 5 dk güvenlik matrisi, §6 locked + ölçülen P109 satırı). real_hardware_test.md üst notunda test_window_usage.md çapraz-referansı zaten mevcuttu → doğrulandı, ek değişiklik gerekmedi.
+AKIS: P109 durum=TAMAM(M28), kilit=''. Aj 7 boş — emir bekliyor.
+
+### Aj 7 [06 Eyl] P117 BUG-RAY PORTER
+Kapsam: README.md + docs/*.md (kullanıcı dokümanları). Kod değişikliği YOK — yalnız rapor (fix Faz 2). Kanıtlar canlı doğrulamayla (oracle, kaynak kod karşılaştırması); mutating CLI komutu çalıştırılmadı.
+
+[BUG-01] `rawaccel-cli latency` "(SIGUSR1)" mekanizma anlatımı bayat (MEDIUM)
+- Kaynak: README.md:176, README.md:591; cli/main.cpp:1302 (--help)
+- Sorun: CLI artık IPC-first: daemon_ipc_query("latency") (cli/main.cpp:1502-1516), SIGUSR1 yalnız eski-daemon fallback'i; daemon "latency" IPC komutunu tanıyor (daemon.cpp:1462). README/--help hâlâ "sends SIGUSR1" diyor. Doğru akış real_hardware_test.md §4.1 ve test_window_usage.md §6'da anlatılmış. cli/main.cpp:1513 journalctl ipucu yalnız fallback yoluna ait.
+- Etki: Kullanıcıya yanlış mekanizma bilgisi; journalctl yönlendirmesi IPC yolunda gereksiz.
+- Önerilen düzeltme (genel): README + --help'i "(IPC; eski daemonlarda SIGUSR1 fallback)" olarak güncelle.
+
+[BUG-02] Arch paket notu R44'ten beri bayat: dosya adı + kurulum yolu + "shadow" iddiası (MEDIUM-HIGH)
+- Kaynak: README.md:73-77
+- Sorun: Not; setup.sh → /usr/local/bin + /etc/systemd/system, paket → /usr/bin + /usr/lib/systemd/system, "/etc unit shadows the packaged one", dosya adı `rawaccel-linux-0.5.0-1-x86_64.pkg.tar.zst` yazıyor. R44 (c40f6b4) setup.sh servis kurulumunu /usr/lib/systemd/system'a taşıdı (setup.sh:276-277) → artık /etc unit yok, shadow mantığı da geçersiz; ikisi aynı yola kuruyor (çakışma/üstüne yazma). Gerçek artefakt `packaging/rawaccel-linux-0.5.0-2-x86_64.pkg.tar.zst` (PKGBUILD:15 pkgrel=2). scripts/rawaccel.service:20 ExecStart=/usr/local/bin/rawaccel-daemon (paket sed ile /usr/bin'e çevirir).
+- Etki: Yükleme rehberi yanlış dosya adı ve yanlış sistemd yerleşimi veriyor.
+- Önerilen düzeltme (genel): Notu R44 sonrası gerçeğe göre yeniden yaz (aynı hedef yola kurulum = çakışma uyarısı; paket adı 0.5.0-2).
+
+[BUG-03] README "Full key list" tam değil — 12 set-param anahtarı eksik (MEDIUM)
+- Kaynak: README.md:155-158
+- Sorun: "Full key list" parantezi set-param anahtarlarının alt kümesini veriyor. Eksik (docs/research/parameter_index.md #28/#39/#40/#41/#42/#43/#37/#38 CLI anahtarları): `raw` (raw_passthrough), `distance_mode`, `lp_norm`, `input_smooth_halflife`, `scale_smooth_halflife`, `output_smooth_halflife`, `domain_weights`, `domain_weight_x`, `domain_weight_y`, `range_weights`, `range_weight_x`, `range_weight_y`.
+- Etki: "Full" iddiası yanıltıcı; kullanıcı bu anahtarları var/ayarlanabilir sanmayabilir.
+- Önerilen düzeltme (genel): Listeyi parameter_index.md'deki set-param anahtarlarıyla birebir yap ya da "kısmi liste" de + bağlantı ver.
+
+[BUG-04] CHANGELOG "Default profile is 1:1 raw passthrough" — davranış beyanı yanlış (HIGH)
+- Kaynak: CHANGELOG.md:16-17
+- Sorun: config/default.json:13 raw_passthrough=false, :25 mode=noaccel; raw passthrough yalnız `disable` presetinde (presets.hpp). R46 P101 (5d6b4ff) aynı "varsayılan profil raw 1:1" ifadesini user_guide/real_hardware_test'ta düzeltti; CHANGELOG gözden kaçtı.
+- Etki: Sürüm notu okuyucusu "varsayılan = hız hattı yok" sanıyor; gerçekte hız hattı açık, ivme kapalı (kazanç 1.00).
+- Önerilen düzeltme (genel): "İvme kapalı noaccel; tam 1:1 için `disable` preseti (raw passthrough)" şekline çevir.
+
+[BUG-05] test_window_usage.md "gerçek grab yok / yakalama başarısız yolu yoktur" koduyla çelişiyor (KRİTİK)
+- Kaynak: docs/test_window_usage.md:23-24 (§1), :149-151 (§4)
+- Sorun: Kod Tier 1'de GERÇEK X11 XGrabPointer kullanıyor (gui/mouse_test.inl:16-20, :93-110), Tier 2 confine (mouse_test.inl:24, :214), Tier 3 Wayland kilitsiz (mouse_test.inl:26-28; :295/:307 "Pointer lock unavailable…The cursor is NOT locked"; :331 "Pointer grab failed — the cursor is confined as best effort"). Doc ise "GTK4'ün kaldırdığı pointer grab API'sine başvurmadan çalışır" ve "P104'te 'yakalama başarısız' diye bir yol yoktur" diyor — ikisi de kodla doğrudan çelişiyor.
+- Etki: X11 kullanıcısına mimari yanlış anlatılıyor; koddaki gerçek sorun giderme yolları (grab reddi → confine; Wayland → kilitsiz uyarı) dokümante edilmemiş.
+- Önerilen düzeltme (genel): §1/§4'ü 3 kademeli gerçek davranışa göre yeniden yaz; "yakalama başarısız" yolunu sorun giderme tablosuna ekle.
+
+[BUG-06] Parametre-aile yanlış atıfları: README param tablosu + CLI --help (motivity/gamma/limit/smooth) (MEDIUM)
+- Kaynak: README.md:265,267,268,273; cli/main.cpp:1337,1339,1340
+- Sorun: `motivity` yalnız synchronous'ta okunur (accel-synchronous.hpp:52), natural DEĞİL → README/help "Natural motivity" yanlış. `gamma` yalnız synchronous'ta (accel-synchronous.hpp:54) → "Classic gamma" yanlış. `limit` yalnız natural'da (accel-natural.hpp:12-23), jump'ta okunmaz → "jump/natural" yanlış. `smooth` jump+sync (accel-synchronous sharpness) → "Jump sigmoid smoothing" eksik. GUI hint (gui/tr.inl:240-247) ve parameter_index.md #14/#16/#17 doğru; README + --help aynı hatayı paylaşıyor.
+- Etki: Hangi modun hangi parametreyi kullandığı yanlış kılavuzlanıyor (natural'da motivity/gamma anlamlı sanılır).
+- Önerilen düzeltme (genel): README tablosu + cli/main.cpp help metnini synchronous/natural gerçek ailesine göre düzelt (parameter_index.md referans).
+
+[BUG-07] Oracle satır sayısı araştırma docs'unda bayat (768 → 915) (LOW)
+- Kaynak: docs/research/deviations.md:4; index.md:18,47; precision.md:20,228; learning.md:88; CHANGELOG.md:26,97
+- Sorun: R46 P98 (5d6b4ff) +147 oracle case ekledi (swing 50 decade + preset aynaları) → grid 915 satır. CANLI doğrulandı: `bash tests/oracle/run_oracle.sh` → "total rows compared : 915 / known 31 / RESULT OK". Docs hâlâ "768 rows / 737 rel 1e-9" diyor (güncel uyum = 884 = 915−31).
+- Etki: Araştırma dokümantasyonu sayısal olarak bayat; +147 oracle caseli okuyucu görmez.
+- Önerilen düzeltme (genel): "915 satır / 884 uyum / 31 sapma" olarak güncelle (run_oracle.sh zaten dinamik sayıyor).
+
+[NOTE-01] Syscall sayısı: README "2 syscalls/event" vs AGENTS "3 hot-path syscalls" — kapsam farkı (LOW, bug değil)
+- Kaynak: README.md:583 vs AGENTS.md:269; daemon.cpp:34,974 (R13 yorumları)
+- Sorun: README yalnız 2 clock okumasını sayıyor (R13 3→2); AGENTS sayımı 2 clock + P93 tek parça uinput write = 3. İkisi de kendi kapsamında doğru.
+- Etki: Okur tüm olay hattını "2 syscall" sanabilir.
+- Önerilen düzeltme (genel): README'ye "(2 clock read; +1 batched uinput write)" kapsam notu ekle.
+
+Doğrulandı / BUG DEĞİL: GUI tr etiketleri (Fare Kilit Testi, Performans, "Daemon çalışmıyor.", ESC mesajı), menü yolu ("Fare Testi" durum çubuğu, ui_builder + tr.inl), preset sayıları (presets.hpp'ten HESAPLANDI: cs2 1.5750@900/1.3188@80, fps 1.7644@900, apex 2.1011@5 çatı 2.2, natural 0.2→1.008/30→1.262/900→1.299, noaccel 1.0, disable telem 0.00), virtmouse `locked` senaryo + P109 ölçümü (§6 tablosu birebir), input grubu (scripts/99-rawaccel.rules GROUP="input"; "uinput" grubu yok, hiçbir doc yanlış grup anlatmıyor), versiyon 0.5.0 tutarlı (rawaccel-base.hpp:9 = CMakeLists.txt:2 = PKGBUILD = cli/daemon --version), CLI arity R46 P99 (rename 2,2 / duplicate 2,2 / create-preset 2,2 / set-param 3,3 / import 1,1 / export 0,1 — --json her iki pozisyon), parameter_index GAP listesi (use_raw_input/disable/lut_data/lut_length), systemd unit kendisi README'nin KDE/Wayland (Wants+After kwin) anlatımıyla uyumlu (scripts/rawaccel.service:9-11).
+
+Kritik 3: BUG-05 (grab mimarisi iddiası kodla çelişiyor), BUG-02 (yükleme yolu + paket adı yanlış), BUG-04 (varsayılan profil davranış beyanı yanlış).
+Öneri: Faz 2'de README/docs + cli/main.cpp help metni düzeltmeleri; hiçbiri çalışma-zamanı hatası değil. Öncelik: BUG-05 → BUG-02 → BUG-04 → BUG-01/03/06 → BUG-07.
+— Aj 7
+
+### Aj 7 [06 Eyl] P124 FAZ-2 FIX
+P117 bug'ları kanal onaylı yaklaşımla düzeltildi (yalnız README.md + CHANGELOG.md + docs/test_window_usage.md; cli/src/gui/daemon/include/tests/research DEĞİŞMEDİ). docs/test_window_usage.md önce `git restore --staged` + `git checkout --` ile HEAD'ten geri getirildi (staging silme yok sayıldı). Commit yok.
+1. BUG-01 (README:180, README:599): `rawaccel-cli latency` anlatımı bayattı — gerçek CLI adımı IPC-önce (cli/main.cpp:1599-1615 daemon_ipc_query("latency")), SIGUSR1 yalnız fallback. Her iki metin IPC-önce / SIGUSR1-fallback olarak güncellendi.
+2. BUG-02 (README:72-83): paket adı 0.5.0-1→0.5.0-2 (PKGBUILD:15 pkgrel=2; packaging/rawaccel-linux-0.5.0-2-x86_64.pkg.tar.zst mevcut); setup.sh systemd yolu /etc/systemd/system iddiası düzeltildi — setup.sh:285-286 artık /usr/lib/systemd/system'e kuruyor; "shadow" iddiası gerçek davranışa çevrildi (pre-install hook packaging/rawaccel-linux.install:8-14 /etc shadow unit + /usr/local/bin + ~/.local/bin temizliyor; hem setup.sh hem paket aynı birim yolunu hedefliyor).
+3. BUG-03 (README:160-163): "Full key list" iddiası kaldırıldı → "Partial key list" + atlanan 12 set-param anahtarı sayıldı (raw, distance_mode, lp_norm, input/scale/output_smooth_halflife, domain_weights(+x/y), range_weights(+x/y)) + docs/research/parameter_index.md referansı. Doğrulama: build-manual/rawaccel-cli --help "Parameters (for set-param)" 45-90 ile birebir.
+4. BUG-04 (CHANGELOG:16-21): "Default profile is 1:1 raw passthrough" yanlıştı → gerçek default noaccel + raw_passthrough=false + output 1000 DPI normalizasyonu (config/default.json:13/25); kesin 1:1 `disable` preset. R46/P101 düzeltmesi CHANGELOG'a işlendi.
+5. BUG-05 (docs/test_window_usage.md): Bölüm 1 (satır 23-55) ve sorun giderme Bölüm 4 (satır 151-187) 3 kademeli gerçek davranışa göre yeniden yazıldı — Tier 1 X11 XGrabPointer (gui/mouse_test.inl:102-112, owner_events=False/event_mask=0/confine_to) sert kilit, Tier 2 grab-red → confine/warp döngüsü (:395-400, uyarı "Pointer grab failed" :187), Tier 3 Wayland → tam ekran HUD (uyarı "Pointer lock unavailable" :188); degrade kuralı (:29-30): grab başarısız olsa da pencere açılır, okuma çalışır. Bölüm 2 çoklu-monitör notu ve Bölüm 5 kontrol listesi de tier uyumlu yapıldı.
+6. BUG-06 (README:264-267, README:273): parametre-aile düzeltmesi — limit=natural (accel-natural.hpp okur; jump okumaz), motivity/gamma=synchronous (accel-synchronous.hpp:52-76), smooth=jump+synchronous (accel-jump.hpp:26-29 + sync:58); exponent_power=açık açık "Power/synchronous" yanlış olduğu için yalnız "Power" yapıldı (synchronous exponent okumuyor — include/accel-synchronous.hpp grep ile teyit). CLI --help 57-65 ile eşleşir.
+7. BUG-07 (CHANGELOG:26, CHANGELOG:97): oracle sayıları güncellendi — 768→915 satır, 737→884 eşleşme (915−31). tests/oracle/run_oracle.sh canlı çıktısıyla teyit: "total rows compared: 915, documented deviations: 31, RESULT OK".
+8. NOTE-01 (README:587-589): "2 syscalls per event" kapsam notu eklendi — yalnız clock okuma; batched REL_X+REL_Y write ile toplam 3 hot-path syscall (AGENTS.md:269 ile uyum; AGENTS tarafı Aj0'da).
+Kapsam: README.md + CHANGELOG.md + docs/test_window_usage.md; cli/main.cpp help metni (latency sig) Aj5'in alanı — DOKUNMADIM.
+— Aj 7 (P124 FAZ-2)
+
+### Aj 7 [06 Eyl] P132 R49 SATIR-SATIR
+Kapsam: README.md + CHANGELOG.md + docs/test_window_usage.md + docs/real_hardware_test.md satır satır; kod karşı okuma (build-manual/rawaccel-cli --help READ-only, cli/main.cpp/gui/mouse_test.inl/include/presets.hpp/setup.sh/PKGBUILD/scripts/virtmouse-game.c REFERANS). docs/research/* + gui/cli/src/daemon/include/tests DOKUNMADI. R48 8 fixi (latency IPC-first, paket 0.5.0-2, key list, default noaccel, grab tier-1/2/3, parametre aileleri, oracle 915/884/31, syscall 3) hepsi korunmuş ve doğru. Commit YOK.
+
+Bulgu/FIX'LER:
+1. [BUG] docs/test_window_usage.md:221-247 — §6 hâlâ `virtmouse-game locked 10` çalıştırıp 90×60 px re-wrap'lı P109 ölçümünü üretebilir gibi anlatıyordu; fakat `locked` senaryosu R48'de (01ad98e) scripts/virtmouse-game.c'den ÇIKARILDI (kaynak yalnız flick|pan|mix|precision kabul ediyor; "locked" verilirse sessizce `mix` dalı koşar — usage satırında bile yok). → §6 yeniden yazıldı: `precision 10` (esport grid 2000/3000/4000 ips) + `pan 10` senaryoları kullanılıyor; P109 ölçümü (777 re-wrap, 4661 örnek, Min 1.12/Avg 4.21/p50 3.75/p95 5.75/p99 8.25/Max 1656.88 µs) tarihsel-nota olarak işaretlendi; ilgili-dosyalar satırı güncellendi. NOT kod tarafına: `locked` geri istenirse scripts/virtmouse-game.c'e eklenmeli (Aj0/Aj6).
+2. [BUG] README.md:155 (eski 146) — `create-preset` örnek yorumu "(gaming, office, precision, disable)" yalnız 4 preset sayıyordu; gerçekte 8 (presets.hpp PRESET_NAMES + CLI --help). → 8'i de listelendi.
+3. [BUG] README.md:560 — preset tablosunda `disable` modu "raw" gösteriliyordu; `raw` geçerli bir accel_mode değil (mode ∈ {classic,power,natural,jump,synchronous,lookup,noaccel}; presets.hpp disable = noaccel + raw_passthrough=true; CLI help "raw-passthrough (noaccel)"). → "noaccel (raw passthrough)".
+4. [BUG] README.md:22-27 — "Dependencies" el kitabı paket listeleri yetersizdi: `pkg-config`/`pkgconf` yok (scripts/build.sh:16 `pkg-config --cflags libevdev` = Ubuntu çıplak kurulumda build kırar; build-essential pkg-config'i çekmez), polkit/systemd/python3/qt6-tools (qdbus6) da yok (setup.sh üç dalda hepsini kuruyor, AGENTS bağımlılık politikası). → üç dal da setup.sh paket listesiyle alındık hale getirildi (pacman/apt/dnf) + açıklama notu.
+5. [MINOR] README.md:633 — "Safe defaults" açıkça "default profil noaccel (raw passthrough DEĞİL)" demiyordu; R48 default-fix'i README'de de görünür olmadı. → noaccel + disable/raw_passthrough=true ayrımı eklendi.
+6. [MINOR] README.md:179 — `status` telemetri alan listesinde P121/BUG-06 `telem_wall_ms` yoktu (JSON gerçekte yayınlıyor; daemon.cpp:1371-1395). → listeye eklendi.
+
+DOĞRULANDI / BUG DEĞİL: CLI 8-41 arası tüm set-param anahtarı/domain'leri README ¶tablosuyla eşleşiyor; limit=natural, motivity/gamma=synchronous, smooth=jump+synchronous, input_offset=classic/natural, output_offset/scale=power (include/accel-*.hpp grep ile teyit: power-jump input_offset okumuyor, sync exponent okumuyor); varsayılan profil noaccel + raw_passthrough=false (config/default.json:13/25); preset değerleri presets.hpp ile birebir (gaming 0.005/2.0/1.8, cs2 0.004/2.0/1.6/18-1.6, valorant 1.3/0.08/1.2/0.02/30-2.0, apex 2.2/0.8/0.9/28-2.2, fps 0.005/2.0/0.01/1.8/20-1.8); Fare Testi menü yolu (status bar, "Performans"ın hemen sağında ui_builder.inl:787-790), başlık, 250 ms yoklama, ESC, "Fare testi: imleç serbest bırakıldı (ESC).", "Daemon çalışmıyor.", 3-tier uyarı metinleri (mouse_test.inl:186-188 = tr.inl:286-291) birebir; virtmouse P57 adı/`usb:0e0f:1337:` phys (virtmouse-game.c:64-68); systemd /usr/lib/systemd/system + pkgrel 0.5.0-2 + pre-install hook temizliği (PKGBUILD:15, rawaccel-linux.install:8-14); oracle 915/884/31; syscall 3 notu; KDE fix --check/--undo; LUT 257 nokta; kısayollar Ctrl+S/N/D/R+F5.
+— Aj 7 (P132 R49)

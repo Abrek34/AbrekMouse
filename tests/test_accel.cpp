@@ -109,6 +109,36 @@ static std::regex  g_filter_regex;
     } \
 } while(0)
 
+// ── Yardımcı: koşu başına ayrı geçici dizin (T4/T5) ──────────────────────────
+//
+// Bu dosya tarihsel olarak SABİT /tmp/... yollarına yazıyordu. İki `run_tests.sh`
+// kopyası eşzamanlı koşunca aynı dosyaya yazıyor; biri diğerinin dosyasını
+// `std::remove()` ile SİLİNCE, öteki guardsız bir `load_config` çağrısında
+// "Cannot open config file" alıp süreci SIGABRT ile düşürüyordu. Ölçüldü:
+// 3 kopya × 3 denemede 6/9 koşu rc≠0. Paylaşılan kaynak sayısı: 42 sabit
+// /tmp yolu + paylaşılan build-manual/ (ETXTBSY) + /dev/shm fixture'ı.
+//
+// `run_tests.sh` artık koşu başına `TMPDIR=$(mktemp -d)` dışa aktarıyor; `mktemp`
+// zaten TMPDIR'a baktığı için oradaki 14 `mktemp` çağrısı da kendiliğinden
+// yönleniyor. `tmp_path()` aynı dizini okur, böylece hiçbir testin *anlamı*
+// değişmeden yalnızca dosya konumu koşuya özgü olur.
+//
+// GERİYE UYUMLULUK (PC ile ölçüldü): TMPDIR verilmediğinde tmp_path("a.json")
+// TAM OLARAK "/tmp/a.json" döner — eski davranışın birebir aynısı, yani elle
+// `./test_accel` çalıştıran da eskisi gibi /tmp'ye yazmaya devam eder. Tek
+// fark: son bileşende '/' varsa normalize edilir (yoksa çift '/' oluşurdu).
+static std::string tmp_dir() {
+    const char* t = std::getenv("TMPDIR");
+    std::string d = (t && *t) ? std::string(t) : std::string("/tmp");
+    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    std::error_code ec;            // /tmp zaten var; hata önemsiz
+    std::filesystem::create_directories(d, ec);
+    return d;
+}
+
+/// "/tmp/<name>" → "$TMPDIR/<name>"; TMPDIR verilmemişse "/tmp/<name>".
+static std::string tmp_path(const char* name) { return tmp_dir() + "/" + name; }
+
 // ── Yardımcı: varsayılan accel_args ile belirli alanları geçersiz kıl ─────────
 
 static accel_args make_args(accel_mode mode) {
@@ -131,7 +161,7 @@ static accel_args make_args(accel_mode mode) {
 
 static void test_logitech_receiver_discovery() {
     SECTION("Logitech receiver discovery — capability classification");
-    const std::string root = "/tmp/rawaccel_receiver_fixture";
+    const std::string root = tmp_path("rawaccel_receiver_fixture");
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root + "/1-3");
     std::filesystem::create_directories(root + "/2-1");
@@ -444,7 +474,7 @@ static void test_logitech_hidpp_packets() {
 
 static void test_logitech_hidraw_discovery() {
     SECTION("Logitech hidraw device discovery");
-    const std::string root = "/tmp/rawaccel_hidraw_fixture";
+    const std::string root = tmp_path("rawaccel_hidraw_fixture");
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
 
@@ -1759,7 +1789,7 @@ static void test_file_roundtrip() {
     cfg.profiles.push_back(dp2);
 
     // Geçici dosyaya kaydet
-    std::string tmp = "/tmp/rawaccel_test_roundtrip.json";
+    std::string tmp = tmp_path("rawaccel_test_roundtrip.json");
     save_config(cfg, tmp);
 
     // Yeniden yükle
@@ -1782,7 +1812,10 @@ static void test_file_roundtrip() {
 static void test_save_config_relative_path() {
     SECTION("BUG-22 — save_config supports bare relative filenames");
 
-    char tmpl[] = "/tmp/rawaccel_rel_XXXXXX";
+    // mkdtemp() writes into the buffer, so it cannot stay a string literal —
+    // the prefix now comes from tmp_dir() like every other path in this file.
+    char tmpl[4096];
+    snprintf(tmpl, sizeof tmpl, "%s/rawaccel_rel_XXXXXX", tmp_dir().c_str());
     char* dir = mkdtemp(tmpl);
     EXPECT(dir != nullptr);
     if (!g_section_active || !dir) return;
@@ -2313,7 +2346,7 @@ static void test_config_error_paths() {
 
     // ── bozuk JSON → load_config exception fırlatmalı ─────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_bad.json";
+        std::string tmp = tmp_path("rawaccel_test_bad.json");
         { std::ofstream f(tmp); f << "{ not valid json !!!"; }
         bool threw = false;
         try { load_config(tmp); } catch (...) { threw = true; }
@@ -2324,14 +2357,14 @@ static void test_config_error_paths() {
     // ── var olmayan dosya → exception ────────────────────────────────────
     {
         bool threw = false;
-        try { load_config("/tmp/rawaccel_nonexistent_XXXXX.json"); }
+        try { load_config(tmp_path("rawaccel_nonexistent_XXXXX.json")); }
         catch (...) { threw = true; }
         EXPECT(threw);
     }
 
     // ── eksik alanlar → varsayılan değerler korunmalı ─────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_minimal.json";
+        std::string tmp = tmp_path("rawaccel_test_minimal.json");
         { std::ofstream f(tmp); f << R"({"profiles": [{"name": "x"}]})"; }
         app_config cfg = load_config(tmp);
         EXPECT(!cfg.profiles.empty());
@@ -2393,7 +2426,7 @@ static void test_input_validation() {
 
     // ── DPI clamping via JSON load ────────────────────────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_validation.json";
+        std::string tmp = tmp_path("rawaccel_test_validation.json");
         { std::ofstream f(tmp); f << R"({
             "profiles": [{
                 "name": "v",
@@ -2410,7 +2443,7 @@ static void test_input_validation() {
 
     // ── rotation normalisation ────────────────────────────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_rot.json";
+        std::string tmp = tmp_path("rawaccel_test_rot.json");
         { std::ofstream f(tmp); f << R"({
             "profiles": [{"name":"r","profile":{"degrees_rotation":720}}]
         })"; }
@@ -2422,7 +2455,7 @@ static void test_input_validation() {
 
     // ── snap angle clamp ──────────────────────────────────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_snap.json";
+        std::string tmp = tmp_path("rawaccel_test_snap.json");
         { std::ofstream f(tmp); f << R"({
             "profiles": [{"name":"s","profile":{"degrees_snap":90}}]
         })"; }
@@ -2433,7 +2466,7 @@ static void test_input_validation() {
 
     // ── speed_max >= speed_min ────────────────────────────────────────────
     {
-        std::string tmp = "/tmp/rawaccel_test_speed.json";
+        std::string tmp = tmp_path("rawaccel_test_speed.json");
         { std::ofstream f(tmp); f << R"({
             "profiles": [{"name":"sp","profile":{"speed_min":10,"speed_max":5}}]
         })"; }
@@ -2473,7 +2506,7 @@ static void test_input_validation() {
 static void test_multi_profile_roundtrip() {
     SECTION("multi-profile config — save/load/active_profile integrity");
 
-    std::string tmp = "/tmp/rawaccel_test_multiprof.json";
+    std::string tmp = tmp_path("rawaccel_test_multiprof.json");
 
     // Build a config with 3 profiles
     app_config cfg_out;
@@ -2549,27 +2582,27 @@ static void remove_tmp_leftovers(const std::string& base_path) {
 static void test_atomic_write() {
     SECTION("atomic config write — no .tmp file left after successful save");
 
-    std::string tmp_path = "/tmp/rawaccel_test_atomic.json";
+    std::string atomic_path = tmp_path("rawaccel_test_atomic.json");
     // N-15: save_config names the temp file with a pid suffix
     // (path.<pid>.tmp), so a bare "<path>.tmp" assertion could never detect a
     // real leftover.  Glob path.*.tmp to catch a leftover from any pid.
-    remove_tmp_leftovers(tmp_path);
+    remove_tmp_leftovers(atomic_path);
 
     app_config cfg;
     device_profile dp; dp.name = "atomic_test";
     cfg.profiles.push_back(dp);
 
-    save_config(cfg, tmp_path);
+    save_config(cfg, atomic_path);
 
     // No .tmp (any pid suffix) may exist after a successful save
-    EXPECT(tmp_leftover_count(tmp_path) == 0); // tmp files gone (renamed to final)
+    EXPECT(tmp_leftover_count(atomic_path) == 0); // tmp files gone (renamed to final)
 
     // Final file must exist and be valid JSON
-    app_config reloaded = load_config(tmp_path);
+    app_config reloaded = load_config(atomic_path);
     EXPECT(!reloaded.profiles.empty());
     EXPECT(reloaded.profiles[0].name == "atomic_test");
 
-    std::remove(tmp_path.c_str());
+    std::remove(atomic_path.c_str());
 }
 
 // ── Test 23: profile_from_json / profile_to_json IPC round-trip ──────────────
@@ -3401,7 +3434,7 @@ static void test_cfg_p54_guards() {
 
     SECTION("P54-B3 — save_config tmp is pid-suffixed, atomic, no .tmp left");
     {
-        const std::string path = "/tmp/test_p54_b3.json";
+        const std::string path = tmp_path("test_p54_b3.json");
         std::filesystem::remove(path);
         remove_tmp_leftovers(path);
         app_config cfg;
@@ -3431,7 +3464,7 @@ static void test_cfg_p54_guards() {
                                  {"cap_mode", 3}, {"name", 42}}}
             }})}
         };
-        const std::string path = "/tmp/test_p54_b4.json";
+        const std::string path = tmp_path("test_p54_b4.json");
         {
             std::ofstream f(path);
             f << j.dump(4);
@@ -3467,11 +3500,11 @@ static void test_lut_sort_json_roundtrip() {
         cfg.profiles.push_back(dp);
 
         // Save and reload
-        const char* tmp = "/tmp/test_lut_sort_rt.json";
+        const std::string tmp = tmp_path("test_lut_sort_rt.json");
         save_config(cfg, tmp);
 
         app_config cfg2 = load_config(tmp);
-        std::remove(tmp);
+        std::remove(tmp.c_str());
 
         EXPECT(cfg2.profiles.size() == 1);
         auto& ax = cfg2.profiles[0].prof.accel_x;
@@ -3515,18 +3548,18 @@ static void test_lut_sort_json_roundtrip() {
         cfg.active_profile = "bf1_rt";
         cfg.profiles.push_back(dp);
 
-        const char* tmp = "/tmp/test_bf1_rt.json";
+        const std::string tmp = tmp_path("test_bf1_rt.json");
         save_config(cfg, tmp); // stamps version
         for (int it = 0; it < 3; it++) {
             app_config c = load_config(tmp);
             double y = c.profiles[0].prof.accel_x.data[3];
             EXPECT_NEAR(y, 200.0f, 1e-9); // no repeated rescaling on reload
         }
-        std::remove(tmp);
+        std::remove(tmp.c_str());
 
         // And a legacy versionless file must STILL be migrated exactly once
         // (y_new = y · x) — one-shot migration behaviour is preserved.
-        const char* legacy = "/tmp/test_bf1_legacy.json";
+        const std::string legacy = tmp_path("test_bf1_legacy.json");
         {
             std::ofstream of(legacy);
             of << R"({ "active_profile": "bf1", "use_raw_input": true,
@@ -3538,7 +3571,7 @@ static void test_lut_sort_json_roundtrip() {
                "lut_data": [0.0,0.0,100.0,200.0], "lut_length": 4 } } } ] })";
         }
         app_config cl = load_config(legacy);
-        std::remove(legacy);
+        std::remove(legacy.c_str());
         EXPECT_NEAR(cl.profiles[0].prof.accel_x.data[3], 20000.0f, 1e-9); // 200 · 100
     }
 }
@@ -3760,7 +3793,7 @@ static void test_accel_args_sanitize() {
 
     // 13. JSON round-trip with negative accel_args → sanitized on load
     {
-        const char* tmp = "/tmp/rawaccel_test_accel_args_sanitize.json";
+        const std::string tmp = tmp_path("rawaccel_test_accel_args_sanitize.json");
         {
             std::ofstream f(tmp);
             f << R"({
@@ -3809,7 +3842,7 @@ static void test_accel_args_sanitize() {
         EXPECT(cfg.profiles[0].prof.domain_weights.y >= 0);
         EXPECT(cfg.profiles[0].prof.range_weights.x >= 0);
         EXPECT(cfg.profiles[0].prof.range_weights.y >= 0);
-        std::remove(tmp);
+        std::remove(tmp.c_str());
     }
 
     // 14. Negative acceleration + non-integer exponent → NaN guarded to 0 in constructor
@@ -3829,7 +3862,7 @@ static void test_accel_args_sanitize() {
 static void test_raw_passthrough_json() {
     SECTION("raw_passthrough — JSON round-trip");
 
-    const char* tmp = "/tmp/rawaccel_test_raw_passthrough.json";
+    const std::string tmp = tmp_path("rawaccel_test_raw_passthrough.json");
 
     // Default: false
     {
@@ -3891,7 +3924,7 @@ static void test_raw_passthrough_json() {
         EXPECT(cfg.profiles[0].prof.raw_passthrough == false);
     }
 
-    std::remove(tmp);
+    std::remove(tmp.c_str());
 }
 
 // ── Fuzz test: all accel modes × random accel_args → no NaN/Inf/crash ────────
@@ -4027,7 +4060,7 @@ static void test_fuzz_json_roundtrip() {
     std::uniform_real_distribution<double> dist_wide(-500.0, 500.0);
     std::uniform_int_distribution<int> dist_mode(0, 6);
 
-    const char* tmp = "/tmp/rawaccel_test_fuzz_roundtrip.json";
+    const std::string tmp = tmp_path("rawaccel_test_fuzz_roundtrip.json");
     constexpr int ITERS = 200;
     int sanitize_fail = 0;
 
@@ -4095,7 +4128,7 @@ static void test_fuzz_json_roundtrip() {
             sanitize_fail++; // should never throw — sanitize handles all edge cases
         }
     }
-    std::remove(tmp);
+    std::remove(tmp.c_str());
     EXPECT(sanitize_fail == 0);
 }
 
@@ -5048,7 +5081,7 @@ static void test_motion_math_clamp_remainder_reset() {
 
 static void test_save_config_durability_path() {
     SECTION("BUG-13 — save_config: tmp file is removed and target updated atomically");
-    std::string path = "/tmp/_rawaccel_save_test.json";
+    std::string path = tmp_path("_rawaccel_save_test.json");
     // N-15: save_config names the temp file with a pid suffix.  Glob
     // path.*.tmp so a leftover from any pid is caught.
     std::remove(path.c_str());
@@ -6340,7 +6373,7 @@ static void test_config_profiles_over_max() {
     // MAX_PROFILES_FILE and app_config_from_json keeps MAX_PROFILES.
 
     const size_t N = MAX_PROFILES + 44;   // 300 — the overflow this regressed on
-    std::string tmp = "/tmp/rawaccel_test_profiles_over_max.json";
+    std::string tmp = tmp_path("rawaccel_test_profiles_over_max.json");
     {
         std::ofstream f(tmp);
         f << R"({"version":"1.1.0","active_profile":"p299","profiles":[)";
@@ -6389,7 +6422,7 @@ static void test_config_empty_profiles() {
     SECTION("R10 — config: empty profiles array handling");
 
     // Create a config JSON with empty profiles
-    std::string tmp = "/tmp/rawaccel_test_empty_profiles.json";
+    std::string tmp = tmp_path("rawaccel_test_empty_profiles.json");
     {
         std::ofstream f(tmp);
         f << R"({"active_profile":"nonexistent","profiles":[]})";
@@ -6410,7 +6443,7 @@ static void test_config_empty_profiles() {
 static void test_config_missing_active_profile() {
     SECTION("R10 — config: active_profile references non-existent profile");
 
-    std::string tmp = "/tmp/rawaccel_test_missing_active.json";
+    std::string tmp = tmp_path("rawaccel_test_missing_active.json");
     {
         std::ofstream f(tmp);
         f << R"({
@@ -6463,7 +6496,7 @@ static void test_config_profiles_wrong_type_rejected() {
              "accel_y":{"mode":"power","gain":true,"scale":2.2}}}]})";
 
     const std::string saglam = SAGLAM;
-    const std::string tmp = "/tmp/rawaccel_test_k1_profiles_type.json";
+    const std::string tmp = tmp_path("rawaccel_test_k1_profiles_type.json");
 
     auto yaz = [&](const std::string& icerik) {
         std::ofstream f(tmp, std::ios::trunc);
@@ -6557,7 +6590,7 @@ static void test_config_profiles_wrong_type_rejected() {
 static void test_config_save_preserves_permission_bits() {
     SECTION("K4 — save_config: permission bits are preserved, umask-independent");
 
-    const std::string tmp = "/tmp/rawaccel_test_k4_perm.json";
+    const std::string tmp = tmp_path("rawaccel_test_k4_perm.json");
     // umask is process-global state: without save+restore this section would
     // silently change the permissions every LATER test in the process observes.
     const mode_t eski_umask = ::umask(0);
@@ -6684,7 +6717,7 @@ static void test_config_extreme_values() {
 static void test_config_duplicate_device_id() {
     SECTION("R10 — config: duplicate device_id → first match wins");
 
-    std::string tmp = "/tmp/rawaccel_test_dup_devid.json";
+    std::string tmp = tmp_path("rawaccel_test_dup_devid.json");
     {
         std::ofstream f(tmp);
         f << R"({
@@ -7498,7 +7531,7 @@ static void test_json_int_overflow_safe() {
     {
         std::string js = R"({"profiles":[{"name":"x","dpi":1e26,"polling_rate":1e26,
                           "profile":{"accel_x":{"mode":"classic"}}}]})";
-        std::string tmp = "/tmp/rawaccel_test_bug5.json";
+        std::string tmp = tmp_path("rawaccel_test_bug5.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -7510,7 +7543,7 @@ static void test_json_int_overflow_safe() {
     {
         std::string js = R"({"profiles":[{"name":"y","dpi":-1e30,"polling_rate":-1e30,
                           "profile":{}}]})";
-        std::string tmp = "/tmp/rawaccel_test_bug5b.json";
+        std::string tmp = tmp_path("rawaccel_test_bug5b.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -7521,7 +7554,7 @@ static void test_json_int_overflow_safe() {
     {
         std::string js = R"({"profiles":[{"name":"z","dpi":"not a number",
                           "polling_rate":true,"profile":{}}]})";
-        std::string tmp = "/tmp/rawaccel_test_bug5c.json";
+        std::string tmp = tmp_path("rawaccel_test_bug5c.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -7534,7 +7567,7 @@ static void test_json_int_overflow_safe() {
         std::string js = R"({"profiles":[{"name":"l",
                           "profile":{"accel_x":{"mode":"lookup","lut_length":1e26,
                                                  "lut_data":[1.0,1.0]}}}]})";
-        std::string tmp = "/tmp/rawaccel_test_bug5d.json";
+        std::string tmp = tmp_path("rawaccel_test_bug5d.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -8166,7 +8199,7 @@ static void test_config_unicode_names() {
     cfg.active_profile = dp.name;
 
     // Save to temp file
-    std::string tmp = "/tmp/rawaccel_test_unicode.json";
+    std::string tmp = tmp_path("rawaccel_test_unicode.json");
     save_config(cfg, tmp);
 
     // Load back
@@ -8723,7 +8756,7 @@ static void print_usage(const char* argv0) {
 static void test_p99_config_guards() {
     SECTION("P99-A — round-trip byte-identity for hostile profile names");
     {
-        const std::string path = "/tmp/test_p99_a.json";
+        const std::string path = tmp_path("test_p99_a.json");
         std::filesystem::remove(path);
         app_config cfg;
         cfg.active_profile = "main-\u2735";
@@ -8797,7 +8830,7 @@ static void test_p99_config_guards() {
                 }}
             }})}
         };
-        const std::string path = "/tmp/test_p99_b.json";
+        const std::string path = tmp_path("test_p99_b.json");
         std::filesystem::remove(path);
         { std::ofstream f(path); f << j.dump(4); }
         app_config cfg = load_config(path);   // must NOT throw (P99-B)
@@ -8839,7 +8872,7 @@ static void test_p99_config_guards() {
                 }}
             }})}
         };
-        const std::string pathl = "/tmp/test_p99_b_lut.json";
+        const std::string pathl = tmp_path("test_p99_b_lut.json");
         std::filesystem::remove(pathl);
         { std::ofstream f(pathl); f << jl.dump(4); }
         app_config cfgl = load_config(pathl);   // must NOT throw
@@ -8854,7 +8887,7 @@ static void test_p99_config_guards() {
 
     SECTION("P99-C — .bak rotate + simulated write failure restores previous");
     {
-        const std::string dir = "/tmp/test_p99_c_dir";
+        const std::string dir = tmp_path("test_p99_c_dir");
         const std::string path = dir + "/settings.json";
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
@@ -8896,7 +8929,7 @@ static void test_p99_config_guards() {
         } else {
             // As root chmod is ineffective — simulate via an occupied
             // directory component (file where a dir is needed).
-            const std::string d2 = "/tmp/test_p99_c_blocker";
+            const std::string d2 = tmp_path("test_p99_c_blocker");
             const std::string path2 = d2 + "/settings.json";
             std::filesystem::remove_all(d2);
             { std::ofstream f(d2); f << "x"; }
@@ -8998,7 +9031,7 @@ static void test_o31_config_c2_c3() {
         js += R"(","profiles":[{"name":"l","profile":
                           {"accel_x":{"mode":"lookup","lut_length":514,
                                       "lut_data":[1.0,1.0, 2.0,4.0]}}}]})";
-        std::string tmp = "/tmp/rawaccel_test_o31c2.json";
+        std::string tmp = tmp_path("rawaccel_test_o31c2.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -9016,7 +9049,7 @@ static void test_o31_config_c2_c3() {
         js += R"(","profiles":[{"name":"l","profile":
                           {"accel_x":{"mode":"lookup","lut_length":3,
                                       "lut_data":[1.0,1.0, 5.0]}}}]})";
-        std::string tmp = "/tmp/rawaccel_test_o31c2b.json";
+        std::string tmp = tmp_path("rawaccel_test_o31c2b.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -9035,7 +9068,7 @@ static void test_o31_config_c2_c3() {
             {"name":"g0","profile":{"accel_x":{"gain":0},"raw_passthrough":0}},
             {"name":"gb","profile":{"accel_x":{"gain":2}}}
         ]})";
-        std::string tmp = "/tmp/rawaccel_test_o31c3.json";
+        std::string tmp = tmp_path("rawaccel_test_o31c3.json");
         { std::ofstream f(tmp); f << js; }
         app_config cfg = load_config(tmp);
         std::remove(tmp.c_str());
@@ -9742,10 +9775,10 @@ static void test_fao1_sync_motivity_grid() {
 
     SECTION("P119 FAO1 — synchronous motivity<1 × smooth grid (LEGACY vs math ref)");
     {
-        const char* refpath = "/tmp/rawaccel_p119_sync_m1_ref.csv";
+        const std::string refpath = tmp_path("rawaccel_p119_sync_m1_ref.csv");
         bool written = false;
         {
-            FILE* f = std::fopen(refpath, "w");
+            FILE* f = std::fopen(refpath.c_str(), "w");
             if (f) {
                 written = true;
                 for (double m : ms) for (double sm : sms)
@@ -9773,7 +9806,7 @@ static void test_fao1_sync_motivity_grid() {
             double denom = std::fabs(r);
             EXPECT(std::fabs(loc - r) <= 1e-9 * denom);  // rel 1e-9 pin
         }
-        std::remove(refpath);
+        std::remove(refpath.c_str());
 
         // BUG-01 işaret (regression) testi — headline m=0.3: hiçbir smooth'ta
         // eğri ters dönmüyor: yüksek hız 1/m≈3.33'a, düşük hız m≈0.3'a gider.

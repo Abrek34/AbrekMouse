@@ -1188,13 +1188,3 @@ T5 — daemon/daemon.hpp denetimi (93ec6277 O31-D1):
 Lane B koordinasyonu: include/logitech_hidpp.hpp'te shared_ptr<HidppTransport> eklendi (115 satır) — bu Aj 3 sahası, çakışma yok.
 KAPI: 7/7 YEŞİL (build 0 uyarı, tests 34164/34164, oracle 1408/79, simd, tr, cli-asan, tracker)
 AKIS: kilit → null
-
-### Aj.2 [P108] [30 Eylül 2026] [00:15]
-KAPSAM: tests/bench_hotpath.cpp (geçici Lane C yetkisi)
-Q1 — min_seconds mantığı: ÇALIŞIYOR. --min-seconds 0.001 → iter=100k, wall=0.16s; --min-seconds 0.5 → iter=1.6M-10M, wall=7.3s. Sessiz yoksayma YOK.
-Q2 — median-of-3: DOĞRU. 3 tek koşu medianı elle doğrulandı (noaccel: [13.68, 13.94, 14.21] → median=13.94). Ortalamaya karışma YOK.
-Q3 — gate atlatma riskleri: (a) eksik config → fallback 50.0 ns (yanlış-OK riski); (b) NaN/Inf → sort NaN'ı sona atar, 2/3 NaN olursa median NaN → NaN > threshold = false → yanlış-OK; (c) iterations=0 → min 100k koruyor. PC: NaN testi binary bozulmadan yapılamaz, risk belge edildi.
-Q4 — power-dual+4ema kararlılığı: TERSTE BULUNDU. AJ1: 4× daha kararlı (1.12% vs 4.54%). Ölçümlerim: min-s 0.1 → power-dual+4ema CV=6.85% (EN AZ kararlı), power-whole CV=2.01%, classic CV=1.14%. min-s 0.5 → power-dual+4ema CV=4.32%, power-whole CV=0.93%. Neden: 4 EMA → event/işlem ↑ → iterasyon ↓ → örnekleme gürültüsü ↑ + wall time ↑ → scheduler/thermal gürültüsü ↑.
-DÜZELTME: YOK (sadece denetim).
-KAPI: 7/7 YEŞİL (build rc=0, tests 34164/34164, oracle 1408/79, simd, tr, cli-asan, tracker).
-AKIS: kilit → null

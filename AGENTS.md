@@ -542,10 +542,33 @@ compute sample staleness). Design keeps the hot path lock-free:
   identical over 1,510,738 inputs including an exhaustive sweep of every 1-4
   char string.
 - **`LOGITECH_QUIRKS` is a data registry, NOT an enforced write gate (O31-H6)**:
-  the `nvconfig`/`headset` rows have **zero consumers** — measured project-wide.
-  `rgb_effects` (`0x8071`) appears in exactly one place outside this table (the
-  enum at `include/logitech_hidpp.hpp:81`) and `0x0622` only in comments; no
-  code reads either vector. The only HID++ writes in the tree are `set_dpi`,
+  the `nvconfig`/`headset` rows have **zero consumers** — measured project-wide
+  (AJ3 B-9, re-measured by AJ1 29 Sep 2026: `nvconfig` → **3** occurrences and
+  `headset` → **3**, and **every** one is inside `logitech_quirks.hpp` — a
+  comment (`:20`), a struct (`:56` / `:62`), and the `std::vector` member
+  declaration (`:73` / `:74`). The search method is positive-controlled: the
+  same `grep` does find `v2d_mul` in `rawaccel.hpp`, so the zero is a real zero
+  and not a broken query.
+  ⚠️ **Measurement trap, recorded because it produced a wrong number:** the
+  first pass reported `nvconfig` **5×**, because `grep -rn` without path
+  scoping also matched the agent's own report inside
+  `.aihaberlesme/mesajlar/aj3.log`, which was quoting the same string twice.
+  **A grep whose pattern appears in your own report will count your report.**
+  Scope to `--include=*.hpp --include=*.cpp --include=*.inl` (or exclude
+  `.aihaberlesme/`), and treat a count that jumps between two runs on an
+  unchanged tree as a signal that the *query* changed, not the code).
+  The **occurrence counts** below are what drift — the *conclusion* does not.
+  `rgb_effects` (`0x8071`) is now **5** occurrences, not "exactly one outside
+  this table": `include/logitech_hidpp.hpp:82` (the enum — the line moved from
+  `:81`) plus four inside this table, of which **`:89` is a live data row**
+  (G502 X PLUS), not a comment. `0x0622` is **4** occurrences and the earlier
+  "only in comments" was **false**: `logitech_quirks.hpp:99` is a live data row
+  (G522 LIGHTSPEED), alongside the comment at `:17`, the doc at `:61` and the
+  member declaration at `:74`. Either way **no code reads either vector** — the
+  extra hits are data, not consumers — so the "no enforced gate" hüküm stands
+  (AJ3 B-10). Treat this paragraph as a *claim with a live count*, and re-measure
+  the count before quoting it; the qualitative statement is the load-bearing
+  half. The only HID++ writes in the tree are `set_dpi`,
   `set_polling_rate`, `set_lift_off_distance`, `set_led_brightness`,
   `set_change_host` and `write_onboard_profile_sector`, and none consults the
   table. The "default-DENY allowlist" the header and the HID++ panel label used
@@ -596,6 +619,18 @@ compute sample staleness). Design keeps the hot path lock-free:
   logged, and the pre-fix code retried unconditionally).
   **DONE — the writes now run on `hidpp_thread_`, not the loop thread
   (`93ec6277`).** The note that used to sit here ("still not done … queue them
+  onto `hidpp_thread_`") is obsolete. One wording note, because the sentence
+  this note replaced **overclaimed and contradicted itself two lines later**:
+  it said the drain "holds **no lock at all**", while `drain_hidpp_writes()`
+  (`daemon/daemon.cpp:1736-1783`, 48 lines) takes **exactly one** lock —
+  `hidpp_wq_mu_` at `:1740` — and `devices_mutex_` / `hidpp_devs_mutex_` are
+  never taken (AJ3 P104-B-1, measured 29 Sep 2026). The load-bearing half is
+  still exactly true and is what the second half of that paragraph said:
+  **no daemon mutex, and the single leaf lock is scoped to the dequeue only**
+  (`:1740-1743`), so the blocking writes at `:1756` (`set_polling_rate`) and
+  `:1766` (`set_dpi`) run unlocked. "No lock at all" was the wrong way to say
+  it — the same overclaim class as the `byte-identical` wording corrected in
+  the config-path section below.
   onto `hidpp_thread_`") is obsolete. `apply_profile()` plans, marks the
   sentinel and enqueues; `drain_hidpp_writes()` performs the writes. Three
   things were load-bearing and are not obvious from the code:
@@ -612,11 +647,17 @@ compute sample staleness). Design keeps the hot path lock-free:
     a second apply arriving mid-flight enqueue the same write again — a slider
     drag would queue one job per intermediate value. Folding them together
     makes that window unrepresentable.
-  - **The drain holds no lock at all** (verified mechanically: both write call
-    sites have 0 locks open, and it takes neither daemon mutex), so the
-    5.8 s stall no longer blocks the motion loop. `hidpp_wq_mu_` is a LEAF
-    mutex: never taken under a daemon mutex, never held across a blocking
-    write.
+  - **The drain holds no daemon mutex, and its single lock is scoped to the
+    dequeue only** (measured 29 Sep 2026, AJ3 P104-B-1 — this sentence used to
+    read "holds **no lock at all**", which was **false and contradicted itself
+    two lines later**). `drain_hidpp_writes()` (`daemon/daemon.cpp:1736-1783`,
+    48 lines) takes **exactly one** lock: `hidpp_wq_mu_` at `:1740`, whose scope
+    is `:1740-1743` — the `hidpp_hw_take()` dequeue and nothing else.
+    `devices_mutex_` and `hidpp_devs_mutex_` are **never** taken, and the two
+    blocking writes (`set_polling_rate` at `:1756`, `set_dpi` at `:1766`) run
+    **unlocked**, so the 5.8 s stall no longer blocks the motion loop.
+    `hidpp_wq_mu_` is a LEAF mutex: never taken under a daemon mutex, never
+    held across a blocking write.
   Two behaviour changes worth stating: the "Set polling rate to N Hz" log is
   now emitted by the worker *after* the write returns, so it reports a fact
   rather than an intention; and writes still queued at `stop()` are discarded
@@ -633,8 +674,19 @@ compute sample staleness). Design keeps the hot path lock-free:
   returns `0x04` for a packet built with `0x48`. Asserted in
   `test_hidpp_short_payload_budget()`.
 - **Config-path policy is applied to the RESOLVED path, on every entry point**
-  (O31-S1): `validate_config_path()` lives in **two byte-identical copies** —
-  `daemon/main.cpp` and `cli/main.cpp` — and **both must stay in sync**. It runs
+  (O31-S1): `validate_config_path()` lives in **two copies with byte-identical
+  CONTROL FLOW but not byte-identical text** — `daemon/main.cpp` and
+  `cli/main.cpp`. Measured 29 Sep 2026 (AJ3 B-6, independently re-measured by
+  AJ1): `daemon/main.cpp` 1877 B vs `cli/main.cpp` 1723 B, so "byte-identical"
+  was false; the **only** divergence is the log prefix on `std::cerr` lines
+  (daemon emits a `[rawaccel]` prefix, CLI prints a plain user-facing message).
+  The decision chain is identical in both: the 7-line `return` sequence
+  (`return false;` ×2 → `if (!check_config_path_policy(canonical)) return
+  false;` → `return false;` ×3 → `return true;`) matches exactly, and
+  `check_config_path_policy` is called at the same point. So what must stay in
+  sync is the **policy and its ordering**, not the message strings — a
+  divergence in the `return` chain is a security bug; a divergence in the
+  prefix is not. It runs
   two steps: `resolve_config_target()` canonicalises the deepest existing
   ancestor and re-appends the not-yet-created tail (so the check cannot be
   fooled by `..` or a symlink, without requiring the target to exist), then
