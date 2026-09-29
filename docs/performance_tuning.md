@@ -298,5 +298,5 @@ init/object costs — another sign there is nothing left to squeeze in hot math.
   FMA/`-ffp-contract` notes, interaction-aware defaults.
 - `docs/real_hardware_test.md` — §3.2 DPI ladder, §4 latency methodology +
   reference tables.
-- `aihaberlesme.md` — T22a synthetic benchmark (ns/event per mode, %0.24 CPU),
+- ~~`aihaberlesme.md`~~ (silindi 2026-09-30) — T22a synthetic benchmark (ns/event per mode, %0.24 CPU)
   P31/P94/P101 hot-path measurements.

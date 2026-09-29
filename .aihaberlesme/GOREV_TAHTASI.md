@@ -37,7 +37,8 @@ bash .aihaberlesme/raporla.sh 5 P109 \
 
 ⛔ Log dosyalarına `>` veya `cat >` **YASAK** — `raporla.sh` kendi içinde `>>`
 kullanır **ve** dosyanın küçülmediğini doğrular.
-⭐ Tarihsel ajan logları `tarihsel-aj<N>.log` olarak arşivlendi (`aj5.log` dahil —
+⭐ Eski takımın ham logları (Aj 0-8) 29 Eylül 2026'da silindi; git geçmişinde
+tarihsel-aj<N>.log olarak duruyor. `aj5.log` dahil —
 13 Eylül'den kalma 84 KB'lık kayıttı, bugünkü Aj 5 onu ezecekti).
 
 **Kontrol (AJ1 için):** `bash .aihaberlesme/raporla.sh --kontrol`
@@ -95,7 +96,7 @@ Aj 1 her turda bu dosyayı okur ve cevabını hemen altına yazar.
 | **A** | **Aj 2** | nemotron-3-ultra | `daemon/daemon.cpp`, `daemon/daemon.hpp`, `daemon/main.cpp`, `daemon/lat_stats.hpp`, `daemon/motion_math.hpp`, `setup.sh`, `scripts/**` |
 | **B** | **Aj 3** | big-pickle | `cli/main.cpp`, `src/config.cpp`, `src/logitech_hidpp.cpp`, `src/logitech_receiver.cpp`, `include/**` |
 | **C** | **Aj 4** | nemotron-3.5-lightning | `gui/**`, `tests/**`, `packaging/**`, `docs/**`, `.github/**`, `CMakeLists.txt` |
-| **Y** | **Aj 1** | space-bunny (yönetici) | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `aihaberlesme.md`, `.aihaberlesme/**`, `olcum/**`, `config/**` |
+| **Y** | **Aj 1** | space-bunny (yönetici) | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md, `.aihaberlesme/**`, `olcum/**`, `config/**` |
 
 ### Bu turda kilidi olan dosya var mı?
 

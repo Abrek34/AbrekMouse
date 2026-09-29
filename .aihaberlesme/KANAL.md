@@ -31,7 +31,7 @@
 | **A** | Aj 2 | `daemon/**`, `setup.sh`, `scripts/**` |
 | **B** | Aj 3 | `cli/**`, `src/**`, `include/**` |
 | **C** | Aj 4 | `gui/**`, `tests/**`, `packaging/**`, `docs/**`, `.github/**`, `CMakeLists.txt` |
-| **Y** | Aj 1 | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `aihaberlesme.md`, `.aihaberlesme/**`, `olcum/**` |
+| **Y** | Aj 1 | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `.aihaberlesme/**`, `olcum/**` |
 
 > `olcum/**` AJ1'indir çünkü ölçüm araçları (PC üreten kanıt üreticileri) tüm
 > turların ortak kanıt tabanıdır; diğer ajanlar **ölçüm isteyerek** üretir.

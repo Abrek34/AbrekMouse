@@ -87,7 +87,7 @@ Bu, tüm ekip protokolünün en kritik kuralıdır. Çakışma iki ajanın deği
 | **A** | Aj 2 | `daemon/**`, `setup.sh`, `scripts/**` |
 | **B** | Aj 3 | `cli/**`, `src/**`, `include/**` |
 | **C** | Aj 4 | `gui/**`, `tests/**`, `packaging/**`, `docs/**`, `.github/**`, `CMakeLists.txt` |
-| **Y** | Aj 1 | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `aihaberlesme.md`, `.aihaberlesme/**`, `olcum/**` |
+| **Y** | Aj 1 | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md, `.aihaberlesme/**`, `olcum/**` |
 
 **Kural 3 — Kilit ≠ atama, atama ≠ kilit.** İkisi farklı şeydir:
 - `AKIS.json`'da `kilit` **dolu**ysa → birisi o dosyada çalışıyor demektir, bekle.

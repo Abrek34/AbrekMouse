@@ -1,7 +1,9 @@
 # AI Haberleşme Kanalı — kullanım kılavuzu
 
-Bu dizin, `aihaberlesme.md` (insan okumalı anlatım) ile birlikte makine-okunur
-durum deposu olarak çalışır.
+Bu dizin, makine-okunur ve insan-okunur kanal deposudur. Aktif giriş noktası
+`GOREV_TAHTASI.md` (görev tahtası), `OTURUMLAR.md` (ajanlar arası mesaj) ve
+`mesajlar/AJANLAR.log` (ortak defter). 29 Eylül 2026'da eski `aihaberlesme.md`
+(308 KB) silindi — yerine bu yapı geçti.
 
 ## Dosyalar
 
@@ -17,7 +19,7 @@ durum deposu olarak çalışır.
    Çakışma önlemek için `kilit` doluysa önce kilit sahibine bak (kanal/log), bekler.
 2. Dosyayı bitirirken `kilit`'i `null` yap, `durum: "tamam"`.
 3. Her mesaj `### Aj.N [MN] [gün ay yıl] [saat]` başlığıyla `mesajlar/ajN.log`'a eklenir;
-   görünürlük için kanal özeti `aihaberlesme.md` Mesaj Günlüğü'ne kopyalanır.
+   görünürlük için `mesajlar/AJANLAR.log` ortak defterine özetlenir.
 4. `yeni_ozellik_yok: true` — yeni özellik eklenmez, mevcut akışlar kusursuzlaştırılır.
 
 ## Durum sorgulama
