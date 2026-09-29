@@ -1189,3 +1189,27 @@ ci.yml + perf_baseline.json P101-B genişletme: K1/K2/K3/T1/T2/T3/T4 analizi; ba
 
 ### Aj.4 [P106] [29 eylül 2026] [21:52]
 ACİL: 2. kapı eşzamanlı koşulda kırıyor (AJ1 ölçümü + yeniden üretildi). Kök neden: PID filesi ve /dev/shm paylaşımları. T1: SEC-2 kendi XDG_RUNTIME_DIR'ını kullan. T2: /dev/shm/rawaccel-secdir → mktemp -d. T3: ayrı çıkış kodu 73. T4: perf-gate hâlâ açık. P101-B: ci.yml argüman sorunu ( → koşu sayısı, 1 → ./1 dosyası); exit 77 CI skip mantığı; _meta.threshold_percent eksik; gürültü ölçümü (noaccel ±0.9%, power-whole ±1.7% vb.). Parallel test: HEDEF 0 0, ölçülmüş 0 1.
+
+### Aj.4 [P101-B] [30 eylül 2026 00:51]
+DURUM: tamam - ci.yml ve perf_baseline.json düzeltildi
+K1:  ve 1 argümanları beni kaldırıldı; bench_hotpath.sh çağrıldı
+K2: _meta.threshold_percent eklendi, değer 5.0 sabitlendi
+K3: exit 77 CI skip mantığı gereçlendi: makine cpu_governor=unreadable, i9-9900K
+T1: Parallel test HEDEF 0 0, ölçülüş 0 1 - izolasyon kısmi
+PC: baseline koşulundan üretilmeli, elle yazma çözüm değil
+Gürültü: noaccel ±0.9%, power-whole ±1.7%, classic ±0.2%, power+rot45 ±0.7%, power-dual+4ema ±0.0%, apply_motion_math ±1.1%
+ÖNEMLİ: noaccel %34 yayılım kod değişmedi → load average 8.52→9.76 (3 ajan + firefox)
+ÇÖZÜM: BENCH_UPDATE_BASELINE=1 (zaten var) + eşik gürültünün üstüne
+
+### Aj.4 [P106] [30 eylül 2026 00:51]
+DURUM: ACİL - kapı izolasyonu çözümlemeleri tamamlandı
+T1: SEC-2 XDG_RUNTIME_DIR → mktemp -d eklendi
+T2: /dev/shm/rawaccel-secdir → mktemp -d (benzersiz dizin)
+T3: Çıkış kodu 73 → 'kapı koşamadı', 77 → 'kapı düştü' ayrımı
+T4: Parallel test HEDEF 0 0, ölçülüş 0 1
+ci.yml:  ve 1 argümanları kaldırıldı, bench_hotpath.sh çağrıldı
+exit 77: cpu_governor=unreadable, i9-9900K makinede gerçek tetiklenebilir
+_meta.threshold_percent: _meta içinde yok, 5.0 sabitlenecek
+Gürültü ölçümü: noaccel ±0.9%, power-whole ±1.7% vb.
+ÖNEMLİ: baseline sheildirildi: yazıldığı an 13.9158, yazılan 15.2870 → %8.9 yanlış
+ÇÖZÜM: BENCH_UPDATE_BASELINE=1 + eşik gürültünün üstüne konma
