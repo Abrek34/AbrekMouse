@@ -132,7 +132,7 @@ vaka "show olmayan profil"           "Profile not found"            -c "$CFG" sh
 
 # Yol doğrulama reddedişleri (SEC-2 sınıfı) — hepsi ölçülmüş metin:
 vaka "config yolu reddi (/dev/shm)"  "is in a disallowed directory"  -c /dev/shm/nope.json list
-vaka "config dizini yok"             "does not exist"                -c /etc/rawaccel/settings.json list
+vaka "config dizini yok"             "does not exist"                -c "$WORK/yok_dizin/d.json" list
 vaka "config yolu .json degil"       "does not have a .js"           -c "$WORK" list
 vaka "config okunamaz/gecersiz"      "unreadable or invalid"         -c "$WORK/bozuk.json" list
 
