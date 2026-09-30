@@ -51,6 +51,26 @@ mutation testing the trap was reached with an empty variable and expanded to
 was initially misattributed to a server restart. That guard exists in both
 `run_tests.sh` and `run_tests_asan.sh`.
 
+### Fixed: a skipped perf gate in CI looked identical to a passing one
+
+All four SKIP paths in `.github/workflows/ci.yml` were `echo` + `exit 0`.
+`exit 0` is the right decision — an unusable host is not a regression, and
+failing the pipeline for it would teach everyone to ignore the job — but on
+its own it renders as a **green tick**: the appearance of "verified" for a gate
+that measured nothing. That is the class this repo forbids elsewhere
+(`run_cli_sanitized.sh:20` and `run_simd_parity.sh` both "skip loudly, never
+quietly"). Every SKIP path now also emits a `::warning::` annotation, which
+GitHub shows as a yellow warning on the job summary, while a genuinely measured
+pass stays a plain green tick — so "green = actually measured" is readable from
+the UI.
+
+Proven, not asserted: `olcum/aj1/perf_gate_gorunurluk.sh` extracts the **real**
+`run: |` block from `ci.yml` (it is not hand-copied) and drives all four paths
+with stub bench scripts. On the fixed tree all four match expectation. Mutated
+back to the pre-fix file, the 77 and 126 paths come out `annotation=(none)` —
+**silently green** — and the tool exits 1. Raw numbers:
+`olcum/aj1/perf_gate_kanit.txt`.
+
 ### Fixed: perf gate measured against a load average that never applied
 
 `scripts/bench_hotpath.sh` guarded on `loadavg`, which on this host sat at

@@ -171,14 +171,25 @@ jobs:
             build-essential pkg-config libevdev-dev python3
 
       - name: Run hot-path perf gate
+        # A SKIPPED perf gate must never be indistinguishable from a PASSED one.
+        # `exit 0` is still correct — an unusable host is not a regression, and
+        # failing the pipeline for it would train everyone to ignore this job —
+        # but on its own it renders as a green tick, which is the exact thing
+        # this repo forbids elsewhere: run_cli_sanitized.sh:20 and
+        # run_simd_parity.sh both "skip loudly, never quietly". A green tick on
+        # a gate that never measured anything is a false claim of verification,
+        # so every skip path below also emits a `::warning::` annotation, which
+        # GitHub renders as a yellow warning on the job summary. The perf gate
+        # has now skipped silently on every push to this repository (the host
+        # check never passed), and nothing in the UI said so.
         run: |
           set -e
           if [ ! -x scripts/bench_hotpath.sh ]; then
-            echo "Perf gate SKIP: scripts/bench_hotpath.sh (Aj5 P135) henüz yok."
+            echo "::warning::Perf gate SKIPPED — scripts/bench_hotpath.sh yok. Hiçbir regresyon ölçülmedi."
             exit 0
           fi
           if [ ! -f tests/perf_baseline.json ]; then
-            echo "Perf gate SKIP: tests/perf_baseline.json (P137) henüz yok."
+            echo "::warning::Perf gate SKIPPED — tests/perf_baseline.json yok. Hiçbir regresyon ölçülmedi."
             exit 0
           fi
           # P109 (Aj5): bayat Python kopyası silindi. bench_hotpath.sh kendi
@@ -191,11 +202,11 @@ jobs:
           BENCH_RC=$?
           set -e
           if [ $BENCH_RC -eq 77 ]; then
-            echo "Perf gate SKIP: ortam geçersiz (CPU model/governor uyuşmazlığı)"
+            echo "::warning::Perf gate SKIPPED (exit 77) — ortam geçersiz. Regresyon ölçülmedi; bu yeşil bir performans sonucu DEĞİLDİR."
             exit 0
           fi
           if [ $BENCH_RC -eq 126 ]; then
-            echo "Perf gate SKIP: benchmark binary kullanımda (ETXTBSY)"
+            echo "::warning::Perf gate SKIPPED (exit 126) — benchmark binary kullanımda (ETXTBSY). Regresyon ölçülmedi."
             exit 0
           fi
           if [ $BENCH_RC -ne 0 ]; then
