@@ -6,6 +6,54 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.4] — 2026-09-30
+
+Kullanıma hazır sürüm: yedi kapının tamamı yeşil, kurulu sistemde de.
+
+### Fixed: gate 2 turned red whenever the product was installed
+
+`tests/run_tests.sh` gave each run its own `XDG_RUNTIME_DIR`, but that only
+changes the PID file the daemon *writes* — `daemon/main.cpp:458-459` checks
+liveness against the **union** of three candidates
+(`$XDG_RUNTIME_DIR` || `/run` || `/tmp`), deliberately, so a daemon started
+without `XDG_RUNTIME_DIR` is still caught. With a root-owned live
+`/run/rawaccel.pid`, the test's own daemon refused to start with
+"Another instance may already be running" and the gate failed for the wrong
+reason. The fix isolates the test environment (`unshare -Urm` with an empty
+tmpfs over `/run`, falling back to `bwrap`; if neither is available the gate
+FAILS loudly rather than skipping silently). Scope is `/run` only — masking
+`/tmp` breaks the legitimate-config-path case.
+
+### Fixed: gate 6 depended on whether the product was installed
+
+`tests/run_cli_sanitized.sh` tested "config directory does not exist" against
+the hardcoded system path `/etc/rawaccel/settings.json`. Once installed, that
+directory exists, so the case's precondition was unsatisfiable and the gate
+read red on a correct build — and green on an uninstalled one. Now uses a
+deliberately absent directory under the test's own `$WORK`.
+
+### Reverted: exp2 coefficient cache (PERF1)
+
+Measured, not assumed. 5+5 interleaved runs: `power-dual+4ema` −1.04 %,
+`classic` **+0.59 % regression**; an independent 3-run measurement gave
+−1.05 ns (−0.35 %), i.e. inside noise. Cause: `linear_ema_smoother` carries
+5 cache fields × 2 axes = 20 live doubles → x86 register spill. The oracle is
+bit-identical after the revert (1408 rows / 79 documented deviations).
+
+### Measured: denormal stall in the trend accumulator
+
+`windowTrendTotal` / `cutoffTrendTotal` decay geometrically (`× 0.75`) and
+never reach exactly zero, sticking at the smallest subnormal. Same binary,
+only the CPU's FTZ/DAZ bits toggled: **145.11 → 13.23 ns/call (−91 %)**.
+Measurement tools live in `olcum/aj4/` and `olcum/aj5/` and do not touch
+production code.
+
+### Gates
+
+All seven green with the daemon installed and running:
+build (0 warnings) · 34164/34164 · oracle 1408 rows / 79 deviations ·
+SIMD parity · tr coverage · CLI ASan/UBSan 31/31 · tracker bridge.
+
 ## [1.2.3] — 2026-09-13
 
 ### Fixed: asymmetric hardware DPI (X ≠ Y) after profile apply
