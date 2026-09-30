@@ -31,3 +31,6 @@ tests/corpus_accel/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a
 # olcum/config-presets/__pycache__/ çalışma ağacında untracked olarak duruyordu.
 __pycache__/
 *.py[cod]
+
+# AJ5 ölçüm gölge kopyası: include/ + daemon/ kopyası, depoya girmez
+olcum/aj5/shadow/

@@ -499,7 +499,7 @@ static void sanitize_accel_args(accel_args& a) {
     // lower floor above predates P120-FAZ2 and no ceiling was ever added).
     // See config.hpp LIMIT_MAX for why the number is exactly 100.
     if (a.limit           > LIMIT_MAX)         a.limit          = LIMIT_MAX;
-    // AJ4-K7: the same gauge↔sanitize scan (gauge_scan.py) over the remaining
+    // AJ4-K7: the same gauge↔sanitize scan (olcum/arsiv/gauge_scan.py) over the remaining
     // accel_args fields.  Each ceiling == that field's GUI gauge maximum AND ==
     // its R15 round-trip boundary value — see config.hpp for the measured
     // table and the preset headroom.  Without these, a hand-edited value above

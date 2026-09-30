@@ -176,6 +176,14 @@ double run_config_median(const char* name, int runs, int iterations,
 
         double total_ns = static_cast<double>(end - start);
         double ns_per_event = total_ns / iterations;
+        
+        // P110 HATA 2 FIX: Reject non-finite measurements (NaN/Inf)
+        // NaN/Inf would corrupt median and cause silent false-OK in regression gate
+        if (!std::isfinite(ns_per_event)) {
+            std::cerr << "ERROR: Non-finite measurement for " << name << " (run " << r << "): " << ns_per_event << "\n";
+            std::exit(1);
+        }
+        
         samples.push_back(ns_per_event);
     }
 
@@ -233,8 +241,16 @@ int main(int argc, char** argv) {
     std::map<std::string, int> config_iterations;
     for (const auto& name : config_names) {
         auto it = baseline.find(name);
-        double baseline_ns = (it != baseline.end()) ? it->second : 50.0;  // fallback
-        config_iterations[name] = calc_iterations(baseline_ns, min_seconds);
+        if (it == baseline.end()) {
+            std::cerr << "ERROR: Baseline missing required config: " << name << "\n";
+            std::cerr << "Available keys: ";
+            for (const auto& kv : baseline) {
+                std::cerr << kv.first << " ";
+            }
+            std::cerr << "\n";
+            return 1;
+        }
+        config_iterations[name] = calc_iterations(it->second, min_seconds);
     }
 
     std::vector<std::pair<std::string, double>> results;

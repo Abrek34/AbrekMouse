@@ -1,0 +1,35 @@
+
+### Aj.5 [P111] [30 eylül 2026 01:07]
+DURUM: kapsam dışı
+NOT: P111 görev metni Aj 3 için yazılmış (run_tests_asan.sh + AGENTS.md:145)
+KAPSAM: Ben Lane D (ci.yml) — bu görev bana ait değil
+AJ1: Bu mesaj Aj 3'e yönlendirilmeli, bana değil
+
+### Aj.5 [P112] [30 eylül 2026 01:30]
+DURUM: tamam — 5 yüzey tarandı, sessiz geçiş bulunamadı
+Y1 bench_hotpath.cpp: 2 bilinen hata var (50.0 fallback :236, NaN medyan :182) — Aj2 P110'da düzeltiliyor; başka sessiz geçiş YOK; --min-seconds 0→100000 clamp'li, --json bozuksa exit 1, _meta kendisinden okunmuyor
+Y2 run_oracle.sh: known_deviations.txt bozulursa exit 1 (:115-121), stale→exit 1 (:318-323), coverage check sağlam; PC: 1408 satır, 79 deviation, rc=0
+Y3 tr_coverage: tr.inl yoksa exit 2, combo tanımı yoksa exit 1, dinamik anahtarlar UYARI (bilinen sınırlama); PC: rc=0
+Y4 simd_parity: envanter denetimi sağlam, yeni v2d_* sınıflandırılmamışsa exit 1; PC: 3 backend PASS, rc=0
+Y5 test_accel.cpp: EXPECT→g_failed++→main return g_failed?1:0, SECTION çökse exception→rc≠0, --filter eşleşmezse exit 1 (P114 düzeltilmiş); 1605 EXPECT/34164 assert=21.3× (döngüler, normal)
+KAPI: Y2 rc=0, Y3 rc=0, Y4 rc=0, Y5 rc=0
+MUTASYON: dosyaya dokunulmadı (SALT-OKUNUR); PC'ler mevcut davranış ölçümü
+
+### Aj.5 [P115] [30 eylül 2026 01:34]
+KRİTİK BULGU: P09'da ci.yml'i bench_hotpath.sh'e bağladığımızda yüzeye çıkan hata
+bench_hotpath.sh:parse_baseline_json fonksiyonu _meta bloğu içindeki threshold_percent'ı OKUMUYOR
+in_meta guard'ı _meta içindeki tüm anahtarları engelliyor → threshold_percent hiç okunmuyor
+Sonuç: bench_hotpath.sh 'ERROR: baseline threshold_percent is present but not a number' ile çıkıyor
+Bu, P09'un bir yan etkisi — ci.yml'deki Python kopyası kendi gate'ini yapıyordu, bu hata görünmezdi
+ÇÖZÜM: parse_baseline_json fonksiyonu _meta içindeki anahtarları da okuyacak şekilde düzeltilmeli
+KAPSAM: bench_hotpath.sh Aj2'nin kapsamı (scripts/**) — ben düzenleyemem
+AJ1: Bu hatayı Aj2'ye iletir misin? P115 önce bunun düzeltilmesini gerektiriyor
+
+### Aj.5 [P115-B] [30 eylül 2026 01:46]
+A1: boş 12 koşu → medyan 3.17% · p95 18.81% · en kötü 18.81%; yüklü 12 koşu (6 CPU yükü) → medyan 44.90% · p95 58.38% · en kötü 58.38%
+A2: ÖNERİLEN EŞİK %20 — gerekçe: boş p95=18.81% + güvenlik payı; boşta yanlış alarm yok (en kötü 18.81% < 20%); yüklüde gürültü ~45% → yük koruması şart
+A3: YÜK KORUMASI TASLAĞI (uygulanmadı — Aj4 bitince AJ1 uygulayacak): bench_hotpath.sh başına eklenecek — /proc/loadavg oku, nproc*0.5 aşılırsa net mesaj + exit 77 (CI'de SKIP); yükte asla sahte karar VERMEZ
+A4: Negatif kontrol — koruma kapalıyken yüklü makinde sahte yeşil sayısı = 0/12 (tüm koşular kırmızı); ama bu yükte CI'nin SÜREKLİ kırmızı olduğu anlamına gelir; yük koruması sahte kırmızıyı çözer
+PC: yüksüz 12 koşu ölçüldü, yüklü 12 koşu ölçüldü, sahte-yeşil sayısı 0
+KAPI: A1 ölçümleri tamam, A2 eşik önerisi hazır, A3 taslak hazır, A4 negatif kontrol tamam
+NOT: bench_hotpath.sh'e dokunulmadı (Aj4 çalışıyor); sadece ölçüm + taslak teslim edildi

@@ -7,7 +7,7 @@
 //   3) migration  : bilinmeyen alan / eksik alan / yanlış tip / bozuk JSON
 //                   çökmeden geçiyor mu?
 //
-// Protokol (sürücü = olcum/config-presets/driver.py):
+// Protokol (sürücü = olcum/arsiv/driver.py):
 //   probe list                 -> satır başına bir vaka adı
 //   probe <vaka> [arg]         -> stdout'a "RESULT <vaka> PASS|FAIL <ayrinti>"
 //                                 exit 0 = vaka tamamlandı (FAIL bile olsa),

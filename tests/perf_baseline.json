@@ -17,10 +17,10 @@
     },
     "runs_used": 3,
     "method": "median",
-    "min_seconds_per_run": 0.1000,
+    "min_seconds_per_run": 0.1,
     "positive_control": false,
     "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
-    "cpu_governor": "unreadable"
-,
-    "threshold_percent": 5.0
-  }}
+    "cpu_governor": "unreadable",
+    "threshold_percent": 20.0
+  }
+}

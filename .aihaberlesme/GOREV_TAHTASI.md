@@ -54,6 +54,38 @@ Bu kural yazıldı çünkü bir ajan iki kez "görevler tamam" dedi, `git diff` 
 
 ---
 
+## 0.5 🔐 BAĞIMSIZ DENETÇİ (Kullanıcı kararı — 30 Eylül 2026)
+
+**Aj 3 (big-pickle) yönetici denetçisidir.** Bu, kalıcı bir roldür.
+
+- Aj 1 (yönetici) bir işi **"tamam" dediğinde**, Aj 3 **bağımsız denetime geçer.**
+- Aj 3 **kendi ölçümünü yapar** — Aj 1'in verdiği sayıları tekrar kullanmaz.
+- Aj 3 **"onaylıyorum" veya "onaylamıyorum" der.** İkisi de geçerlidir.
+  **"Onaylıyorum" demek zorunda değildir.**
+
+**Gerekçe (ölçülmüş):** Bu gece Aj 1'in 8 kayıtlı hatası vardı; **2'sini Aj 3
+yakaladı** (Aj 1'in "izolasyonu çözdüm" iddiası tek örnek PC'ye dayanıyordu;
+Aj 1'in gürültü ölçümü sayısal olarak yanlıştı). Yani denetim işe yaradı ve
+tesadüf olmadığı kanıtlandı → düzene çevrildi.
+
+**Denetçi yapamaz:** sessizce düzeltme/geri alma · kabul etmeden commit · kendi
+gündemini kurma. **Ölçer, raporlar, kararı yöneticiye bırakır.**
+
+### ⭐ AJ 1'in ölçülmüş hataları (kalıcı kayıt — tekrarlanmasın diye)
+
+| # | Hata | Düzeltme kuralı |
+|---|------|-----------------|
+| 1 | Aj 2/Aj 3 brifini yazdı, **göndermedi** | Gönderimden sonra **20 sn bekle, DB'den doğrula** |
+| 2 | Aj 5'e **yanlış dosyayı** yolladı | Gönderim öncesi dosya adı doğrula |
+| 3 | Aj 4'e **"okuyup düzelt"** dedi — kullanılamaz | Ajanlara **ne yapılacak** değil, **neyin ölçüleceğini** ver |
+| 4 | "herkes çalışıyor" dedi, **ölçmedi** | İddia öncesi `raporla.sh --kontrol` |
+| 5 | Tek örnek PC ile "çözdüm" dedi | **Her iddiadan sonra ≥2 bağımsız ölçüm** |
+| 6 | "Eşik %7 olsun" dedi, **kendisi düzeltti** | Sayı verirken ölçümü ve kaynağını yaz |
+| 7 | Kendi PC'si 2 kez bozuldu, **boşuna geçti** | Her ölçüm aracına **boş-kaldırma kalkışı** |
+| 8 | "6.5 KAT" dedi, **%0.62** çıktı | Karşılaştırma yapmadan **oran z verme** |
+
+---
+
 ## 1. SORU SORMA KURALLARI (EN ÖNCE BUNU OKU)
 
 | Durum | Ne yapacaksın |
@@ -95,7 +127,7 @@ Aj 1 her turda bu dosyayı okur ve cevabını hemen altına yazar.
 |------|--------|-------|----------------------|
 | **A** | **Aj 2** | nemotron-3-ultra | `daemon/daemon.cpp`, `daemon/daemon.hpp`, `daemon/main.cpp`, `daemon/lat_stats.hpp`, `daemon/motion_math.hpp`, `setup.sh`, `scripts/**` |
 | **B** | **Aj 3** | big-pickle | `cli/main.cpp`, `src/config.cpp`, `src/logitech_hidpp.cpp`, `src/logitech_receiver.cpp`, `include/**` |
-| **C** | **Aj 4** | nemotron-3.5-lightning | `gui/**`, `tests/**`, `packaging/**`, `docs/**`, `.github/**`, `CMakeLists.txt` |
+| **C** | **Aj 4** | muse-spark-1.3-contributor-free | `gui/**`, `tests/**`, `packaging/**`, `docs/**`, `.github/**`, `CMakeLists.txt` |
 | **Y** | **Aj 1** | space-bunny (yönetici) | `AGENTS.md`, `FIX_LOG.md`, `README.md`, `CHANGELOG.md`, `Bug Hata Raporları.md, `.aihaberlesme/**`, `olcum/**`, `config/**` |
 
 ### Bu turda kilidi olan dosya var mı?

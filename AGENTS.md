@@ -142,9 +142,29 @@ bash tests/run_tracker_bridge.sh
 | **total** | | **~168.9** |
 
 **Exit codes:** 0 = pass, 1 = fail, 77 = environment unusable (skip with message).
-All seven must pass before push. `run_tests_asan.sh` is an **internal mode** of
-gate 2 (invoked by `run_tests.sh`), not a separate gate. `run_e2e.sh` requires
-root + `/dev/uinput` and is not in CI.
+All seven must pass before push. `run_e2e.sh` requires root + `/dev/uinput` and
+is not in CI.
+
+**`run_tests_asan.sh` is NOT invoked by `run_tests.sh` and is NOT one of the
+seven gates.** It is a separate, optional command. This sentence previously read
+"an internal mode of gate 2 (invoked by `run_tests.sh`)" — that was **false**:
+`run_tests.sh` mentions it only in a comment (`tests/run_tests.sh:52`), and
+there is no call site. Measured, not inferred.
+
+⭐ **What "seven gates green" therefore does and does not mean for sanitizers:**
+
+| Translation unit | Run under ASan+UBSan by | By the seven gates? |
+|---|---|---|
+| `cli/main.cpp` | gate 6 `run_cli_sanitized.sh` | **yes** |
+| `tests/test_accel.cpp` | `run_tests_asan.sh` (separate) | ⛔ **no** |
+
+So the 34 164 assertions run **without** sanitizers in the canonical pipeline.
+CI's `sanitizers` job does run them, but that is a **different workflow**, not one
+of the seven local gates — so a green local run is not a sanitized local run. If
+you change `test_accel.cpp` or any header it includes, run
+`bash tests/run_tests_asan.sh` yourself; nothing in the seven will catch a leak
+or UB there. (The same hole is why gate 6 exists: `cli/main.cpp` was covered by
+no sanitizer job at all until `run_cli_sanitized.sh` was added.)
 
 NOT: `scripts/bench_hotpath.sh` yedi kapidan biri **DEGILDIR** - CI'daki
 `perf-gate` isidir (kirilim olcum kapisi, dogruluk kapisi degil).

@@ -1237,3 +1237,9 @@ Rapor Aj1'e gönderildi
 
 ### [AJ2] P108 tamamlandı — bench_hotpath.cpp denetimi
 Q1: min_seconds çalışıyor (0.001→0.16s, 0.5→7.3s). Q2: median-of-3 doğru (elle doğrulandı). Q3: riskler — eksik config fallback 50ns (yanlış-OK), NaN → median NaN (yanlış-OK), iter=0 korumalı. Q4: power-dual+4ema AJ1'in '4x kararlı' iddiası TERSTE — CV%=6.85% (en az kararlı), neden: 4 EMA → iter↓ + wall time↑ → gürültü↑. 7/7 kapı yeşil. Kod değişikliği YOK.
+
+### [AJ2] PERF1 tamamlandı — exp2 önbelleği
+include/rawaccel.hpp: simple_ema_smoother + linear_ema_smoother exp2 cache eklendi. time EXACT eşitse önbellek (bit-özdeşlik). 7/7 kapı YEŞİL. power-dual+4ema: 307.34 → 296.06 ns/event (-3.7%, ~11 ns kazanç). Cache hit rate: 99.999% (daemon 1.0 ms sabit). exp2/olay: 8 → 1 (8x azalma). Oracle 1408/79 PASS (bit-özdeşlik kanıtlandı). Tests 34164/34164. Kod değişikliği SADECE include/rawaccel.hpp.
+
+### [AJ2] PERF3 tamamlandı — exp2 önbelleği DOĞRULAMA
+A/B (5+5 koşu): power-dual+4ema -1.04% (-3.14 ns), classic +0.59% REGRESYON, power-whole/noaccel ~0. KÖK NEDEN: linear_ema 20 fazladan double → kayıt taşması. simple_ema 6 double → faydalı. ÖNERİ: (b) simple_ema cache KORU, linear_ema cache KALDIR. Oracle 1408/79 PASS, tests 34164/34164. Kod kalıcı değiştirilmedi.

@@ -79,7 +79,12 @@ done
 if [[ -n "${POS_RUNS:-}" ]]; then
     RUNS="${POS_RUNS}"
 fi
-OUTPUT_FILE="${POS_OUTPUT:-$PROJECT_ROOT/bench_hotpath_results.txt}"
+# P113 follow-up (AJ4 finding, confirmed by AJ1): the --output flag above sets
+# OUTPUT_FILE, and this line used to overwrite it unconditionally — so
+# `--output /tmp/x.json` silently wrote to bench_hotpath_results.txt instead and
+# the requested file was never created. Respect an already-set OUTPUT_FILE; only
+# fall back to the deprecated positional form, then to the default.
+OUTPUT_FILE="${OUTPUT_FILE:-${POS_OUTPUT:-$PROJECT_ROOT/bench_hotpath_results.txt}}"
 
 # Build benchmark if needed
 if [[ ! -f "$BENCH_BIN" ]]; then
@@ -120,8 +125,39 @@ if [[ ! -f "$BENCH_BIN" ]]; then
     exit 1
 fi
 
-# Default threshold for BENCH_UPDATE_BASELINE (before baseline is read)
-THRESHOLD_PCT=5.0
+# ── Load guard (P115, AJ5 measurement 30 Sep 2026) ───────────────────────────
+# The measured noise floor of this benchmark, same unchanged binary:
+#   idle machine : median 3.17% · p95 18.81%   (12 runs)
+#   loaded       : median 44.90% · p95 58.38%  (12 runs, 6-CPU load)
+# A 5% threshold is therefore inside the idle noise (false reds) and a loaded
+# machine is 9× noisier still (every run red — measured, not predicted:
+# 0/12 false greens, 12/12 red). Raising the threshold alone cannot fix this:
+# covering 58% would blind the gate to a real 20% regression. So the gate
+# refuses to measure on a loaded machine instead — exit 77, the project's
+# existing "environment unusable, skip with a message" code, which CI already
+# handles. It never prints OK/REGRESSION when it did not measure.
+BENCH_LOAD_GUARD="${BENCH_LOAD_GUARD:-1}"
+_bench_load_check() {
+    [[ "$BENCH_LOAD_GUARD" == "1" ]] || return 0
+    local cores load
+    cores=$(nproc 2>/dev/null || echo 1)
+    # /proc/loadavg field 1 is the 1-minute average.
+    load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+    # Over half the core count the measurements are not comparable; 1-core
+    # machines would trip this constantly, so floor the limit at 2.0.
+    local limit
+    limit=$(awk -v c="$cores" 'BEGIN { l = c * 0.5; print (l < 2.0) ? 2.0 : l }')
+    if awk -v l="$load" -v t="$limit" 'BEGIN { exit (l > t) ? 0 : 1 }'; then
+        echo "LOAD-SKIP: 1-min loadavg ${load} > limit ${limit} (${cores} cores)." >&2
+        echo "LOAD-SKIP: the perf gate did NOT measure, so it makes no claim." >&2
+        echo "LOAD-SKIP: measured noise here is ~9x the idle floor; a green or red" >&2
+        echo "LOAD-SKIP: result would be a property of the load, not of the code." >&2
+        echo "LOAD-SKIP: re-run when idle, or set BENCH_LOAD_GUARD=0 to override." >&2
+        exit 77
+    fi
+    echo "loadavg ${load} <= limit ${limit} (${cores} cores) — measuring." >&2
+}
+_bench_load_check
 
 # Handle BENCH_UPDATE_BASELINE early (env var takes precedence over flag)
 if [[ "${BENCH_UPDATE_BASELINE:-0}" == "1" ]] || [[ "$UPDATE_BASELINE" == "true" ]]; then
@@ -158,20 +194,51 @@ if [[ $BENCH_EXIT -ne 0 ]]; then
 fi
 
 # Parse JSON output using awk (no jq/bc needed)
-# Use index() for literal string matching instead of regex
-# Only match top-level keys (not nested in _meta)
+# Exact-key match (P113): the key must start at column 3 ("  \"key\"") and be
+# followed by optional spaces + colon, so a longer key like "classic-fast"
+# can never be mistaken for "classic" (index() substring matching did that).
+# Numbers carry an optional sign + exponent so -5 is reported as -5 instead
+# of silently becoming 5; callers that need a measurement must additionally
+# pass the value through require_positive_number below.
 parse_bench_json() {
     local json="$1"
     local key="$2"
     echo "$json" | awk -v key="\"$key\"" '
         /^  "_meta":/ { in_meta = 1 }
         in_meta && /^  }$/ { in_meta = 0 }
-        !in_meta && index($0, key) {
+        !in_meta && index($0, "  " key) == 1 {
+            rest = substr($0, 2 + length(key) + 1)
+            if (rest !~ /^ *:/) next
             # Find the number after the colon
-            match($0, /: *([0-9]+\.?[0-9]*)/, arr)
+            match(rest, /: *(-?[0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?)/, arr)
             if (arr[1] != "") print arr[1]
         }
     '
+}
+
+# P113 ("kapı sessizce geçiyor" sınıfı): an empty / zero / corrupt
+# measurement must FAIL the gate, never read as OK. awk coerces "" and
+# non-numeric strings to 0 in arithmetic, and `base == 0` / `cur == 0` both
+# flow into the "OK" branch below — so every comparison input is validated
+# here, at the comparison site, not only at the parse site.
+require_positive_number() {
+    local val="$1" label="$2"
+    if [[ ! "$val" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+        echo "ERROR: $label is not a number (got: '$val')" >&2
+        exit 1
+    fi
+    if ! awk -v v="$val" 'BEGIN { exit (v + 0 > 0) ? 0 : 1 }'; then
+        echo "ERROR: $label must be > 0 (got: '$val'). Zero means nothing was measured." >&2
+        exit 1
+    fi
+}
+
+require_nonnegative_number() {
+    local val="$1" label="$2"
+    if [[ ! "$val" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+        echo "ERROR: $label must be a number >= 0 (got: '$val')" >&2
+        exit 1
+    fi
 }
 
 # Extract all config results
@@ -184,6 +251,7 @@ for config in "${CONFIGS[@]}"; do
         echo "ERROR: Failed to parse result for $config" >&2
         exit 1
     fi
+    require_positive_number "$val" "benchmark result for $config"
     RESULTS["$config"]="$val"
 done
 
@@ -201,9 +269,15 @@ parse_baseline_json() {
     echo "$json" | awk -v key="\"$key\"" '
         /^  "_meta":/ { in_meta = 1 }
         in_meta && /^  }$/ { in_meta = 0 }
-        !in_meta && index($0, key) {
-            # Match either number or quoted string
-            match($0, /: *([0-9]+\.?[0-9]*|"[^"]*")/, arr)
+        !in_meta && index($0, "  " key) == 1 {
+            rest = substr($0, 2 + length(key) + 1)
+            if (rest !~ /^ *:/) next
+            # Match either number or quoted string (a config/threshold
+            # caller must still pass the value through
+            # require_positive_number/require_nonnegative_number — a quoted
+            # string such as "unreadable" is data for cpu_model, never a
+            # measurement)
+            match(rest, /: *(-?[0-9]+\.?[0-9]*([eE][-+]?[0-9]+)?|"[^"]*")/, arr)
             if (arr[1] != "") {
                 val = arr[1]
                 # Remove surrounding quotes if present
@@ -219,9 +293,16 @@ BASELINE_JSON="$(cat "$BASELINE_FILE")"
 # Threshold: flag override > baseline > default 5.0
 if [[ -n "$THRESHOLD_PCT_OVERRIDE" ]]; then
     THRESHOLD_PCT="$THRESHOLD_PCT_OVERRIDE"
+    require_nonnegative_number "$THRESHOLD_PCT" "--threshold override"
 else
-    THRESHOLD_PCT=$(parse_baseline_json "$BASELINE_JSON" "threshold_percent")
-    if [[ -z "$THRESHOLD_PCT" ]]; then
+    # NOTE: threshold_percent lives inside _meta by design (written there by
+    # --update-baseline), so it is extracted loosely here and validated
+    # strictly: a missing key falls back to the default, but a present-but-
+    # corrupt value fails loudly instead of silently loosening the gate.
+    if echo "$BASELINE_JSON" | grep -q '"threshold_percent"[[:space:]]*:'; then
+        THRESHOLD_PCT="$(echo "$BASELINE_JSON" | sed -n 's/.*"threshold_percent"[[:space:]]*:[[:space:]]*"\?\([^",}]*\)"\?.*/\1/p' | head -1)"
+        require_nonnegative_number "$THRESHOLD_PCT" "baseline threshold_percent"
+    else
         THRESHOLD_PCT=5.0
     fi
 fi
@@ -233,6 +314,7 @@ for config in "${CONFIGS[@]}"; do
         echo "ERROR: Failed to parse baseline for $config" >&2
         exit 1
     fi
+    require_positive_number "$val" "baseline for $config"
     BASELINE["$config"]="$val"
 done
 

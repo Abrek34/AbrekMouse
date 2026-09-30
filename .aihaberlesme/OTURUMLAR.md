@@ -10,10 +10,11 @@
 
 | Ajan | Model | Oturum Kimliği (session id) |
 |------|-------|------------------------------|
-| **Aj 1** (yönetici) | `space-bunny-free` | `ses_f1199eaf8ffe1sFoTv46EmtzBf` |
+| **Aj 1** (yönetici) | `big-pickle` | `ses_f1199eaf8ffe1sFoTv46EmtzBf` | ⚠️ 30 Eylül 21:2x → **MODEL DEĞİŞTİ: `big-pickle`** (önceki `space-bunny-free`). Yönetici + bütüncül **denetimçi** rolleri bu modelde birleşti: AJ 1 artık hem görev verir hem de kendi "tamam" iddialarının bağımsız denetimini yapar. |
 | **Aj 2** | `nemotron-3-ultra-free` | `ses_f1199d68dffeaLOGBRD7IAG2Ku` |
-| **Aj 3** | `big-pickle` | `ses_f1199c1bbffeuU5YLL8vCLDher` |
-| **Aj 4** | `nemotron-3.5-lightning-free` | `ses_f119964f7ffeuuWIQThJd3P3Mu` |
+| **Aj 3** | `space-bunny-free` | `ses_f1199c1bbffeuU5YLL8vCLDher` | ⚠️ 30 Eylül 21:2x → **MODEL DEĞİŞTİ: `space-bunny-free`** (önceki `big-pickle`). **Aj 1 ve Aj 3 takas edildi** — oturum kimlikleri yerinde kaldı, sadece model adları yer değiştirdi. |
+| **Aj 4** | `muse-spark-1.3-contributor-free` | `ses_f10bafc41ffe3pfexUmCMdSTlo` | ⛔ ESKİSİ `nemotron-3.5-lightning-free` / `ses_f119964f7ffeuuWIQThJd3P3Mu` — çıkarıldı 30 Eylül 01:30: çıktı bozuldu (İspanyolca metin + `</toolcall>` sızıntısı) | ⚠️ 30 Eylül 01:30 → **MODEL DEĞİŞTİ: `muse-spark-1.3-contributor-free`**
+  yeni oturum: `ses_f10bafc41ffe3pfexUmCMdSTlo` · çıkarılma sebebi: çıktı bozuldu (İspanyolca metin + `</toolcall>` sızıntısı, kanıt: session_message seq433)
 
 ---
 
@@ -26,12 +27,12 @@
   --prompt "mesajın"
 ```
 
-**Örnek — Aj 3, Aj 1'e soruyor:**
+**Örnek — Aj 3 (`space-bunny-free`), Aj 1'e (`big-pickle`) soruyor:**
 
 ```bash
 /home/a/.opencode/bin/opencode run \
   --session ses_f1199eaf8ffe1sFoTv46EmtzBf \
-  --model opencode/space-bunny-free \
+  --model opencode/big-pickle \
   --prompt "Aj 1: include/rawaccel.hpp:350 clamp sınırını değiştirmek istiyorum. Bu senin lane'ın mı? Cevap ver."
 ```
 

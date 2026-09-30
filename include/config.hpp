@@ -36,7 +36,7 @@ static constexpr double OUTPUT_OFFSET_MAX  = 100.0;
 //   [1.2, 2.2] (include/presets.hpp) and the oracle grid spans [1.2, 1.8]
 //   (tests/oracle/oracle_cases.hpp), so the ceiling touches neither.
 //
-// AJ4-K7 (same scan, olcum/config-presets/gauge_scan.py): the scan then showed
+// AJ4-K7 (same scan, olcum/arsiv/gauge_scan.py): the scan then showed
 // that `limit` was NOT special — SIX more accel_args fields have a GUI gauge
 // maximum that sanitize never enforced, and for all six the same two
 // independent constraints agree on the number:

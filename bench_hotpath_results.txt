@@ -1,13 +1,13 @@
 === RawAccel Hot-Path Benchmark Results ===
-Date: Çrş 30 Eyl 2026 00:33:04 +03
-Runs: 3 (median), Min seconds per run: 0.1
+Date: Çrş 30 Eyl 2026 21:45:06 +03
+Runs: 1 (median), Min seconds per run: 0.1
 
-noaccel: 13.6711 ns/event
-power-whole: 39.1532 ns/event
-classic: 43.9218 ns/event
-power+rot45+snap15+clamp: 59.0414 ns/event
-power-dual+4ema: 302.9805 ns/event
-apply_motion_math(full): 43.6167 ns/event
+noaccel: 13.5263 ns/event
+power-whole: 38.7240 ns/event
+classic: 45.5171 ns/event
+power+rot45+snap15+clamp: 60.3897 ns/event
+power-dual+4ema: 296.6757 ns/event
+apply_motion_math(full): 43.4726 ns/event
 
-Baseline threshold: 5.0%
+Baseline threshold: 20.0%
 Status: OK

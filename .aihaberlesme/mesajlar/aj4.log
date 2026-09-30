@@ -1213,3 +1213,70 @@ _meta.threshold_percent: _meta içinde yok, 5.0 sabitlenecek
 Gürültü ölçümü: noaccel ±0.9%, power-whole ±1.7% vb.
 ÖNEMLİ: baseline sheildirildi: yazıldığı an 13.9158, yazılan 15.2870 → %8.9 yanlış
 ÇÖZÜM: BENCH_UPDATE_BASELINE=1 + eşik gürültünün üstüne konma
+
+### Aj.4 [BAKIS] [30 eylül 2026 01:22]
+1) ORACLE_COVERED: 9 — isimler: accel_classic, accel_power, accel_natural, accel_jump, accel_synchronous, accel_lookup, accel_noaccel, accel_union_apply, accel_union_init
+2) ORACLE_NOT_COVERED: 15
+3) PATTERNS: 17
+4) unlisted_covered satırı: 261
+5) PRODUCTION_FILES: 15
+6) tam satır metni: unlisted_covered = oracle_harness_calls - ORACLE_COVERED
+
+### Aj.4 [BAKIS] [30 eylül 2026 01:22]
+1) ORACLE_COVERED: 9 — isimler: accel_classic, accel_power, accel_natural, accel_jump, accel_synchronous, accel_lookup, accel_noaccel, accel_union_apply, accel_union_init
+2) ORACLE_NOT_COVERED: 15
+3) PATTERNS: 17
+4) unlisted_covered satırı: 261
+5) PRODUCTION_FILES: 15
+6) tam satır metni: unlisted_covered = oracle_harness_calls - ORACLE_COVERED
+
+### Aj.4 [BAKIS2] [30 eylül 2026 01:25]
+1) TOTAL: gercek 6, yazilan 3 - sebep: for listesi (noaccel accel_classic accel_power) bench_hotpath.cpp:239-246 ve bench_hotpath.sh:178'deki 6 CONFIGS'un yarisini saymiyor; 2 isim bile uydurma (gercek: classic, power-whole). Kanit: perf_baseline_orig.json'da 6 top-level anahtar (noaccel/power-whole/classic/power+rot45+snap15+clamp/power-dual+4ema/apply_motion_math(full)).
+2) kacirma yolu: s9 out dolu gelir, s10 val dolu gelir (999999999.0 hatta null->'None' bile), s11 [ -n ] true -> s12 PASSED+1, s14 FAILED+1 hic calismaz -> s18 FAILED==0 -> exit 0 yesil. Olculdu: null 'None' basar (non-empty), 999999999.0 PASSED dalina girer.
+3) en kotu hata: esik karsilastirmasi yok - baseline + %5 (bench_hotpath.sh:293-311) hic okunmuyor, awk delta/is_regression yok. Yesil 'bench JSON uretti' demek, 'regresyon yok' degil; 10x yavaslama bile yesil. Gercekte olculen: liveness (alan var mi), degil correctness (hizli mi).
+4) bu sinifin genel adi: varlik kontrolu dogruluk kontrolu yerine - esiksiz/tautolojik kapi (vacuous pass, zayif assertion).
+
+### Aj.4 [BAKIS2] [30 eylül 2026 01:29]
+1) TOTAL: gercek evren 6 config (scripts/bench_hotpath.sh:178 CONFIGS, tests/bench_hotpath.cpp:239-246 config_names, tests/perf_baseline_orig.json 6 top-level anahtar), yazilan 3. Ustelik o 3 isimden SADECE noaccel gercek; accel_classic/accel_power yalniz tests/oracle/run_oracle.sh geciyor (bench config'i DEGIL). Ve bench'te --config BAYRAGI YOK: bench_hotpath.cpp:218/230 argv'yi positional_args'a topluyor, hic okumuyor (grep --config = 0 satir) -> her cagri 6 config'i birden kosuyor. Yani olcen/raporlanan 0, gercek kosu 3 cagri x 6 = 18, TOTAL yazilan 3. Kanit (ham): ./build-manual/bench_hotpath --json --config noaccel -> rc=0, anahtarlar ['noaccel','power-whole','classic','power+rot45+snap15+clamp','power-dual+4ema','apply_motion_math(full)','_meta'], 'ns_per_event' in d = False; ./bench diye dosya proje kokunde YOK (ls rc=2).
+2) kacirma yolu (satir satir): s9 out="$(./bench ... 2>/dev/null || true)" -> bench'in cikis kodu yutulur; s10 val=... ; s11 if [ -n "$val" ] -> yalnizca DOLU MU bakar, degerin sayi olup olmadiigina, esige gore buyuk kucuk olduguna BAKMAZ; s12 PASSED+1, s14 FAILED+1 asla calismaz; s19 [ "$FAILED" -eq 0 ] -> PASSED==TOTAL kontrolu YOK; s19 exit 0. PC (ham cikti, /tmp/opencode/bakis2/gate.sh birebir kopya): V3 bench '{"ns_per_event": 999999999.0}' (10x kotu) -> PASS=3 FAIL=0 TOTAL=3 rc=0; V4 null -> PASS=3 FAIL=0 rc=0; V5 bench exit 1 (crash) -> PASS=3 FAIL=0 rc=0 (|| true yuttu). Ters yon de olcildu: GERCEK bench JSON'u ile -> KeyError: 'ns_per_event' -> val bos -> V1 (./bench yok) PASS=0 FAIL=3 TOTAL=3 rc=1, V2 (gercek cikti) PASS=0 FAIL=3 TOTAL=3 rc=1 -> kapI bugun %100 kirmizi, hic yesil gormuyor.
+3) en kotu hata: kapI ilk kez OLCUMU karsilastirmiyor - baseline + esik (delta%, threshold 5.0) sadece scripts/bench_hotpath.sh:289-311'de; snippet baseline'i hic okumuyor, hicbir sayi kontrolu yok. Sonuc: 10x yavaslama bile yesil (V3 olcumu). 'Yesil' dediginde gercekten olctugu sey: 'python3 dolu bir satiri basabildi' = canlilik/varlik; hiz/regresyon/correctness hakkinda HICBIR SEY degil. Ayni kapinin bugunku hali de kirik: yanlis anahtar (ns_per_event bench JSON'unda yok) + koke ./bench koymamis olmak -> surekli kirmizi. Yani kapI iki ucun da kirik: su an gecemez, anahtar eklenirse de HICBIR degeri ayirt etmeden gecer.
+4) bu sinifin genel adi: varlik kontrolunu dogruluk kontrolu sanmak - esiksiz/tautolojik kapi (vacuous pass / weak assertion) + tek dogruluk kaynagi olmayan sabit sayim (TOTAL loop listesinden turetilmiyor, PASS+FAIL==TOTAL tutarlilik kontrolu yok). Duzeltme yonu: degeri dogula (sayi + sonlu + esik/baseline karsilastirmasi), TOTAL'i loop listesinden turet, cikisa PASSED==TOTAL kosulu ekle.
+
+### Aj.4 [TEST] [30 eylül 2026 01:30]
+1) ORACLE_COVERED: 9 girdi — isimler: accel_classic, accel_power, accel_natural, accel_jump, accel_synchronous, accel_lookup, accel_noaccel, accel_union_apply, accel_union_init
+2) ORACLE_NOT_COVERED: 15 girdi
+3) PATTERNS: 17 anahtar
+4) unlisted_covered satiri: 261 — unlisted_covered = oracle_harness_calls - ORACLE_COVERED
+5) PRODUCTION_FILES: 15 dosya
+DOGRULAMA: python3 ile makinede sayildi, tahmin yok. git diff --stat kaynak dosyalara dokunulmadi (sadece raporla.sh log eki).
+
+### Aj.4 [P113] [30 eylül 2026 01:36]
+DURUM: tamam - sadece scripts/bench_hotpath.sh degisti (+55/-9), commit yok
+BULGU 1 bench_hotpath.sh:300-303 - sifir/bos olcum OK: awk bos girdiyi 0'a cevirir, base==0 ve cur==0 dallari OK basar. Kanit (duzeltme oncesi, gercek dosyadan): cur='' base=43.8619 -> delta=-100.00% is_regression=0 OK; cur=0.0000 -> guard gecti -> OK; base=0 -> delta inf% -> OK
+BULGU 2 bench_hotpath.sh:220-227 - mevcut-ama-bozuk threshold sessizce 5.0'a duser: threshold_percent:abc -> parse '' -> -z dali default. Kanit: ESKI parse -> bos -> default 5.0 (sessiz). Gercek dosyada threshold _meta icinde oldugu icin ayrica sed-cikarim eklendi
+BULGU 3 parse fonksiyonlari - tirnakli cop sayi yerine gecer: parse_baseline_json 'unreadable' dondurur (-z guard gecer), awk fatal + sahte REGRESSION uretir. Kanit: duzeltme oncesi delta bos + sifirla-bolme hatasi
+DUSURULEN SUPHE: alt-dize eslesme (classic-fast) - ESKI kod da [] dondurdu (anahtar tirnakli arandigi icin). Olculdu, bulgu degil; colon-anchor hardening olarak kaldi
+DENETLENDI-TEMIZ: || true cpu satirlari (244/245/273 - 77/warning yollarina gider, yesil degil), BENCH_EXIT kontrolleri, negatif sayi (eski de bos donduruyordu)
+DUZELTME: require_positive_number (bench+baseline girdileri), require_nonnegative_number (--threshold + baseline esigi), _meta-ici esik icin sed-cikarim + dogrulama, exact-key eslesme (sutun+kolon), sayida isaret/us destegi
+PC-ONCE: M1 bos->OK, M2 0.0000->OK, M3 base 0->OK, esik abc->sessiz 5.0 (yukaridaki olcumler)
+PC-SONRA: S1-S7 hepsi ERROR rc=1 (ornek: benchmark result for classic must be > 0 (got: '0.0000')); esik abc->ERROR must be a number >= 0; esik 1.0->KABUL
+PC-TEMIZ: T1 gercek baseline'dan 6/6 anahtar OK (13.6782/39.1757/43.8619/58.5337/307.3409/43.9391); T2 kararlar 3/3 (OK/OK/REGRESSION); tam-kosu ayni bayraklarla rc=0, 6 satir tablo, Threshold 5.0%
+KAPI: bash -n OK; tam-kosu ONCESI rc=1 (noaccel %6.44 gercek olcum, hizli ayar gurultusu) / SONRASI rc=0 ALL WITHIN THRESHOLD
+GOZLEM (duzeltmedim, kapsam disi): --output bayragi :82'de eziliyor (OUTPUT_FILE unconditional overwrite) - tam-kosu /tmp yerine bench_hotpath_results.txt'e yazdi. Tek satirlik fix, karari sana birakiyorum
+git diff --stat: scripts/bench_hotpath.sh | 64 +++ 55 insertions 9 deletions; baska dosyaya dokunmadim
+
+### Aj.4 [PERF4] [30 eylül 2026 21:50]
+ARAC: olcum/aj5/trend_prof.cpp + olcum/aj5/shadow (uretim include kopyasi, TREND_VARIANT ile blok kapatma) + -I. Inline olculdu: objdump'ta smooth sembolu/cagrisi YOK (tam inline), exp2 dogrudan dongude. V0-shadow 141.27 = uretim-include 143.39 (metodoloji gecerli)
+TABLO cagri-basi (V0=141.3ns): (3) bolmesiz V2=11.8 | (4) clampsiz V8=149.2 | (1) dampsiz V3=81.9 | (2) entegresiz V4=113.0 | trend-exp2siz V7=7.9 | trendsiz V1=6.4 | ffast-math V0=10.8. Gercek is ~11ns, subnormal cezasi ~130ns (%92)
+OLCULEMEYEN PAY: tekli-kapatma deltalari toplanamaz (129+59+28+... >> 135). Sebep: (3)/(7) kapatmak trend'i tam 0'da dondurup subnormal kaynagini da yok ediyor (yan-etki). Durust paylasim: ffast ile toplam ceza 130.5ns; blok gercek-isleri toplami ~4.4ns (2 div+clamp+damp+entegrasyon normal float'ta)
+C1 dallanma: CURUTULDU - V5 dal-hep=140.2约V0 (dal kararli-aliniyor, mispredict yok); V6 dal-hic=112.8 tasarrufu subnormal mult azalmasindan
+C2 denormal: DOGRULANDI (4 bagimsiz kanit) - (a) ffast 141.3->10.8ns; (b) PROB min|trend|=4.941e-324 (en kucuk subnormal), min|nwt|=0; (c) V2/V7 trend tam-0'da donunca hizli; (d) onceki state_dump trendW=4.94e-324. Mekanizma: ilk gecici trend'i tiny-yapar, geometrik sonum (x0.75) asla tam 0'a inemez, her olay ~10 subnormal op x ~13ns
+ONERI (uygulama AJ2'de): trend deadband snap - fabs(trend)<1e-12 ise 0'la; maliyet ~1ns (2 fabs+dal), sayisal etki fiziksel anlamsiz (1e-12 ips egim), beklenen kazanc ~120-130ns/cagri -> power-dual+4ema ~300ns'tan ~70-90ns'a. FTZ/DAZ onerilmez (global CSR yan-etkisi). Gecerlilik: oracle + capraz-kontrol sart
+CROSS-CHECK: AJ1'in onbellekli-agac 128.5 + 4x2.9 exp2 = ~140约benim onbelleksiz 141.3 (PERF1 cache calisiyor, subnormal'i degistirmiyor)
+DETERMINIZM: V0 141.27/141.82/141.50 (+-%0.3), 7 ornek bant +/-1ns. Alet tekrarlanabilir
+SERIT: uretime dokunmadim (M include/rawaccel.hpp AJ2'nin PERF1 cache'i, benim degil); git diff --cached bos; yeni dosyalar sadece olcum/aj5/ (trend_prof.cpp + shadow/)
+
+### Aj.4 [HAZIR] [30 eylül 2026 21:55]
+DURUM: bosta — TEST tamamlandi, yeni gorev bekliyorum
+SON IS: TEST 5/5 dogru cevaplandi, salt-okunur kuralina uyuldu
+ISTEK: siradaki isi ver, hazirim

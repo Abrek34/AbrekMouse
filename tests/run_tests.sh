@@ -62,7 +62,13 @@ BIN="$TMPDIR/test_accel"
 
 TMP_FILES=()
 cleanup_tmp() {
-    rm -f "${TMP_FILES[@]}"
+    # `rm -f` cannot remove a directory — it fails with "is a directory" and,
+    # under `set -e`, that aborts the function BEFORE the RA_TMPDIR removal
+    # below, so a single SECD/SECD_SHM/SECD_RT directory in TMP_FILES leaked
+    # both itself and the whole TMPDIR. Those three are added at :361/:371/:377.
+    # `rm -rf` handles files and directories alike; `|| true` keeps one bad
+    # entry from skipping the rest. (Found by AJ3's audit, 30 Sep 2026.)
+    rm -rf "${TMP_FILES[@]}" 2>/dev/null || true
     if [ -n "${RA_TMPDIR:-}" ] && [ -d "$RA_TMPDIR" ]; then
         rm -rf "$RA_TMPDIR"
     fi
@@ -91,6 +97,81 @@ CLI="$ROOT/build-manual/rawaccel-cli"
 DAEMON="$ROOT/build-manual/rawaccel-daemon"
 
 die() { echo "Hata: $*" >&2; exit 1; }   # L-BUG-41: unhelpful chatter→açıklayıcı hata
+
+# ── P111 (AJ3): daemon kapısı KURULUM-DUYARSIZ olsun ──────────────────────────
+# `daemon/main.cpp:458-459` PID dosyası canlılık kontrolünü üç adayın BİRLEŞİMİ
+# olarak yapar: `$XDG_RUNTIME_DIR/rawaccel.pid` **VE** `/run/rawaccel.pid` **VE**
+# `/tmp/rawaccel.pid`. Yani `XDG_RUNTIME_DIR` yalnız *yazma* yolunu değiştirir,
+# *okunan* aday kümesini değiştirmez — ve bu üretimde kasıtlıdır (XDG'siz
+# başlatılmış bir daemon'ı da yakalamak için, tek instance garantisi).
+# ÖLÇÜLDÜ: canlı bir sistem daemon'ı varken SEC-2 bloğu `XDG_RUNTIME_DIR`'ı
+# koşuya özel verse bile "Another instance may already be running (PID file
+# exists)" deyip kendi fişini kullanmayı reddediyor → kapı, ürünün kurulu olup
+# olmadığına BAĞLIYDI. Kurulu değilken aynı blok yeşildi.
+# Çözüm: daemon çağrıları root GEREKTİRMEYEN bir mount namespace'inde, `/run`
+# üzerine boş bir tmpfs ile koşturulur (`unshare -Urm`; yoksa `bwrap`).
+# KAPSAM SADECE `/run`: `/tmp` bilerek maskelenmez. Negatif kontrol ölçüldü —
+# `/tmp` de maskelenince "kabul edilen meşru config yolu" vakası KIRILIYOR
+# ("Config directory '/tmp/.../d' does not exist"), yani maske genişletilemez.
+# Test /run'a HİÇ yazmıyor: /run/rawaccel.pid ölçüm boyunca değişmedi.
+DAEMON_ISO=none
+DAEMON_ISO_PROBED=0
+
+# `daemon/main.cpp:441-446` `pid_file_is_live` ile AYNI mantık: `kill(pid,0)` 0
+# dönerse canlı; EPERM (sinyal gönderilemiyor) ise **yine canlı** sayılır —
+# "var ama doğrulanamıyor, bu yüzden reddet". ⚠️ bash'in `kill -0` komutu EPERM
+# ile ESRCH'i AYNI rc ile verdiği için ayrım `/proc/<pid>` varlığıyla yapılır
+# (hata metni çözüm yerelinden bağımsız değil: burada "İşleme izin verilmedi").
+# Bu ayrım olmadan canlı root daemon **ölü** görünür ve düzeltme sessizce hiç
+# devreye girmez — ölçüldü: ilk hâlde `kill -0 693` rc=1, `/proc/693` ise VAR.
+ra_pid_live () {
+    local f="$1" n
+    [ -r "$f" ] || return 1
+    n=$(tr -dc '0-9' < "$f" 2>/dev/null) || return 1
+    [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || return 1
+    kill -0 "$n" 2>/dev/null && return 0    # sinyal gidebiliyor = kesin canlı
+    [ -e "/proc/$n" ] && return 0           # EPERM: var ama sinyal gönderilemiyor
+    return 1
+}
+
+# Testin sahiplenemediği iki GLOBAL aday (üçüncüsü zaten koşuya özel).
+ra_foreign_daemon_live () {
+    ra_pid_live /run/rawaccel.pid && return 0
+    ra_pid_live /tmp/rawaccel.pid && return 0
+    return 1
+}
+
+# Bir komutu gerekiyorsa izole namespace içinde koşturur. Geçiş şeffaftır:
+# izolasyon gerekmiyorsa komut BİREBİB doğrudan çalışır.
+ra_daemon_run () {
+    if [ "$DAEMON_ISO_PROBED" -eq 0 ]; then
+        DAEMON_ISO_PROBED=1
+        if ra_foreign_daemon_live; then
+            if unshare -Urm true 2>/dev/null; then
+                DAEMON_ISO=unshare
+            elif bwrap --bind / / --dev /dev true 2>/dev/null; then
+                DAEMON_ISO=bwrap
+            else
+                echo "FAIL: canlı bir RawAccel daemon'ı var (PID dosyası: /run/rawaccel.pid veya" >&2
+                echo "      /tmp/rawaccel.pid) ve kapıyı izole edecek root gerektirmeyen" >&2
+                echo "      namespace yok: ne 'unshare -Urm' ne 'bwrap' çalışıyor." >&2
+                echo "      SESSİZCE ATLANMAZ. Çözüm: 'rawaccel-cli stop', ya da" >&2
+                echo "      kernel.unprivileged_userns_clone=1 olsun." >&2
+                exit 1
+            fi
+        fi
+    fi
+    case "$DAEMON_ISO" in
+        unshare)
+            unshare -Urm /bin/sh -c '
+                mount -t tmpfs tmpfs /run 2>/dev/null || exit 70
+                exec "$@"' ra "$@" ;;
+        bwrap)
+            bwrap --bind / / --dev /dev --tmpfs /run -- "$@" ;;
+        *)
+            "$@" ;;
+    esac
+}
 
 if [ ! -x "$CLI" ]; then
     echo "Hata: CLI kapısı çalıştırılamadı: $CLI" >&2
@@ -528,7 +609,7 @@ PY4
     secd_daemon_reject () {
         local desc="$1" path="$2" want="$3"
         set +e
-        OUT=$(timeout 5 "$DAEMON" -c "$path" 2>&1)
+        OUT=$(ra_daemon_run timeout 5 "$DAEMON" -c "$path" 2>&1)
         RC=$?
         set -e
         if [ $RC -ne 1 ] || ! echo "$OUT" | grep -qE "$want"; then
@@ -539,7 +620,7 @@ PY4
     secd_daemon_accept () {
         local desc="$1" path="$2"
         set +e
-        OUT=$(timeout 3 "$DAEMON" -c "$path" 2>&1)
+        OUT=$(ra_daemon_run timeout 3 "$DAEMON" -c "$path" 2>&1)
         RC=$?
         set -e
         if [ $RC -eq 1 ] || echo "$OUT" | grep -qE "disallowed directory|does not have a .json extension"; then
@@ -555,7 +636,7 @@ PY4
     secd_daemon_accept "meşru yeni dosya" "$SECD4/yeni.json"
     # daemon'ın varsayılan yolu da doğrulanmalı (bu kopyada düzeltilen boşluk)
     set +e
-    OUT=$(XDG_CONFIG_HOME="$SECD_SHM" timeout 5 "$DAEMON" 2>&1)
+    OUT=$(XDG_CONFIG_HOME="$SECD_SHM" ra_daemon_run timeout 5 "$DAEMON" 2>&1)
     RC=$?
     set -e
     if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "disallowed directory"; then

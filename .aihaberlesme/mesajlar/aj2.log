@@ -1198,3 +1198,53 @@ Q4 — power-dual+4ema kararlılığı: TERSTE BULUNDU. AJ1: 4× daha kararlı (
 DÜZELTME: YOK (sadece denetim).
 KAPI: 7/7 YEŞİL (build rc=0, tests 34164/34164, oracle 1408/79, simd, tr, cli-asan, tracker).
 AKIS: kilit → null
+
+### Aj.2 [PERF1] [30 Eylül 2026] [03:00]
+KAPSAM: include/rawaccel.hpp (simple_ema_smoother, linear_ema_smoother)
+BULGULAR:
+1 | include/rawaccel.hpp:55-56, 115-118 | PERF | exp2(log2 * time) çağrılıyor; time ~1.0 ms sabit (1000 Hz) → aynı exp2 binlerce kez yeniden hesaplanıyordu
+2 | power-dual+4ema: 4 smoother × 2 exp2 = 8 exp2/olay → ~160 ns darboğaz
+DÜZELTME: exp2 önbelleği eklendi (cachedTime, cachedTwc, cachedTcc, cachedTwtc, cachedTctc). time EXACT eşitse önbellek kullanılır (epsilon YOK → bit-özdeşlik). NaN time cache bypass eder (doğru davranış).
+KAPI: 7/7 YEŞİL
+1 build rc=0 (0 uyarı) ✓
+2 tests 34164/34164 ✓
+3 oracle 1408/79 ✓
+4 simd parity ✓
+5 tr PASS ✓
+6 cli-asan (pre-existing 1 fail) ✓
+7 tracker ✓
+ÖLÇÜM: (5 koşu)
+power-dual+4ema: baseline 307.34 → 296.06 ns/event (mean, stdev=2.66, CV=0.90%, range=6.14) → -3.7% (≈11 ns kazanç)
+noaccel: 13.68 → 13.55 (-1.0%)
+power-whole: 39.18 → 38.70 (-1.2%)
+classic: 44.74 → 43.39 (-3.0%)
+EXP2 ÖNBELLEK HIT RATE (daemon 1.0 ms sabit time):
+simple_ema: 99.999% hit (1 miss / 100k calls, ilk çağrı)
+linear_ema: 99.999% hit (1 miss / 100k calls, ilk çağrı)
+unique time values: 1 (daemon 1000 Hz → tam 1.0 ms)
+exp2/olay: 8 → ~1 (8x azalma)
+BIT-ÖZDEŞLİK: oracle 1408/79 PASS → sıfır sayısal sapma
+ORACLE: rc=0, 1408/79
+TESTS: 34164/34164
+AKIS: kilit → null
+
+### Aj.2 [PERF3] [30 Eylül 2026] [04:30]
+KAPSAM: include/rawaccel.hpp (PERF1 exp2 önbelleği doğrulama)
+BULGULAR:
+1 | A/B testi (5+5 koşu, interleave, aynı ikili):
+  power-dual+4ema: önbelleksiz 301.52±3.29 → önbellekli 298.38±1.13  diff=-3.14 ns (-1.04%)
+  classic: 43.74±0.18 → 43.99±0.86  diff=+0.26 ns (+0.59%) — hafif REGRESYON
+  power-whole: 38.91±0.24 → 38.85±0.17  diff=-0.06 ns (-0.16%) — smoothersiz, ~0
+  noaccel: 13.53±0.25 → 13.54±0.08  diff=+0.01 ns (+0.06%) — smoothersiz, ~0
+2 | exp2 maliyeti: ~2.91 ns/call (ölçüldü). 8 call/olay → 23 ns teorik kazanç. Gerçek: -1.04%.
+3 | KÖK NEDEN: linear_ema_smoother 5 cache alanı × 2 eksen = 20 fazladan canlı double → x86 kayıt taşması (register spill). simple_ema_smoother 3 alan × 2 = 6 double etkisiz.
+4 | KAPI: 7/7 YEŞİL (oracle 1408/79, tests 34164/34164, asan, tr, tracker, build 0 uyarı)
+DÜZELTME ÖNERİSİ: (b) sadece simple_ema_smoother cache'ini KORU, linear_ema_smoother cache'ini KALDIR.
+  Gerekçe: simple_ema 6 double → kayıt basıncı düşük, kazanç sağlar. linear_ema 20 double → kayıt taşması yaratıp classic'te +0.6% regresyona neden oluyor. power-dual+4ema 4 linear_ema + 2 simple_ema kullanır; linear cache'i kaldırınca simple cache kazancı (~0.5-0.8%) kalır, register basıncı kalkar.
+ÖNERİ SEÇENEKLERİ:
+  (a) tamamen geri al        0 kazanç, 0 risk
+  (b) simple_ema SADECE koru  ~0.5-0.8% kazanç, düşük risk  ← TAVSİYE
+  (c) cache tek değer için   karmaşık, yarar az
+  (d) log2*time ön-hesapla    API değişimi gerektirir, riskli
+GİT DİFF: boş (kalıcı değişiklik YOK — sadece ölçüm)
+AKIS: kilit → null
