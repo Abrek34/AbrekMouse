@@ -142,10 +142,19 @@ only after that 2.46 s of stillness.
 
 ### Still not verified — do not read the green gates as "ready to ship"
 
-- **No CI run exists for any commit.** Every workflow run dies in ~5 s with
+- **No CI run has ever executed a single step.** Not one workflow run in this
+  repository's history has run anything. Measured across all 8 runs
+  (2026-09-29 → 2026-10-01), **every job reports `steps=0`** and every run dies
+  in 3–6 s; `actions/jobs/*/logs` returns HTTP 404 `BlobNotFound` for a job that
+  had produced any output at all. Earlier runs carried the explicit message
   "The job was not started because your account is locked due to a billing
-  issue." This is an account problem, not a code problem, but it means nothing
-  pushed here has been verified on GitHub.
+  issue." A 3-second run cannot be a build plus 34 164 assertions plus the
+  oracle plus ASan plus fuzz; a compile error or a red gate would still have
+  produced compiler or test output in the log, and there is no log. So this is
+  an **account** blocker, not a code one — and it is not fixable from here.
+  Raw data: `olcum/aj1/ci_durum_kanit.txt`.
+  **"Seven gates green" is a local, measured result; no commit has been verified
+  on GitHub. The two do not substitute for each other.**
 - **The installed binaries are stale.** `/usr/bin/rawaccel-gui` predates the
   stale-config fix (verified by string search: the new warning text is absent
   from the installed binary and present in the fresh build). Reinstalling
