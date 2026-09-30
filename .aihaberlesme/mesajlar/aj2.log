@@ -1248,3 +1248,23 @@ DÜZELTME ÖNERİSİ: (b) sadece simple_ema_smoother cache'ini KORU, linear_ema_
   (d) log2*time ön-hesapla    API değişimi gerektirir, riskli
 GİT DİFF: boş (kalıcı değişiklik YOK — sadece ölçüm)
 AKIS: kilit → null
+
+### Aj.2 [PERF6] [30 Eylül 2026] [06:00]
+KAPSAM: include/rawaccel.hpp (linear_ema_smoother denormal deadband)
+BULGULAR:
+1 | Denormal deadband eklendi (DBL_MIN eşiği, kill_denormal helper). 4 çağrı/smooth(): trend çarpımlarının ve güncellemelerinin sonrası.
+2 | A/B testi (5+5 koşu, interleave, aynı ikili, power-dual+4ema):
+   without deadband: 297.21±0.16 ns/event (5 run)
+   with deadband (DBL_MIN): 301.29±2.77 ns/event (clean 4/5, 1 outlier çıkarılmış)
+   diff: +4.08 ns (+1.37%) — REGRESYON, KAZANÇ YOK
+3 | KÖK NEDEN: deadband SADECE depolanan trend değerlerine uygulanıyor (sonuçta).
+   Asıl mikrocode assist, ara hesaplamalarda (trendDampening=0.75 çarpımı) subnormal üreten DALGADA Oluyor.
+   deadband depolanan değeri flush eder ama ara hesaplamayı etkilemez → fayda 0, overhead (+1.4%) var.
+4 | Subnormal pratikte YOK: speed=0 olduğunda trendler 0.75^N ile çarpılır ve floating-point underflow ile TAM 0.0'a iner (subnormal aralığına girmeden). DBL_MIN'e (2.2e-308) kadar inmez.
+5 | Deadband overhead: 4 fabs+karşılaştırma/smooth() → ~1-2 ns/olay maliyet, fayda 0.
+6 | FTZ+DAZ (global) çalışır çünkü TÜM ara hesaplamaları flush eder; deadband sadece sonuçta.
+DÜZELTME ÖNERİSİ: (a) deadband TAMAMEN GERİ AL — fayda 0, overhead +1.4%, kod karmaşıklığı.
+   Alternatif (d) log2*time ön-hesapla / exp2'siz EMA formülü — API değişimi, riskli.
+   FTZ+DAZ global (AJ4 önerisi) reddedildiği için, bu yol DEVRE DIŞI.
+KAPI: 7/7 YEŞİL (oracle 1408/79, tests 34164/34164, asan, tr, tracker, build 0 uyarı)
+AKIS: kilit → null

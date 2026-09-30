@@ -21,6 +21,8 @@
     "positive_control": false,
     "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
     "cpu_governor": "unreadable",
-    "threshold_percent": 20.0
+    "threshold_percent": 20.0,
+    "control_config": "noaccel",
+    "control_max_percent": 12.0
   }
 }

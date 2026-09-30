@@ -1243,3 +1243,6 @@ include/rawaccel.hpp: simple_ema_smoother + linear_ema_smoother exp2 cache eklen
 
 ### [AJ2] PERF3 tamamlandı — exp2 önbelleği DOĞRULAMA
 A/B (5+5 koşu): power-dual+4ema -1.04% (-3.14 ns), classic +0.59% REGRESYON, power-whole/noaccel ~0. KÖK NEDEN: linear_ema 20 fazladan double → kayıt taşması. simple_ema 6 double → faydalı. ÖNERİ: (b) simple_ema cache KORU, linear_ema cache KALDIR. Oracle 1408/79 PASS, tests 34164/34164. Kod kalıcı değiştirilmedi.
+
+### [AJ2] PERF6 tamamlandı — denormal deadband DOĞRULAMA
+DBL_MIN eşiğiyle denormal deadband eklendi (4 kill_denormal çağrısı/smooth). A/B (5+5 interleave): power-dual+4ema without=297.21±0.16 → with=301.29±2.77 → +4.08 ns (+1.37%) REGRESYON. KÖK NEDEN: deadband sadece depolanan trendlere uygulanıyor; mikrocode assist ara çarpımda (0.75^N) subnormalde; pratikte trendler 0.75^N underflow → 0.0'a iner (subnormal aralığına girmeden). Deadband overhead +1.4%, fayda 0. ÖNERİ: (a) deadband tamamen geri al. 7/7 kapı yeşil.

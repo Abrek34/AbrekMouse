@@ -6,6 +6,136 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.5] — 2026-10-01
+
+Sürüm notundaki abartı düzeltildi: 1.2.4 "kurulu bir sistemde doğrulandı,
+bilinen bir kusur yok" diyordu. İkisi de doğrulanamıyordu (aşağıda). Bu
+sürüm yedi kapının yeşil olduğunu **yalnızca doğru ifade eder**, ve kullanıma
+hazırlık iddiasını taşımaz.
+
+### Fixed: the GUI stale-config guard was dead code on Linux (STALE-1)
+
+`gui/main.cpp` loads the config once at startup and `save_config_now()` writes
+`S->config` back in full, so any edit made since — by `rawaccel-cli`, a second
+GUI, or the daemon persisting an IPC `set_config` to `/etc` — was silently
+discarded with nothing in any log. The fix records the file mtime at load and
+refuses the save when the file moved underneath.
+
+**The first version of that guard did nothing.** It used `-1` as the
+"unreadable" sentinel and tested `stamp >= 0` to mean "the read succeeded".
+`fs::file_time_type` is not signed-positive, and on libstdc++/Linux it is not:
+measured `fs::last_write_time()` on a live file returns
+`-4646858292110006316`, i.e. **every real mtime is negative**. So
+`config_mtime_loaded >= 0` never held, the guard was never entered, and the
+silent clobber it was written to prevent still happened. Found by
+`olcum/aj1/stale1_proof.cpp`, which printed two *different* stamps and then
+still reported "mtime aynı". Validity is now decided by comparing against a
+sentinel no real mtime can equal (`CONFIG_STAMP_UNREADABLE`), never by a sign
+test. Proof: without the guard the CLI's `mode=power` is overwritten back to
+`mode=classic`; with it, the save is refused and `mode=power` survives.
+
+The guard is **detect-and-warn, not auto-reload**: reloading would discard the
+user's own unsaved widget edits, which is a strictly worse data-loss path.
+`config_mtime_saved` was removed — it had no reader.
+
+### Fixed: `run_tests_asan.sh` was conditionally green
+
+Two sources, both measured: the binary lived at a **shared** path
+(`build-manual/test_accel_asan`), so a second copy overwrote a running one
+(`ETXTBSY` → rc 126), and `TMPDIR` was never exported, so both copies used the
+same fixed `/tmp/test_p99_c_dir` and one copy's `remove_all` threw under the
+other (`SIGABRT` → rc 134). Each run now gets its own `TMPDIR` and its own
+binary. The cleanup gained a delete-before-verify guard, because during
+mutation testing the trap was reached with an empty variable and expanded to
+`rm -rf /tmp` — the proof harness destroyed its own evidence, and the failure
+was initially misattributed to a server restart. That guard exists in both
+`run_tests.sh` and `run_tests_asan.sh`.
+
+### Fixed: perf gate measured against a load average that never applied
+
+`scripts/bench_hotpath.sh` guarded on `loadavg`, which on this host sat at
+144–158 permanently, so the guard never fired. It now runs a real control
+config (`noaccel`, named in `tests/perf_baseline.json`) and compares it to
+`_meta.threshold_percent`, exiting 77 when the host is too busy to measure.
+A positive control is what exposed the original number: with the control
+active, `noaccel` measures **−0.40 %**; without it the harness reported a
+**+84 %** false regression on that same config.
+
+The two `_meta` fields that record the control (`control_config`,
+`control_max_percent`) were **written but never read** — dead data. They are now
+consumed, validated, and rejected if unknown, and `control_max_percent` is
+required to be *below* `threshold_percent` (a control that fires only after the
+gate it guards is not a control). Verified by three mutations: an unknown
+control config and an over-threshold value both fail; a control too small to
+trip fails with exit 77, which proves the baseline is really being read.
+
+### Fixed: `use_raw_input` was documented backwards nowhere, i.e. not at all
+
+The name is inverted with respect to behaviour: `true` lets the daemon
+intercept and accelerate the device, `false` makes it skip the device entirely
+via `ioctl(EVIOCGRAB, 0)`. Nothing said so. Now documented in
+`rawaccel-cli --help` and in the README's Global switches table. Distinct from
+the per-profile `raw` / `raw_passthrough` (default `false`), which bypass only
+one profile.
+
+### Measured: the acceleration curve is provably monotonic (not a defect)
+
+Live telemetry on the physical G502 after the user moved the mouse reported
+gain 1.265–1.581 against a `limit` of 1.8, but the sampled points were **not
+monotonic**, which looked like a bug. It is not:
+
+- The isolated `classic::operator()` curve over 0.001–40 ips at 40 000 points:
+  39 999 increasing steps, **0** decreasing steps. The curve is smooth.
+- All `speed_processor` half-lives in the live profile are `0.0`, so the EMA
+  and trend blocks are inert — the smoothing hypothesis is excluded by
+  configuration, not by argument.
+- The reported `telem_gain` is `Σout/Σin` over a telemetry window, while the
+  curve is applied per event at instantaneous speed. Real mouse input is
+  bursty, so the windowed ratio is an x-weighted average of per-event gains and
+  is not required to be monotonic. `olcum/aj1/dalgalanma_kaynak.cpp` reproduces
+  the observed 1.27–1.58 band from lognormal event speeds (μ 12–45 ips,
+  CV 0.8–2.5) with no defect assumed.
+
+A side result worth keeping: across that whole sweep the p98 gain never
+exceeded the configured `limit` (max 1.7966), so the cap holds under input
+variance far beyond normal use.
+
+### Reverted: denormal deadband (PERF6) — no gain, measured cost
+
+`kill_denormal()` on the trend accumulators measured **+4.08 ns/event
+(+1.37 %)** over 5+5 interleaved runs: a regression, not a speedup. The
+deadband only flushed the *stored* trend value; the subnormals that matter are
+produced in the intermediate `x *= trendDampening` accumulation, so the
+intervention missed them while adding four `fabs`+compare per call. Reverted.
+
+The subnormals are real and worth recording where they come from, because the
+first explanation was wrong. `0.75^N` does **not** underflow to zero — measured:
+still `4.0e-203` at N = 1620, and not zero at N = 5000. A microscopic count
+per candidate path (`olcum/aj1/subnormal_nerede.cpp`, 200 000 iterations) puts
+them in the accumulation (`76 850` subnormal results) and the `windowTotal`
+sum (`5 650`), first reached after **2 462** calls — about 2.46 s of no mouse
+movement — and **not** in the `1 - exp2(log2(0.75)·t)` coefficient, which never
+goes subnormal because it tends to 1.0. Turning on FTZ/DAZ drops the hot-path
+cost from ~151 ns to ~15 ns per call (−90 %, 3 runs each), so a global FTZ/DAZ
+remains the real lever; its measured numerical effect is 0.0032 % of 100 ips and
+only after that 2.46 s of stillness.
+
+### Still not verified — do not read the green gates as "ready to ship"
+
+- **No CI run exists for any commit.** Every workflow run dies in ~5 s with
+  "The job was not started because your account is locked due to a billing
+  issue." This is an account problem, not a code problem, but it means nothing
+  pushed here has been verified on GitHub.
+- **The installed binaries are stale.** `/usr/bin/rawaccel-gui` predates the
+  stale-config fix (verified by string search: the new warning text is absent
+  from the installed binary and present in the fresh build). Reinstalling
+  requires root, which this environment does not have.
+- **The seven gates are not a sanitized run of `test_accel.cpp`.** Per
+  `AGENTS.md`, that translation unit is sanitized only by the separate
+  `run_tests_asan.sh`, which is not one of the seven. The `sanitizers` CI job
+  is a different workflow that has never executed.
+- **Clean install is unexercised**: `setup.sh` needs root.
+
 ## [1.2.4] — 2026-09-30
 
 Kullanıma hazır sürüm: yedi kapının tamamı yeşil, kurulu sistemde de.

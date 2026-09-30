@@ -1692,7 +1692,13 @@ Odak: `tests/`, `scripts/`, `setup.sh`, `.github/workflows/ci.yml`, `packaging/`
 - Öneri: SKIP'i warning + exit 1 yap (veya en azından ayrı "SKIP" çıktısı ile fail).
 
 **T30-N8 · DÜŞÜK · README ve eski dokular bayat versiyon iddiasında**
-- Konum: `README.md:5,72,85` (hâlâ "Current state: v0.6.4", artifact 0.6.4), `RAWACCEL_AUDIT.md:1`, `SOLAAR_INTEGRATION_REPORT.md:4`
+- Konum: ~~`README.md:5,72,85`~~, ~~`RAWACCEL_AUDIT.md:1`~~, ~~`SOLAAR_INTEGRATION_REPORT.md:4`~~
+    — **kaydın kendisi bayattı, düzeltildi 30 eylül 2026.** README'nin iddiası
+    artık doğru (`README.md:5` = "Current state: v1.2.4", 0.6.4 geçmişi
+    README'de hiç geçmiyor), ve atfettiği iki doküman (`RAWACCEL_AUDIT.md`,
+    `SOLAAR_INTEGRATION_REPORT.md`) depoda **0 kopya** — silinmişlerdi, yani
+    kayıt var-olmayan satırlara işaret ediyordu. Kalan tek iş gerçek:
+    sürüm bump'ında README'yi de güncelleme kuralı (aşağıdaki Öneri).
 - Açıklama: CHANGELOG güncel (1.1.0); README/dokular güncellenmemiş.
 - Öneri: Versiyon bump politikasına dokümanları da ekle (PKG-1 ile aynı zincir).
 
@@ -1887,6 +1893,15 @@ Kapsam: CLI/GUI/Config/HIDPP alt tur tarama bulguları + satır-satır doğrulam
 - Kalıcı kapı: `tests/run_tests.sh` içinde **SEC-2 config-yolu kapısı**, gerçek binary'lerle karşıya karşı (CLI + daemon kopyaları ayrı ayrı; çıkış kodu + **spesifik** hata mesajı). `/dev/shm` yoksa **sessizce atlamaz**, hata verir. Traversal derinliği **hesaplanır ve `readlink -f` ile doğrulanır**, yoksa kapı yanlış sebeple kırılıp yeşil görünebilirdi.
 - **`📌 KAPININ KENDİSİ DE İKİ KEZ GÖZDEN GEÇİRİLDİ`** (pozitif kontroller kapıyı kırdı, sonra kapıyı güçlendirdim): (1) ilk hâlde mesaj regex'i iki kuralı ayırt edemiyordu → `.json` kuralı kaldırılınca kapı **yeşil kaldı**; ayrıştırıcı artık hangi kuralın ihlal edildiğini ayrı ayrı doğruluyor ve uzantı kuralı **yasak önek altında değil, meşru dizinde** bağımsız ölçülüyor. (2) ilk hâlde yalnız CLI kopyası kapsanıyordu → `daemon/main.cpp`'de "varsayılan yolu doğrulama" bozulunca kapı **yeşil kaldı**; daemon kopyası için ayrı blok eklendi. **Son ölçüm: 4 pozitif kontrolün 4'ü de kapıyı kırdı** (politika ham dizgeye / varsayılan yol doğrulanmıyor / uzantı kuralı yok / çözümleme-sembolik bağ yok). Ayrıca bu turda bir **ölçüm hatası** yakaladım: bir pozitif kontrolden sonra kaynağı geri yükleyip **yeniden derlemedim**, böylece kapı bozuk bir binary'yi reddetti ve "kapı çalışmıyor" gibi göründü; düzeltme kodda değil derleme adımındaydı.
 - Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ.** Kaynak: AJ2 `raporlar/cli.md` K1 (AJ1 tarafından bağımsız olarak yeniden ölçüldü; şiddeti ve kapsamı düzeltildi, üçüncü yol eklendi). Kapılar: build 0 uyarı · testler 34015/34015 · oracle `RESULT: OK` (1119/67) · SIMD PASS · TR kapsama PASS.
+
+**STALE-1 · YÜKSEK (kayıt AJ1) · GUI bayat config'i sessizce eziyordu — ve İLK KORUMA ÖLÜ KODDU**
+- Konum: `gui/main.cpp:47` (`config_file_stamp`), `:64-79` (`save_config_now` içindeki guard), `:76` (yeniden damgalama), `:242` (yükleme damgası); `gui/app_state.hpp:66-90` (`CONFIG_STAMP_UNREADABLE` + `config_mtime_loaded`)
+- Açıklama: `gui/main.cpp:185` config'i **bir kez** okuyor, `save_config_now()` `S->config`'i **tümüyle** geri yazıyor. Bu arada dışarıdan yapılan her değişiklik — `rawaccel-cli set-param`, ikinci bir GUI, ya da daemon'ın IPC `set_config`'i `/etc/rawaccel/settings.json`'a kalıcılaştırması — **hiçbir log satırı olmadan** siliniyor. Canlı ölçüm: `mode`/`device_id` üzerine yapılan CLI onarımı sonraki bir GUI yazımıyla ezilmişti.
+- **⭐ ÖLÜ KOD — asıl bulgu.** İlk koruma `-1`'i "okunamadı" işareti yapıp geçerliliği `stamp >= 0` ile test ediyordu. `fs::file_time_type` işaretli-pozitif değildir ve libstdc++/Linux'ta **değildir**: canlı bir dosyada ölçülen `fs::last_write_time()` = `-4646858292110006316`, yani **her gerçek mtime negatiftir**. Dolayısıyla `config_mtime_loaded >= 0` **hiç doğru olmadı**, guard **hiç girilmedi**, ve önlemeye çalıştığı sessiz ezme **yine oldu**. Bulunması `olcum/aj1/stale1_proof.cpp` sayesinde: araç **iki FARKLI** damga bastı ve yine de "mtime aynı" dedi — işaret testinin kendisi hataydı. Düzeltme: geçerlilik **hiçbir gerçek mtime'in eşit olamayacağı** bir sentinel'e (`CONFIG_STAMP_UNREADABLE = numeric_limits<int64_t>::min()`) karşılaştırılarak belirleniyor, **asla işaretle**. `config_mtime_saved` silindi — hiç okuyucusu yoktu.
+- Kanıt (mutasyon, `stale1_proof`): koruma **YOK** → `mode=power` yazıldı, dosyaya `mode=classic` döndü ⛔ CLI değişikliği **silindi**. Koruma **İÇİN** → `mode=power` **korundu**, "Not saved: config changed on disk" ile kayıt reddedildi ✅. Yani guard artık ölü kod değil, gözle görülür biçimde işe yarıyor.
+- ⭐ Tasarım kararı: **tespit + uyar, otomatik yeniden yükleme DEĞİL.** Otomatik yeniden yükleme kullanıcının **kendi kaydedilmemiş widget düzenlemelerini** de atardı — bu, kararı vermeye zorlamaktan daha kötü bir veri kaybı yolu.
+- Durum: ✅ **DOĞRULANDI + DÜZELTİLDİ + ÖLÜ KOD BULUNDU.** Kaynak: AJ1 (bulgu ve kanıt), düzeltme `gui/main.cpp` + `gui/app_state.hpp`. Kapılar: build 0 uyarı · çeviri kapsama PASS (yeni metin `gui/tr.inl`'e eklendi) · testler 34164/34164 · oracle 1408/79.
+- ⭐ **Kurulum notu:** `/usr/bin/rawaccel-gui` bu düzeltmeyi **içermiyor** (kurulu ikilide yeni uyarı metni 0 kopya, taze derlemede 1 kopya — dizgi aramasıyla ölçüldü). `setup.sh` root gerektirdiği için yeniden kurulum kullanıcının işidir.
 
 **O31-L1 · DÜŞÜK · import LUT guard'ı 515 (tek, >514) öğeyi sessizce düşürüyordu (CLI F5)**
 - Konum: `cli/main.cpp:1690-1702` (`n % 2 != 0 || n / 2 > LUT_POINTS_CAPACITY`) vs `src/config.cpp:182-190`

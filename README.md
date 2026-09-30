@@ -2,9 +2,18 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v1.2.4** — native Logitech HID++ hardware controls for DPI,
+> **Current state: v1.2.5** — native Logitech HID++ hardware controls for DPI,
 > report rate, and sensor lift-off distance. Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
+>
+> ⚠️ **Verification status, stated plainly.** The seven gates in
+> [AGENTS.md](AGENTS.md) are green, and the acceleration was confirmed working
+> on real hardware (gain 1.27–1.58 against a configured limit of 1.8). But no
+> GitHub Actions run has ever completed for this repository — every run stops
+> in ~5 s with an account billing lock — so no commit here is CI-verified, and
+> `test_accel.cpp` is sanitized only by `tests/run_tests_asan.sh`, which is
+> **not** one of the seven. See the "Still not verified" section of the
+> [1.2.5 changelog entry](CHANGELOG.md) before treating this as install-ready.
 
 ## Features
 
@@ -404,6 +413,32 @@ Raw Accel's "sens multiplier" behavior; the `yx_ratio` scales all of the Y axis.
 > `lr_output_dpi_ratio`, `ud_output_dpi_ratio` and `yx_output_dpi_ratio`.
 > The CLI spells them `lr_ratio` / `ud_ratio` / `yx_ratio`
 > (e.g. `rawaccel-cli set-param <p> yx_ratio 1.1`).
+
+### Global switches (top-level config keys, not per-profile)
+
+These live at the top level of `settings.json` and apply to **every** mouse.
+They are deliberately not `set-param` parameters, because they are not
+per-profile.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `use_raw_input` | `true` | `true` = the daemon grabs every mouse and applies the active profile, so **acceleration works**. `false` = the daemon grabs **nothing**; every mouse passes through untouched — no acceleration and no telemetry. |
+| `active_profile` | `"default"` | Name of the profile applied to devices with no explicit `device_id` match. |
+
+> ⚠ **`use_raw_input` is easy to misread** — it is *not* "pass raw input
+> through". Read it as *"the daemon is allowed to take over the raw input
+> device"*. Setting it to `false` **disables acceleration entirely**, for every
+> mouse, and the symptom is a mouse that behaves exactly like an unaccelerated
+> one with nothing in the logs to explain it.
+>
+> It is also **not the same thing** as the per-profile `raw` parameter
+> (`raw_passthrough`), which bypasses processing for one profile only.
+
+Verify with:
+
+```bash
+rawaccel-cli status --json | grep use_raw_input   # want: true
+```
 
 ## Multi-Mouse / Per-Device Profile Assignment
 

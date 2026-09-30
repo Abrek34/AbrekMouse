@@ -41,9 +41,48 @@ void set_status(AppState* S, const std::string& msg) {
     gtk_label_set_text(GTK_LABEL(S->status_bar), msg.c_str());
 }
 
+// STALE-1 (AJ1, 30 Sep 2026; sentinel fixed 1 Oct 2026): mtime of the config
+// file, or CONFIG_STAMP_UNREADABLE if unreadable.
+// fs::last_write_time is in `file_time_type` ticks, not seconds; only the
+// RELATIVE comparison below matters, so the absolute epoch is irrelevant.
+// STAR: error is signalled by returning the sentinel, NOT by a negative value
+// and NOT by a sign test.  On libstdc++/Linux every real mtime is ALREADY
+// negative (measured -4646858292110006316), so `stamp >= 0` would mean
+// "unreadable" for every readable file.  See the sentinel note in app_state.hpp.
+static std::int64_t config_file_stamp(const std::string& path) {
+    std::error_code ec;
+    auto t = fs::last_write_time(path, ec);
+    if (ec) return CONFIG_STAMP_UNREADABLE;
+    return static_cast<std::int64_t>(t.time_since_epoch().count());
+}
+
 void save_config_now(AppState* S) {
     try {
+        // STALE-1: refuse to silently clobber a config that changed underneath
+        // us.  `S->config` was loaded once at startup, so writing it back in
+        // full discards any edit made since — by the CLI, another GUI, or the
+        // daemon persisting an IPC set_config.  We do NOT auto-reload: that
+        // would throw away the user's own unsaved widget edits, which is a
+        // worse data-loss path than making them decide.  CONFIG_STAMP_UNREADABLE
+        // means "never stamped" (first save of a session, or the file was
+        // unreadable), in which case there is nothing to compare against and we
+        // proceed.  Validity is decided by COMPARING TO THE SENTINEL, never by a
+        // sign test -- on libstdc++/Linux every real mtime is already negative,
+        // so `>= 0` was false for every readable file and this whole guard was
+        // dead code (measured 1 Oct 2026).  See the sentinel note in app_state.hpp.
+        if (S->config_mtime_loaded != CONFIG_STAMP_UNREADABLE) {
+            std::int64_t now_stamp = config_file_stamp(S->config_path);
+            if (now_stamp != CONFIG_STAMP_UNREADABLE && now_stamp != S->config_mtime_loaded) {
+                set_status(S, trf(
+                    "Not saved: %s changed on disk since this window was opened "
+                    "(edited by the CLI or another tool). Reopen the GUI to load "
+                    "it, otherwise your save would discard those changes.",
+                    S->config_path.c_str()));
+                return;   // nothing written, nothing pushed
+            }
+        }
         save_config(S->config, S->config_path);
+        S->config_mtime_loaded = config_file_stamp(S->config_path);
         S->unsaved = false;
         // Push the full config to the daemon over IPC ("set_config" RPC):
         // the daemon persists it to its OWN config path — for a root systemd
@@ -205,6 +244,11 @@ int main(int argc, char* argv[]) {
             state.config.profiles.push_back(dp);
         }
     }
+    // STALE-1: stamp the config file's mtime NOW, so save_config_now() can tell
+    // "nobody touched it" from "someone changed it while this window was open".
+    // Stamped after the load (and after any corrupt-file backup, which is a
+    // copy and does not touch the original).
+    state.config_mtime_loaded = config_file_stamp(state.config_path);
     // R5-D: a missing config is a normal first-run, not a corrupt one — don't
     // flash the ".corrupt-" backup alarm for a file that never existed (the
     // old catch-all copied a nonexistent file, failed, and called the failed

@@ -1280,3 +1280,14 @@ SERIT: uretime dokunmadim (M include/rawaccel.hpp AJ2'nin PERF1 cache'i, benim d
 DURUM: bosta — TEST tamamlandi, yeni gorev bekliyorum
 SON IS: TEST 5/5 dogru cevaplandi, salt-okunur kuralina uyuldu
 ISTEK: siradaki isi ver, hazirim
+
+### Aj.4 [CORR-1] [30 eylül 2026 22:54]
+ANA BULGU: 79/79 GERCEKTEN kasitli, 0 maskelenmis hata. Sayi: baslik 23/9/23/12/12 = dosyadaki gercek sayimla birebir (awk ile sayildi). Tum 79 satir >1e-9 gercekten sapiyor (prob: 79/79 genuine)
+SINIFLAR: C1 23 hepsi tek-yon (local<ref), max-mutlak 447.2 (spd 0.001: local 1.005/ref 448.214), max-goreli ~1.0 | C2 9 satir hepsi spd=0, hepsi local=1>ref (ref 0 power, 0.667/0.5 sync), diger hizlar bit-ayni | C3 23: 1 identity (spd0) + 22 sekil, yon KARISIK 18+/5- (negatifler spd 0.001-0.5, <=%0.3) - floor'lanmis us egrinin sekmini degistiriyor, crossover aciklamali | C4 12/12 local>ref (ref hard-0) | C5 12/12 ref NaN vs local finite (0.063->31.6)
+KAPSAM: bos-listeli gercek run_oracle.sh kopyasi (/tmp ayna, repoya dokunulmadi) -> tam 79 UNKNOWN, fazlasi yok eksigi yok. Liste eksiksiz
+UI ERISILEBILIRLIK: exp<1 ulasilamaz - kanit gui/ui_builder.inl:239 exponent_spin=make_spin(1,10,...) + src/config.cpp:420-421 sanitize [1,10] clamp. Oracle exp=0.5 satirlari yalniz ham API'den
+KOK NEDEN C1: include/accel-classic.hpp:28 (ctor exp<=1 dali) + :47-48 (operator linear path sabit 1+acceleration); referans x^(exp-1) koruyor -> patlama referans tarafinda (448.2), yerel sabit (1.005). AGENTS testi + sanitize ile kasitli
+KOK NEDEN C3: include/accel-power.hpp:35-36 n=max(ep,1e-3) paylasilan floor (BUG-02); referans ham 5e-4 kullaniyor. C4/C5: ayni dosya :42-71 P155 guard (cap.y<=0 -> scale=1, cap yok)
+YAN-BULGU (duzeltmedim, AJ2 seridi): accel-power.hpp:62-64 yorumu 'gain family NOT listed' diyor ama dosyada 12 gain satiri LISTELI ve kapi onlarla yesil. Yorum stale, liste dogru. include/'a dokunmadim
+ONERI: liste DUZELTILMEMELI (sayi/tanim/kok-neden tutarli); sadece stale yorum AJ2'ye not. Arac kalici: olcum/aj4/deviation_probe.cpp (tek kosuda 79 satir + sinif istatistigi)
+git diff --cached --stat: bos; tests/oracle/ temiz; yeni dosya sadece olcum/aj4/deviation_probe.cpp

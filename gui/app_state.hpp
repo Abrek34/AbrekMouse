@@ -20,6 +20,7 @@
 #include <vector>
 #include <sstream>
 #include <iomanip>
+#include <cstdint>   // std::int64_t (STALE-1 config mtime)
 #include <algorithm>
 #include <filesystem>
 #include <functional>
@@ -63,6 +64,28 @@ struct InputDeviceInfo {
 };
 
 // ── Application state ─────────────────────────────────────────────────────────
+
+// STALE-1 (AJ1, 1 Oct 2026): "unreadable" sentinel for a config-file mtime.
+//
+// ⭐ WHY NOT -1, AND WHY NOT A SIGN TEST.  `fs::file_time_type` is NOT
+// guaranteed to be signed-positive, and on this platform it is not: measured
+// `fs::last_write_time()` on a live file returns
+//     -4646858292110006316
+// (libstdc++'s file_clock epoch sits AFTER the represented times, so every
+// real mtime is negative).  A first version of the STALE-1 guard tested
+// `stamp >= 0` to mean "the read succeeded", which on Linux is FALSE FOR EVERY
+// REAL FILE — so the whole stale-config guard was dead code: the
+// `config_mtime_loaded >= 0` precondition never held, the guard was never
+// entered, and the silent-clobber behaviour it was written to prevent still
+// happened.  Found by the mutation proof in `olcum/aj1/stale1_proof.cpp`, which
+// printed two DIFFERENT stamps and then still reported "mtime aynı".
+//
+// The sentinel is therefore a value no real mtime can equal, and validity is
+// decided by COMPARING TO IT — never by the sign.  `std::numeric_limits<…>::min()`
+// is used because `last_write_time().count()` is a signed 64-bit tick count and
+// a real mtime at any plausible tick magnitude cannot reach it.
+constexpr std::int64_t CONFIG_STAMP_UNREADABLE = std::numeric_limits<std::int64_t>::min();
+
 struct AppState {
     app_config  config;
     std::string config_path;
@@ -72,6 +95,21 @@ struct AppState {
     bool        xy_linked  = true;
     bool        updating   = false;
     bool        unsaved    = false;
+
+    // STALE-1 (AJ1, 30 Sep 2026): the config file is read ONCE at startup
+    // (`state.config = load_config(...)`, gui/main.cpp), and `save_config_now`
+    // writes `S->config` back in FULL.  Any change made elsewhere in the
+    // meantime — `rawaccel-cli set-param`, a second GUI, a root daemon that
+    // persisted an IPC `set_config` to /etc — is therefore SILENTLY DISCARDED
+    // on the next GUI save, with nothing in any log.  Measured live: a CLI
+    // repair of `mode`/`device_id` was overwritten by a later GUI write, and
+    // the GUI has no way to know it is about to do it.
+    //
+    // This records the mtime observed at load / after each save so
+    // save_config_now() can DETECT that the file moved underneath us.  The fix
+    // is detect-and-warn, NOT auto-reload: reloading would discard the user's
+    // own unsaved widget edits, which is a strictly worse data-loss path.
+    std::int64_t config_mtime_loaded = CONFIG_STAMP_UNREADABLE;  // mtime at load / last save
 
     // Daemon state
     guint       daemon_poll_id = 0;

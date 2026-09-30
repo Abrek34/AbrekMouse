@@ -54,6 +54,7 @@ CXXFLAGS="-std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -I$ROOT/include -I$
 #     3/6 rc=0 (3× rc=134 SIGABRT, "Cannot open config file"), ayrı TMPDIR
 #     verilirken 6/6 rc=0.  Düzeltmesi T5'in aynısı (1 satır) ama o dosya
 #     bu turda yetki kapsamı dışındaydı.
+RA_TMP_PARENT="${TMPDIR:-/tmp}"        # mktemp'e verdiğimiz ebeveyn
 export TMPDIR="$(mktemp -d)"
 RA_TMPDIR="$TMPDIR"
 # P106 madde 3 (AJ1): ikili artık koşuya özel. `TMPDIR` C++17'de de görünür
@@ -69,8 +70,19 @@ cleanup_tmp() {
     # `rm -rf` handles files and directories alike; `|| true` keeps one bad
     # entry from skipping the rest. (Found by AJ3's audit, 30 Sep 2026.)
     rm -rf "${TMP_FILES[@]}" 2>/dev/null || true
-    if [ -n "${RA_TMPDIR:-}" ] && [ -d "$RA_TMPDIR" ]; then
-        rm -rf "$RA_TMPDIR"
+    # ⚠️ SİLME ÖNCESİ DOĞRULAMA — bu satırlar bir güvenlik ağıdır, süs değil.
+    # Ölçüldü (TEST-1, AJ3): koruma olmadan, `export TMPDIR` satırı yanlışlıkla
+    # `/tmp`'ye çevrilirse `RA_TMPDIR=/tmp` olur ve EXIT trap'i `rm -rf /tmp`
+    # çalıştırır — o denemede oturumun /tmp kanıtının tamamı silindi. Yani
+    # "temizleme" yolu, kendi betiğinin dışındaki her şeyi silme yoluydu.
+    # `mktemp -d` ÖLÇÜLDÜ: daima `<ebeveyn>/tmp.` + tam 10 karakter üretiyor
+    # (3 örnek: tmp.pApTW2fwVV / tmp.FpoQQTEn0q / tmp.Fk5BloUI8n). Silme ancak
+    # ad bu kalıba uyuyor VE ebeveyn bizim verdiğimiz ebeveyn ise yapılır.
+    local d="${RA_TMPDIR:-}"
+    if [ -n "$d" ] && [ -d "$d" ] \
+       && [[ "$(basename "$d")" == tmp.?????????? ]] \
+       && [ "$(dirname "$d")" = "$RA_TMP_PARENT" ]; then
+        rm -rf "$d"
     fi
     return 0   # EXIT trap'inin dönüş değeri çıkış kodunu bozmasın
 }

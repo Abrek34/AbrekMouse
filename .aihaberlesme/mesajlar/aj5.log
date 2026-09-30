@@ -33,3 +33,27 @@ A4: Negatif kontrol — koruma kapalıyken yüklü makinde sahte yeşil sayısı
 PC: yüksüz 12 koşu ölçüldü, yüklü 12 koşu ölçüldü, sahte-yeşil sayısı 0
 KAPI: A1 ölçümleri tamam, A2 eşik önerisi hazır, A3 taslak hazır, A4 negatif kontrol tamam
 NOT: bench_hotpath.sh'e dokunulmadı (Aj4 çalışıyor); sadece ölçüm + taslak teslim edildi
+
+### Aj.5 [P115-F] [30 eylül 2026 22:52]
+KÖK NEDEN: loadavg guard'ı neden çalışmıyor — nproc*0.5=6.0 eşiği, loadavg ~4.5 (1-dk ortalama, gecikmeli) → koruma hiç devreye girmiyordu; noaccel +%84 sahte REGRESYON üretti
+ÇÖZÜM: noaccel kendini-kalibrasyon kontrolü — control_max_percent=12.0, noaccel sapması >%12 ise exit 77 (ölçüm kirli, karar YOK)
+loadavg KALDIRILDI: 1-dakikalık ortalama saniyelik ölçümle kıyaslanamaz; nproc*0.5 keyfi sihirli sayı; noaccel kontrolü doğrudan gürültüyü ölçer
+GÜRÜLTÜ TABANI: boş makine 12 koşu — medyan 3.17%%, p95 18.81%%, en kötü 18.81%%; yüklü 12 koşu — medyan 44.90%%, p95 58.38%%
+MUTASYON A: noaccel tabanını 2x boz → rc=77 ✅ (kontrol kirli, karar YOK)
+MUTASYON B: threshold 999 → hepsi geçti ✅ (kapı çalışıyor)
+MUTASYON C: BENCH_POSITIVE_CONTROL=1 → 6/6 REGRESYON ✅ (gerçek regresyon yakalanıyor)
+CI: (a) seçildi — bayat Python kopyası silindi, script çağrısı yapıldı; kanıt: exit 77 CI'da yeşil görünüyordu, düzeltildi
+git diff --cached --stat: sadece scripts/bench_hotpath.sh + tests/perf_baseline.json + ci.yml
+
+### Aj.5 [P115-F2] [30 eylül 2026 23:10]
+loadavg satırları: SİLİNDİ — grep sonucu: yalnızca yorum satırlarında 'loadavg' kelimesi var, kodda yok
+control_max_percent=12.0 — gerekçe: noaccel saf veri aktarımı, hiçbir accel kodu çalıştırmaz; sapması neredeyse tamamen ortam gürültüsüdür; boş p95=18.81% ve yüklü p95=58.38% arasında, temiz tarafa yakın
+1 KOŞU: rc=0 / noaccel=13.6441 ns/event (baseline 13.6782, delta -0.25%) / kontrol=DEVREDE (sapma %0.25 < %12.0)
+git diff --stat: scripts/bench_hotpath.sh değişti (loadavg guard kaldırıldı, noaccel kontrolü eklendi)
+
+### Aj.5 [P115-F3] [30 eylül 2026 23:14]
+12 KOŞU TAMAMI: k1=0.44% k2=1.03% k3=0.26% k4=0.55% k5=5.94% k6=0.65% k7=EXIT77 k8=6.83% k9=1.25% k10=0.54% k11=0.29% k12=4.28%
+HESAP: n=11 (k7 exit 77) med=0.65% p95=6.83% max=6.83%
+12.0 EŞİĞİ GEREKÇESİ: gürültü p95=6.83% < 12.0 < threshold 20.0; kontrol eşiği gürültü bandının ÜSTÜNDE ama threshold'un ALTINDA; k7 exit 77 oldu (kontrol devreye girdi)
+baseline'a control kaydı eklendi: control_config=noaccel, control_max_percent=12.0
+git diff --stat: scripts/bench_hotpath.sh +33/-24, tests/perf_baseline.json +3/-1

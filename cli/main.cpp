@@ -2853,9 +2853,21 @@ Presets (values loaded by `create-preset <preset> <name>`):
   exp-power = power-mode exponent; classic/natural presets use
   exponent_classic/other defaults instead.  All presets: dpi 800, poll 1000.
 
+Top-level config key — NOT a set-param, it is global (not per-profile):
+  use_raw_input     true  = the daemon grabs every mouse and applies the active
+                        profile, so acceleration WORKS (this is the default).
+                  false = the daemon grabs NOTHING; every mouse passes through
+                        untouched — no acceleration and no telemetry.
+                  ⚠ Distinct from the per-profile `raw` parameter below, which
+                    bypasses processing for ONE profile only. The two names are
+                    easy to confuse, and turning use_raw_input off disables
+                    acceleration for EVERY mouse. Read it as "the daemon is
+                    allowed to take over the raw input device".
+
 Parameters (for set-param). Domain = accepted range — out-of-range values are
 REJECTED (exit 1, config untouched); default = fresh `create` profile value:
-  raw               true|false|1|0  (raw passthrough — bypass all processing). Default false.
+  raw               true|false|1|0  (raw passthrough — bypass all processing for
+                    THIS profile). Default false.
   mode              classic|power|natural|jump|synchronous|lookup|noaccel. Default noaccel.
   device_id         Assign profile to a device ("usb:VVVV:PPPP:serial", by-id path,
                     or event node); empty string = all mice. Hint: run `status`

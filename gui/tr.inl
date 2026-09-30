@@ -140,6 +140,11 @@ static const char* tr(const char* key) {
             {"UD Ratio:",         "Aşa/Yuk Oranı:"},
             {"Y/X Ratio:",        "Y/X Oranı:"},
             {"Raw Input (intercept mice)", "Ham Giriş (fareleri yakala)"},
+            // STALE-1: save_config_now() refuses to overwrite a config that
+            // changed on disk while the window was open, because writing the
+            // in-memory copy would silently discard the other tool's edit.
+            {"Not saved: %s changed on disk since this window was opened (edited by the CLI or another tool). Reopen the GUI to load it, otherwise your save would discard those changes.",
+             "Kaydedilmedi: %s bu pencere açıldığından beri diskte değişti (CLI veya başka bir araç tarafından düzenlendi). Yeniden yüklemek için GUI'yi kapatıp yeniden aç; aksi halde kaydetmen bu değişiklikleri siler."},
             {"Min (ips):",        "Min (ips):"},
             {"Max (ips):",        "Maks (ips):"},
             {"DPI:",              "DPI:"},

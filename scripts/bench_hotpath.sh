@@ -125,39 +125,43 @@ if [[ ! -f "$BENCH_BIN" ]]; then
     exit 1
 fi
 
-# ── Load guard (P115, AJ5 measurement 30 Sep 2026) ───────────────────────────
+# ── Self-calibrating control check (P115-F, AJ5 measurement 30 Sep 2026) ──────
 # The measured noise floor of this benchmark, same unchanged binary:
 #   idle machine : median 3.17% · p95 18.81%   (12 runs)
 #   loaded       : median 44.90% · p95 58.38%  (12 runs, 6-CPU load)
 # A 5% threshold is therefore inside the idle noise (false reds) and a loaded
 # machine is 9× noisier still (every run red — measured, not predicted:
 # 0/12 false greens, 12/12 red). Raising the threshold alone cannot fix this:
-# covering 58% would blind the gate to a real 20% regression. So the gate
-# refuses to measure on a loaded machine instead — exit 77, the project's
-# existing "environment unusable, skip with a message" code, which CI already
-# handles. It never prints OK/REGRESSION when it did not measure.
-BENCH_LOAD_GUARD="${BENCH_LOAD_GUARD:-1}"
-_bench_load_check() {
-    [[ "$BENCH_LOAD_GUARD" == "1" ]] || return 0
-    local cores load
-    cores=$(nproc 2>/dev/null || echo 1)
-    # /proc/loadavg field 1 is the 1-minute average.
-    load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
-    # Over half the core count the measurements are not comparable; 1-core
-    # machines would trip this constantly, so floor the limit at 2.0.
-    local limit
-    limit=$(awk -v c="$cores" 'BEGIN { l = c * 0.5; print (l < 2.0) ? 2.0 : l }')
-    if awk -v l="$load" -v t="$limit" 'BEGIN { exit (l > t) ? 0 : 1 }'; then
-        echo "LOAD-SKIP: 1-min loadavg ${load} > limit ${limit} (${cores} cores)." >&2
-        echo "LOAD-SKIP: the perf gate did NOT measure, so it makes no claim." >&2
-        echo "LOAD-SKIP: measured noise here is ~9x the idle floor; a green or red" >&2
-        echo "LOAD-SKIP: result would be a property of the load, not of the code." >&2
-        echo "LOAD-SKIP: re-run when idle, or set BENCH_LOAD_GUARD=0 to override." >&2
+# covering 58% would blind the gate to a real 20% regression.
+#
+# The OLD loadavg guard (nproc*0.5) was removed: /proc/loadavg is a 1-minute
+# average, but this benchmark runs in seconds — comparing a minute-average to
+# a second-scale measurement is a category error. Measured: loadavg ~4.5 while
+# the machine was loaded, so the guard never fired and the gate produced 6/6
+# false REGRESSIONS (noaccel +84% — a config that runs NO accel code).
+#
+# NEW APPROACH: `noaccel` is the self-calibrating control. It runs no accel
+# code, so any deviation from its baseline is pure environment noise. If the
+# control is dirty, the whole run is invalid — no claim about the code.
+CONTROL_CONFIG="noaccel"
+CONTROL_MAX_PERCENT="${CONTROL_MAX_PERCENT:-12.0}"
+_bench_control_check() {
+    local current="$1" baseline="$2"
+    local delta
+    delta=$(awk -v cur="$current" -v base="$baseline" -v max="$CONTROL_MAX_PERCENT" 'BEGIN {
+        if (base == 0) { print "inf"; exit }
+        d = (cur - base) / base * 100
+        if (d < 0) d = -d
+        printf "%.2f", d
+    }')
+    if awk -v d="$delta" -v max="$CONTROL_MAX_PERCENT" 'BEGIN { exit (d > max) ? 0 : 1 }'; then
+        echo "CONTROL-SKIP: ${CONTROL_CONFIG} deviates ${delta}% from baseline (max ${CONTROL_MAX_PERCENT}%)." >&2
+        echo "CONTROL-SKIP: the measurement environment is dirty — this run makes no claim." >&2
+        echo "CONTROL-SKIP: re-run when idle, or set CONTROL_MAX_PERCENT=0 to override." >&2
         exit 77
     fi
-    echo "loadavg ${load} <= limit ${limit} (${cores} cores) — measuring." >&2
+    echo "control ${CONTROL_CONFIG}: ${delta}% deviation (max ${CONTROL_MAX_PERCENT}%) — measuring." >&2
 }
-_bench_load_check
 
 # Handle BENCH_UPDATE_BASELINE early (env var takes precedence over flag)
 if [[ "${BENCH_UPDATE_BASELINE:-0}" == "1" ]] || [[ "$UPDATE_BASELINE" == "true" ]]; then
@@ -307,6 +311,40 @@ else
     fi
 fi
 
+# STALE-2 (AJ1, 30 Sep 2026): `control_config` / `control_max_percent` were
+# added to tests/perf_baseline.json but NOTHING read them — the control check
+# ran off the hard-coded shell defaults, so editing the baseline silently had
+# no effect and the file claimed a setting the gate ignored.  Read them here,
+# with the same extract-then-validate shape as threshold_percent above: a
+# missing key keeps the default, a present-but-corrupt value fails loudly
+# rather than silently loosening the dirty-environment guard.
+if echo "$BASELINE_JSON" | grep -q '"control_config"[[:space:]]*:'; then
+    _cc="$(echo "$BASELINE_JSON" | sed -n 's/.*"control_config"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    # An unknown control name would make the check compare against a config
+    # that was never measured (parse_baseline_json would fail later) — reject.
+    _known=0
+    for c in "${CONFIGS[@]}"; do [[ "$c" == "$_cc" ]] && _known=1 && break; done
+    if [[ "$_known" -ne 1 ]]; then
+        echo "ERROR: baseline control_config '$_cc' is not one of the measured configs: ${CONFIGS[*]}" >&2
+        exit 1
+    fi
+    CONTROL_CONFIG="$_cc"
+fi
+if echo "$BASELINE_JSON" | grep -q '"control_max_percent"[[:space:]]*:'; then
+    CONTROL_MAX_PERCENT="$(echo "$BASELINE_JSON" | sed -n 's/.*"control_max_percent"[[:space:]]*:[[:space:]]*"\?\([^",}]*\)"\?.*/\1/p' | head -1)"
+    require_nonnegative_number "$CONTROL_MAX_PERCENT" "baseline control_max_percent"
+    # STALE-2: a control threshold at or above the regression threshold is
+    # useless — the control would only fire after the gate it guards has
+    # already failed.  Measured noise p95 was 6.83% against threshold 20.0
+    # (AJ5, 12 runs), so anything >= threshold_percent is a configuration
+    # error, not a tuning choice.
+    if awk -v c="$CONTROL_MAX_PERCENT" -v t="$THRESHOLD_PCT" 'BEGIN{exit !(c>=t)}'; then
+        echo "ERROR: baseline control_max_percent ($CONTROL_MAX_PERCENT) must be BELOW threshold_percent ($THRESHOLD_PCT)" >&2
+        echo "       — a control that only trips after the gate it guards is useless." >&2
+        exit 1
+    fi
+fi
+
 declare -A BASELINE
 for config in "${CONFIGS[@]}"; do
     val=$(parse_baseline_json "$BASELINE_JSON" "$config")
@@ -317,6 +355,11 @@ for config in "${CONFIGS[@]}"; do
     require_positive_number "$val" "baseline for $config"
     BASELINE["$config"]="$val"
 done
+
+# Self-calibrating control check: if noaccel (which runs no accel code) deviates
+# more than CONTROL_MAX_PERCENT from its baseline, the measurement environment
+# is dirty — the whole run is invalid, no claim about the code.
+_bench_control_check "${RESULTS[$CONTROL_CONFIG]}" "${BASELINE[$CONTROL_CONFIG]}"
 
 # G-5: CPU model/governor validation — exit 77 if mismatch
 # Baseline stores cpu_model and cpu_governor in _meta; current run captures them.
