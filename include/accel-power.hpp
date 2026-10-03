@@ -139,6 +139,16 @@ struct power {
         if (speed <= 0) return 1.0;
         if (!gain_mode) {
             double out = base_fn_impl(speed);
+            // A9 (CUR-3 parity): the GAIN branch below has a local finiteness
+            // guard (ORTA-BUG-ALG-02 / CUR-3); the LEGACY branch had none.  minsd
+            // already folds NaN/±Inf to legacy_cap when a cap is set, but for
+            // an UNBOUNDED legacy curve (legacy_cap == DBL_MAX) an overflowed
+            // pow() left a non-finite/absurd value in the pipeline.  Mirror
+            // CUR-3 exactly: a requested cap is the continuous ceiling, an
+            // unbounded curve falls back to identity (never a dead frame).
+            if (!std::isfinite(out)) {
+                out = legacy_cap < DBL_MAX ? legacy_cap : 1.0;
+            }
             return minsd(out, legacy_cap);
         }
         // P155: match the reference GAIN order — the cap branch is checked

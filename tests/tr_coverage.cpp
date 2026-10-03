@@ -237,7 +237,13 @@ int main(int argc, char** argv) {
                 if (call_names.count(ident) || skip > 0) {
                     // expect '('
                     size_t j = i2;
-                    while (j < src.size() && src[j] == ' ') j++;
+                    // C4 (L18 B-18): yalnız ' ' atlanıyordu; `tr\n("...")` veya
+                    // `tr\t("...")` biçimindeki bir çağrı '(' sanılıp sessizce
+                    // atlanıyordu (stil değişikliğiyle gerçek bir çağrı görünmez
+                    // olabilir). Satır sonu / sekme / CR de boşluk sayılır.
+                    while (j < src.size() && (src[j] == ' ' || src[j] == '\t' ||
+                                              src[j] == '\n' || src[j] == '\r'))
+                        j++;
                     if (j < src.size() && src[j] == '(') {
                         size_t arg = j + 1;
                         for (size_t k = 0; k < skip; k++) {
@@ -268,7 +274,10 @@ int main(int argc, char** argv) {
                     }
                 } else if (ident == "tr_combo_fill") {
                     size_t j = i2;
-                    while (j < src.size() && src[j] == ' ') j++;
+                    // C4: aynı boşluk sınıfı burada da geçerli.
+                    while (j < src.size() && (src[j] == ' ' || src[j] == '\t' ||
+                                              src[j] == '\n' || src[j] == '\r'))
+                        j++;
                     if (j < src.size() && src[j] == '(') {
                         size_t arg = j + 1;
                         // first arg: widget expr; second arg: array name (or tr())
@@ -372,6 +381,23 @@ for (const auto& an : combo_arrays) {
     }
 
     // ── Report ───────────────────────────────────────────────────────────────
+    //
+    // C3 (L18 B-17): sayı tabanı (floor) denetimi. Tarayıcı bozulup hiçbir şey
+    // bulamazsa (ör. GUI kaynak yolu değişir, slurp() sessizce boş döner),
+    // eski kod yine de "MISSING: none" + PASS veriyordu — 287 çağrı sitesi 17'ye
+    // düşse bile yeşil kalıyordu. Benzersiz anahtar sayısı makul tabanın
+    // altındaysa tarayıcının KENDİSİ şüphelidir: eksik çeviri değil, META-FAIL.
+    // Taban bilinçli olarak mevcut ölçümün (287) altına, 250'ye çekildi:
+    // meşru bir gui daralması bu kadar büyük olmaz, tarayıcı arızası olur.
+    static constexpr size_t MIN_EXPECTED_KEYS = 250;
+    if (used.size() < MIN_EXPECTED_KEYS) {
+        std::cout << "\nMETA-FAIL: scanner collected only " << used.size()
+                  << " keys (expected >= " << MIN_EXPECTED_KEYS
+                  << ") — the scanner itself may be broken\n";
+        std::cout << "Result: FAIL (scanner floor)" << std::endl;
+        return 1;
+    }
+
     std::vector<std::string> missing, orphan_list;
     for (const auto& u : used)
         if (!dict_keys.count(u)) missing.push_back(u);

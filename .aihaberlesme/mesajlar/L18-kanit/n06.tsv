@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	if (!data || len != 7) return std::nullopt;	if (!data || len < 7) return std::nullopt; //MUT	N06 short_packet from_bytes() yanlış uzunluk kabul ediyor

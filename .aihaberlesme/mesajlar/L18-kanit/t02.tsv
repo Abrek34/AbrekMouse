@@ -1,0 +1,1 @@
+gui/ui_builder.inl	    tr_combo_fill(S->mode_combo, mode_names);	    tr_combo_fill(S->mode_combo, mode_names);\n    tr("L18 KONTROL cevrilmemis yeni dizgi");	yeni cevrilmemis tr() cagrisi eklendi -> kirmizi olmali

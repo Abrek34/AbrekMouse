@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	return code > 0 && code < (sizeof(rates) / sizeof(rates[0]))	return code < (sizeof(rates) / sizeof(rates[0])) //MUT	N13 rate_code_to_hz code 0 artık 1000 donuyor

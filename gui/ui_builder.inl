@@ -239,7 +239,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     S->exponent_spin   = make_spin(1,    10,    0.05,  2.0);
     S->power_exp_spin  = make_spin(0.0001, 5, 0.01,  0.05, 4);   // O31-G4: min == sanitize exponent_power floor (1e-4)
     S->limit_spin      = make_spin(0,    100,   0.05,  1.5);    // O31-G4: sanitize floors limit at 0, not 0.1
-    S->offset_spin     = make_spin(0,    100,   0.5,   0.0);
+    S->offset_spin     = make_spin(0,    500,   0.5,   0.0);    // L16-01: input_offset sanitize domaini [0, CAP_X_MAX=500]; 100'lük gauge geçerli değeri sessizce kırpıyordu
     S->decay_spin      = make_spin(0,    10,    0.01,  0.1);
     S->cap_x_spin      = make_spin(0,    500,   1,     15, 0);
     S->cap_y_spin      = make_spin(0,    100,   0.05,  1.5);
@@ -450,8 +450,13 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     // ── Speed Limit ───────────────────────────────────────────────────────────
     append_section("<b>Speed Limit</b>");
     GtkWidget* sg = append_grid();
-    S->speed_min_spin = make_spin(0, 500, 1, 0, 0);
-    S->speed_max_spin = make_spin(0, 500, 1, 0, 0);
+    // L16-01: sanitize has NO upper bound on speed_min/speed_max (only >= 0),
+    // so a value >500 from JSON/CLI was silently rewritten to 500 on the next
+    // widget edit.  100000 is far above any physical speed (8000 Hz * 32000
+    // DPI eventually saturates the clamp domain) and removes the data-loss
+    // window for realistic configs while keeping the spin usable.
+    S->speed_min_spin = make_spin(0, 100000, 1, 0, 0);
+    S->speed_max_spin = make_spin(0, 100000, 1, 0, 0);
     connect_spin(S->speed_min_spin, S);
     connect_spin(S->speed_max_spin, S);
     grid_row(sg, 0, "Min (ips):", S->speed_min_spin);

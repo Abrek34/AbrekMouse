@@ -116,7 +116,23 @@ struct lat_stats {
                 // counts (e.g. p50 of a single sample = 0.5µs, not ~0.25µs).
                 return (static_cast<double>(i) + 0.5) * BUCKET_US;
         }
-        return max_us; // all overflow
+        // L10-08 (MED): the target lies in the overflow samples (> RANGE_US).
+        // Returning max_us for EVERY such percentile made p25 = p50 = p75 =
+        // 5000 µs on a mixed distribution — p50 could exceed the reported avg,
+        // which is impossible for a real distribution (measured: p50 5000 vs
+        // exact 2755, avg 2772).  Interpolate linearly across the overflow
+        // region instead: the k-th overflow sample sits proportionally between
+        // RANGE_US and max_us.  Bounded, monotone, and much closer to the
+        // exact value; only the overflow tail is estimated (the histogram
+        // itself stays exact for samples <= RANGE_US).
+        if (over > 0) {
+            const uint64_t in_range = count - over; // samples inside the histogram
+            const double pos = (target > in_range) ? static_cast<double>(target - in_range) : 0.0;
+            double frac = pos / static_cast<double>(over);
+            if (frac > 1.0) frac = 1.0;
+            return RANGE_US + frac * (max_us - RANGE_US);
+        }
+        return max_us;
     }
 
     // ── Snapshot (read + reset atomically, caller must NOT hold mtx) ────────
@@ -142,6 +158,16 @@ struct lat_stats {
                 cum += hist[i];
                 if (cum >= target)
                     return (static_cast<double>(i) + 0.5) * BUCKET_US;
+            }
+            // L10-08: same overflow interpolation as lat_stats::percentile()
+            // (see the comment there) — p50 must never exceed the reported avg
+            // on a mixed distribution.
+            if (over > 0) {
+                const uint64_t in_range = count - over;
+                const double pos = (target > in_range) ? static_cast<double>(target - in_range) : 0.0;
+                double frac = pos / static_cast<double>(over);
+                if (frac > 1.0) frac = 1.0;
+                return RANGE_US + frac * (max_us - RANGE_US);
             }
             return max_us;
         }

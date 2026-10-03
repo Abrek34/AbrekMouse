@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	event.connected = (notification.address & 0x01) == 0;	event.connected = (notification.address & 0x01) == 1; //MUT	N11 HID++1.0 CONNECTED (0x42) bit-0 yorumu TERS çevrildi

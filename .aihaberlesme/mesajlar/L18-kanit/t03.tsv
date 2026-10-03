@@ -1,0 +1,1 @@
+tests/tr_coverage.cpp	used.insert(key);	/*MUT: used.insert(key);*/	tarayici hicbir anahtar toplamiyor (used.insert islevsiz)

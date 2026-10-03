@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	if (feature_id == 0 || param_len > HIDPP_SHORT_PAYLOAD_MAX)\n        return std::nullopt;	if (feature_id == 0) return std::nullopt; //MUT	N02 feature_request() TAŞMA REDDİ SİLİNDİ

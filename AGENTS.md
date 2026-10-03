@@ -121,7 +121,7 @@ bash tests/run_simd_parity.sh
 # 5. Translation coverage (every UI string has Turkish entry)
 bash tests/run_tr_coverage.sh
 
-# 6. CLI under ASan + UBSan (31 real commands)
+# 6. CLI under ASan + UBSan (34 real commands)
 bash tests/run_cli_sanitized.sh
 
 # 7. Tracker bridge (record↔code consistency)
@@ -361,8 +361,8 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 151 `test_` functions / 217 `SECTION` groups, 34164 runtime assertions (the
-  runner's own count; the source has 1603 `EXPECT` call sites — `#define` lines
+- 151 `test_` functions / 217 `SECTION` groups, 34267 runtime assertions (the
+  runner's own count; the source has 1611 `EXPECT` call sites — `#define` lines
   excluded, loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
@@ -484,7 +484,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (151 functions / 217 `SECTION` groups, 34164 runtime assertions) |
+| `tests/test_accel.cpp` | Unit + integration tests (151 functions / 217 `SECTION` groups, 34267 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -492,7 +492,7 @@ daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
 | `tests/e2e_harness.cpp` | E2E harness: synthetic uinput mouse + REAL daemon + virtual sink; accel (T-A1..T-A4) + raw (T-B1) phase checks |
 | `tests/run_e2e.sh` | E2E runner (root): builds harness, SIGSTOP/SIGCONT-sensitive system-daemon isolation, runs both phases, propagates 0/1/77 |
 | `tests/run_tests_asan.sh` | Unit test runner under ASan + UBSan |
-| `tests/run_cli_sanitized.sh` | Runs `cli/main.cpp` under ASan + UBSan over 31 real commands (8 presets, profile CRUD, JSON round-trip, config-path rejections); each command asserts its own expected output marker, so an arg rename can't silently turn the gate into 31 no-ops. Exit 0/1/77 |
+| `tests/run_cli_sanitized.sh` | Runs `cli/main.cpp` under ASan + UBSan over 34 real commands (8 presets, profile CRUD, JSON round-trip, config-path rejections); each command asserts its own expected output marker, so an arg rename can't silently turn the gate into 34 no-ops. Exit 0/1/77 |
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
 | `tests/run_tr_coverage.sh` | Translation coverage runner (exit 1 on MISSING) |

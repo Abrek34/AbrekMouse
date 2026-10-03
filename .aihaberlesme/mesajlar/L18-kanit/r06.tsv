@@ -1,0 +1,1 @@
+src/logitech_receiver.cpp	    case logitech_receiver_kind::lightspeed:    return "Lightspeed";	    case logitech_receiver_kind::lightspeed:    return "lightspeed"; //MUT	R06 logitech_receiver_kind_name() Lightspeed -> lightspeed

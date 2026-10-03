@@ -1,0 +1,15 @@
+O31-H2 — the "32" row                      0/0 geçti
+O31-H2 — the two real 12-char              7/7 geçti
+O31-H1 — onboard sector chunk              50/50 geçti
+O31-H1 — long packet wire layout           44/44 geçti
+O31-D1 — a never-pushed                    8/8 geçti
+O31-D1 — 0 is an unambiguous               41/41 geçti
+O31-D1 — a changed field                   4/4 geçti
+O31-D1 — a rebuilt transport               4/4 geçti
+O31-D1 — a full daemon sequence            2/2 geçti
+job transport outlives                       6/6 geçti
+same values twice                            10/10 geçti
+slider drag                                  6/6 geçti
+replug re-pushes                             4/4 geçti
+FIFO order preserved                         22/22 geçti
+non-enqueueable jobs                         7/7 geçti

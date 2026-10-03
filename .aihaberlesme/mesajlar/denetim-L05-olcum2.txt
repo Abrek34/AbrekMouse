@@ -1,0 +1,22 @@
+### raw_passthrough / gain with numeric and boolean JSON values (isolated re-measure)
+  value=true    gain -> 1    raw_passthrough -> 1
+  value=false   gain -> 0    raw_passthrough -> 0
+  value=0       gain -> 0    raw_passthrough -> 0
+  value=1       gain -> 1    raw_passthrough -> 1
+  value=2       gain -> 1    raw_passthrough -> 0
+
+### top-level use_raw_input and profiles[].disable with non-boolean values
+  value=true      use_raw_input -> 1    disable -> 1
+  value=false     use_raw_input -> 0    disable -> 0
+  value=0         use_raw_input -> 1    disable -> 0
+  value=1         use_raw_input -> 1    disable -> 0
+  value=2         use_raw_input -> 1    disable -> 0
+  value="true"    use_raw_input -> 1    disable -> 0
+
+### cap partial (corrected)
+  {"cap":[500]}          -> cap={15,0}   (struct default is {15,0})
+  {"cap":[null,2]}       -> cap={15,2}   (struct default is {15,0})
+  {"cap":[24,"x"]}       -> cap={24,0}   (struct default is {15,0})
+  {"cap":[]}             -> cap={15,0}   (struct default is {15,0})
+  {"cap":[500,3,99]}     -> cap={500,3}   (struct default is {15,0})
+  {"cap":["a","b"]}      -> cap={15,0}   (struct default is {15,0})

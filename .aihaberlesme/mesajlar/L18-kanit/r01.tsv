@@ -1,0 +1,1 @@
+src/logitech_receiver.cpp	    {0xc548, logitech_receiver_kind::bolt,          6, true},	    {0xc548, logitech_receiver_kind::bolt,          4, true}, //MUT	R01 Bolt alıcısı max_paired_devices 6 -> 4

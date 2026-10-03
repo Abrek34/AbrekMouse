@@ -1,0 +1,38 @@
+MUT[Q01]
+    uygulanan: Q01 find_logitech_quirks() 2-karakter kısa-anahtar HAVUZU geri geldi [1 yerde]
+    BUILD-FAIL [tests/test_accel.cpp]
+      tests/../include/logitech_quirks.hpp:131:47: error: request for member 'size' in 'entry.rawaccel::logitech_quirks_entry::model_id', which is of non-class type 'const char* const'
+MUT[Q02]
+    uygulanan: Q02 logitech_compose_model_id() ham 12-char model_id"yi KULLANMIYOR [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 390/401 geçti, 11 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 11)
+        FAIL  tests/test_accel.cpp:774  produced_other == 0  (section: O31-H2 — composed modelId is only ever "" or 12 chars)
+        FAIL  tests/test_accel.cpp:775  produced_12 == 16  (section: O31-H2 — composed modelId is only ever "" or 12 chars)
+        FAIL  tests/test_accel.cpp:776  produced_empty == 16  (section: O31-H2 — composed modelId is only ever "" or 12 chars)
+MUT[Q03]
+    uygulanan: Q03 LOGITECH_QUIRKS[2] anahtarı "32" -> "32X" [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 395/397 geçti, 2 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 2)
+        FAIL  tests/test_accel.cpp:821  std::string(LOGITECH_QUIRKS[2].model_id) == "32"  (section: O31-H2 — the two real 12-char keys still resolve)
+        FAIL  tests/test_accel.cpp:822  find_logitech_quirks(std::string("32")) != nullptr  (section: O31-H2 — the two real 12-char keys still resolve)
+MUT[Q04]
+    uygulanan: Q04 identify(): model_id 6 byte -> 4 byte (8 hex, kısa id ÜRETİLEBİLİR hale geldi) [1 yerde]
+    rc=0  !! YESIL KALDI (test YAKALAMADI)
+    === Sonuç: 397/397 geçti (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 0)
+MUT[Q05]
+    uygulanan: Q05 identify(): take_id() dilim adımı 2 -> 1 [1 yerde]
+    rc=0  !! YESIL KALDI (test YAKALAMADI)
+    === Sonuç: 397/397 geçti (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 0)
+MUT[Q06]
+    uygulanan: Q06 identify(): transport_flags offsetu 6 -> 7 [1 yerde]
+    rc=0  !! YESIL KALDI (test YAKALAMADI)
+    === Sonuç: 397/397 geçti (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 0)
+MUT[Q07]
+    uygulanan: Q07 parse_firmware_record(): model_id dilimi 9/6 -> 10/5 [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:712  parsed->model_id == "AABBCCDDEEFF"  (section: Logitech HID++ firmware and transport-ID offsets)
+MUT[Q08]
+    uygulanan: Q08 identify(): model_id bloğu eşiği 13 -> 12 [1 yerde]
+    rc=0  !! YESIL KALDI (test YAKALAMADI)
+    === Sonuç: 397/397 geçti (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 0)

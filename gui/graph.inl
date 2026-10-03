@@ -162,8 +162,25 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
     };
 
     auto& dp = cur_prof(S);
-    draw_curve(dp.prof.accel_x, C_CURVE);
-    if (!S->xy_linked) draw_curve(dp.prof.accel_y, C_CURVE2);
+    // L17-2 (CRIT): raw passthrough bypasses the acceleration engine entirely
+    // (1:1 counts), so drawing the accel curve was simply wrong — the user saw
+    // a curve that the daemon never applies in this mode.  Show the flat 1.0
+    // reference and a mode notice instead.
+    if (dp.prof.raw_passthrough) {
+        cairo_set_source_rgb(cr, C_REF[0], C_REF[1], C_REF[2]);
+        cairo_set_line_width(cr, 2.2);
+        double y1 = to_cy(1.0);
+        cairo_move_to(cr, GRAPH_ML, y1);
+        cairo_line_to(cr, GRAPH_ML + PW, y1);
+        cairo_stroke(cr);
+        cairo_set_source_rgb(cr, 0.9, 0.6, 0.1);
+        cairo_set_font_size(cr, 11);
+        cairo_move_to(cr, GRAPH_ML + 8, GRAPH_MT + PH / 2);
+        cairo_show_text(cr, tr("Raw passthrough — acceleration is bypassed (1:1)"));
+    } else {
+        draw_curve(dp.prof.accel_x, C_CURVE);
+        if (!S->xy_linked) draw_curve(dp.prof.accel_y, C_CURVE2);
+    }
 
     cairo_reset_clip(cr);
 
@@ -210,9 +227,12 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
         cairo_move_to(cr, lx + 16, ly + 4);
         cairo_show_text(cr, label);
     };
-    draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10, C_CURVE, tr("X Axis"));
-    if (!S->xy_linked)
-        draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 24, C_CURVE2, tr("Y Axis"));
+    // Legend — hidden in raw passthrough (no accel curve is drawn, L17-2)
+    if (!dp.prof.raw_passthrough) {
+        draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10, C_CURVE, tr("X Axis"));
+        if (!S->xy_linked)
+            draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 24, C_CURVE2, tr("Y Axis"));
+    }
 
     // Zoom hint
     {

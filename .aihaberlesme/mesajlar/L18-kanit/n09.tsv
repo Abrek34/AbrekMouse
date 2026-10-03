@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	if (!fs::is_character_file(p, fec)) continue;	/*MUT: is_character_file kontrolü kaldırıldı*/	N09 discover_logitech_hidraw_devices() is_character_file kontrolü SİLİNDİ

@@ -496,6 +496,7 @@ static gpointer hw_apply_thread(gpointer data) {
         bool ok_dpi = false;
         bool ok_rate = false;
         bool ok_lod = false;
+        bool lod_unsupported = false; // L17-5: no write attempted (no LOD support)
         uint16_t dpi = 0;
         uint32_t rate_hz = 0;
         int lod = 0;
@@ -581,12 +582,15 @@ static gpointer hw_apply_thread(gpointer data) {
             } else {
                 out.ok_rate = false;
             }
-            // LOD only if supported
+            // LOD only if supported.  L17-5 (HIGH): the else branch reported
+            // ok_lod=true ("applied") even though NO write was attempted, so a
+            // device without LOD support showed "LOD→Low" on every Apply while
+            // set_lift_off_distance() was never called.  Report "unsupported".
             if (task->supports_lod) {
                 out.ok_lod = transport.set_lift_off_distance(
                     (hidpp_lift_off_distance)task->lod, task->device_index);
             } else {
-                out.ok_lod = true; // no change requested
+                out.lod_unsupported = true;
             }
         }
 
@@ -617,9 +621,16 @@ static gpointer hw_apply_thread(gpointer data) {
                         r->out.ok_dpi ? "" : tr("(rejected)"));
             parts += " · " + trf("Rate→%d Hz%s", r->out.rate_hz,
                                  r->out.ok_rate ? "" : tr("(rejected)"));
-            parts += " · " + std::string(tr("LOD→"))
-                          + tr(lod_en[std::clamp(r->out.lod, 1, 3)])
-                          + (r->out.ok_lod ? "" : tr("(rejected)"));
+            // L17-5: distinguish "write rejected" from "device has no LOD
+            // support (nothing was written)" — the old render claimed success
+            // for the latter.
+            parts += " · " + std::string(tr("LOD→"));
+            if (r->out.lod_unsupported) {
+                parts += std::string(tr("(unsupported)"));
+            } else {
+                parts += std::string(tr(lod_en[std::clamp(r->out.lod, 1, 3)]));
+                if (!r->out.ok_lod) parts += std::string(tr("(rejected)"));
+            }
         }
         hw_set_status(S, parts);
         hw_update_ui_state(S);

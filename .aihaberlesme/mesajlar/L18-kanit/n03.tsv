@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	for (size_t off = 0; off < data.size(); off += chunk) {	for (size_t off = 0; off < data.size(); off += chunk + 1) { //MUT	N03 write_onboard_profile_sector() chunk ilerlemesi bozuldu (off += chunk+1)

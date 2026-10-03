@@ -1,0 +1,49 @@
+MUT[M01]
+    uygulanan: plan_for() "transport degisti -> ikisini de yaz" KISA DEVRESI SILINDI [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 108/114 geçti, 6 BAŞARISIZ (11 section eşleşti, 206 atlandı) ===  (FAIL satiri: 6)
+        FAIL  tests/test_accel.cpp:999  rebuilt.polling_rate  (section: O31-D1 — a rebuilt transport re-pushes both fields)
+        FAIL  tests/test_accel.cpp:1000  rebuilt.dpi  (section: O31-D1 — a rebuilt transport re-pushes both fields)
+        FAIL  tests/test_accel.cpp:1033  blocking_writes == 6  (section: O31-D1 — a full daemon sequence hits the blocking path once)
+
+MUT[M02a]
+    uygulanan: sentinel polling_rate 0 -> 1000 (mouse_device varsayilani) [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 112/114 geçti, 2 BAŞARISIZ (11 section eşleşti, 206 atlandı) ===  (FAIL satiri: 2)
+        FAIL  tests/test_accel.cpp:941  fresh.polling_rate == 0  (section: O31-D1 — a never-pushed device still writes its first value)
+        FAIL  tests/test_accel.cpp:946  !(fresh.polling_rate == kDevDefaultPoll)  (section: O31-D1 — a never-pushed device still writes its first value)
+
+MUT[M02b]
+    uygulanan: sentinel dpi 0 -> 800 (mouse_device varsayilani) [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 112/114 geçti, 2 BAŞARISIZ (11 section eşleşti, 206 atlandı) ===  (FAIL satiri: 2)
+        FAIL  tests/test_accel.cpp:942  fresh.dpi == 0  (section: O31-D1 — a never-pushed device still writes its first value)
+        FAIL  tests/test_accel.cpp:947  !(fresh.dpi == kDevDefaultDpi)  (section: O31-D1 — a never-pushed device still writes its first value)
+
+MUT[M03]
+    uygulanan: hidpp_hw_take() LIFO oldu (front -> back) [1 yerde]
+    rc=139  OK  -> KIRMIZI (yakaladi)
+      (FAIL satiri: 3)
+        FAIL  tests/test_accel.cpp:1186  out.dpi == 100 * (i + 1)  (section: FIFO order preserved)
+        FAIL  tests/test_accel.cpp:1187  *static_cast<int*>(out.transport.get()) == i  (section: FIFO order preserved)
+        FAIL  tests/test_accel.cpp:1186  out.dpi == 100 * (i + 1)  (section: FIFO order preserved)
+
+MUT[M04]
+    uygulanan: hidpp_hw_enqueue() enqueueable() REDDINI KALDIRILDI [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 107/114 geçti, 7 BAŞARISIZ (11 section eşleşti, 206 atlandı) ===  (FAIL satiri: 7)
+        FAIL  tests/test_accel.cpp:1106  !hidpp_hw_enqueue(q, std::move(j2))  (section: same values twice -> exactly one job)
+        FAIL  tests/test_accel.cpp:1107  q.size() == 1  (section: same values twice -> exactly one job)
+        FAIL  tests/test_accel.cpp:1114  q.size() == 2  (section: same values twice -> exactly one job)
+
+MUT[M05]
+MUT-FAIL: m05.tsv:1 -- 2 alan, 4 bekleniyor
+
+MUT[M06]
+    uygulanan: enqueueable() dev_idx kontrolunu BIRAKTI (0xFF kabul) [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 111/114 geçti, 3 BAŞARISIZ (11 section eşleşti, 206 atlandı) ===  (FAIL satiri: 3)
+        FAIL  tests/test_accel.cpp:1204  !bad_index.enqueueable()  (section: non-enqueueable jobs are rejected and do not grow the queue)
+        FAIL  tests/test_accel.cpp:1205  !hidpp_hw_enqueue(q, std::move(bad_index))  (section: non-enqueueable jobs are rejected and do not grow the queue)
+        FAIL  tests/test_accel.cpp:1212  q.empty()  (section: non-enqueueable jobs are rejected and do not grow the queue)
+

@@ -1,0 +1,4 @@
+MUT[M00_POZITIF_KONTROL_bos_mutasyon] rc=0  !! YESIL KALDI (test YAKALAMADI)
+    bozulan: <yok: pozitif kontrol>
+    === Sonuç: 59/59 geçti (5 section eşleşti, 212 atlandı) ===   (FAIL satiri: 0)
+DONE rc=0

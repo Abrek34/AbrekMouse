@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	            if (count->size() >= 13) {	            if (count->size() >= 12) { //MUT	Q08 identify(): model_id bloğu eşiği 13 -> 12

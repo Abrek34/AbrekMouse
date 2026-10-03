@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	                    id_offset += 2;\n                    return id;\n                };\n                info.bluetooth_id = take_id(0x01);	                    id_offset += 1; //MUT\n                    return id;\n                };\n                info.bluetooth_id = take_id(0x01);	Q05 identify(): take_id() dilim adımı 2 -> 1

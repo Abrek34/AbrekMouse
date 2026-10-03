@@ -62,10 +62,14 @@ static int kde_libinput_accel_state() {
             line[--len] = '\0';
 
         if (line[0] == '[') {
-            // strncmp(...,10) only confirms the prefix matches; a section header
-            // like "[LibinputSomething]" would otherwise be treated as Libinput.
-            // Require the closing ']' right after the 10-byte section name.
-            in_libinput = (strncmp(line, "[Libinput]", 10) == 0 && line[10] == ']');
+            // L15-C1 (CRIT): the section test used to be
+            //   strncmp(line, "[Libinput]", 10) == 0 && line[10] == ']'
+            // which can NEVER be true: "[Libinput]" is exactly 10 bytes, so
+            // line[10] is the NUL terminator, not ']'.  The warning bar was
+            // dead code — a user running KDE with adaptive libinput
+            // acceleration never saw the double-acceleration warning.
+            // Correct: the prefix match IS the whole test.
+            in_libinput = (strncmp(line, "[Libinput]", 10) == 0);
             continue;
         }
         if (!in_libinput) continue;
@@ -389,12 +393,23 @@ pid_t read_daemon_pid() {
     return 0;
 }
 
-bool daemon_running() {
+/// True if the daemon appears alive.  `ipc_ok` (optional out-param) receives
+/// whether liveness was CONFIRMED through the IPC ping (reachable) or only
+/// inferred from the PID file / /proc scan (alive but unresponsive — e.g. a
+/// frozen loop thread that accepts the socket but never replies).
+/// L15-C2 (HIGH): callers that gate the Apply button on daemon availability
+/// need that distinction; the old bool-only API could not express it, so a
+/// frozen daemon showed a green "running" badge with a fully enabled GUI.
+bool daemon_running(bool* ipc_ok) {
+    if (ipc_ok) *ipc_ok = false;
     // Fast path: try IPC ping first (socket exists only while daemon is running).
     // Skip the ping entirely when no socket file is present (BUG-10 — no query).
     if (daemon_socket_exists()) {
         std::string pong = daemon_ipc_query("ping");
-        if (!pong.empty() && pong.find("pong") != std::string::npos) return true;
+        if (!pong.empty() && pong.find("pong") != std::string::npos) {
+            if (ipc_ok) *ipc_ok = true;
+            return true;
+        }
     }
     // Fallback: check PID file / /proc scan
     return read_daemon_pid() > 0;
@@ -503,6 +518,17 @@ static std::string daemon_device_slice(const std::string& resp, AppState* S) {
     return !match.empty() ? match : !live.empty() ? live : first;
 }
 
+/// Name of the device whose slice daemon_device_slice() selects — used by the
+/// mouse test window to show WHICH mouse the telemetry belongs to (L17-3: with
+/// an "all devices" profile the fallback picks the first telemetry-bearing
+/// device, which may be a different mouse than the user is moving).
+/// Returns an empty string when unavailable.
+static std::string daemon_device_name(const std::string& resp, AppState* S) {
+    std::string slice = daemon_device_slice(resp, S);
+    if (slice.empty()) return {};
+    return json_string_field(slice, "name");
+}
+
 /// Numeric value of `key` inside the device slice the active profile targets.
 /// Returns -1 when the device slice is absent, the key is missing, or the value
 /// is not a finite number.
@@ -536,7 +562,13 @@ void update_daemon_status(AppState* S) {
     // callbacks (on_daemon_start/stop/reload) that are NOT tracked for
     // g_source_remove — a destroyed window must not touch widgets.
     if (S->window_destroyed) return;
-    bool running = daemon_running();
+    // L15-C2 (HIGH): distinguish "reachable" from merely "alive".  A frozen
+    // daemon (PID file live, socket accepts, no reply) used to show a green
+    // "running" badge with Apply/Stop/Reload all enabled — clicking Apply
+    // waited out the 5 s push timeout and nothing was applied.
+    bool ipc_ok = false;
+    bool running = daemon_running(&ipc_ok);
+    const bool unreachable = running && !ipc_ok;
     if (running && !S->daemon_prev_running) {
         // R8-RESEND: daemon (re)started since the last poll.  App focus is
         // normally pushed by the KWin relay ONLY on a focus change, so a
@@ -545,18 +577,24 @@ void update_daemon_status(AppState* S) {
         kwin_focus_resend_current(S);
     }
     S->daemon_prev_running = running;
-    if (running) {
+    if (unreachable) {
+        gtk_label_set_markup(GTK_LABEL(S->daemon_status),
+            tr("<span foreground='#c08040'>● Daemon unreachable</span>"));
+    } else if (running) {
         gtk_label_set_markup(GTK_LABEL(S->daemon_status),
             tr("<span foreground='#40c040'>● Daemon running</span>"));
     } else {
         gtk_label_set_markup(GTK_LABEL(S->daemon_status),
             tr("<span foreground='#c04040'>● Daemon stopped</span>"));
     }
-    // Update button sensitivity based on whether the daemon is running
-    if (S->apply_btn)        gtk_widget_set_sensitive(S->apply_btn,        running);
+    // Update button sensitivity based on whether the daemon is running.
+    // L15-C2: an unreachable daemon disables Apply/Reload (they would block
+    // the UI for the push timeout and cannot succeed); Stop stays enabled so
+    // the user can still try to terminate the stuck instance.
+    if (S->apply_btn)        gtk_widget_set_sensitive(S->apply_btn,        running && !unreachable);
     if (S->daemon_start_btn) gtk_widget_set_sensitive(S->daemon_start_btn, !running);
     if (S->daemon_stop_btn)  gtk_widget_set_sensitive(S->daemon_stop_btn,  running);
-    if (S->daemon_reload_btn)gtk_widget_set_sensitive(S->daemon_reload_btn,running);
+    if (S->daemon_reload_btn)gtk_widget_set_sensitive(S->daemon_reload_btn,running && !unreachable);
 
     // Query and display battery level from daemon — but ONLY when the daemon is
     // actually reachable (BUG-10): with the daemon down this previously fired a

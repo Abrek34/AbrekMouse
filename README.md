@@ -2,7 +2,7 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v1.2.5** — native Logitech HID++ hardware controls for DPI,
+> **Current state: v1.2.6** — native Logitech HID++ hardware controls for DPI,
 > report rate, and sensor lift-off distance. Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
 >
@@ -12,8 +12,11 @@ A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the
 > GitHub Actions run has ever completed for this repository — every run stops
 > in ~5 s with an account billing lock — so no commit here is CI-verified, and
 > `test_accel.cpp` is sanitized only by `tests/run_tests_asan.sh`, which is
-> **not** one of the seven. See the "Still not verified" section of the
-> [1.2.5 changelog entry](CHANGELOG.md) before treating this as install-ready.
+> **not** one of the seven. v1.2.6 closed the M101 audit's data-loss and
+> silent-success classes (see its changelog entry), but the same CI and
+> hardware limits still apply: this is not a "verified on an installed system"
+> claim. See the [1.2.6 changelog entry](CHANGELOG.md) before treating this as
+> install-ready.
 
 ## Features
 

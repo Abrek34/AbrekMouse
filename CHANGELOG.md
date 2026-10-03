@@ -6,6 +6,110 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.6] — 2026-10-03
+
+M101 denetim turunun (20 lane, `.aihaberlesme/mesajlar/denetim-L*.md`)
+"yedi kapı yeşil ama ölçtüklerinin yarısını ölçmüyor" bulgularına karşı
+düzeltme turu. Kullanıcı verisi kaybına yol açan üç sınıf kapatıldı:
+GUI'nin LUT'u silmesi, config yazımının sessiz tersine dönmesi, ve
+test/gate altyapısının kendi kendini denetlememesi.
+
+### Fixed — kullanıcı verisi kaybı
+
+- **GUI grafiği kullanıcının LUT eğrisini siliyordu (L03-01, CRIT).**
+  `accel_args::data[]` `mutable` idi ve `synchronous::fill_lut()` iç LUT
+  integralini doğrudan oraya yazıyordu; `gui/graph.inl`'in `compute_curve`
+  fonksiyonu profil `accel_args`'ının referansını geçtiği için yalnızca bir
+  grafik çizimi kullanıcının kayıtlı eğrisini eziyor ve sonraki kayıt bunu
+  diske yazıyordu (ölçülen sapma: lookup gain 3.33 → 5.01, 500 ips'te 15×).
+  `mutable` kaldırıldı; synchronous kendi `lut[]` üyesini kullanıyor.
+- **`use_raw_input`/`disable` sayısal 0/1 değerlerinin TERSİNİ yüklüyordu
+  (L05-01, CRIT).** `{"use_raw_input": 0}` → `true`, `{"disable": 1}` →
+  `false`; sessiz, kalıcı ve kullanıcının istediğinin tam tersi. `gain`/
+  `raw_passthrough` ile aynı O31-C3 toleransı uygulandı.
+- **`lut_data` tek başına (lut_length'siz) sessizce yok ediliyordu (L05-03).**
+  `lut_length` yoksa eleman sayısından türetiliyor; tek load→save turu
+  eğriyi kalıcı siliyordu.
+- **Kısmi `cap` dizisi sessizce atılıyordu (L05-02).** `{"cap":[500]}` artık
+  x=500'ü korur; `cap.y` struct default'u doküman/oracle/config ile
+  hizalandı (`{15, 1.5}`, eskiden `{15, 0}` = "cap yok" sentineli, 100k
+  ips'te 501× gain).
+- **`diff` iki farklı tam-config export'unu "no differences" diyordu
+  (L13-05);** wrapper artık reddediliyor. `domain_weights`/`range_weights`
+  %.10g string yerine gerçek double ε ile karşılaştırılıyor (L13-06).
+
+### Fixed — sessiz "başarılı" yalanları
+
+- **`push_config` bir geri alma (revert) push'unu sessizce düşürüyordu
+  (L08-01, CRIT).** Bekleyen farklı bir push varken uygulanmış config'e
+  dönüş "zaten o" diye atlanıyor, ardından bekleyen push uygulanıyordu.
+  No-op guard'lar artık `has_pending` durumunda atlanıyor.
+- **`stop` / `reload` / `status` doğrulanmamış başarı bildiriyordu
+  (L13-01/02/03).** `stop` ~2 s boyunca çıkışı yoklar; `reload` IPC-onaylı
+  ve yalnız-sinyal yollarını ayırır; `status --json` donmuş daemon'u
+  `"unreachable"` + rc=3 olarak raporlar ve her zaman `devices:[]` içerir;
+  `timestamp_ms` eklendi (L13-04).
+- **GUI donmuş daemon'u "running" gösteriyordu (L15-C2).** Artık
+  "unreachable" rozeti; Apply/Reload duyarsız (5 s ana-iş-parçacığı
+  blokajı yerine).
+- **KWin uyarı barı ölü koddu (L15-C1, CRIT).** `line[10] == ']'` koşulu
+  hiçbir gerçek kwinrc satırında doğru olamıyordu (10 baytlık başlık +
+  NUL); çift-hızlandırma uyarısı asla görünmüyordu.
+- **HID++ paneli desteklenmeyen LOD'u "uygulandı" diye gösteriyordu
+  (L17-5).** Artık "(unsupported)".
+- **Fare testi penceresi ölçülen cihazın kimliğini göstermiyordu (L17-3).**
+  "Tüm cihazlar" profilinde telemetri ilk cihazdan okunabildiği için
+  yanlış fare olabilirdi; "Device:" satırı eklendi.
+- **Grafik raw passthrough modunda da ivme eğrisi çiziyordu (L17-2).**
+  Artık 1:1 düz çizgi + mod notu.
+
+### Fixed — motor doğruluğu
+
+- **Sel (natural) NaN/Inf girdide korumasızdı (L02-10); jump LEGACY
+  (L02-12); power LEGACY (L01-B05)** — finiteness guard'ları eklendi.
+- **Lookup tek noktalı LUT + GAIN ölü imleç üretiyordu (L02-01).** `x0<=0`
+  durumunda `0.0` yerine kimlik dönüyor.
+- **Classic GAIN `1 < exponent_classic < 1.015625` bandında monotoniklik
+  kırığı (L01-B01/B02).** Pozitif `constant` kuyruğu sıfıra çökertiliyor;
+  oracle bu bandı hiç görmüyordu.
+- **Smoother NaN girdiyle KALICI zehirleniyordu (L09-05).** Tek bir bozuk
+  kare tüm EMA durumunu NaN yapıyor, profil değişimi bile kurtarmıyordu
+  (yalnız fiş çekmek). `isfinite(speed)` guard'ı eklendi.
+- **`real_polling_rate` <100 Hz'de sessizce eski kalıyordu (L09-02);**
+  ölçüm bandı 5 Hz'e genişletildi.
+
+### Fixed — kapı altyapısı (sessiz yeşil)
+
+- **Test kayıt defteri denetimi (L20-CRIT-1):** 151 `RUN_TEST()` çağrısı
+  sayılıyor; bir tanesi silinirse `META-FAIL` + rc=1. Eskiden 151 testin
+  tamamı silinse `0/0 geçti` + rc=0 idi.
+- **`bench_hotpath.cpp` sabit mutlak baseline yolu (L20-CRIT-2)** — CI'da
+  perf kapısı kırıktı; `BENCH_BASELINE` env + exe-göreli arama.
+- **`tr_coverage` sayı tabanı (L18 B-17/B-19):** 287→17 düşse bile PASS
+  veriyordu ve eksik dosya sessizce atlanıyordu; taban 250 + dosya var-yok
+  denetimi.
+- **SIMD parity kapısı kör noktaları (L04-01/02/03):** smoother dalları,
+  `yx_output_dpi_ratio` ve `v2d_max` artık değer-pinli assert'lerle
+  sınanıyor (mutasyon testiyle doğrulandı: lane swap, DPI ratio ve
+  max→min mutasyonlarının hepsi artık kırmızı).
+- **`lat_stats::percentile()` taşma örneklerinde `max_us` dönüyordu
+  (L10-08);** p50 > avg absurdity'si interpole ediliyor.
+- **`json_str` 0x80 üstü ham bayt geçiriyordu (L10-06);** geçersiz UTF-8
+  artık `\u00XX` kaçışlanıyor (tek tuhaf cihaz adı tüm `status` çıktısını
+  boşaltıyordu).
+- **`chmod` dönüş değeri atılıyordu (L10-02);** loglanıyor.
+
+### Kapılar
+
+Yedi kapı bu düzeltmelerle yeşil: build 0 uyarı · 34267/34267 assertion ·
+oracle 1408 satır / 79 sapma · SIMD parity (yeni kapsamla) · tr coverage ·
+CLI ASan/UBSan 34/34 · tracker bridge. Ayrıca iki bağımsız mutasyon
+doğrulaması: test çağrısı silme → META-FAIL; SIMD lane swap / DPI ratio /
+max-min → kırmızı.
+
+⚠️ Unchanged honesty: CI hâlâ hiç çalışmadı (hesap kilitli, adım=0);
+kurulum/root/donanım yolu bu ortamda koşulamadı.
+
 ## [1.2.5] — 2026-10-01
 
 Sürüm notundaki abartı düzeltildi: 1.2.4 "kurulu bir sistemde doğrulandı,

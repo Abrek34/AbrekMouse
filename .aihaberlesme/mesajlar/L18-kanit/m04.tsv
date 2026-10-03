@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	if (!job.enqueueable()) return false;	/*MUT*/	hidpp_hw_enqueue() enqueueable() REDDINI KALDIRILDI

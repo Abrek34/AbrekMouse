@@ -212,14 +212,22 @@ if [ "$envanter_rc" -ne 0 ]; then
 fi
 
 # Does this host even have AVX2? On non-x86 hosts skip it rather than fail.
+# L04-05: the probe used to only check COMPILATION.  On a host whose CPU
+# cannot execute AVX2 (pre-Haswell, masked by hypervisor/OS) the probe
+# succeeded, the avx2 binary then died with SIGILL, and the "graceful skip"
+# contract (exit 77) was unreachable — the user saw a bare "TEST BAŞARISIZ".
+# Compile AND run the probe so an unrunnable AVX2 host is classified skip.
 have_avx2=1
 if ! echo 'int main(){return 0;}' | $CXX $STD -mavx2 -x c++ - -o "$TMP/avx2probe" 2>/dev/null; then
     have_avx2=0
+elif ! "$TMP/avx2probe" >/dev/null 2>&1; then
+    have_avx2=0   # compiles but the CPU cannot execute it (SIGILL)
 fi
 
 outputs=()
 ran=0
 failed=0
+avx2_ran=0
 
 for entry in "${BACKENDS[@]}"; do
     label="${entry%%:*}"
@@ -248,6 +256,7 @@ for entry in "${BACKENDS[@]}"; do
     echo "--- $label: $(head -1 "$TMP/out_$label.txt") ---"
     outputs+=("$TMP/out_$label.txt")
     ran=$((ran + 1))
+    [ "$label" = "avx2" ] && avx2_ran=1
 done
 
 if [ "$failed" -ne 0 ]; then
@@ -280,6 +289,21 @@ if [ "$mismatch" -ne 0 ]; then
     echo
     echo "Sonuç: FAIL — backend'ler farklı sonuç üretti"
     exit 1
+fi
+
+# L04-06: the SSE2+scalar comparison passing is NOT the full contract — the
+# AVX2 path (the one the shipping -march=native build executes) was NOT
+# measured on this host.  Exiting 0 here used to make run_tests.sh print a
+# plain green "N/N geçti" with no skip notice (the 77 branch never fired), so
+# "loudly skipped, never quietly passed" held only on hosts where the binary
+# could not even be built.  Emit the documented 77 so the caller shows the
+# DİKKAT line.
+if [ "$avx2_ran" -eq 0 ]; then
+    echo
+    echo "DİKKAT: AVX2 backend bu konakta çalıştırılamadı — yalnız $ran backend"
+    echo "        karşılaştırıldı.  Üretimde çalışan AVX2 yolu BU KOŞUDA denenmedi."
+    echo "Sonuç: PASS (kısmi) — AVX2 atlandı"
+    exit 77
 fi
 
 echo

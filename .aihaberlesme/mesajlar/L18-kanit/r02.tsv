@@ -1,0 +1,1 @@
+src/logitech_receiver.cpp	    {0xc542, logitech_receiver_kind::nano,          1, false},	    {0xc542, logitech_receiver_kind::nano,          1, true},  //MUT	R02 Nano c542 hidpp_supported false -> true

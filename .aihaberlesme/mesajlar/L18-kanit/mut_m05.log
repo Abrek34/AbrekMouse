@@ -1,0 +1,7 @@
+MUT[M05]
+    uygulanan: hidpp_hw_plan_job() sentinel'i isaretlemiyor -> dedup kayboldu [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 388/397 geçti, 9 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 9)
+        FAIL  tests/test_accel.cpp:1105  !j2.enqueueable()  (section: same values twice -> exactly one job)
+        FAIL  tests/test_accel.cpp:1106  !hidpp_hw_enqueue(q, std::move(j2))  (section: same values twice -> exactly one job)
+        FAIL  tests/test_accel.cpp:1107  q.size() == 1  (section: same values twice -> exactly one job)

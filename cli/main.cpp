@@ -208,7 +208,9 @@ static bool pid_is_rawaccel_daemon(pid_t pid) {
 /// misleading "is it running?" message even when the daemon was up.
 enum class signal_result { sent, not_running, permission_denied, other };
 
-static signal_result send_signal_to_daemon(int sig) {
+/// @param out_pid  optional: receives the PID that was targeted (L13-01 —
+///                 cmd_stop needs it to verify the daemon actually exited).
+static signal_result send_signal_to_daemon(int sig, pid_t* out_pid = nullptr) {
     // N6: daemon prefers $XDG_RUNTIME_DIR/rawaccel.pid — check it first.
     std::vector<std::string> paths;
     const char* xdg = std::getenv("XDG_RUNTIME_DIR");
@@ -224,6 +226,7 @@ static signal_result send_signal_to_daemon(int sig) {
         // R5-S-1: only signal a PID that is actually the rawaccel daemon —
         // prevents signalling a recycled / spoofed process.
         if (!pid_is_rawaccel_daemon(pid)) continue;
+        if (out_pid) *out_pid = pid;
         if (kill(pid, sig) == 0) return signal_result::sent;
         if (errno == EPERM)      return signal_result::permission_denied;
         return signal_result::other;
@@ -307,16 +310,27 @@ static std::string daemon_ipc_query(const std::string& cmd) {
     return daemon_ipc_send(cmd + "\n");
 }
 
+/// How a reload attempt ended.  L13-02: a bool/`signal_result` could not tell
+/// an IPC-CONFIRMED reload ("ok":true — the daemon processed it) apart from a
+/// legacy SIGHUP that was merely DELIVERED.  cmd_reload needs that distinction
+/// to stop printing "Daemon reloaded." for the unverified path.
+enum class reload_result { ipc_ok, signal_sent, not_running, permission_denied, other };
+
 /// Ask the daemon to reload its config.  Tries the IPC socket first (works
 /// for any user in the input group regardless of who the daemon runs as),
 /// then falls back to SIGHUP for older daemons that don't speak IPC.
-/// P130-R49: now returns the full signal_result so callers know *why* the
-/// reload failed (not_running vs permission_denied) instead of having to
-/// re-issue the SIGHUP a second time just to find out.
-static signal_result daemon_reload_via_any_path() {
+/// P130-R49: returns the full outcome so callers know *why* the reload failed
+/// (not_running vs permission_denied) AND whether success was confirmed by the
+/// daemon (ipc_ok) or is only an unverified signal delivery (signal_sent).
+static reload_result daemon_reload_via_any_path() {
     std::string resp = daemon_ipc_query("reload");
-    if (resp.find("\"ok\":true") != std::string::npos) return signal_result::sent;
-    return send_signal_to_daemon(SIGHUP);
+    if (resp.find("\"ok\":true") != std::string::npos) return reload_result::ipc_ok;
+    switch (send_signal_to_daemon(SIGHUP)) {
+    case signal_result::sent:              return reload_result::signal_sent;
+    case signal_result::not_running:       return reload_result::not_running;
+    case signal_result::permission_denied: return reload_result::permission_denied;
+    default:                               return reload_result::other;
+    }
 }
 
 /// Push the caller's full config to the running daemon (IPC "set_config" RPC).
@@ -346,7 +360,10 @@ static bool daemon_apply_config(const app_config& cfg) {
     // down the legacy SIGHUP path.  Any non-empty response containing "error"
     // means the daemon is alive and answered with an explicit rejection.
     if (resp.find("\"error\"") != std::string::npos) return false;
-    return daemon_reload_via_any_path() == signal_result::sent;
+    // Legacy fallback path: an IPC-confirmed reload OR a delivered SIGHUP both
+    // count as "accepted" here (callers only care whether the push was applied).
+    auto rr = daemon_reload_via_any_path();
+    return rr == reload_result::ipc_ok || rr == reload_result::signal_sent;
 }
 
 // ── Global CLI flags ──────────────────────────────────────────────────────────
@@ -384,8 +401,19 @@ static int daemon_apply_if_enabled(const app_config& cfg) {
         std::cout << "Config applied to the daemon.\n";
         return 0;
     }
-    std::cerr << "Warning: config saved locally but the daemon did not reload it.\n"
-              << "  Re-run without the change, or apply with: rawaccel-cli reload\n";
+    // L12-11: the old advice ("Re-run without the change, or apply with:
+    // rawaccel-cli reload") was wrong twice: "re-run without the change"
+    // is contradictory (it reads as "undo it"), and `reload` only makes the
+    // daemon re-read ITS OWN config file — it does not push this CLI's saved
+    // working copy when the daemon runs with a different -c path (the common
+    // root systemd case).  Give commands the user can actually run instead.
+    // Note: this branch is only reached WITHOUT --no-daemon (that flag returns
+    // earlier), so "re-run this command" cannot collide with the flag.
+    std::cerr << "Warning: config saved locally but the daemon did not apply it.\n"
+              << "  Check the daemon: rawaccel-cli status\n"
+              << "  If it is not running, start it: sudo systemctl start rawaccel\n"
+              << "  If it is running but refused the config: journalctl -u rawaccel -n 20\n"
+              << "  Once the daemon is reachable, re-run this command to push the saved config.\n";
     return 1;
 }
 
@@ -411,6 +439,12 @@ static void print_signal_failure(signal_result r, const char* action, const char
 }
 
 static int finite_double_to_int(double v) {
+    // L12-07: both range comparisons below are false for NaN, so the final
+    // static_cast<int>(NaN) was UB (UBSan: "nan is outside the range of
+    // representable values of type 'int'").  Today the only two callers
+    // (dpi / polling_rate) guard with isfinite+int_ok first, but the helper
+    // must be safe on its own — defense in depth.
+    if (std::isnan(v)) return 0;
     if (v < static_cast<double>(INT_MIN)) return INT_MIN;
     // BUG-CRIT-2: (double)INT_MAX == 2147483648.0 — `>` lets 2147483648.0 fall
     // through to the cast below, which is UB.  `>=` clamps it to INT_MAX.
@@ -512,6 +546,14 @@ static void print_profile(const device_profile& dp) {
     std::cout << "  lr_ratio:     " << p.lr_output_dpi_ratio << (std::fabs(p.lr_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
     std::cout << "  ud_ratio:     " << p.ud_output_dpi_ratio << (std::fabs(p.ud_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
     std::cout << "  yx_ratio:     " << p.yx_output_dpi_ratio << (std::fabs(p.yx_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
+    // L12-05 (MED): set-param'ın kabul ettiği alan show/list'te de görünmeli.
+    // domain_weights/range_weights (ve tek-eksen _x/_y varyantları) kabul edilen
+    // 40 anahtarın 6'sıydı ama print_profile hiçbirini basmıyordu; kullanıcı
+    // set-param rc=0 alıp JSON'a yazıldığı hâlde "ayarım yok" sanıyordu.  cap
+    // ile aynı [x, y] biçimi kullanılır; _x/_y varyantları bu aynı çiftin tek
+    // eksenini değiştirir, dolayısıyla tek satır üç anahtarı da görünür kılar.
+    std::cout << "  domain_weights: [" << p.domain_weights.x << ", " << p.domain_weights.y << "]\n";
+    std::cout << "  range_weights:  [" << p.range_weights.x << ", " << p.range_weights.y << "]\n";
     {
         auto& sp = p.speed_processor_args;
         std::string dist = sp.whole ? (sp.lp_norm >= 16 || sp.lp_norm <= 0 ? "max" :
@@ -842,6 +884,54 @@ static int cmd_validate(const std::string& config_path) {
                           << "' (Y axis) — should be even (speed, gain pairs)\n";
                 has_warnings = true;
             }
+            // L12-08: warn about semantically meaningless (but in-range)
+            // settings — validate used to say "All checks OK" for all three.
+            // These are WARNINGS only; the exit code must stay 0.
+            // Axis helper: same condition checked for X and Y so a
+            // hand-edited file can't hide the dead setting in accel_y.
+            auto axis_warn = [&](const accel_args& a, const char* axis) {
+                // L12-01 (validate side): mode=lookup with no LUT data —
+                // set-param already warns with C-8, but validate (the command
+                // a user runs on a file) stayed silent about the dead profile.
+                if (a.mode == accel_mode::lookup && a.length == 0) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': mode=lookup but the " << axis
+                              << "-axis LUT is empty — the profile behaves like noaccel\n";
+                    has_warnings = true;
+                }
+                // L02-08: jump constructs smooth_rate = (smooth*cap.x < 1) ? 0
+                // : ... so a positive `smooth` that is too small to make the
+                // product reach 1 is silently ignored — the user tunes
+                // "smooth 0.01" and still gets a hard step.
+                if (a.mode == accel_mode::jump && a.smooth > 0.0 &&
+                    a.smooth * a.cap.x < 1.0) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': jump smoothing is ignored (" << axis
+                              << " axis) — smooth (" << a.smooth
+                              << ") × cap_x (" << a.cap.x
+                              << ") < 1; increase smooth or cap_x";
+                    if (a.cap.x > 0.0)
+                        std::cerr << " (needs smooth ≥ " << 1.0 / a.cap.x << ")";
+                    std::cerr << "\n";
+                    has_warnings = true;
+                }
+                // L02-14: natural's internal accel coefficient is
+                // decay_rate/limit; with a tiny decay_rate the GAIN branch's
+                // cancellation can flip the gain negative (measured: negative
+                // gain / inverted axis at limit=100 decay=1e-9).  1e-4 is the
+                // established safety floor (the L02 report's recommended
+                // config.cpp base — same value sanitize already enforces for
+                // exponent_power).
+                if (a.mode == accel_mode::natural && a.decay_rate < 1e-4) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': natural decay_rate (" << a.decay_rate
+                              << ", " << axis << " axis) < 1e-4 — gain can go "
+                                 "negative (axis reversal); increase decay_rate\n";
+                    has_warnings = true;
+                }
+            };
+            axis_warn(p.accel_x, "X");
+            axis_warn(p.accel_y, "Y");
         }
 
         // CFG-2: cross-check the RAW JSON (pre-sanitize) against the values
@@ -1169,8 +1259,24 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // CLI domain must start at the same floor to keep P107 byte-correctness.
         if (!range_ok(key.c_str(), 0.01, SCALE_MAX)) return 1;
     } else if (key == "limit" || key == "decay_rate" || key == "motivity" ||
-               key == "gamma" || key == "smooth" ||
-               key == "speed_min" || key == "speed_max") {
+               key == "gamma" || key == "smooth") {
+        // L03-03 (MED): sanitize enforces ceilings for these five
+        // (LIMIT_MAX/DECAY_RATE_MAX/MOTIVITY_MAX/GAMMA_MAX/SMOOTH_MAX in
+        // include/config.hpp) but the CLI only checked the lower bound, so
+        // `set-param g smooth 16` stored 1.0 and `limit 5000` stored 100 with
+        // rc=0 — the P107 "bytes-birebir" contract was empty here.  Reject
+        // out-of-range values (rc=1, config untouched) like every other field;
+        // the ceiling constants are shared with sanitize so the CLI domain can
+        // never drift from it.
+        const double hi = (key == "limit")      ? LIMIT_MAX
+                        : (key == "decay_rate") ? DECAY_RATE_MAX
+                        : (key == "motivity")   ? MOTIVITY_MAX
+                        : (key == "gamma")      ? GAMMA_MAX
+                                                : SMOOTH_MAX;
+        if (!range_ok(key.c_str(), 0, hi)) return 1;
+    } else if (key == "speed_min" || key == "speed_max") {
+        // speed_min/speed_max have no sanitize ceiling (only >= 0), so they
+        // stay min-only — an upper bound here would invent a new domain.
         if (!min_ok(key.c_str(), 0)) return 1;
     } else if (key == "input_offset") {
         // O31-L2: sanitize clamps input_offset to CAP_X_MAX at load, so the
@@ -1394,9 +1500,32 @@ static int cmd_export(const app_config& cfg, const std::string& name) {
 /// never show up as bogus diffs.  Read-only: never touches the config file,
 /// the daemon, or the LUT data.
 static int cmd_diff(const app_config& cfg, const std::string& a, const std::string& b) {
-    auto resolve = [&](const std::string& ref, device_profile& out) -> bool {
+    // Where a diff side came from — the L13-10 note may only claim "one side is
+    // a file" when that is actually true.
+    enum class diff_kind { profile, file };
+    auto resolve = [&](const std::string& ref, device_profile& out,
+                       diff_kind& kind) -> bool {
+        // L13-09: load_config tolerates duplicate names (only import rejects
+        // them).  Silently returning the first match made `diff same same`
+        // compare one entry against itself while a second, different entry of
+        // the same name existed.  Keep first-match-wins (documented daemon
+        // semantics) but say so.
+        const device_profile* first = nullptr;
+        size_t matches = 0;
         for (const auto& dp : cfg.profiles) {
-            if (dp.name == ref) { out = dp; return true; }
+            if (dp.name == ref) {
+                if (!first) first = &dp;
+                ++matches;
+            }
+        }
+        if (first) {
+            if (matches > 1)
+                std::cerr << "Warning: duplicate profile name '" << ref << "' ("
+                          << matches << " entries in the config) — using the "
+                          << "first match.\n";
+            out = *first;
+            kind = diff_kind::profile;
+            return true;
         }
         // Not a profile name — try it as a JSON file (the `export` format).
         // Same bounded chunked read as import (stat() can fail on FUSE/pipes).
@@ -1418,21 +1547,41 @@ static int cmd_diff(const app_config& cfg, const std::string& a, const std::stri
             return false;
         }
         try {
+            // L13-05: `export` (no name) emits a {"profiles":[...]} wrapper.
+            // profile_from_json() has no top-level name/profile, so the wrapper
+            // silently degraded to an empty default profile — two completely
+            // different full-config exports diffed as "no differences", rc=0.
+            // Reject the ambiguous source instead of guessing which profile.
+            const nlohmann::json raw = nlohmann::json::parse(content);
+            if (raw.is_object() && raw.contains("profiles")) {
+                std::cerr << "diff: '" << ref << "' is a full-config export "
+                             "(has 'profiles'); extract a single profile first "
+                             "(rawaccel-cli export <name>).\n";
+                return false;
+            }
             out = profile_from_json(content);
         } catch (const std::exception& e) {
             std::cerr << "Invalid profile JSON in " << ref << ": " << e.what() << "\n";
             return false;
         }
+        kind = diff_kind::file;
         return true;
     };
 
     device_profile A, B;
-    if (!resolve(a, A) || !resolve(b, B)) return 1;
+    diff_kind kind_a = diff_kind::profile, kind_b = diff_kind::profile;
+    if (!resolve(a, A, kind_a) || !resolve(b, B, kind_b)) return 1;
 
     std::cout << "diff '" << A.name << "' vs '" << B.name << "'\n";
-    if (A.name == B.name && (A.name == a || A.name == b))
+    // L13-10: the note is only meaningful when the two sides are (a) different
+    // sources, (b) one is a config profile and the other a file, and (c) they
+    // share a name.  It used to fire for a self-diff (a == b), claiming "one
+    // side is a file" when neither was, and "the values differ" when they did
+    // not.
+    if (a != b && A.name == B.name && kind_a != kind_b)
         std::cout << "note: both sides share the name '" << A.name
-                  << "' but the values differ (one side is a file).\n";
+                  << "' (one side is a config profile, the other a file) — "
+                     "check the values below.\n";
 
     int diffs = 0;
     auto dnum = [](double v) -> std::string {
@@ -1556,10 +1705,14 @@ static int cmd_diff(const app_config& cfg, const std::string& a, const std::stri
             ++diffs;
         }
     };
-    sval("domain_weights", dnum(A.prof.domain_weights.x) + "," + dnum(A.prof.domain_weights.y),
-                            dnum(B.prof.domain_weights.x) + "," + dnum(B.prof.domain_weights.y));
-    sval("range_weights", dnum(A.prof.range_weights.x) + "," + dnum(A.prof.range_weights.y),
-                           dnum(B.prof.range_weights.x) + "," + dnum(B.prof.range_weights.y));
+    // L13-06: these two were compared as %.10g STRINGS via sval(), so a real
+    // 1e-4 difference at |v| >= 1e5 was invisible (1e6 vs 1e6.0001 printed the
+    // same) while every other double uses dbl()'s raw-double 1e-9 epsilon.
+    // Compare component-by-component with dbl().
+    dbl("domain_weights.x", A.prof.domain_weights.x, B.prof.domain_weights.x);
+    dbl("domain_weights.y", A.prof.domain_weights.y, B.prof.domain_weights.y);
+    dbl("range_weights.x",  A.prof.range_weights.x,  B.prof.range_weights.x);
+    dbl("range_weights.y",  A.prof.range_weights.y,  B.prof.range_weights.y);
     bval("speed.whole", A.prof.speed_processor_args.whole, B.prof.speed_processor_args.whole);
     dbl("speed.lp_norm", A.prof.speed_processor_args.lp_norm, B.prof.speed_processor_args.lp_norm);
     dbl("speed.input_smooth_halflife", A.prof.speed_processor_args.input_speed_smooth_halflife,
@@ -1766,10 +1919,25 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                 std::cerr << "Warning: ignoring non-string active_profile in wrapper\n";
         }
         if (wrapper_app.contains("use_raw_input")) {
-            if (wrapper_app["use_raw_input"].is_boolean())
-                cfg.use_raw_input = wrapper_app["use_raw_input"].get<bool>();
-            else
+            if (wrapper_app["use_raw_input"].is_boolean()) {
+                const bool v = wrapper_app["use_raw_input"].get<bool>();
+                // L13-07: a well-formed `false` used to be applied SILENTLY —
+                // the import itself ran, rc=0, and the daemon then grabbed no
+                // devices at all (global acceleration dead) with no warning.
+                // use_raw_input is the daemon's master intercept switch, so a
+                // flipped value from the imported wrapper must be loud.
+                if (v != cfg.use_raw_input) {
+                    std::cerr << "Warning: imported use_raw_input="
+                              << (v ? "true" : "false") << " (previous "
+                              << (cfg.use_raw_input ? "true" : "false")
+                              << ") — the daemon will "
+                              << (v ? "grab all devices." : "grab NO devices.")
+                              << "\n";
+                }
+                cfg.use_raw_input = v;
+            } else {
                 std::cerr << "Warning: ignoring non-boolean use_raw_input in wrapper\n";
+            }
         }
         if (wrapper_app.contains("version") && wrapper_app["version"].is_string())
             cfg.version = wrapper_app["version"].get<std::string>();
@@ -1805,11 +1973,27 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
 
 static int cmd_reload() {
     auto r = daemon_reload_via_any_path();
-    if (r == signal_result::sent) {
+    // L13-02: only the IPC path is a confirmation — the daemon answered with
+    // "ok":true after processing the request.  The SIGHUP fallback is merely a
+    // delivered signal (a frozen daemon that swallows it still looks "sent"),
+    // so it must not claim "reloaded".  It stays rc=0 (the signal WAS sent and
+    // that is the best a legacy daemon supports) but says so honestly.
+    if (r == reload_result::ipc_ok) {
         std::cout << "Daemon reloaded.\n";
         return 0;
     }
-    print_signal_failure(r, "reload", "HUP");
+    if (r == reload_result::signal_sent) {
+        std::cout << "Reload signal sent (unverified — no IPC confirmation; the "
+                     "daemon may not have processed it).\n";
+        return 0;
+    }
+    signal_result sr = signal_result::other;
+    switch (r) {
+    case reload_result::not_running:       sr = signal_result::not_running; break;
+    case reload_result::permission_denied: sr = signal_result::permission_denied; break;
+    default:                               sr = signal_result::other; break;
+    }
+    print_signal_failure(sr, "reload", "HUP");
     return 1;
 }
 
@@ -1857,13 +2041,36 @@ static int cmd_rename(app_config& cfg, const std::string& config_path, const std
 }
 
 static int cmd_stop() {
-    auto r = send_signal_to_daemon(SIGTERM);
-    if (r == signal_result::sent) {
-        std::cout << "Daemon stopped.\n";
-        return 0;
+    pid_t pid = 0;
+    auto r = send_signal_to_daemon(SIGTERM, &pid);
+    if (r != signal_result::sent) {
+        print_signal_failure(r, "stop", "TERM");
+        return 1;
     }
-    print_signal_failure(r, "stop", "TERM");
-    return 1;
+    // L13-01 (CRIT): kill() == 0 only proves the signal was DELIVERED, not that
+    // the daemon exited.  A frozen daemon (stuck loop thread) keeps the PID
+    // file and its /proc entry, yet the old code printed "Daemon stopped."
+    // with rc=0.  Poll for up to ~2 s: a clean shutdown removes the PID file,
+    // and the process itself disappears (kill(pid,0) → ESRCH).  If it is still
+    // alive after the window, say so and fail — scripts that chain
+    // `stop && systemctl is-active` must not read success.
+    bool stopped = true;
+    if (pid > 0) {
+        stopped = false;
+        for (int i = 0; i < 20; ++i) {
+            if (kill(pid, 0) != 0 && errno == ESRCH) { stopped = true; break; }
+            usleep(100000); // 100 ms × 20 ≈ 2 s
+        }
+    }
+    if (!stopped) {
+        // rc=1 and a message that names the remediation; "did not stop" is the
+        // honest description of a signal that was sent but not acted upon.
+        std::cerr << "Daemon did not stop (signal sent; check with "
+                     "'systemctl status rawaccel').\n";
+        return 1;
+    }
+    std::cout << "Daemon stopped.\n";
+    return 0;
 }
 
 static bool daemon_running() {
@@ -1906,7 +2113,10 @@ static std::string monitor_time_stamp() {
 /// staleness).  Interactive on a TTY (re-drawn in place); line-stream mode
 /// (one sample per line, first line = header) when piped/redirected so it is
 /// script-friendly.  Never touches the config file.
-/// @param interval_ms  poll period; must be within [20, 60000].
+/// @param interval_ms  poll period; must be within [1, 60000] (L13-17: the
+///         doc used to claim [20, 60000] while the router at main() accepts
+///         any v > 0 — a 1 ms interval is legitimate, so the doc now matches
+///         the code instead of the router narrowing the domain).
 static int cmd_monitor(int interval_ms) {
     if (!daemon_running()) {
         std::cerr << "Daemon is not running.  Start it with: sudo systemctl start rawaccel\n";
@@ -1916,7 +2126,17 @@ static int cmd_monitor(int interval_ms) {
     sa.sa_handler = monitor_sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, nullptr);
+    // L13-18: capture the previous disposition and restore it on every exit
+    // path (RAII below).  cmd_monitor is a leaf command today, but a process
+    // that inherited SIG_IGN or a parent's handler must not keep ours after
+    // the monitor returns.
+    struct sigaction old_sa {};
+    const bool sigint_installed = (sigaction(SIGINT, &sa, &old_sa) == 0);
+    struct sigint_restore {
+        bool active;
+        const struct sigaction* old;
+        ~sigint_restore() { if (active) sigaction(SIGINT, old, nullptr); }
+    } sigint_guard{sigint_installed, &old_sa};
 
     const bool tty = isatty(STDOUT_FILENO);
     auto num = [](const nlohmann::json& j, const char* key, double fallback = 0.0) {
@@ -2042,13 +2262,39 @@ static int cmd_monitor(int interval_ms) {
     return 0;
 }
 
+/// CLOCK_MONOTONIC_RAW milliseconds since boot — the same clock the daemon's
+/// telem_wall_ms uses, so a consumer can judge how fresh this status snapshot
+/// is (L13-04).  Integer milliseconds (not seconds) so a poller can also see
+/// sub-second jitter.
+static long long status_now_monotonic_raw_ms() {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 static int cmd_status_json(const std::string& config_path) {
     nlohmann::json out;
     bool running = daemon_running();
     out["daemon"] = running ? "running" : "stopped";
     out["config"] = config_path;
+    // L13-04: no timestamp existed anywhere in status --json, and per-device
+    // telem_wall_ms is absent in raw passthrough — consumers had no number to
+    // answer "when was this measured?".
+    out["timestamp_ms"] = status_now_monotonic_raw_ms();
     out["profiles"] = nlohmann::json::array();
     bool config_ok = true;
+    // L13-03: probe IPC independently of the config load, so a frozen daemon
+    // is reported unreachable even when the config is also unreadable.
+    bool daemon_unreachable = false;
+    nlohmann::json live(nlohmann::json::object());
+    if (running) {
+        try {
+            live = nlohmann::json::parse(daemon_ipc_query("status"));
+        } catch (const std::exception& e) {
+            out["device_error"] = e.what();
+            daemon_unreachable = true;
+        }
+    }
     try {
         auto cfg = load_config(config_path);
         out["active_profile"] = cfg.active_profile;
@@ -2080,32 +2326,49 @@ static int cmd_status_json(const std::string& config_path) {
             po["mode"] = mode_s;
             out["profiles"].push_back(po);
         }
-        if (running) {
-            try {
-                auto resp = daemon_ipc_query("status");
-                nlohmann::json j = nlohmann::json::parse(resp);
-                if (j.contains("devices") && j["devices"].is_array())
-                    out["devices"] = j["devices"];
-            } catch (const std::exception& e) {
-                out["device_error"] = e.what();
-            }
-        }
+        if (running && !daemon_unreachable &&
+            live.contains("devices") && live["devices"].is_array())
+            out["devices"] = live["devices"];
     } catch (...) {
         config_ok = false;
         out["config_error"] = true;
     }
+    // Schema consistency (L13-03): `devices` must always exist, even when the
+    // daemon is stopped/unreachable or reports none — the key used to vanish.
+    if (!out.contains("devices")) out["devices"] = nlohmann::json::array();
+    if (daemon_unreachable) out["daemon"] = "unreachable";
     std::cout << out.dump(2) << "\n";
     // P115-A5-07: config_error must be a failure exit, not daemon-status-only.
-    // Exit 0 = daemon running + config OK; 1 = config error; 2 = daemon stopped.
-    if (!config_ok) return 1;
-    if (!running)   return 2;
+    // L13-03: 3 = daemon unreachable (PID file present, IPC dead).
+    // Exit 0 = daemon running + config OK; 1 = config error; 2 = daemon stopped;
+    // 3 = daemon unreachable.
+    if (!config_ok)          return 1;
+    if (daemon_unreachable)  return 3;
+    if (!running)            return 2;
     return 0;
 }
 
 static int cmd_status(const std::string& config_path) {
     if (g_json) return cmd_status_json(config_path);
     bool running = daemon_running();
-    std::cout << "Daemon:  " << (running ? "running" : "stopped") << "\n";
+    // L13-03: probe the IPC channel up front so the Daemon line tells the truth
+    // (running vs unreachable) and the live-device block reuses this one
+    // response instead of querying twice.
+    bool daemon_unreachable = false;
+    nlohmann::json live(nlohmann::json::object());
+    if (running) {
+        try {
+            live = nlohmann::json::parse(daemon_ipc_query("status"));
+        } catch (const std::exception& e) {
+            daemon_unreachable = true;
+            std::cerr << "\n(daemon unreachable for live device details: "
+                      << e.what() << ")\n";
+        }
+    }
+    std::cout << "Daemon:  "
+              << (running ? (daemon_unreachable ? "unreachable" : "running")
+                          : "stopped")
+              << "\n";
     bool config_ok = true;
     try {
         auto cfg = load_config(config_path);
@@ -2154,11 +2417,11 @@ static int cmd_status(const std::string& config_path) {
         }
 
         // Live device details from a running daemon (detected DPI/poll/battery,
-        // effective profile match).  Only available when the daemon is reachable.
-        if (running) {
-            try {
-                auto resp = daemon_ipc_query("status");
-                nlohmann::json j = nlohmann::json::parse(resp);
+        // effective profile match).  Only available when the daemon is reachable;
+        // the response was fetched once at the top (L13-03).
+        if (running && !daemon_unreachable) {
+            {
+                nlohmann::json& j = live;
                 if (j.contains("devices") && j["devices"].is_array()) {
                     size_t ndev = j["devices"].size();
                     std::cout << "\nDevices (" << ndev << "):\n";
@@ -2239,16 +2502,9 @@ static int cmd_status(const std::string& config_path) {
                 } else {
                     std::cout << "\nDevices: daemon reports none grabbed.\n";
                 }
-            } catch (const std::exception& e) {
-                // C-6-FIX: this is a diagnostic (daemon IPC failed), not normal output.
-            // Scripts that pipe `rawaccel-cli status` should not see internal
-            // errors on stdout — it would break JSON pipelines and pollute
-            // shell captures.  Direct diagnostics to stderr.
-            std::cerr << "\n(daemon unreachable for live device details: "
-                      << e.what() << ")\n";
             }
         }
-        if (running)
+        if (running && !daemon_unreachable)
             std::cout << "\nTip: rawaccel-cli latency  → dump latency stats\n";
     } catch (...) {
         config_ok = false;
@@ -2257,8 +2513,10 @@ static int cmd_status(const std::string& config_path) {
     // P115-A5-07: a broken config used to print to STDOUT and exit 0 whenever
     // the daemon happened to be running — scripts saw "success" while the
     // effective config was actually unreachable.  Report on stderr and fail.
-    if (!config_ok) return 1;
-    if (!running)   return 2;
+    // L13-03: rc=3 for a reachable-looking PID with a dead IPC channel.
+    if (!config_ok)          return 1;
+    if (daemon_unreachable)  return 3;
+    if (!running)            return 2;
     return 0;
 }
 
@@ -2808,8 +3066,9 @@ Commands:
                                  that differ; exit 0 = identical, 1 = differ
   monitor [interval-ms]         Live per-device telemetry (IPS, gain, latency,
                                  poll rate, battery) from the running daemon.
-                                 Default 500 ms; interactive on a TTY,
-                                 line-stream when piped. Ctrl-C to quit.
+                                 Default 500 ms; valid range 1-60000 ms.
+                                 Interactive on a TTY, line-stream when piped.
+                                 Ctrl-C to quit.
   status                        Show daemon status, profiles, and device assignments
   receivers                     List detected Logitech receivers and HID++ capability
   hidpp                         List detected Logitech HID++ devices and query info
@@ -2878,16 +3137,16 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
                     degenerate). Default 0.005.
   exponent_classic  Classic exponent. Domain 1–10. Default 2.
   exponent_power    Power exponent (synchronous ignores it). Domain 1e-4–5. Default 0.05.
-  limit             Upper multiplier asymptote (natural mode). Domain ≥ 0. Default 1.5.
-  decay_rate        Natural decay rate. Domain ≥ 0. Default 0.1.
-  motivity          Synchronous motivity. Domain ≥ 0. Default 1.5.
-  gamma             Synchronous gamma. Domain ≥ 0. Default 1.
+  limit             Upper multiplier asymptote (natural mode). Domain 0–100. Default 1.5.
+  decay_rate        Natural decay rate. Domain 0–10. Default 0.1.
+  motivity          Synchronous motivity. Domain 0–10. Default 1.5.
+  gamma             Synchronous gamma. Domain 0–10. Default 1.
   input_offset      Speed offset before acceleration starts. Domain 0–500, and must
                     stay ≤ cap_x (checked against both X and Y). Default 0.
   output_offset     Output offset (power mode). Domain 0–100. Default 0.
   scale             Scale factor (power mode). Domain 0.01–100. Default 1.
   sync_speed        Synchronous sync speed. Domain ≥ 1e-4. Default 5.
-  smooth            Jump/synchronous smoothness. Domain ≥ 0. Default 0.5.
+  smooth            Jump/synchronous smoothness. Domain 0–1. Default 0.5.
   cap_x             Input speed cap. Domain 0–500, and ≥ input_offset on both axes.
                     Default 15.
   cap_y             Output gain cap. Domain 0–100. Default 1.5.

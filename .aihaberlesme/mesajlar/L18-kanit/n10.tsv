@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	if (info.vendor == 0x046d) { // Logitech vendor ID	if (true) { //MUT: vendor kontrolü kaldırıldı	N10 discover_logitech_hidraw_devices() vendor kontrolü SİLİNDİ

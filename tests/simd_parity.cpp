@@ -190,6 +190,22 @@ static void test_extreme_primitives() {
     emit_case("min(NaN,1)", simd::v2d_get_x(simd::v2d_min(simd::v2d_set1(nan), simd::v2d_set1(1.0))));
     emit_case("min(1,NaN)", simd::v2d_get_x(simd::v2d_min(simd::v2d_set1(1.0), simd::v2d_set1(nan))));
     emit_case("max(NaN,1)", simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(nan), simd::v2d_set1(1.0))));
+    // L04-03 (HIGH): the three max/min cases above are all DEGENERATE — MINPD
+    // and MAXPD return the same value for ±0 and NaN-vs-number, so the gate
+    // could not distinguish v2d_max from v2d_min (mutation stayed green).
+    // These two use ordered, distinct operands and can only pass if max is
+    // really max.  NOTE: emit_case() alone would NOT catch the mutation —
+    // it only feeds the cross-backend diff, and a mutation hits all three
+    // backends identically.  These use expect_true so the VALUE is pinned.
+    emit_case("max(-1,1)",  simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(-1.0), simd::v2d_set1(1.0))));
+    emit_case("max(1,-1)",  simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(1.0), simd::v2d_set1(-1.0))));
+    emit_case("max(2,3)",   simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(2.0), simd::v2d_set1(3.0))));
+    expect_true("max(-1,1)==1", simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(-1.0), simd::v2d_set1(1.0))) == 1.0);
+    expect_true("max(2,3)==3",  simd::v2d_get_x(simd::v2d_max(simd::v2d_set1(2.0), simd::v2d_set1(3.0))) == 3.0);
+    // Symmetric min pin (the mutation direction that used to be the only
+    // detectable one — keep it explicit rather than accidental).
+    expect_true("min(-1,1)==-1", simd::v2d_get_x(simd::v2d_min(simd::v2d_set1(-1.0), simd::v2d_set1(1.0))) == -1.0);
+    expect_true("min(2,3)==2",   simd::v2d_get_x(simd::v2d_min(simd::v2d_set1(2.0), simd::v2d_set1(3.0))) == 2.0);
 
     // ── hmin/hmax lane discipline at the edges.
     emit_case("hmin(+0,-0)", simd::v2d_hmin(simd::v2d_set(0.0, NEG)));
@@ -284,6 +300,104 @@ static void run_pipeline_extreme(const char* label, double dx, double dy) {
     emit_case(label, in.y);
 }
 
+// ── 2c. Smoother branches of the SIMD path (L04-01) ────────────────────────
+// scale/output smoothing make modify_separate_simd take the branches at
+// rawaccel.hpp:428/437, which the base pipeline above never reaches.  A lane
+// swap there (the historical Y-axis class) hits ALL THREE backends
+// identically, so the cross-backend diff cannot see it — the value pins below
+// are what catch it.  Input is y-only (0,300) with a strong acceleration, so:
+//   * scale branch: out.y ≈ 300 * scale_y (large) vs swapped ≈ 300 * scale_x
+//     (scale_x == 1 because x has no motion) — a ~40x gap.
+//   * output branch: out.y ≈ v_in.y vs swapped = smooth(|v_in.x|) = 0.
+static void run_pipeline_smoothing(const char* label, double dx, double dy,
+                                   double scale_hl, double output_hl) {
+    profile prof;
+    prof.accel_x.mode = accel_mode::classic;
+    prof.accel_y.mode = accel_mode::classic;
+    prof.accel_x.acceleration = 2.0; // strong gain so the pins separate widely
+    prof.accel_y.acceleration = 2.0;
+    // High cap so the clean case reaches a large gain while a lane swap
+    // collapses to ≈dy (scale branch, scale_x == 1) or 0 (output branch,
+    // smooth(|0|) == 0).  Default cap.y = 1.5 would compress the separation.
+    prof.accel_x.cap = { 15.0, 10.0 };
+    prof.accel_y.cap = { 15.0, 10.0 };
+    prof.output_dpi     = NORMALIZED_DPI;
+    prof.domain_weights = { 1, 1 };
+    prof.range_weights  = { 1, 1 };
+    prof.speed_processor_args.whole = false;
+    prof.speed_processor_args.scale_smooth_halflife        = scale_hl;
+    prof.speed_processor_args.output_speed_smooth_halflife = output_hl;
+
+    modifier_settings settings = make_settings(prof);
+    speed_processor sp;
+    sp.init(prof.speed_processor_args);
+    modifier mod;
+
+    // Several frames so the EMA has actually engaged by the last sample.
+    // Every frame is fed the SAME fresh input: reusing the returned `in` (the
+    // in-place modified value) would turn a lane swap into an oscillation
+    // (X↔Y alternate) whose last sample lands back on the correct order,
+    // masking the very bug this asserts (measured: mutation stayed green
+    // with the reuse form).
+    vec2d in{};
+    for (int i = 0; i < 16; i++) {
+        in = vec2d{ dx, dy };
+        mod.modify(in, sp, settings, 1.0, 16.0);
+    }
+
+    if (dy != 0.0) {
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s: Y axisi korunmadi", label);
+        expect_true(buf, in.y != 0.0);
+    }
+    // L04-01 value pin: with the correct lane order the y-only input comes out
+    // at least 3x the raw delta (gain ~10 at these settings); a lane swap
+    // collapses it to ≈dy (scale branch) or ≈0 (output branch).
+    if (dy > 0.0 && in.x == 0.0) {
+        char buf[128];
+        snprintf(buf, sizeof buf, "%s: lane sirasi bozuk (out.y=%g, beklenen > %g)",
+                 label, in.y, dy * 3.0);
+        expect_true(buf, in.y > dy * 3.0);
+    }
+    emit_case(label, in.x);
+    emit_case(label, in.y);
+}
+
+// ── 2d. Non-unit per-axis output DPI ratio (L04-02) ────────────────────────
+static void run_pipeline_dpi_ratio(const char* label, double lr, double yx,
+                                   double dx, double dy) {
+    profile prof;
+    prof.accel_x.mode = accel_mode::classic;
+    prof.accel_y.mode = accel_mode::classic;
+    prof.output_dpi     = NORMALIZED_DPI;
+    prof.domain_weights = { 1, 1 };
+    prof.range_weights  = { 1, 1 };
+    prof.lr_output_dpi_ratio = lr;
+    prof.yx_output_dpi_ratio = yx;
+    prof.speed_processor_args.whole = false;
+
+    modifier_settings settings = make_settings(prof);
+    speed_processor sp;
+    sp.init(prof.speed_processor_args);
+    modifier mod;
+
+    vec2d in{ dx, dy };
+    mod.modify(in, sp, settings, 1.0, 16.0);
+
+    // With yx = 2 and equal raw deltas the per-axis gains are equal (same
+    // accel args), so out.y must be exactly twice out.x.  The mutation
+    // "v2d_set(dpi_adj, dpi_adj)" collapses them to equal.
+    if (dx == dy && dy != 0.0 && yx > 1.0) {
+        char buf[160];
+        snprintf(buf, sizeof buf,
+                 "%s: YX dpi ratio uygulanmadi (out.x=%g out.y=%g, beklenen y=%.3g)",
+                 label, in.x, in.y, in.x * yx);
+        expect_true(buf, std::fabs(in.y - in.x * yx) < 1e-6 * std::fabs(in.x * yx));
+    }
+    emit_case(label, in.x);
+    emit_case(label, in.y);
+}
+
 int main() {
     printf("backend %s\n", backend_name());
 
@@ -313,6 +427,21 @@ int main() {
     run_pipeline_extreme("inf_in",      inf,    1.0);
     run_pipeline_extreme("nan_in",      nan,    1.0);
     run_pipeline_extreme("both_inf",    inf,    inf);
+
+    // L04-01 (HIGH): the gate never exercised the SCALE/OUTPUT smoother
+    // branches of modify_separate_simd — both smoothing halflifes were 0, so
+    // the X/Y lane swap at rawaccel.hpp:437 (`v2d_set(ox, oy)`) could not be
+    // observed (mutation stayed green).  Y-only inputs + value pins inside
+    // run_pipeline_smoothing() close that: the swapped result collapses.
+    run_pipeline_smoothing("scale_smooth_y_only",  0.0, 300.0, 20.0, 0.0);
+    run_pipeline_smoothing("output_smooth_y_only", 0.0, 300.0, 0.0, 20.0);
+    run_pipeline_smoothing("both_smooth_y_only",   0.0, 300.0, 20.0, 20.0);
+
+    // L04-02 (HIGH): yx_output_dpi_ratio is a real user setting; the old gate
+    // left it at 1, so dropping the Y multiplier (rawaccel.hpp:461) stayed
+    // green.  Equal raw deltas make the per-axis gains equal (same args), so
+    // the ratio pins the comparison: out.y must be exactly 2x out.x.
+    run_pipeline_dpi_ratio("yx_ratio_2", 1.0, 2.0, 100.0, 100.0);
 
     if (failures == 0) {
         printf("result PASS\n");

@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	if (!plan.any()) return {};\n    sync.mark_attempted(t, rate, dpi);	if (!plan.any()) return {};\n    //MUT: mark_attempted CAGRILMADI (plan/mark ayrimi)	hidpp_hw_plan_job() sentinel'i isaretlemiyor -> dedup kayboldu

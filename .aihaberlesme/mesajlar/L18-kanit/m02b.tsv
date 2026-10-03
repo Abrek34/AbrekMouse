@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	int         dpi          = 0;         // 0 = never pushed	int         dpi          = 800;  //MUT	sentinel dpi 0 -> 800 (mouse_device varsayilani)

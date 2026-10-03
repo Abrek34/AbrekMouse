@@ -184,6 +184,7 @@ struct AppState {
     // while showing live speed/gain telemetry (daemon status JSON). ESC, focus
     // loss or window destroy releases the lock.
     GtkWidget* mouse_test_win    = nullptr;
+    GtkWidget* test_device_lbl   = nullptr; // L17-3: name of the measured device
     GtkWidget* test_speed_lbl    = nullptr; // live "In (ips)" value
     GtkWidget* test_out_lbl      = nullptr; // live "Out (ips)" value
     GtkWidget* test_gain_lbl     = nullptr; // live "Gain (×)" value
@@ -191,7 +192,7 @@ struct AppState {
     GtkWidget* test_lat_lbl      = nullptr; // live "Latency p50/p95 (µs)" value
     GtkWidget* test_poll_lbl     = nullptr; // live "Poll rate (Hz)" value
     GtkWidget* test_hint_lbl     = nullptr; // lock-tier explanation (persistent)
-    GtkWidget* test_name_lbls[5] = {};      // "In/Out/Gain/Latency/Poll:" name labels (Bug-09)
+    GtkWidget* test_name_lbls[6] = {};      // "In/Out/Gain/Latency/Poll/Device:" name labels (Bug-09, L17-3)
     GtkWidget* test_title_lbl    = nullptr; // "Mouse Lock Test" heading (Bug-09)
     int        test_hint_state   = 0;       // hint: 0=Tier-1 locked, 1=Tier-2 confine, 2=Tier-3 n/a
     int        test_status_state = -1;      // status: -1=unset, 0=live, 1=awaiting, 2=daemon down, 3=unfocused
@@ -342,7 +343,7 @@ std::string check_duplicate_device_ids(const app_config& cfg);
 
 // daemon
 pid_t read_daemon_pid();
-bool  daemon_running();
+bool  daemon_running(bool* ipc_ok = nullptr);
 bool  daemon_send_signal(int sig, std::string* err_out = nullptr);
 int  daemon_ipc_push_config(const std::string& json, std::string* resp_out = nullptr);
 void  update_daemon_status(AppState* S);

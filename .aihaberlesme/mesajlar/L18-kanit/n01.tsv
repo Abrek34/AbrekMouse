@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	    if (param_len > HIDPP_SHORT_PAYLOAD_MAX) return std::nullopt;	    /*MUT*/	N01 send_feature_request() TAŞMA REDDİ SİLİNDİ

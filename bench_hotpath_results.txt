@@ -1,13 +1,25 @@
-=== RawAccel Hot-Path Benchmark Results ===
-Date: Çrş 30 Eyl 2026 23:23:59 +03
-Runs: 1 (median), Min seconds per run: 0.1
-
-noaccel: 13.7489 ns/event
-power-whole: 40.4961 ns/event
-classic: 43.7949 ns/event
-power+rot45+snap15+clamp: 59.9312 ns/event
-power-dual+4ema: 304.5499 ns/event
-apply_motion_math(full): 44.0219 ns/event
-
-Baseline threshold: 20.0%
-Status: OK
+{
+  "noaccel": 13.6849,
+  "power-whole": 38.9645,
+  "classic": 43.4321,
+  "power+rot45+snap15+clamp": 58.0313,
+  "power-dual+4ema": 297.2923,
+  "apply_motion_math(full)": 43.4765,
+  "_meta": {
+    "unit": "ns/event",
+    "iterations_per_config": {
+      "noaccel": 7310904,
+      "power-whole": 2552603,
+      "classic": 2279883,
+      "power+rot45+snap15+clamp": 1708418,
+      "power-dual+4ema": 325372,
+      "apply_motion_math(full)": 2275878
+    },
+    "runs_used": 3,
+    "method": "median",
+    "min_seconds_per_run": 0.1000,
+    "positive_control": false,
+    "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_governor": "unreadable"
+  }
+}

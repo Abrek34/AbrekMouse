@@ -1,0 +1,15 @@
+MUT[N12]
+    uygulanan: N12 battery_voltage BE16 -> LE16 [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:353  ev.battery->level >= 80 && ev.battery->level <= 89  (section: HID++ notification classification: battery/connection/illumination)
+MUT[N14]
+    uygulanan: N14 POZİTİF KONTROL: discover_logitech_hidraw_devices() her koşulda sahte bir cihaz döndürüyor [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 395/397 geçti, 2 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 2)
+        FAIL  tests/test_accel.cpp:483  missing.empty()  (section: Logitech hidraw device discovery)
+        FAIL  tests/test_accel.cpp:495  found.empty()  (section: Logitech hidraw device discovery)
+MUT[N15]
+    uygulanan: N15 POZİTİF KONTROL: symlink ile sahte char-device hidraw düğümü eklendi [1 yerde]
+    rc=0  !! YESIL KALDI (test YAKALAMADI)
+    === Sonuç: 398/398 geçti (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 0)

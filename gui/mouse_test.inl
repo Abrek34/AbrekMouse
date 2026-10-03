@@ -197,9 +197,10 @@ static void mouse_test_set_hint(AppState* S, int state) {
 /// window is closed.
 void mouse_test_refresh_language(AppState* S) {
     if (!S->mouse_test_win) return;
-    const char* names[5] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):"),
-                             tr("Latency p50/p95 (µs):"), tr("Poll rate (Hz):") };
-    for (int i = 0; i < 5 && S->test_name_lbls[i]; i++)
+    const char* names[6] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):"),
+                             tr("Latency p50/p95 (µs):"), tr("Poll rate (Hz):"),
+                             tr("Device:") };
+    for (int i = 0; i < 6 && S->test_name_lbls[i]; i++)
         gtk_label_set_text(GTK_LABEL(S->test_name_lbls[i]), names[i]);
     if (S->test_title_lbl)
         gtk_label_set_markup(GTK_LABEL(S->test_title_lbl),
@@ -291,6 +292,16 @@ static gboolean mouse_test_poll(gpointer user_data) {
     if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), fmt_us(in).c_str());
     if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   fmt_us(out).c_str());
     if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  fmt_us(gain).c_str());
+    // L17-3 (HIGH): name the measured device.  With an "all devices" profile
+    // (empty device_id — the default) the slice falls back to the first device
+    // that has telemetry, which can be a different mouse than the one the user
+    // is moving; without a name on screen the readout looked like it belonged
+    // to the tested mouse.
+    if (S->test_device_lbl) {
+        std::string dev_name = daemon_device_name(resp, S);
+        gtk_label_set_text(GTK_LABEL(S->test_device_lbl),
+            dev_name.empty() ? "—" : dev_name.c_str());
+    }
 
     // EXT: live per-event processor latency (p50/p95 µs) + real poll rate from
     // the same status slice.  lat_* only appear once the daemon recorded ≥ 1
@@ -401,10 +412,11 @@ static void mouse_test_teardown(GtkWidget* widget, gpointer user_data) {
     S->test_gain_lbl    = nullptr;
     S->test_lat_lbl     = nullptr;
     S->test_poll_lbl    = nullptr;
+    S->test_device_lbl  = nullptr;
     S->test_status_lbl  = nullptr;
     S->test_hint_lbl    = nullptr;
     S->test_title_lbl   = nullptr;
-    for (int i = 0; i < 5; i++) S->test_name_lbls[i] = nullptr;
+    for (int i = 0; i < 6; i++) S->test_name_lbls[i] = nullptr;
     S->test_hint_state   = 0;
     S->test_status_state = -1;
     mouse_test_stop_poll(S);
@@ -539,6 +551,12 @@ void on_mouse_test_clicked(GtkButton*, gpointer user_data) {
     gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[4], 0, 4, 1, 1);
     S->test_poll_lbl = value_lbl();
     gtk_grid_attach(GTK_GRID(grid), S->test_poll_lbl, 1, 4, 1, 1);
+
+    // L17-3: which physical mouse the numbers above belong to.
+    S->test_name_lbls[5] = name_lbl(tr("Device:"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[5], 0, 5, 1, 1);
+    S->test_device_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_device_lbl, 1, 5, 1, 1);
 
     S->test_status_lbl = gtk_label_new(tr("Awaiting motion…"));
     gtk_label_set_xalign(GTK_LABEL(S->test_status_lbl), 0.5);

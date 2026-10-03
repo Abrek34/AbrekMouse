@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	out = std::move(q.front());	out = std::move(q.back()); //MUT	hidpp_hw_take() LIFO oldu (front -> back)

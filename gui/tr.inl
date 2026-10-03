@@ -73,6 +73,8 @@ static const char* tr(const char* key) {
                                                                 "<b>Kazanım Eğrisi</b>  <small>(tekerlek = yakınlaştır)</small>"},
             {"Speed (ips)",         "Hız (inç/sn)"},
             {"Gain",                "Kazanç"},
+            {"Raw passthrough — acceleration is bypassed (1:1)",
+             "Ham geçiş — ivme devre dışı (1:1)"},
             {"X Axis",              "X Ekseni"},
             {"Y Axis",              "Y Ekseni"},
             {"%.0f ips  (scroll=zoom)",                  "%.0f inç/sn  (tekerlek=yakınlaştır)"},
@@ -318,6 +320,8 @@ static const char* tr(const char* key) {
             // ── Daemon status / battery (markup + format) ────────────────────
             {"<span foreground='#40c040'>● Daemon running</span>",
              "<span foreground='#40c040'>● Daemon çalışıyor</span>"},
+            {"<span foreground='#c08040'>● Daemon unreachable</span>",
+             "<span foreground='#c08040'>● Daemon yanıt vermiyor</span>"},
             {"<span foreground='#c04040'>● Daemon stopped</span>",
              "<span foreground='#c04040'>● Daemon durduruldu</span>"},
             {"<b><span foreground='red'>Battery: %d%% (Low!)</span></b>",
@@ -354,6 +358,8 @@ static const char* tr(const char* key) {
              "Gecikme p50/p95 (µs):"},
             {"Poll rate (Hz):",
              "Yoklama hızı (Hz):"},
+            {"Device:",
+             "Cihaz:"},
             {"Pointer is locked inside this fullscreen test window.\nMove the mouse to see live speed/gain.\nPress ESC to release.",
              "İmleç bu tam ekran test penceresinin içine kilitli.\nCanlı hız/kazanç için fareyi hareket ettirin.\nKilit ESC ile bırakılır."},
             {"Pointer grab failed — the cursor is confined as best effort (no pointer lock).\nMove the mouse to see live speed/gain.\nPress ESC to release.",
@@ -399,6 +405,7 @@ static const char* tr(const char* key) {
             {"Rate→%d Hz%s",              "Hız→%d Hz%s"},
             {"LOD→",                      "LOD→"},
             {"(rejected)",                "(reddedildi)"},
+            {"(unsupported)",             "(desteklenmiyor)"},
             {" (charging)",              " (şarj oluyor)"},
             {"Notification: battery %s%s",
                                          "Bildirim: pil %s%s"},
@@ -454,8 +461,11 @@ static const char* tr(const char* key) {
              "LUT noktası kaldırıldı."},
             {"Warning: LUT (%s axis) was truncated to %d points (max capacity).",
              "Uyarı: LUT (%s ekseni) %d noktaya kısaltıldı (maks kapasite)."},
-            {"Warning: unsaved changes to \"%s\" were discarded.",
-             "Uyarı: \"%s\" için kaydedilmemiş değişiklikler atıldı."},
+            // L16-02: the profile switch KEEPS unsaved edits in memory (they
+            // live in S->config.profiles), so the old "were discarded" wording
+            // was false and must not be resurrected.
+            {"Warning: profile '%s' has unsaved changes in memory — remember to Apply before closing.",
+             "Uyarı: '%s' profilinde bellekte kaydedilmemiş değişiklikler var — kapatmadan önce Uygula'ya basmayı unutmayın."},
             {"A profile with that name already exists.",
              "Bu ada sahip bir profil zaten var."},
             {"Maximum number of profiles (%d) reached.",

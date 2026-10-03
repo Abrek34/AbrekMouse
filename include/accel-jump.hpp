@@ -40,6 +40,13 @@ struct jump {
     }
 
     double operator()(double x, const accel_args&) const {
+        // L02-12: finiteness guard for BOTH branches.  The GAIN branch only
+        // caught a non-finite RESULT (gain), so a NaN input was transformed
+        // by the LEGACY path (smooth(x) = step.y/(1+exp(...)) → NaN) and
+        // escaped as NaN; the hard-step legacy path returned 1+step.y for a
+        // NaN because `NaN < step.x` is false.  Identity is the established
+        // non-finite fallback for every mode.
+        if (!std::isfinite(x)) return 1.0;
         if (!gain_mode) {
             // LEGACY: direct multiplier — sigmoid blend of the step.
             if (is_smooth()) return smooth(x) + 1.0;

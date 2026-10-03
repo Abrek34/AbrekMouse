@@ -625,13 +625,21 @@ bool AccelDaemon::push_config(const std::string& json_str) {
                 log("Config push skipped (matches pending un-applied config).", true);
                 return true;
             }
+            // L08-01 (CRIT): the two "matches the APPLIED config" guards below
+            // must NOT fire while a different push is still armed-but-unapplied.
+            // Scenario: applied=A, pending=B armed; the user reverts to A.  The
+            // old code skipped the revert as a no-op ("already A") and returned
+            // true — yet B was still pending and got applied afterwards, so the
+            // revert was silently lost.  With has_pending, fall through to the
+            // enqueue path so the revert replaces B (save_worker overwrites
+            // push_cfg_, run_loop applies A).
             size_t new_hash = std::hash<std::string>{}(new_json);
-            if (new_hash == config_hash_) {
+            if (!has_pending && new_hash == config_hash_) {
                 log("Config push skipped (no-op guard: hash unchanged).", true);
                 return true;
             }
             // Hash differs — do full JSON comparison as fallback (hash collision defense).
-            if (new_json == app_config_to_json(config_)) {
+            if (!has_pending && new_json == app_config_to_json(config_)) {
                 config_hash_ = new_hash; // sync hash for future fast path
                 log("Config push skipped (no-op guard: content unchanged).", true);
                 return true;
@@ -897,8 +905,17 @@ bool AccelDaemon::setup_devices() {
         // every physical report through two uinput devices.
         if (!dev.device_id.empty() &&
             opened_device_ids_.count(dev.device_id)) {
+            // L08-05: this skip used to be verbose-only, so two DIFFERENT
+            // serial-less devices sharing a VID:PID (both produce the same
+            // "usb:VVVV:PPPP:" id) left the second mouse silently
+            // unaccelerated.  The id format is deliberately kept (changing it
+            // would break every stored per-device profile binding) but the
+            // skip is now VISIBLE at default log level with the paths, so the
+            // collision is diagnosable instead of invisible.
             log("Skipping duplicate device_id: " + dev.name + " (" +
-                dev.device_id + ")", true);
+                dev.device_id + ") at " + dev.path +
+                " — already grabbed for the same id; bind profiles by the "
+                "by-id path to distinguish serial-less twins.");
             ioctl(dev.fd_in, EVIOCGRAB, 0);
             close(dev.fd_in);
             continue;
@@ -2252,14 +2269,19 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
 /// device down and flap the mouse until the next ~2 s scan.
 static inline bool uinput_write_retry_ev(libevdev_uinput* uidev,
                                          unsigned int type, unsigned int code,
-                                         int value) {
+                                         int value,
+                                         const std::function<void(const std::string&)>& report = {}) {
     const int fd = uinput_fd(uidev);
     if (fd < 0) return false;
     input_event ev{};
     ev.type  = type;
     ev.code  = code;
     ev.value = value;
-    return uinput_write_retry(fd, &ev, sizeof(ev));
+    // L09-03 (HIGH): this single-event variant used to drop the report hook
+    // (4th argument absent → empty std::function), so a budget-exhausted drop
+    // on any of the 1:1 raw/overflow forward paths was 100% silent, while the
+    // batched path reported it.  Forward the caller's report when given.
+    return uinput_write_retry(fd, &ev, sizeof(ev), report);
 }
 
 /// P93-BATCH (PERF): accumulate output events in a small stack buffer and submit
@@ -2455,8 +2477,16 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // sysfs/nominal.
     if (dev.last_frame_ev_us != 0 && frame_ev_us > dev.last_frame_ev_us) {
         uint64_t interval_us = frame_ev_us - dev.last_frame_ev_us;
-        // Only accept reasonable intervals (0.1ms - 10ms = 100Hz-10kHz)
-        if (interval_us >= 100 && interval_us <= 10000) {
+        // Only accept reasonable intervals (0.1ms - 200ms = 5Hz-10kHz)
+        // L09-02 (HIGH): the floor used to be 10000us (100 Hz), so a device
+        // that slowed below 100 Hz (USB autosuspend / driver fallback) had
+        // every interval REJECTED and real_polling_rate silently kept its old
+        // value forever (measured: 50 Hz and 10 Hz both reported as 1000).
+        // The band is a plausibility filter, not a config domain — extend the
+        // floor to 5 Hz so a real slowdown is measured (detected_polling_rate
+        // is report-only; the POLL_RATE_MIN=125 sanitize bound is for the
+        // user's nominal config value, not for the measurement).
+        if (interval_us >= 100 && interval_us <= 200000) {
             dev.frame_ev_us_samples[dev.frame_ev_us_next] = interval_us;
             dev.frame_ev_us_next =
                 (dev.frame_ev_us_next + 1) % mouse_device::POLL_RATE_SAMPLES;
@@ -2494,7 +2524,9 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
                     uint64_t median_us = sorted[n / 2];
                     if (median_us > 0) {
                         int rate_hz = static_cast<int>(1000000.0 / median_us + 0.5);
-                        if (rate_hz >= 100 && rate_hz <= 10000)
+                        // L09-02: floor lowered 100 -> 5 (see the interval
+                        // comment above) so a slowed device updates the field.
+                        if (rate_hz >= 5 && rate_hz <= 10000)
                             dev.telemetry->real_polling_rate.store(
                                 rate_hz, std::memory_order_relaxed);
                     }
@@ -2683,8 +2715,18 @@ for (size_t i = 0; i < read_count; ++i) {
                     dev.pending_dx   += dx;
                     dev.pending_dy   += dy;
                     dev.has_pending_motion = true;
+                    const size_t parked_before = dev.pending_ev_count;
                     for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
                         dev.pending_events[dev.pending_ev_count++] = queued_events[i];
+                    // L09-04: the loop cap used to make an overflow SILENT (no
+                    // counter, no log).  Report when queued non-motion events
+                    // did not fit, so lost buttons/wheel are diagnosable.
+                    const size_t parked = dev.pending_ev_count - parked_before;
+                    if (queued_count > parked)
+                        log("Deferred-event buffer overflow on " + dev.name +
+                            ": dropped " +
+                            std::to_string(queued_count - parked) +
+                            " queued event(s) after SYN_DROPPED.");
                     queued_count = 0;
                 }
                 dx = dy = 0;
@@ -2732,7 +2774,7 @@ for (size_t i = 0; i < read_count; ++i) {
                 // and let the SYN_REPORT flush preserve source order.  Raw
                 // passthrough keeps the 1:1 inline contract.
                 if (dev.settings.prof.raw_passthrough) {
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 } else if (queued_count < queued_events.size()) {
@@ -2742,7 +2784,7 @@ for (size_t i = 0; i < read_count; ++i) {
                     // (before its queued slot data) beats dropping it.
                     if (!flush_queued()) return;
                     if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 }
@@ -2801,7 +2843,7 @@ for (size_t i = 0; i < read_count; ++i) {
                 // this caused subtly different cursor feel even in raw mode.
                 // Skip accumulation entirely in this mode.
                 if (dev.settings.prof.raw_passthrough) {
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 } else if (ev.code == REL_X) {
@@ -2818,7 +2860,7 @@ for (size_t i = 0; i < read_count; ++i) {
                 // until the SYN would reorder it behind a raw REL already
                 // forwarded — violating the 1:1 bit-faithful contract.
                 if (dev.settings.prof.raw_passthrough) {
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 } else if (queued_count < queued_events.size()) {
@@ -2830,7 +2872,7 @@ for (size_t i = 0; i < read_count; ++i) {
                     // non-motion group early changes no interval).
                     if (!flush_queued()) return;
                     if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                         { dev.disconnected = true; return; }
                     wrote_unsynced_event = true;
                 }
@@ -2843,7 +2885,7 @@ for (size_t i = 0; i < read_count; ++i) {
             // already written (a press that lags its motion can mis-slot into
             // libinput's frame classification on some compositors).
             if (dev.settings.prof.raw_passthrough) {
-                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                     { dev.disconnected = true; return; }
                 wrote_unsynced_event = true;
             } else if (queued_count < queued_events.size()) {
@@ -2851,7 +2893,7 @@ for (size_t i = 0; i < read_count; ++i) {
             } else {
                 if (!flush_queued()) return;
                 if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value))
+                if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
                     { dev.disconnected = true; return; }
                 wrote_unsynced_event = true;
             }
@@ -2875,6 +2917,12 @@ for (size_t i = 0; i < read_count; ++i) {
         dev.pending_ev_count = 0;
         for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
             dev.pending_events[dev.pending_ev_count++] = queued_events[i];
+        // L09-04: visibility for the deferred-event overflow (see the
+        // SYN_DROPPED site for the full rationale).
+        if (queued_count > dev.pending_ev_count)
+            log("Deferred-event buffer overflow on " + dev.name + ": dropped " +
+                std::to_string(queued_count - dev.pending_ev_count) +
+                " queued event(s) at frame deferral.");
     }
     // Close any frame that accumulated WRITTEN events (raw passthrough REL or
     // forwarded SYN subtypes) but never saw a SYN.  This is the only remaining
@@ -2886,7 +2934,7 @@ for (size_t i = 0; i < read_count; ++i) {
     // extra empty frame that violates the T-B1 byte-identical 1:1 contract,
     // exactly the LOW-1 asymmetry the accel path was rebuilt to avoid.
     if (wrote_unsynced_event && !dev.settings.prof.raw_passthrough) {
-        if (!uinput_write_retry_ev(uidev, EV_SYN, SYN_REPORT, 0))
+        if (!uinput_write_retry_ev(uidev, EV_SYN, SYN_REPORT, 0, out.drop_report))
             { dev.disconnected = true; return; }
         wrote_unsynced_event = false;
     }
@@ -3002,14 +3050,41 @@ static std::string json_str(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 2);
     out += '"';
-    for (unsigned char c : s) {
-        if      (c == '"')  out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else if (c < 0x20)  out += ' '; // replace other controls with space
-        else                out += static_cast<char>(c);
+    // L10-06 (MED): bytes >= 0x80 used to pass through raw.  dev.name comes
+    // from EVIOCGNAME — an arbitrary kernel byte array with no UTF-8
+    // guarantee — so one odd byte made the whole status JSON unparseable for
+    // nlohmann consumers (rawaccel-cli status/--json showed "unreachable" and
+    // dropped the device list with exit 0).  Valid UTF-8 sequences pass
+    // through unchanged; malformed bytes are escaped as \u00XX, which is
+    // always valid JSON.
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if      (c == '"')  { out += "\\\""; ++i; }
+        else if (c == '\\') { out += "\\\\"; ++i; }
+        else if (c == '\n') { out += "\\n";  ++i; }
+        else if (c == '\r') { out += "\\r";  ++i; }
+        else if (c == '\t') { out += "\\t";  ++i; }
+        else if (c < 0x20)  { out += ' ';    ++i; } // replace other controls with space
+        else if (c < 0x80)  { out += static_cast<char>(c); ++i; }
+        else {
+            // Determine the UTF-8 sequence length from the lead byte and
+            // validate the continuation bytes; malformed single bytes escape.
+            int len = ((c & 0xE0) == 0xC0) ? 2
+                    : ((c & 0xF0) == 0xE0) ? 3
+                    : ((c & 0xF8) == 0xF0) ? 4 : 0;
+            bool valid = len > 0 && i + static_cast<size_t>(len) <= s.size();
+            for (int k = 1; valid && k < len; ++k)
+                valid = (static_cast<unsigned char>(s[i + k]) & 0xC0) == 0x80;
+            if (!valid) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                out += buf;
+                ++i;
+            } else {
+                out.append(s, i, static_cast<size_t>(len));
+                i += static_cast<size_t>(len);
+            }
+        }
     }
     out += '"';
     return out;
@@ -3292,9 +3367,21 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
             if (chown(sock_path.c_str(), 0, grp->gr_gid) != 0)
                 log("IPC: chown(input group) failed: " + std::string(strerror(errno)) +
                     " — proceeding with default ownership.", true);
-            chmod(sock_path.c_str(), 0660);
+            // L10-02: the chmod result DISCARDED its return value while the
+            // sibling chown checked its own — the one call that applies the
+            // security-relevant mode (0660) could fail silently (EROFS/EPERM),
+            // leaving the socket at umask default with only a success log.
+            // Shipped unit's UMask=0077 makes this fail-closed, but the guard
+            // must not depend on that.  Log on failure; never abort startup
+            // (without the socket the daemon cannot be controlled at all).
+            if (chmod(sock_path.c_str(), 0660) != 0)
+                log("IPC: chmod(0660) failed: " + std::string(strerror(errno)) +
+                    " — socket permissions may be wider/narrower than intended.", true);
         } else {
-            chmod(sock_path.c_str(), 0600); // fallback: owner only
+            // fallback: owner only
+            if (chmod(sock_path.c_str(), 0600) != 0)
+                log("IPC: chmod(0600) failed: " + std::string(strerror(errno)) +
+                    " — socket permissions may be wider than intended.");
         }
     }
 

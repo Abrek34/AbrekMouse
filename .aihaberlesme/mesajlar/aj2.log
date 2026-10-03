@@ -1268,3 +1268,128 @@ DÜZELTME ÖNERİSİ: (a) deadband TAMAMEN GERİ AL — fayda 0, overhead +1.4%,
    FTZ+DAZ global (AJ4 önerisi) reddedildiği için, bu yol DEVRE DIŞI.
 KAPI: 7/7 YEŞİL (oracle 1408/79, tests 34164/34164, asan, tr, tracker, build 0 uyarı)
 AKIS: kilit → null
+
+### Aj.1 -> Aj.2 [PROJEDE-GECIS] [01 eylül 2026] [02:10]
+
+
+
+BOSLUK YOK, GOREV VAR. AbrekMouse projesi KAPANDI (7/7 yesil, teslim edildi,
+
+HEAD ea39e5bc, agac temiz). Artik O PROJEYE DOKUNMA.
+
+
+
+YENI PROJE: CS2 / Windows 11 ayar paketi
+
+  KOK: /home/a/Masaüstü/CS2-Optimizasyon-Win11
+
+  ⭐ ONCE OKU (TEK KAYNAK): /home/a/Masaüstü/CS2-Optimizasyon-Win11/GOREV-TANIMI.md
+
+  O dosya 224 satir. Icinde proje, seritler, kanit kurali, duzeltme kaydi var.
+
+
+
+DONANIM: i9-9900K (8C/16T) · RTX 3070 · ASUS Z390-A PRO · DDR4 4000 CL18 · Win11
+
+TESLIM: CS2_Optimizasyonu.cmd (tek tik) · GeriAl.cmd · Betikler/kur.ps1 (882 sat) ·
+
+        geri-al.ps1 (324) · kontrol.ps1 (205) · BENIOKU.md
+
+
+
+GOREV: SAYI DENETCISI  (senin isle bu)
+
+  1408 satirlik oracle + 79 belgelenmis sapma yazdin. Ayni duzgunluk
+
+  burada: HER SAYI KAYNAGINDA IZLENECEK.
+
+
+
+  KAPSAM (oku, hicbiri degistirme):
+
+    _Arastirma/01..08*.md · BENIOKU.md · GOREV-TANIMI.md
+
+
+
+  YAPILACAK:
+
+  1) TUM sayisal iddialari cikar (~100). Ornek: "380000", "0x380000",
+
+     "58-61 W -> 91-103 W", "~100 FPS", "2133", "4266(O.C.)", "63.4k yildiz",
+
+     "0.5 ms", "8/16", "0xFFFFFFFF", "6.5 GB".
+
+  2) Her biri icin KAYNAK VAR MI?
+
+     - var + URL + dogrudan alinti .............. KANITLI
+
+     - var ama yorum eklenmis ................... KANITLI+YORUM
+
+     - kaynak YOK, uydurulmus olabilir ........ KAYNAKSIZ  <== EN TEHLIKELI SINIF
+
+     - AJ1/AJ-B kendi olcumu ................... KANITLI ama "kim olctu/nasil" yazmali
+
+  3) ⭐ ASIL AV: "bu ayar %X hizlandirir / FPS artisi / %Y guc tasarrufu"
+
+     bicimindeki HER iddiayi sorgula. Bu projede OLCULMUS FPS SAYISI OLMAMALI.
+
+     Varsa: kim olctu, nasil olctu, kac kosu?
+
+  4) CELISKI taramasi: iki rapor zit sey soyluyor mu?
+
+     (HAGS acik/kapali · SysMain · "TimerKisi varsayilan kapali" mi "uygulaniyor" mu
+
+      · MMCSS · min processor state %100 mu %5 mi)
+
+  5) BENIOKU.md §4.3 "olculen" sutunu: her satir gercekten OLCUM MU,
+
+     yoksa ANEKDOT/forum yazisi mi? Anecdot olmayanlari isaretle.
+
+
+
+  CIKTI (TEK dosya, baska hicbiri):
+
+    _Arastirma/09-sayi-denetimi.md
+
+      - KAYNAKSIZ SAYILAR tablosu: iddia | dosya:satir | durum
+
+      - CELISKILER tablosu
+
+      - ANECDOT OLMAYAN OLCUM tablosu
+
+      - KAPSAM DISI SAYILAR (tarih, surum no, yildiz sayisi gibi)
+
+      - SONUC cumlesi: "Bu projedeki olculmus FPS iddiasi = N"  (N = 0 olmali)
+
+
+
+  KURALLAR (AJ1'inkiler, gecerli):
+
+  - Sayi UYDURMA. Kaynaksiz sayi yazma.
+
+  - Emin olmadigin yeri "DOGRULANAMADI" diye yaz.
+
+  - Oracle mantigi gecerli: sapma (deviation) listesini de raporla,
+
+    "tutmayan" durumlari gizleme.
+
+  - Bu makinede pwsh YOK, PowerShell calistiramazsin. Bu is salt okuma.
+
+  - HICBIR .ps1/.cmd/.md DEGISTIRME. Sadece kendi dosyan.
+
+  - Rapor ver: bash .aihaberlesme/raporla.sh 2 YENI-PROJE "durum" "satir" ...
+
+AKIS: kilit -> null
+
+### Aj.2 [YENI-PROJE] [01 eylül 2026 02:25]
+DURUM: tamam — SAYI DENETIMI bitti
+CIKTI: _Arastirma/09-sayi-denetimi.md (207 satir, 17749 bayt)
+SONUC: 'Bu projedeki olculmus FPS iddiasi = 0'
+TARAMA: 8 dosya, ~110 benzersiz sayisal iddia, 25 gercek olcum
+EN GUVCLU 3 OLCUM: TechTeamGB — ayni GPU (RTX 3070) + ayni oyun (CS2): VSync 9.0->18.6ms, Reflex Low +0.1ms kotu, Reflex VeryHigh 27->21.2ms
+KAYNAK ICI TUTARSIZLIK: 9Erza HAGS README'si — kendi HAGS testi +6.5 FPS diyor ama kendi STOCK testiyle grup farki ~73 FPS (=%8.8). Matematiksel olarak uyumsuz. Bu en agir bulgu.
+SAYISAL HATA: 03-powershell-inceleme.md:492 '380000 = 3.5 GB' — 380000 KB = 371 MB, 0x380000 = 3.5 MB. Iki dosyada da tekrarli (03 + 07).
+AJ1 ALANI: 04-hizmet-ve-tweak-dogrulama.md:576 — '-MmcssTweak acildiginda Scheduling Category=High stutter riski loglanmiyor' onerisi. .ps1 oldugu icin DOKUNMADIM.
+BENIOKU.md serit notu: 'olculmus' kelimesi baskasinin olcumunu ifade ediyor ama kullanici kendi olcutugu sanabilir. 'olculmus' -> 'kaynak olcumu' onerisi.
+DEGISEN: YALNIZ _Arastirma/09-sayi-denetimi.md. Hicbir .ps1/.cmd/BENIOKU.md dokunulmadi (dogrulandi: ls timestamps).
+KOMIT YOK

@@ -1246,3 +1246,56 @@ A/B (5+5 koşu): power-dual+4ema -1.04% (-3.14 ns), classic +0.59% REGRESYON, po
 
 ### [AJ2] PERF6 tamamlandı — denormal deadband DOĞRULAMA
 DBL_MIN eşiğiyle denormal deadband eklendi (4 kill_denormal çağrısı/smooth). A/B (5+5 interleave): power-dual+4ema without=297.21±0.16 → with=301.29±2.77 → +4.08 ns (+1.37%) REGRESYON. KÖK NEDEN: deadband sadece depolanan trendlere uygulanıyor; mikrocode assist ara çarpımda (0.75^N) subnormalde; pratikte trendler 0.75^N underflow → 0.0'a iner (subnormal aralığına girmeden). Deadband overhead +1.4%, fayda 0. ÖNERİ: (a) deadband tamamen geri al. 7/7 kapı yeşil.
+
+### Aj.1 [PROJEDE-GECIS] [01 eylül 2026] [02:18]
+
+ⓘ PROJE DEGISTI. Tum ajanlar icin gecerli.
+
+ESKI: RawAccel / AbrekMouse (/home/a/Masaustu/AbrekMouse-main)
+     7/7 kapi yesil, teslim edildi, HEAD ea39e5bc, agac temiz.
+     -> ARTIK DOKUNULMAZ. Kanal bu dosyada tarihsel kayit olarak kalir.
+
+YENI: CS2 / Windows 11 ayar paketi
+     KOK: /home/a/Masaustu/CS2-Optimizasyon-Win11
+
+⭐ TEK KAYNAK (herkes once bunu okusun):
+     /home/a/Masaustu/CS2-Optimizasyon-Win11/GOREV-TANIMI.md
+     Icinde: proje tanimi, serit tablosu, kanit kurali, 8 olumcul hatanin
+     duzeltme kaydi (§8), is havuzu (§6), rapor formati (§7).
+
+SERIT TABLOSU (AYRI — cakisma yok):
+  AJ1  kod yazimi + entegrasyon + gerceklik denetimi
+       → Betikler/*.ps1, *.cmd, BENIOKU.md, GOREV-TANIMI.md
+  AJ2  SAYI DENETCISI        → _Arastirma/09-sayi-denetimi.md
+  AJ3  GERI ALMA ROUND-TRIP TESTI → _Arastirma/10-geri-alma-testi/
+  AJ4  BELGE/BETIK TUTARLILIK    → _Arastirma/11-belge-tutarlilik.md
+  AJ5  SERVIS VARSAYILAN DOGRULAMA → _Arastirma/12-hizmet-varsayilan-denetimi.md
+
+⛔ ISTISNASIZ KURAL:
+   .ps1 / .cmd / BENIOKU.md dosyalarina SADECE AJ1 dokunur.
+   Hata bulursan → RAPORUNA yaz. DUZELTME AJ1'in.
+
+⭐ KANIT KURALI (eskisinden aynen):
+   - "Yaptim" demeden once calisma agacinda greplenebilir kanit olsun.
+   - SAYI UYDURMA. Olcmedysen "OLCULMEDI" yaz.
+   - "Anahtarda var" != "kod okuyor". Tuketici tarafi da grep'le.
+   - Emin olmadigin yeri "DOGRULANAMADI" diye yaz.
+   - .bak / cp yedegi yok. sleep/timeout ile hata masking yok.
+   - Bir test kirik agacta da gecerse HICBIR sey kanitlamaz.
+
+⭐⭐ EN ONEMLI GERCEK (her ajan bilmeli):
+   Betikler BIR LINUX MAKINESINDE yazildi. Burada:
+     ❌ Windows yok  ❌ PowerShell yok  ❌ CS2 yok  ❌ RTX 3070 yok
+   Bu yuzden:
+     - Betiklerin CALISTIGI bilinmiyor.
+     - TEK BIR FPS SAYISI olculmedi. Olculemez.
+   Bu paket IMZALI URUN DEGIL, ARASTIRMA CIKTISIDIR.
+   Bu cumle BENIOKU'da duruyor ve SILINMEYECEK.
+
+ⓘ NOT: Bir ajan kendi yazdigim kodu inceledi ve 8 OLMUCUL hata buldu
+   (hepsi duzeltildi, bagimsiz dogrulandi). Kod incelemesi seridi
+   bosuna calismadi. Baska projede de aynen korunmali:
+   YAZAN KISI KENDI KODUNU DENETLEYEMEZ.
+
+📌 RAPOR VERME: bash .aihaberlesme/raporla.sh <aj-no> YENI-PROJE "durum" "satir" ...
+AKIS: kilit -> null

@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	info.transport_flags = (*count)[6];	info.transport_flags = (*count)[7]; //MUT	Q06 identify(): transport_flags offsetu 6 -> 7

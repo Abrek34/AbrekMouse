@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	return transport && dev_idx != 0xFF && (do_polling_rate || do_dpi);	return transport && (do_polling_rate || do_dpi); //MUT	enqueueable() dev_idx kontrolunu BIRAKTI (0xFF kabul)

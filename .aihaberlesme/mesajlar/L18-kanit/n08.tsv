@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	constexpr uint32_t rates[] = {0, 1000, 500, 333, 250, 200, 166, 142, 125};	constexpr uint32_t rates[] = {0, 1000, 500, 334, 250, 200, 166, 142, 125}; //MUT	N08 rate_code_to_hz tablosu 333 -> 334

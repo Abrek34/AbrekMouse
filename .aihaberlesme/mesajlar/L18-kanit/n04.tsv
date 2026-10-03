@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	std::vector<uint8_t> params(2 + chunk, 0);	std::vector<uint8_t> params(2 + 16, 0); //MUT: O31-H1 hatası geri getirildi	N04 write_onboard_profile_sector() params 18 byte (taşma)

@@ -26,6 +26,12 @@ struct natural {
     }
 
     double operator()(double x, const accel_args&) const {
+        // L02-10: finiteness guard, same convention as classic/synchronous/
+        // jump/power.  `NaN <= offset` is false, so a NaN input sailed past
+        // the offset check into exp(NaN) → NaN output; +Inf produced
+        // exp(-Inf·…)=0 and then a -nan through 0·Inf in the offset term.
+        // Identity is the established non-finite fallback for every mode.
+        if (!std::isfinite(x)) return 1.0;
         if (x <= offset) return 1.0;
         double t     = x - offset;   // positive distance past offset
         double decay = std::exp(-accel * t);

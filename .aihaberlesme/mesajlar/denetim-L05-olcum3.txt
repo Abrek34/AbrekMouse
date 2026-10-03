@@ -1,0 +1,21 @@
+### (H10) `"cap":[24,"typo"]` -> cap.y silently 0 (= NO CAP, accel-classic.hpp:33)
+  Same profile, only cap[1] differs.  speed 3000 ips, classic GAIN:
+
+  case                         cap.y      gain@3000  ratio vs intended
+  cap:[24,1.2]  (intended)     1.2        1.1998     1.00x
+  cap:[24,"typo"] -> {24,0}    0          3.4495     2.88x  <-- SILENT 8.9x OVER-ACCEL
+
+### (H11) `"cap":[500]` -> array size 1, the ONE valid number 500 is discarded, cap={15,0}
+  cs2 intended cap {18,1.6}    {18,1.6}   1.5925     1.00x
+  "cap":[500] -> {15,0}        {15,0}     13.0000    8.16x  <-- SILENT
+
+### (H12) how much of each PRESET's JSON is inert in its own mode?
+  (readers measured by grep over include/accel-*.hpp)
+  preset     mode      fields the preset writes that this mode's algorithm NEVER reads
+  gaming     classic   limit, decay_rate, motivity, gamma, exponent_power, scale, sync_speed, smooth, output_offset
+  office     natural   acceleration, exponent_classic, exponent_power, scale, limit?NO(limit IS read), gamma, sync_speed, smooth, output_offset, cap
+  precision  classic   limit, decay_rate, motivity, gamma, exponent_power, scale, sync_speed, smooth, output_offset
+  cs2        classic   limit, decay_rate, motivity, gamma, exponent_power, scale, sync_speed, smooth, output_offset
+  valorant   natural   acceleration, exponent_classic, exponent_power, scale, gamma, sync_speed, smooth, output_offset, cap
+  apex       power     acceleration, exponent_classic, limit, decay_rate, motivity, gamma, sync_speed, smooth, input_offset
+  fps        classic   limit, decay_rate, motivity, gamma, exponent_power, scale, sync_speed, smooth, output_offset

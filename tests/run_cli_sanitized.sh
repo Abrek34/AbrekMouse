@@ -128,6 +128,16 @@ vaka "validate (yok dosya)"          "config file not found"        -c "$WORK/yo
 vaka "diff (iki preset)"             "diff"                         -c "$CFG" diff p_gaming p_apex
 vaka "import yok dosya"              "Cannot open"                  -c "$CFG" import /nonexistent-xyz.json
 vaka "import reddedilen yol"         "Cannot open"                  -c "$CFG" import /etc/shadow
+# L13-15: the two import cases above both exit BEFORE any JSON is read, so
+# cmd_import's 215-line parse/validate block ran zero times under ASan.  These
+# cases go THROUGH the JSON path: a valid single-profile import and a
+# malformed one (the latter must be rejected without touching the config).
+printf '%s' '{"name":"p_asan_import","device_id":"","disable":false,"dpi":800,"polling_rate":1000,"profile":{"accel_x":{"mode":"classic","acceleration":0.01}}}' > "$WORK/asan_import.json"
+vaka "import (geçerli JSON)"          "Imported profile"             -c "$CFG" import "$WORK/asan_import.json"
+printf '%s' '{"name":"bad","profile":{"accel_x":{"mode":"NOT_A_MODE"}}}' > "$WORK/asan_bad.json"
+vaka "import (bozuk mode JSON)"       "unknown accel mode"           -c "$CFG" import "$WORK/asan_bad.json"
+printf '%s' 'INVALID JSON {{{' > "$WORK/asan_parse.json"
+vaka "import (parse hatası)"          "Invalid profile JSON"         -c "$CFG" import "$WORK/asan_parse.json"
 vaka "show olmayan profil"           "Profile not found"            -c "$CFG" show yok_boyle_profil
 
 # Yol doğrulama reddedişleri (SEC-2 sınıfı) — hepsi ölçülmüş metin:

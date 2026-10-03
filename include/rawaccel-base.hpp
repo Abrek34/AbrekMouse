@@ -6,7 +6,7 @@
 namespace rawaccel {
 
 /// Single source of truth for the version number — read by GUI and daemon.
-inline constexpr const char* RAWACCEL_VERSION = "1.2.5";
+inline constexpr const char* RAWACCEL_VERSION = "1.2.6";
 
 using milliseconds = double;
 
@@ -75,12 +75,27 @@ struct accel_args {
     double limit              = 1.5;
     double sync_speed         = 5;
     double smooth             = 0.5;
-    vec2d  cap                = { 15, 0 };
+    // L03-02 (HIGH): docs/research/parameter_index.md:85, config/default.json:35
+    // and tests/oracle/ref/rawaccel-base.hpp:61 all say cap.y default = 1.5.
+    // The old `{ 15, 0 }` meant the in-code default was the "no cap" sentinel
+    // (cap.y > 0 ? ... : DBL_MAX), so a profile built without JSON `cap` grew
+    // unbounded (measured 501x gain at 100k ips) while the oracle/JSON default
+    // is the asymptotic 1.5x.  Align the struct with the documented default.
+    vec2d  cap                = { 15, 1.5 };
     cap_mode cap_mode_val     = cap_mode::out;
     int    length             = 0;
-    mutable float data[LUT_RAW_DATA_CAPACITY] = {};
+    // A1 (state bleed): NOT mutable.  This array is user config state (lookup
+    // curve / LUT) and must only change through a non-const reference.  It used
+    // to be `mutable` so the synchronous GAIN LUT generator could write it
+    // through `const accel_args&`; the GUI's compute_curve(args) passes the
+    // profile's own accel_args, so merely drawing a graph overwrote the user's
+    // stored LUT and the next save_config persisted the corruption.  The
+    // synchronous accelerator now keeps its integral LUT in its own member
+    // array (accel-synchronous.hpp), and nothing writes args.data through a
+    // const reference.
+    float data[LUT_RAW_DATA_CAPACITY] = {};
 
-    // Use field-by-field comparison — memcmp is unreliable with mutable/padding members.
+    // Use field-by-field comparison — memcmp is unreliable with padding members.
     // All double fields use epsilon comparison to survive JSON round-trips where
     // double→string→double may introduce sub-ULP differences (fixes xy_linked false-unlink).
     // LUT float data uses a slightly larger epsilon for the same reason.

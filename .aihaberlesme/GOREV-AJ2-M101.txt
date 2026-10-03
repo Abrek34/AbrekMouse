@@ -1,0 +1,78 @@
+AJ1 -> AJ2 GÖREV [M101 DENETİM TURU]  ·  01 eylül 2026
+
+⛔ AJ3 bu turda YOK (başka projede). Denetim yükünü sen ve AJ4 üstleniyor.
+AJ3'ün "bağımsız denetçi" rolü bu turda sende + AJ4'te + 20 alt-ajan.
+⛔ Bu görev İLK SEFERDE ULAŞMAMIŞTI (yanlış bayrak + geçici dizin silinmesi).
+Şimdi gerçekten sende.
+
+ÖNCE OKU: /home/a/Masaüstü/AbrekMouse-main/.aihaberlesme/DENETIM-BRIFING.md
+  (kanıt standardı, yasaklar, "sessiz yeşil" tanımı, rapor formatı)
+
+⭐ SENİN LANE'İN: LANE-A1 — KURULUM, DERLEME, PAKETLEME, CI, SİSTEM SERVİSİ
+Sahip olduğun dosyalar (başka ajanlar BUNLARA DOKUNMAZ):
+  - CMakeLists.txt
+  - scripts/**   (build.sh, install.sh, uninstall.sh, bench_hotpath.sh,
+                  kde-fix-accel.sh, bug_watch.sh, virtmouse-game.c,
+                  rawaccel.service, 99-rawaccel.rules, rawaccel.quirks,
+                  rawaccel.desktop, setup.sh)
+  - .github/workflows/**
+  - packaging/**
+  - build-manual/**
+  - .gitignore
+  - config/**
+
+⛔ KOD DEĞİŞTİRME — bu bir DENETİM turu. Salt okuma + ölçüm.
+⛔ `git checkout` / `git stash` / `git reset` YASAK — 20 alt-ajan aynı
+çalışma ağacında ölçüm yapıyor, bozarsan kanıtları geçersizleşir.
+
+GÖREV — kanıtla şunları yanıtla:
+
+1. ⭐⭐ "7 KAPI" README'de yeşil ilan edilmiş. AGENTS.md'den kapıların
+   TAM listesini çıkar. Her kapı için hangi komutu koşturduğunu yaz, sonra o
+   komutları KENDİN çalıştır: her birinin HAM çıktısı + rc'si. Kaçı gerçekten
+   yeşil, kaçı atlandı/skip?
+   ⭐ AJ4 belge tarafını denetliyor — sen komut tarafını ölç. Çakışma.
+
+2. ⭐⭐ README: "GitHub Actions HİÇBİR ZAMAN tamamlanmadı, her koşu ~5 saniyede
+   billing lock ile duruyor." Doğrulanabilir bir iddia mı? `.github/workflows/`
+   içinden ve mümkünse `gh run list` ile kontrol et, SAYI ver.
+
+3. ⭐ Kurulum yolunun SONUÇ VERİLEBİLİR olduğunu kanıtla: temiz ortamda
+   kurulum gerçekten çalışıyor mu? build.sh / install.sh'i incele ve mümkünse
+   koştur. ⛔ Hangi aşamada root/udev/systemd gerekiyor, belgelenmiş mi?
+
+4. ⛔ `uninstall.sh`: kurulumun TAM TERSİNİ yapıyor mu? Geride dosya bırakıyor mu?
+   Özellikle /etc/udev/rules.d/, systemd unit, kullanıcı config'i, loglar.
+   Listele; hangisinin SİLMEYİ UNUTTUĞUNU bul.
+
+5. ⭐ udev / systemd:
+   - 99-rawaccel.rules: cihaz eklenince/çıkarınca ne yapıyor, doğru mu?
+   - rawaccel.service: Type=, Restart= doğru mu?
+     ⭐ Başarısız olursa ne kadar süre sonra yeniden deniyor? Sonsuz hızlı
+     yeniden başlama döngüsü var mı? ÖLÇ.
+   - unit güvenliği: AmbientCapabilities, kullanıcı, izinler.
+
+6. ⭐ virtmouse-game.c: ne yaptığı belgelenmiş mi? Kurulumda DERLENİYOR mu
+   yoksa elle mi? Eksikse kullanıcı oyunu deneyemez.
+
+7. ⛔ SERT sleep/timeout taraması: scripts/** ve .github/** içinde
+   sleep|usleep|nanosleep|timeout|continue-on-error|exit 0 eşleşmelerini
+   `grep -n` ile HAM ver, her birinin amacını yaz. ⛔ Bu projede sabit bekleme
+   yasak desendir (yalnız metot). CI'da maskeleme var mı?
+
+8. ⭐ bench_hotpath.sh (481 satır) → bench_hotpath_results.txt üretiyor mu?
+   Ürettiği sayı GERÇEK mi — kendi koşturup karşılaştır. Sonuç dosyası
+   bayat mı (tarih damgası)? "Sıfır fayda" diye raporlanan bir şey var mı?
+
+9. ⛔ bug_watch.sh (223 satır): neyi izliyor? Bir hata türünü MASKELİYOR mu?
+
+10. ⭐ setup.sh (33.6 KB): tek kurulum betiği bu kadar büyükse içinde ÇAKIŞAN
+    İKİ YOL var mı? Aynı işi iki yer yapıyor mu? (dosya:satır)
+
+⭐ AJ1 hiçbir "tamam" iddiasını senin kanıtın olmadan kabul etmeyecek.
+CRIT bulguların varsa AJ1 KENDİ komutuyla yeniden ölçecek.
+
+RAPOR: brifing §6 formatında. Tam raporu
+  /home/a/Masaüstü/AbrekMouse-main/.aihaberlesme/mesajlar/aj2-M101-log.md
+dosyasına yaz, özünü mesajının gövdesinde döndür.
+⛔ `cat >` veya `>` ile mevcut log dosyalarını EZME.

@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	(normalize_function_id(function_id) << 4) | (software_id & 0x0F));	(normalize_function_id(function_id) << 0) | (software_id & 0x0F)); //MUT	N05 short_packet to_bytes() byte-3 paketlemesi bozuldu

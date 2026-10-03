@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(rawaccel-linux VERSION 1.2.5 LANGUAGES CXX)
+project(rawaccel-linux VERSION 1.2.6 LANGUAGES CXX)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
@@ -205,6 +205,16 @@ if(BUILD_TESTS)
         dl
     )
     add_test(NAME rawaccel-unit-tests COMMAND rawaccel-tests)
+    # C8 (L04-11): the SIMD parity gate was reachable only via ci.yml /
+    # run_tests.sh — `ctest` alone never exercised AVX2/SSE2/scalar, which is
+    # exactly the gap the original Y-axis AVX2 bug lived in.  Register it as a
+    # second ctest so a plain `ctest` run covers all three backends.
+    # (The script exits 77 when the host cannot run the AVX2 binary; CTest
+    # records that as "Not Run", which is honest — it did not measure.)
+    add_test(NAME rawaccel-simd-parity
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/run_simd_parity.sh)
+    set_tests_properties(rawaccel-simd-parity PROPERTIES
+        SKIP_RETURN_CODE 77)
 endif()
 
 message(STATUS "")

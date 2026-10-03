@@ -1,0 +1,1 @@
+src/logitech_receiver.cpp	    {0xc52f, logitech_receiver_kind::nano,          1, true},	    {0xc52f, logitech_receiver_kind::nano,          1, false}, //MUT	R03 Nano c52f hidpp_supported true -> false

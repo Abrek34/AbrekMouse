@@ -49,6 +49,14 @@ struct simple_ema_smoother {
         // never calls us with time <= 0 (early return), so this only fires on
         // direct/fuzz/test input — return the current estimate unchanged.
         if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        // L09-05 (HIGH): a single non-finite `speed` used to poison the
+        // accumulators PERMANENTLY (windowTotal += twc*(NaN - windowTotal) →
+        // NaN forever, surviving reconfigure() because the smoother is already
+        // initialized).  The only recovery was unplugging the mouse (full
+        // sp.init()).  sanitize lets degenerate-but-representable parameter
+        // sets through, so the guard belongs here at the accumulator boundary:
+        // ignore the sample (return the current estimate) like the time guard.
+        if (!std::isfinite(speed)) return std::min(windowTotal, cutoffTotal);
         // exp2(log2(c) * time) reproduces pow(c, time) for every finite c and
         // positive time.  The branchless form keeps the inlined smoother small,
         // which matters for GCC's inline budget in the whole modifier pipeline.
@@ -111,6 +119,10 @@ struct linear_ema_smoother {
         // -inf * 0 == NaN would poison all four accumulators via the trend
         // terms.  Return the current estimate unchanged instead.
         if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        // L09-05 (HIGH): same permanent-poisoning guard as the simple smoother
+        // — a non-finite input sample is ignored instead of corrupting all
+        // four accumulators (which survived reconfigure() until unplug).
+        if (!std::isfinite(speed)) return std::min(windowTotal, cutoffTotal);
         // Branchless exp2-based coefficients (see simple_ema_smoother::smooth).
         const double twc  = 1.0 - std::exp2(windowLog2      * time);
         const double tcc  = 1.0 - std::exp2(cutoffLog2      * time);
@@ -181,6 +193,11 @@ struct speed_processor {
 
     static constexpr double input_trend_halflife  = 1.25;
     static constexpr double output_trend_halflife = 0.70;
+
+    // L03-09: single source for the subnormal-time guard ceiling, shared by
+    // modifier::modify and modify_separate_simd.  Was duplicated as a local
+    // constexpr in both functions; two literals can drift apart silently.
+    static constexpr double IPS_FACTOR_MAX = 1e6;
 
     speed_processor() = default;
 
@@ -348,9 +365,8 @@ static void modify_separate_simd(vec2d& in, speed_processor& sp,
     }
 
     double ips_factor = dpi_factor / time;
-    constexpr double IPS_FACTOR_MAX = 1e6;
-    if (!std::isfinite(ips_factor) || ips_factor > IPS_FACTOR_MAX)
-        ips_factor = IPS_FACTOR_MAX;
+    if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
+        ips_factor = speed_processor::IPS_FACTOR_MAX;
 
     // 1. Rotation (scalar - branchy, not worth vectorizing)
     if (flags.apply_rotate)
@@ -499,9 +515,8 @@ public:
         // Guard: subnormal / extremely small time values can produce Inf ips_factor
         // which cascades into NaN through the accel pipeline.  Clamp to a sane max
         // (equivalent to ~0.001 ms poll interval, i.e. 1 MHz — well beyond any real hardware).
-        constexpr double IPS_FACTOR_MAX = 1e6;
-        if (!std::isfinite(ips_factor) || ips_factor > IPS_FACTOR_MAX)
-            ips_factor = IPS_FACTOR_MAX;
+        if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
+            ips_factor = speed_processor::IPS_FACTOR_MAX;
 
         // 1. Rotation
         if (flags.apply_rotate)

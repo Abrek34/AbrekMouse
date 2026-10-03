@@ -1,0 +1,33 @@
+MUT[R01]
+    uygulanan: R01 Bolt alıcısı max_paired_devices 6 -> 4 [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:189  r.max_paired_devices == 6  (section: Logitech receiver discovery — capability classification)
+MUT[R02]
+    uygulanan: R02 Nano c542 hidpp_supported false -> true [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:193  !r.hidpp_supported  (section: Logitech receiver discovery — capability classification)
+MUT[R03]
+    uygulanan: R03 Nano c52f hidpp_supported true -> false [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:196  r.hidpp_supported  (section: Logitech receiver discovery — capability classification)
+MUT[R04]
+    uygulanan: R04 Bolt c548 kind bolt -> nano [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 394/396 geçti, 2 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 2)
+        FAIL  tests/test_accel.cpp:198  r.max_paired_devices == 1  (section: Logitech receiver discovery — capability classification)
+        FAIL  tests/test_accel.cpp:201  has_bolt  (section: Logitech receiver discovery — capability classification)
+MUT[R05]
+    uygulanan: R05 vendor filtresi SİLİNDİ (her dizin alıcı sayılıyor) [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 388/391 geçti, 3 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 3)
+        FAIL  tests/test_accel.cpp:201  has_bolt  (section: Logitech receiver discovery — capability classification)
+        FAIL  tests/test_accel.cpp:202  has_nano  (section: Logitech receiver discovery — capability classification)
+        FAIL  tests/test_accel.cpp:203  has_advanced_nano  (section: Logitech receiver discovery — capability classification)
+MUT[R06]
+    uygulanan: R06 logitech_receiver_kind_name() Lightspeed -> lightspeed [1 yerde]
+    rc=1  OK  -> KIRMIZI (yakaladi)
+    === Sonuç: 396/397 geçti, 1 BAŞARISIZ (24 section eşleşti, 193 atlandı) ===  (FAIL satiri: 1)
+        FAIL  tests/test_accel.cpp:205  std::string(logitech_receiver_kind_name(logitech_receiver_kind::lightspeed)) == "Lightspeed"  (section: Logitech receiver discovery — capability classification)

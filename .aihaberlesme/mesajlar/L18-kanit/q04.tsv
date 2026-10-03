@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	info.model_id = bytes_to_hex(count->data() + 7, 6);	info.model_id = bytes_to_hex(count->data() + 8, 4); //MUT: 12 -> 8 hex	Q04 identify(): model_id 6 byte -> 4 byte (8 hex, kısa id ÜRETİLEBİLİR hale geldi)

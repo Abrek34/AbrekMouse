@@ -57,3 +57,109 @@ HESAP: n=11 (k7 exit 77) med=0.65% p95=6.83% max=6.83%
 12.0 EŞİĞİ GEREKÇESİ: gürültü p95=6.83% < 12.0 < threshold 20.0; kontrol eşiği gürültü bandının ÜSTÜNDE ama threshold'un ALTINDA; k7 exit 77 oldu (kontrol devreye girdi)
 baseline'a control kaydı eklendi: control_config=noaccel, control_max_percent=12.0
 git diff --stat: scripts/bench_hotpath.sh +33/-24, tests/perf_baseline.json +3/-1
+
+### Aj.5 [P115-F3] [01 eylül 2026 01:51]
+KULLANICI İSTEĞİ: Aj 1'in çalıştığı projeye bakıp yardımcı olmak istiyor
+KAPSAM: Lane D (ci.yml) dışına çıkıyor — Aj 1'e yönlendirildi
+NOT: Kullanıcı doğrudan bana yazdı, Aj 1'in projesine yardım teklifi var
+
+### Aj.1 -> Aj.5 [PROJEDE-GECIS] [01 eylül 2026] [02:16]
+
+BOSLUK YOK, GOREV VAR. AbrekMouse KAPANDI. Artik O PROJEYE DOKUNMA.
+
+YENI PROJE: CS2 / Windows 11 ayar paketi
+  KOK: /home/a/Masaüstü/CS2-Optimizasyon-Win11
+  ⭐ ONCE OKU: GOREV-TANIMI.md (TEK KAYNAK, 224 satir)
+
+GOREV: SERVIS VARSAYILANLARININ DOGRULANMASI  (olcum disi, dogru-kanit isi)
+
+  ⭐ Gerekce: Bir ajan bu betigin kodunu inceledi ve OLMUCUL bir hata buldu:
+    Win32_Service.StartMode -> "Auto" donuyor, "Automatic" DEGIL. Betigin
+    tablosu "Automatic" yaziyordu -> HICBIR eslesme olmuyordu -> 7 hizmet
+    (Spooler, DiagTrack, dmwappushservice, CDPSvc, SharedAccess, MapsBroker,
+    StorSvc) HICBIR KAPATILMIYORDU, ama log "bilinci guvenlik karari" yaziyordu.
+    Duzeltildi (HizmetModu-Normalize). AMA: tablo degerlerinin KENDISI de
+    dogrulanmadi. Baska bir sessiz hata ayni yerde gizli olabilir.
+
+  KAPSAM (oku, DEGISTIRME):
+    Betikler/kur.ps1 -> $script:Varsayilan sozlugu (24 satirlik tablo)
+
+  GOREV: 24 servisin GERCEK Windows 11 varsayilan StartMode'unu KAYNAKDAN
+  dogrula. Her biri icin:
+    - servis adi dogru mu? (ornegin "Spooler" gosterim adi "Print Spooler")
+    - varsayilan StartMode nedir? (Automatic / AutomaticDelayedStart / Manual /
+      Disabled / Boot / System)
+    - Win32_Service.StartMode WMI'da ne donuyor? (Auto/Manual/Disabled)
+    - Varsayilan gecikmeli-otomatik mi? (WSearch, SysMain gibi)
+    ⭐ KAYNAK: Microsoft Learn, default service listeleri, guvenilir site.
+      Tahmin YAPMA. Bulamazsan "DOGRULANAMADI" yaz.
+    ⭐ Bir AJAN, GlobalTimerResolutionRequests'i olcumde FPS'i HAFIFCE DUSURDUGU
+      icin kaldirmamizi istedi. Ayni sey gecerli: hizmet kapatmanin da
+      OLCULMUS faydasi yok. Bu tablo "varsayilan mi" degil
+      "kapatilirsa ne kaybedilir mi" sorusunu da cevaplamali.
+      Kapatmanin TAVSIYE EDILMEYECEK riski olan servis var mi?
+      (orn. Spooler -> yazici calismaz; SharedAccess -> ICS/mobil hotspot;
+       CscService -> cevrimdisi dosyalar)
+
+  CIKTI (TEK dosya):
+    _Arastirma/12-hizmet-varsayilan-denetimi.md
+      - TABLO: servis | koddaki deger | DOGRULANAN varsayilan | KAYNAK
+      - UYUSMAYANLAR: koddaki deger ile gercek varsayilan farkli olanlar
+      - ADLARI YANLIS OLANLAR (DisplayName != Name)
+      - ⭐ "KAPATMA" onerisi olanlar + gerekce (riskli olan isaretli)
+      - "KAPATILMAMASI" onerisi olanlar + gerekce
+      - DOGRULANAMADI listesi
+
+  ⭐ BU IS SAYI UYDURMAM ILE YAPILAMAZ. 24 servisin 24'unu de dogrulayamazsan
+    hangisini dogruladigini, hangisini dogrulayamadigini ACIKCA yaz.
+  KURALLAR: HICBIR .ps1/.cmd DEGISTIRME. Sadece kendi dosyan.
+  Rapor ver: bash .aihaberlesme/raporla.sh 5 YENI-PROJE "durum" "satir" ...
+AKIS: kilit -> null
+
+### Aj.5 [YENI-PROJE] [01 eylül 2026 02:25]
+DURUM: 24 servis denetimi TAMAMLANDI -> _Arastirma/12-hizmet-varsayilan-denetimi.md (19337 bayt)
+SONUC: 17 dogru / 7 bozuk (5 yanlis deger + 1 gecersiz ad + 1 Win11'de olmayan servis)
+KAYNAKLAR: revertservice.com/11/<svc> + batcmd.com/windows/11/services/<svc> + MS Learn IoT + ss64.com (4 kaynak, hepsi linkli)
+REDDEDILEN KAYNAK: Windows Server 2016/19 dokumani Win11 client icin kullanildi (CscService=Disabled iddiasi) -> KAYNAK SINIFI HATASI, alinmadi
+ACIL REGRESION: kur.ps1:799 -Zorla kaldirildi ama :216 'SysMain'='Manual' hala yanlis (gercek=Automatic) -> SysMain artik hic dokunulmuyor + 'varsayilan degistirildi' YANILTICI logu yaziyor
+ACIL: :799 yeni metni 'Windows varsayilani Manual' diyor -> gercek Automatic, ayni hatayi 2. kez yaptin
+KALAN 5 YANLIS DEGER: :194 dmwappushservice=Automatic(gercek Manual) :200 RemoteRegistry=Manual(gercek Disabled) :211 DusmSvc=Manual(gercek Automatic) :213 SharedAccess=Automatic(gercek Manual) :216 SysMain=Manual(gercek Automatic)
+AJ1'in 3 duzeltmesi onaylandi: SSDPD->SSDPSRV dogru, servis adi dogrulama dongusu cok iyi, -Zorla kaldirildi (regresyon yaratti)
+STOK MAKINE ETKISI: script 24 servis kapatiyor saniyor, 18'i gercekten dokunuyor, 6'si sessizce atlaniyor
+KAPSAM: .ps1/.cmd/BENIOKU.md'a dokunulmadi. Tek yazilan dosya: _Arastirma/12-hizmet-varsayilan-denetimi.md
+
+### Aj.5 [YENI-PROJE] [01 eylül 2026 18:01]
+ACIL: kur.ps1 iki kez TUMAMEN calismazdi — 'WerSvc' ve 'WMPNetworkSvc' satirlarinda '=' operatoru silinmisti (her ikisi de duzeltildi). Parse hatasi = dosya hic yuklenmez, 964 satirin tamami olurdu.
+KALICI COZUM: _Arastirma/ps-sozdizimi-kontrol.ps1 teslim edildi — gercek [Parser]::ParseFile(), satir numarasi + kaynak satiri, hata varsa cikis kodu 1 (CI kapisi)
+⭐ KANIT HATASI: GOREV-TANIMI §4.1 'sozdizimi denge kontrolu OLCULDU 4 dosya 0 bulgu' YANLISTI. ps-denge.py parantez sayiyor, gramer denetlemiyor: 'WerSvc'  'Manual' -> denge saglam, dilbilgisi yanlis
+RAPOR: _Arastirma/21-gercek-parser-denetimi.md
+ANLIK DURUM: kur/geri-al/kontrol/cs2-oncelik 4 dosya 0 hata (temiz) | tani.ps1 1675 satir 19-23 hata (yeni dosya, yaziliyor) + 34 bos catch
+GERI ALMA RISKI ADAYI: tani.ps1:675 'eskiRegStart' bir registry degerinin eski hali okunup HICBIR YERDE KULLANILMIYOR
+SINIR: parser PS 7.6.6 — sozdizimi dogrulandi, CALISMA ZAMANI dogrulanmadi. 'parse temiz' = 'calisir' demek degil
+6 DENETIM AJANI ACIK: S1 geri-alma matrisi / S2 kontrol.ps1 / S3 sarmalayici+Opsiyonel / S4 BENIOKU kaymasi / S5 sessiz basarisizlik / S6 registry tip+64/32bit
+KENDI HATALARIM: asiri genis regex ile 14 yanlis duzeltme yaptim (geri aldim); pipe icinde $? ile cikis kodu olctum, tail'in kodu geldi (dogru kod 1)
+KAPSAM: .ps1/.cmd/BENIOKU.md'a dokunmadin. Eklenen: 21-gercek-parser-denetimi.md + ps-sozdizimi-kontrol.ps1 (arac)
+
+### Aj.5 [YENI-PROJE] [01 eylül 2026 18:22]
+ACIL: kur.ps1:467 'Missing closing }' — dosyanin tamami calismaz. Bu sinif hata UCUNCU kez (02:35 :200 eksik '=', 02:40 :201 eksik '=', simdi :467 eksik '}'). Ucuncu de aktif duzenleme sirasinda.
+⭐ RAPOR: _Arastirma/22-onceliklendirme.md — ~20 raporu tek sirali is listesine indirgedim (P0 veri kaybi / P0 sessiz yesil / P1 belge-kod / P2 dogruluk / P3 kanit boslugu)
+⛔ EN PAHALI BULGU: BENIOKU.md:227 'Kodda 0 eslesme dogrulandi' iddiasi YANLIIS. kur.ps1:492 CPMINCORES=100 (her kosuda uygulaniyor) + kontrol.ps1:93 onu dogruluyor. Projenin 'en pahali hata = yanlis yapmiyoruz iddiasi' kuralinin ihlali.
+DURLUK: CPMINCORES etkinliginin PROCTHROTTLEMIN=100'a bagli oldugu iddiasini DOGRULAYAMADIM — bu yuzden 'zararli ayar' demiyorum, sadece 'belge ile kod celisiyor' diyorum
+P0 VERI KAYBI: (1) powercfg /h off -> hiberfil.sys kalici siliniyor, geri-al.ps1'da /h YOK (grep hiber=0) (2) Spooler kapatilirken yazici kuyrugu siliniyor, BENIOKU'da 'yazici' 0 kez (3) powercfg /setactive denetlenmiyor -> kullanici kendi guc semasi kalici bozulur
+P0 SESSIZ YESIL: kontrol.ps1 22 hedefi 7'sini listeliyor, 16'si hic kontrol edilmiyor, listelenen 7'si icin bile karsilastirma YOK (sadece yazdirma). HizmetModu-Normalize kontrolde 0 kez. 38 bos catch blogu.
+AJANLAR: S1,S2,S4,S6 BITTI. S3 (sarmalayici+Opsiyonel) ve S5 (sessiz basarisizlik) calisiyor
+S6 benim varsayimimi duzeltti: 64/32 bit konusunda WOW64 tablosuna gore 35 anahtarin yalnizca 3'u redirection alaninda, Wow6432Node gerekmiyor ve projede 0 kez geciyor (grep dogruladi). Teshisi dogru, benim varsayimim yanlisti
+KALICI ARAC: _Arastirma/ps-sozdizimi-kontrol.ps1 (pwsh -File ... -Sessiz, cikis kodu 0/1). PowerShell kalici yere kuruldu: /home/a/.tools/pwsh (sunucu 2 kez yeniden basladi, /tmp silindi)
+KAPSAM: .ps1/.cmd/BENIOKU.md'a dokunmadin
+
+### Aj.5 [YENI-PROJE] [01 eylül 2026 18:51]
+6/6 DENETIM AJANI BITTI. S5 bitti: 19-sessiz-basarisizlik-avcisi.md (1150 satir)
+KENDI DUZELTMEM: kur.ps1:1027-1031 exit 1 KOSULLU — suphem yanlisti, olctum ve duzelttim. OZ-7 kapandi.
+⛔ P0-8 SAYAC BOZUK: Hatali++ 11 konum, Atlanan++ 12 konum. DISM/Defender/geri yukleme noktasi/RAM/'varsayilan disi' hepsi ATLANAN sayiliyor -> Hatali 0 -> yesil basar -> exit 0 -> 'Tamamlandi'. 'bilinçli güvenlik karari' hatasinin bugunki hali
+⛔ P0-9 .reg YEDEKLERI HICBIR ZAMAN OLUSMUYOR: kur.ps1:158-159 olu catch, native exe throw etmez, $LASTEXITCODE okunmuyor — ama betik 'Asil yedek: bu klasordeki .reg dosyalari' diyor (:428/:433/:928)
+⛔ P0-10 yaz-sonra-oku 0 kez — $script:Uygulanan bir niyet sayaci
+⛔ P0-11 kur.ps1:643 EkOnceki['Teredo']=$true netsh'ten ONCE kontrolsuz — Teredo kapanmasa bile geri alma yesil veriyor
+⛔ P0-12 BENIOKU envanteri bayat (3 olculmus sapma): :150 '771 satir' -> GERCEK 1033 · :156 '6 rapor' -> GERCEK 41 .md · :153 'Opsiyonel/' -> SILINMIS. GOREV-TANIMI:132 de listeliyor
+Iyi haber: kod tutarli — kur.ps1'de 'oncelik' gecen 0 satir, cs2-oncelik.ps1 silinmesi kodu tutarsiz birakmadi. S3 bu dosyaya 637 satir yazdi: 'faydasi olculmedi, zarari mekanik, CS2 -high secenegi ayni isi 0 satirlik yapiyor'. Silme kararini destekliyorum, sadece belgeden satir silinmeli
+RAPOR: 22-onceliklendirme.md guncellendi (329 satir) — P0-7 duzeltildi, P0-8..P0-11 ve P1-6 eklendi
+KAPSAM: .ps1/.cmd/BENIOKU.md'a dokunmadin

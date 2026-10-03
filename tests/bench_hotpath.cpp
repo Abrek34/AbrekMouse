@@ -15,6 +15,7 @@
 #include <fstream>
 #include <cmath>
 #include <map>
+#include <filesystem>
 
 using namespace rawaccel;
 
@@ -196,6 +197,46 @@ double run_config_median(const char* name, int runs, int iterations,
 }
 
 int main(int argc, char** argv) {
+    // C2 (L20-CRIT-2): baseline path resolution — no hard-coded absolute path.
+    // Priority: explicit `--baseline PATH` → BENCH_BASELINE env var
+    // (scripts/bench_hotpath.sh exports it) → paths relative to the executable
+    // (build-manual/bench_hotpath → ../tests/perf_baseline.json) → paths
+    // relative to CWD.  The first existing candidate wins;
+    // weakly_canonical() resolves it to a usable absolute path.
+    std::string baseline_override;
+    auto resolve_baseline_path = [&]() -> std::string {
+        namespace fs = std::filesystem;
+        std::vector<std::string> candidates;
+        if (!baseline_override.empty()) candidates.push_back(baseline_override);
+        if (const char* env = std::getenv("BENCH_BASELINE"))
+            if (*env) candidates.emplace_back(env);
+
+        std::error_code ec;
+        if (argv[0] && *argv[0]) {
+            fs::path exe = fs::absolute(fs::path(argv[0]), ec);
+            if (!ec) {
+                fs::path dir = exe.parent_path();
+                candidates.push_back((dir / "perf_baseline.json").string());
+                candidates.push_back((dir / "../tests/perf_baseline.json").string());
+                candidates.push_back((dir / "tests/perf_baseline.json").string());
+            }
+        }
+        fs::path cwd = fs::current_path(ec);
+        if (!ec) {
+            candidates.push_back((cwd / "tests/perf_baseline.json").string());
+            candidates.push_back((cwd / "perf_baseline.json").string());
+        }
+        for (const auto& c : candidates) {
+            if (fs::exists(c)) {
+                std::error_code ec2;
+                fs::path canon = fs::weakly_canonical(c, ec2);
+                return ec2 ? c : canon.string();
+            }
+        }
+        return candidates.empty() ? std::string("tests/perf_baseline.json")
+                                  : candidates.front();
+    };
+
     // Parse arguments - handle flags first, then positional args
     int runs = 3;
     bool positive_control = false;
@@ -213,6 +254,11 @@ int main(int argc, char** argv) {
             positive_control = true;
         } else if (std::strcmp(argv[i], "--json") == 0) {
             json_output = true;
+        } else if (std::strcmp(argv[i], "--baseline") == 0) {
+            if (i + 1 < argc) {
+                baseline_override = argv[i + 1];
+                ++i;
+            }
         } else if (std::strcmp(argv[i], "--min-seconds") == 0) {
             if (i + 1 < argc) {
                 min_seconds = std::atof(argv[i + 1]);
@@ -224,7 +270,7 @@ int main(int argc, char** argv) {
     }
 
     // Load baseline for adaptive iterations
-    std::string baseline_path = "/home/a/Masaüstü/AbrekMouse-main/tests/perf_baseline.json";
+    std::string baseline_path = resolve_baseline_path();
     std::map<std::string, double> baseline = parse_baseline_json(baseline_path);
 
     // Config names in order

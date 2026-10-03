@@ -228,3 +228,147 @@ AJ1 tek toplu commit atacak. P102'de (Lane B) **düzeltme bile istenmedi** —
 önce kanıt toplansın, sonra neyin değişeceğine birlikte karar verelim.
 (`include/` değişikliği oracle'i + 3-backend SIMD eşliğini gerektirir;
 Lane B'de kör bir düzeltme birden çok kapıyı etkiler.)
+
+---
+---
+
+# ⭐ M101 — PROJE DEĞİŞTİ: CS2 / WINDOWS 11 AYAR PAKETİ
+
+**Bu bölüm, yukarıdaki tüm M100 içeriğinden daha yenidir ve geçerlidir.**
+AbrekMouse projesi (P101…P155, 7/7 kapı yeşil, HEAD `ea39e5bc`) **KAPANDI VE TESLİM EDİLDİ.**
+Artık o projeye dokunulmaz. Yukarıdaki bölümler tarihsel kayıttır.
+
+**Yeni proje kökü:** `/home/a/Masaüstü/CS2-Optimizasyon-Win11`
+
+| | |
+|---|---|
+| Teslim | `CS2_Optimizasyonu.cmd` (tek tık) · `GeriAl.cmd` · `Betikler/kur.ps1` (881) · `geri-al.ps1` (323) · `kontrol.ps1` (205) · `BENIOKU.md` (356) |
+| Donanım | i9-9900K (8C/16T) · RTX 3070 · ASUS Z390-A PRO · DDR4 4000 CL18 · Windows 11 |
+| ⭐ Tek kaynak | `GOREV-TANIMI.md` — proje, seritler, kanıt kuralı, düzeltme kaydı (§8), iş havuzu (§6) |
+| Kapsam dışı | Steam ve oyun-içi ayarlar (kullanıcı açıkça istemedi) |
+
+## ⭐ Serit tablosu (Ayrı — çakışma yok)
+
+| Ajan | Görev | Sadece dokunacağı dosya |
+|---|---|---|
+| **AJ1** | Kod yazımı, entegrasyon, gerçeklik denetimi | `Betikler/*.ps1`, `*.cmd`, `BENIOKU.md`, `GOREV-TANIMI.md` |
+| **AJ2** | ⭐ **Sayı denetçisi** — her sayı kaynağına kadar | `_Arastirma/09-sayi-denetimi.md` |
+| **AJ3** | ⭐ **Geri alma round-trip testi** | `_Arastirma/10-geri-alma-testi/` |
+| **AJ4** | ⭐ **Belge/betik tutarlılığı** — "yapmıyoruz" dediklerimiz yapıyor muyuz? | `_Arastirma/11-belge-tutarlilik.md` |
+| **AJ5** | ⭐ **Servis varsayılan doğrulaması** | `_Arastirma/12-hizmet-varsayilan-denetimi.md` |
+
+⛔ **İstisnasız:** `.ps1` / `.cmd` / `BENIOKU.md` dosyalarına **sadece AJ1** dokunur.
+Hata bulursan → **raporuna** yaz. Düzeltme AJ1'in.
+
+## ⭐⭐ Doğrulanmamış olan (her ajan bilmeli)
+
+Bu betikler **bir Linux makinesinde yazıldı.** Burada:
+❌ Windows yok · ❌ PowerShell yok (`pwsh` kurulu değil) · ❌ CS2 yok · ❌ RTX 3070 yok
+
+Bu yüzden:
+- Betiklerin **çalıştığı bilinmiyor.**
+- **Tek bir FPS sayısı ölçülmedi, ölçülemez.**
+
+Bu paket **imzalı ürün değil, araştırma çıktısıdır.** Bu cümle `BENIOKU.md`'de
+duruyor ve **silinmeyecek.**
+
+## ⭐ M101'de bulunan ve düzeltilen 8 ölümcül hata
+
+AJ3'ün yazdığı kod incelemesi betiğimde 8 ölümcül hata buldu; **hepsi kapandı**
+(`.aihaberlesme` kanallarında + `GOREV-TANIMI.md` §8'de kayıtlı). İkisi bağımsız
+doğrulandı:
+
+| # | Bulgu | Doğrulama |
+|---|---|---|
+| Ö-1 | `Win32_Service.StartMode` → **`'Auto'`** döner, `'Automatic'` değil → tablo hiç eşleşmiyor → **7 hizmet hiç kapatılmıyordu**; log "bilinçli güvenlik kararı" yazıyordu | MS WMI şeması |
+| Ö-2 | `Set-Service -StartupType AutomaticDelayedStart` **PS 5.1'de geçersiz** → SysMain'in varsayılan yolu hep hata | "only available with PowerShell 6+" |
+
+📌 **Ders (gelecek turlar için):** *yazan kişi kendi kodunu denetleyemez.*
+
+## M101 düzeltmeleri sonrası durum
+
+- 4 betikte sözdizimi denge denetimi: **temiz** (`_Arastirma/ps-denge.py`) — ama bu
+  **bir ayrıştırıcı değil**, sadece denge denetleyicisi. "Çalışır" demez.
+- Araştırma 3 kararı ters çevirdi → o ayarlar **varsayılan kapalı**:
+  `GlobalTimerResolutionRequests` (ölçüldü, FPS'i hafifçe düşürdü) · MMCSS ·
+  `Win32PrioritySeparation`. Aynı mantıkla popüler "min processor state = **%100**"
+  önerisine uyulmadı, **%5** kullanıldı.
+- ⭐ En yüksek getirili kalem scriptin erişemediği yerde: **XMP**. 9900K resmî
+  DDR4-2666 destekliyor; belgelenmiş vakada RAM 2133'te koşuyordu, XMP açılınca
+  **~100 FPS**. Ölçülebilir tek gerçek ölçüm bu.
+
+📌 **Rapor verme:** `bash .aihaberlesme/raporla.sh <aj-no> YENI-PROJE "durum" "satir" ...`
+
+---
+
+# 🔴 M101 — BAĞIMSIZ DENETİM TURU (20 alt-ajan + AJ2 + AJ4)
+
+**Tarih:** 01 eylül 2026 · **Tür:** DENETİM (düzeltme yok) · **AJ3: YOK**
+
+## Neden bu tur?
+
+AJ3 (bağımsız denetçi) bu turda başka projede. Onun rolü **20 alt-ajan +
+AJ2 + AJ4** ile geçici olarak dolduruldu. AJ1 bu turda **hiçbir kodu
+değiştirmedi** — rolü yalnız görev dağıtımı ve bulguların **bağımsız
+yeniden doğrulanması**.
+
+Brifing: `.aihaberlesme/DENETIM-BRIFING.md`
+
+## ⭐ 20 LANE (tek dosya = tek sahip; çakışma için satır aralığı kırıldı)
+
+| Lane | Konu | Dosyalar / satır aralığı |
+|---|---|---|
+| L01 | Classic + Power algoritmaları | `include/accel-classic.hpp`, `accel-power.hpp` |
+| L02 | Natural/Synchronous/Lookup/Jump | `include/accel-{natural,synchronous,lookup,jump}.hpp` |
+| L03 | Çekirdek tipler + vektör | `include/{rawaccel,rawaccel-base,math-vec2}.hpp` |
+| L04 | SIMD doğruluğu + parity kapısı | `include/simd_math.hpp`, `tests/simd_parity.cpp`, `run_simd_parity.sh` |
+| L05 | Config şema + yükle/kaydet | `include/{config,presets}.hpp`, `src/config.cpp` |
+| L06 | HID++ protokol + uygulama | `include/logitech_hidpp.hpp`, `src/logitech_hidpp.cpp` |
+| L07 | Cihaz kimliği + alıcı keşfi | `include/logitech_quirks.hpp`, `src/logitech_receiver.cpp` |
+| L08 | Daemon: algılama/başlatma | `daemon/daemon.cpp` **1–1987** |
+| L09 | Daemon: SICAK YOL | `daemon/daemon.cpp` **1988–2900** |
+| L10 | Daemon: gecikme + IPC | `daemon/daemon.cpp` **2901–3601**, `lat_stats.hpp`, `motion_math.hpp` |
+| L11 | Daemon giriş + sınıf bildirimi | `daemon/main.cpp`, `daemon/daemon.hpp` |
+| L12 | CLI: argüman + profil | `cli/main.cpp` **1–1374** |
+| L13 | CLI: export/diff/import/durum | `cli/main.cpp` **1375–2264** |
+| L14 | CLI: HID++ komutları | `cli/main.cpp` **2265–3297** |
+| L15 | GUI çekirdek + IPC + odak | `gui/{main.cpp,app_state.hpp,daemon_comm,kwin_focus}.inl` |
+| L16 | GUI widget + senkron + i18n | `gui/{ui_builder,widgets_sync,tr}.inl` |
+| L17 | GUI panel/profil/grafik/test | `gui/{hidpp_panel,profile_mgr,devices,graph,mouse_test}.inl` |
+| L18 | Logitech/HID++ testleri | `tests/test_accel.cpp` **1–1217**, `tests/tr_coverage.cpp` |
+| L19 | Algoritma + config testleri | `tests/test_accel.cpp` **1218–4635** |
+| L20 | ⭐ Test KAYITLARI + oracle + koşu hattı | `tests/test_accel.cpp` **4636–10127**, `tests/oracle/**`, `e2e_harness.cpp`, `bench_hotpath.cpp`, `run_*.sh` |
+
+**AJ2 → LANE-A1:** `CMakeLists.txt`, `scripts/**`, `.github/**`, `packaging/**`,
+`build-manual/**`, `.gitignore`, `config/**` — kurulum/derleme/CI/servis
+**AJ4 → LANE-A2:** `README.md`, `CHANGELOG.md`, `AGENTS.md`, `Bug Hata Raporları.md`,
+`FIX_LOG.md`, `docs/**` — **belge ↔ kod tutarlılığı**
+
+## ⭐ AJ1'in kendi bölgesi (kimse dokunmadı)
+
+`olcum/**`, `.aihaberlesme/**` — ölçüm araçlarının kendi denetimi + bulguların
+yeniden doğrulanması.
+
+## ⏳ Beklenen çıktı biçimi
+
+Her ajan: `.aihaberlesme/mesajlar/denetim-L<NN>.md` (alt-ajanlar),
+`aj2-M101-log.md`, `aj4-M101-log.md`. Rapor brifing §6 formatında.
+`KAPI` ve `TEMSIL SINIRI` alanları **her zaman** dolu olmalı.
+
+## ⛔ Bu turun altın kuralı
+
+**"Yeşil" bir iddia, kendi kanıtını üretmedikçe kabul edilmez.**
+AJ1 `CRIT`/`HIGH` bulguları kabul etmeden önce **kendi komutuyla tekrar ölçer.**
+
+---
+
+## ⚠️ KAYIT: `.aihaberlesme/yeni_proje/` KİRLİLİĞİ
+
+Bu klasör **bu projeye ait değil** — CS2 projesinin **bayat bir kopyasıdır**
+(63 fark; yeni araştırma raporları eksik, `betikler/`, `GOREV-TANIMI.md`
+ayrı içerik). Git tarafından **izlenmiyor** (`?? .aihaberlesme/yeni_proje/`).
+
+⛔ Bu turda **hiçbir ajan oraya dokunmadı ve dokunmayacak.** Brifing §7'de
+kapsam dışı olarak ilan edildi.
+
+→ **AJ1'e açık soru:** silinsin mi? Kullanıcı onayı bekleniyor.

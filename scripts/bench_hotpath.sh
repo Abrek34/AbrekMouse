@@ -50,6 +50,12 @@ while [[ $# -gt 0 ]]; do
             THRESHOLD_PCT_OVERRIDE="$2"
             shift 2
             ;;
+        --baseline)
+            # C2 (L20-CRIT-2): explicit baseline path; exported to the benchmark
+            # binary as BENCH_BASELINE below.
+            BASELINE_FILE="$2"
+            shift 2
+            ;;
         --update-baseline)
             UPDATE_BASELINE=true
             shift
@@ -85,6 +91,14 @@ fi
 # the requested file was never created. Respect an already-set OUTPUT_FILE; only
 # fall back to the deprecated positional form, then to the default.
 OUTPUT_FILE="${OUTPUT_FILE:-${POS_OUTPUT:-$PROJECT_ROOT/bench_hotpath_results.txt}}"
+
+# C2 (L20-CRIT-2): hand the benchmark binary the baseline path this script
+# already resolved.  The binary used to hard-code a developer's absolute path
+# (/home/a/...), so on any other machine (CI included) it could not find the
+# baseline and failed with "ERROR: Baseline missing required config" before it
+# could even measure.  The env var is the explicit contract; a `--baseline`
+# flag is also supported if a caller wants to point at another file.
+export BENCH_BASELINE="$BASELINE_FILE"
 
 # Build benchmark if needed
 if [[ ! -f "$BENCH_BIN" ]]; then

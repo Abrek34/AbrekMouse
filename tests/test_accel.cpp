@@ -55,6 +55,21 @@ static int  g_skipped_sections = 0;
 static int  g_sections_matched = 0;
 static const char* g_section = "";
 
+// C1 (L20-CRIT-1) — test kayıt defteri denetimi.
+//
+// Bu dosya tarihsel olarak `return g_failed ? 1 : 0;` dönüyordu ve kaç test
+// FONKSİYONU çağrıldığını hiçbir yerde kayıtlı tutmuyordu: 151 çağrının TAMAMI
+// silinse bile `0/0 geçti` + rc=0 çıkıyordu (sessiz yeşil).  `RUN_TEST()`
+// sarmalayıcısı her çağrıyı sayar; main sonunda bu sayı pinlenmiş değerle
+// karşılaştırılır ve sapma META-FAIL + rc=1 üretir.
+//
+// ⚠️ BU SAYI BİLİNÇLİ PİNLENMİŞTİR: yeni test eklerken (ve main'e çağrısını
+// eklerken) GÜNCELLE; bir test çağrısını silersen gate kırmızıya döner.
+// --filter / --list modları kasıtlı olarak az fonksiyon koşar, bu yüzden
+// meta-kontrol yalnız TAM koşuda uygulanır.
+static int  g_test_functions_run = 0;
+static constexpr int EXPECTED_TEST_FUNCTIONS = 151;
+
 static bool        g_section_active = true;   // current section runs assertions
 static bool        g_list_only      = false;  // --list: print names, skip asserts
 static bool        g_quiet          = false;  // --quiet: suppress PASS lines
@@ -108,6 +123,11 @@ static std::regex  g_filter_regex;
                      __FILE__, __LINE__, #a, #b, std::fabs(_a - _b), _t, g_section); \
     } \
 } while(0)
+
+// C1 (L20-CRIT-1): her test fonksiyonu çağrısını sayan kayıt defteri sarmalı.
+// main'deki 151 çağrının TAMAMI RUN_TEST(...) biçimindedir; main sonundaki
+// meta-kontrol bu sayıyı EXPECTED_TEST_FUNCTIONS ile karşılaştırır.
+#define RUN_TEST(fn) do { ++g_test_functions_run; fn(); } while(0)
 
 // ── Yardımcı: koşu başına ayrı geçici dizin (T4/T5) ──────────────────────────
 //
@@ -333,6 +353,11 @@ static void test_logitech_hidpp_notification_classification() {
         auto ev = classify_hidpp_notification(dev, n);
         EXPECT(ev.kind == hidpp_notification_event_kind::battery);
         EXPECT(ev.feature_id == 0x1004);
+        // L18 B-02: the other four battery cases assert has_value() OUTSIDE
+        // the conditional; this one did not, so a notification that carried no
+        // battery at all still passed (mutations kept the gate green).  Match
+        // the other cases: the battery must be present, THEN the level checked.
+        EXPECT(ev.battery.has_value());
         if (ev.battery) EXPECT(ev.battery->level == 255);
     }
 
@@ -800,8 +825,13 @@ static void test_logitech_quirks_model_id_shape() {
             info.usb_id          = take_id(0x08);
 
             const logitech_quirks* q = find_logitech_quirks(info);
-            if (q)
-                EXPECT(q != &LOGITECH_QUIRKS[2].quirks);  // never the "32" row
+            // L18 B-01: the old `if (q) EXPECT(...)` form ran ZERO assertions,
+            // because for every synthesized 12-char id q is nullptr (that is
+            // the expected outcome of this section).  Compare unconditionally:
+            // `nullptr != &row` is true, so the guard rail now carries the
+            // assertion it claims to carry — one per loop iteration (16 flag
+            // values x 6 offsets = 96 live assertions).
+            EXPECT(q != &LOGITECH_QUIRKS[2].quirks);  // never the "32" row
         }
     }
 
@@ -2594,13 +2624,36 @@ static void test_atomic_write() {
 
     save_config(cfg, atomic_path);
 
+    // C6 (L19-05): the section name says "atomic config write" but the only
+    // old assertion was "no .tmp leftover" — which is vacuously true when no
+    // tmp file is ever created (mutation-proven: replacing tmp+rename with a
+    // direct truncating write kept this section green).  Publish IS a rename,
+    // so the target's inode must CHANGE between two saves.  Guard the
+    // comparison: some filesystems (network/FUSE) can report unstable inodes;
+    // if either stat fails, skip the inode claim with a note.
+    struct stat st_before {};
+    bool have_before = (stat(atomic_path.c_str(), &st_before) == 0);
+
+    // The file must become visible atomically: re-save with a different name
+    // payload and prove the inode changed (rename) rather than the old inode
+    // being truncate-written in place.
+    cfg.profiles[0].name = "atomic_test_2";
+    save_config(cfg, atomic_path);
+
+    if (have_before) {
+        struct stat st_after {};
+        if (stat(atomic_path.c_str(), &st_after) == 0) {
+            EXPECT(st_after.st_ino != st_before.st_ino); // rename, not in-place truncate
+        }
+    }
+
     // No .tmp (any pid suffix) may exist after a successful save
     EXPECT(tmp_leftover_count(atomic_path) == 0); // tmp files gone (renamed to final)
 
     // Final file must exist and be valid JSON
     app_config reloaded = load_config(atomic_path);
     EXPECT(!reloaded.profiles.empty());
-    EXPECT(reloaded.profiles[0].name == "atomic_test");
+    EXPECT(reloaded.profiles[0].name == "atomic_test_2");
 
     std::remove(atomic_path.c_str());
 }
@@ -2832,6 +2885,24 @@ static void test_lat_stats() {
         EXPECT(ls.over == 1);
         // max_us must reflect the overflow sample
         EXPECT(ls.max_us > lat_stats::RANGE_US);
+        // L10-09: this block recorded an overflow sample but never CALLED
+        // percentile(), so the mutation "return 0.0 instead of max_us" stayed
+        // green.  Assert the percentile contract explicitly:
+        //   p50 of {1.0, 600.0} must be > 0 and <= max_us, and the old
+        //   "everything over range -> max_us" shortcut is gone for p25.
+        double p50 = ls.percentile(50);
+        EXPECT(p50 > 0.0);
+        EXPECT(p50 <= ls.max_us + 1e-9);
+        // L10-08: p25 in a mixed distribution must be below max (the old code
+        // returned max_us for every percentile landing in the overflow region).
+        lat_stats mixed;
+        mixed.record(2.0);
+        for (int i = 0; i < 99; i++) mixed.record(600.0 + i * 44.0); // 600..4956
+        double pm25 = mixed.percentile(25);
+        double pm50 = mixed.percentile(50);
+        EXPECT(pm25 <= pm50 + 1e-9);          // monotone
+        EXPECT(pm50 < mixed.max_us);          // not pinned to max
+        EXPECT(pm50 < mixed.avg_us() * 2.0);  // no p50 > avg absurdity
     }
 
     // ── snapshot_and_reset atomically copies + resets ─────────────────────
@@ -9909,199 +9980,199 @@ int main(int argc, char** argv) {
 
     if (!g_list_only) std::printf("=== RawAccel Linux Birim Testleri ===\n");
 
-    test_noaccel();
-    test_classic();
-    test_natural();
-    test_jump();
-    test_synchronous();
-    test_lookup();
-    test_power();
-    test_p81_power_io_fixes();
-    test_accel_union();
-    test_json_roundtrip();
-    test_json_roundtrip_lut();
-    test_json_roundtrip_lut_mode_switch();
-    test_file_roundtrip();
-    test_save_config_relative_path();
-    test_monotonic();
-    test_power_monotonic();
-    test_classic_cap_modes();
-    test_modifier();
-    test_edge_guards();
-    test_modifier_end_to_end();
-    test_speed_processor();
-    test_config_error_paths();
-    test_input_validation();
-    test_multi_profile_roundtrip();
-    test_atomic_write();
-    test_ipc_json_roundtrip();
-    test_motion_math();
-    test_nonfinite_time_does_not_poison_smoothers();
-    test_lat_stats();
+    RUN_TEST(test_noaccel);
+    RUN_TEST(test_classic);
+    RUN_TEST(test_natural);
+    RUN_TEST(test_jump);
+    RUN_TEST(test_synchronous);
+    RUN_TEST(test_lookup);
+    RUN_TEST(test_power);
+    RUN_TEST(test_p81_power_io_fixes);
+    RUN_TEST(test_accel_union);
+    RUN_TEST(test_json_roundtrip);
+    RUN_TEST(test_json_roundtrip_lut);
+    RUN_TEST(test_json_roundtrip_lut_mode_switch);
+    RUN_TEST(test_file_roundtrip);
+    RUN_TEST(test_save_config_relative_path);
+    RUN_TEST(test_monotonic);
+    RUN_TEST(test_power_monotonic);
+    RUN_TEST(test_classic_cap_modes);
+    RUN_TEST(test_modifier);
+    RUN_TEST(test_edge_guards);
+    RUN_TEST(test_modifier_end_to_end);
+    RUN_TEST(test_speed_processor);
+    RUN_TEST(test_config_error_paths);
+    RUN_TEST(test_input_validation);
+    RUN_TEST(test_multi_profile_roundtrip);
+    RUN_TEST(test_atomic_write);
+    RUN_TEST(test_ipc_json_roundtrip);
+    RUN_TEST(test_motion_math);
+    RUN_TEST(test_nonfinite_time_does_not_poison_smoothers);
+    RUN_TEST(test_lat_stats);
 
     // New edge-case tests
-    test_natural_decay_zero();
-    test_extreme_inputs();
-    test_classic_degenerate();
-    test_power_zero_exponent();
-    test_lookup_edge_cases();
-    test_modifier_zero_time();
-    test_ema_smoother_stability();
-    test_subpixel_sign();
-    test_sanitize_extremes();
-    test_lut_sort_on_sanitize();
-    test_cfg_p54_guards();
-    test_lut_sort_json_roundtrip();
-    test_motion_math_overflow();
-    test_accel_args_sanitize();
-    test_raw_passthrough_json();
+    RUN_TEST(test_natural_decay_zero);
+    RUN_TEST(test_extreme_inputs);
+    RUN_TEST(test_classic_degenerate);
+    RUN_TEST(test_power_zero_exponent);
+    RUN_TEST(test_lookup_edge_cases);
+    RUN_TEST(test_modifier_zero_time);
+    RUN_TEST(test_ema_smoother_stability);
+    RUN_TEST(test_subpixel_sign);
+    RUN_TEST(test_sanitize_extremes);
+    RUN_TEST(test_lut_sort_on_sanitize);
+    RUN_TEST(test_cfg_p54_guards);
+    RUN_TEST(test_lut_sort_json_roundtrip);
+    RUN_TEST(test_motion_math_overflow);
+    RUN_TEST(test_accel_args_sanitize);
+    RUN_TEST(test_raw_passthrough_json);
 
     // Fuzz, edge-case, and stress tests
-    test_fuzz_accel_args();
-    test_fuzz_unsanitized_motion_math();
-    test_fuzz_json_roundtrip();
-    test_all_modes_extreme_speeds();
-    test_ema_extreme_time();
-    test_subpixel_tiny_deltas();
-    test_subpixel_negative_deltas();
-    test_modifier_all_flags();
-    test_modifier_separate_mode();
-    test_stress_remainder_drift();
-    test_stress_alternating_direction();
-    test_power_extreme_params();
-    test_lookup_extreme_lut();
-    test_natural_extreme_params();
-    test_synchronous_extreme();
+    RUN_TEST(test_fuzz_accel_args);
+    RUN_TEST(test_fuzz_unsanitized_motion_math);
+    RUN_TEST(test_fuzz_json_roundtrip);
+    RUN_TEST(test_all_modes_extreme_speeds);
+    RUN_TEST(test_ema_extreme_time);
+    RUN_TEST(test_subpixel_tiny_deltas);
+    RUN_TEST(test_subpixel_negative_deltas);
+    RUN_TEST(test_modifier_all_flags);
+    RUN_TEST(test_modifier_separate_mode);
+    RUN_TEST(test_stress_remainder_drift);
+    RUN_TEST(test_stress_alternating_direction);
+    RUN_TEST(test_power_extreme_params);
+    RUN_TEST(test_lookup_extreme_lut);
+    RUN_TEST(test_natural_extreme_params);
+    RUN_TEST(test_synchronous_extreme);
 
     // R6 regression tests
-    test_dpi_ratio_zero_guard();
-    test_lp_distance_zero_vector();
+    RUN_TEST(test_dpi_ratio_zero_guard);
+    RUN_TEST(test_lp_distance_zero_vector);
 
     // R16 (AJ1 §5): lp_distance non-finite bileşen guard'ı + asimetri kapısı
-    test_lp_distance_nonfinite_components();
+    RUN_TEST(test_lp_distance_nonfinite_components);
 
     // R7 deep-dive tests
-    test_ema_extreme_halflife();
-    test_pipeline_nan_injection();
-    test_classic_io_degenerate_cap();
-    test_classic_in_degenerate_cap_naninf();
-    test_classic_legacy_in_cap_boundary();
-    test_motion_math_clamp_remainder_reset();
-    test_save_config_durability_path();
-    test_power_output_offset();
-    test_directional_weight_boundary();
+    RUN_TEST(test_ema_extreme_halflife);
+    RUN_TEST(test_pipeline_nan_injection);
+    RUN_TEST(test_classic_io_degenerate_cap);
+    RUN_TEST(test_classic_in_degenerate_cap_naninf);
+    RUN_TEST(test_classic_legacy_in_cap_boundary);
+    RUN_TEST(test_motion_math_clamp_remainder_reset);
+    RUN_TEST(test_save_config_durability_path);
+    RUN_TEST(test_power_output_offset);
+    RUN_TEST(test_directional_weight_boundary);
 
     // R9 mükemmellik testleri
-    test_subpixel_cumulative_drift();
-    test_classic_gain_mode_cap_consistency();
-    test_natural_gain_formula();
-    test_classic_natural_deep_accuracy();
-    test_natural_reference_values();
+    RUN_TEST(test_subpixel_cumulative_drift);
+    RUN_TEST(test_classic_gain_mode_cap_consistency);
+    RUN_TEST(test_natural_gain_formula);
+    RUN_TEST(test_classic_natural_deep_accuracy);
+    RUN_TEST(test_natural_reference_values);
 
     // R10 — EMA smoother, NaN propagation, event batching, config edge cases
-    test_ema_smoother_halflife();
-    test_ema_smoother_zero_time();
-    test_linear_ema_smoother();
-    test_nan_propagation_all_modes();
-    test_nan_propagation_pathological_params();
-    test_event_batching_accumulation();
-    test_event_batching_split_vs_combined();
-    test_speed_processor_all_distance_modes();
-    test_speed_processor_smoothing();
-    test_syn_dropped_reset_behavior();
-    test_syn_dropped_event_stream();
-    test_config_profiles_over_max();
-    test_config_empty_profiles();
-    test_config_missing_active_profile();
-    test_config_profiles_wrong_type_rejected();
-    test_config_save_preserves_permission_bits();
-    test_config_extreme_values();
-    test_config_duplicate_device_id();
-    test_check_duplicate_device_ids();
-    test_sanitize_nan_fields();
-    test_modify_subnormal_time();
+    RUN_TEST(test_ema_smoother_halflife);
+    RUN_TEST(test_ema_smoother_zero_time);
+    RUN_TEST(test_linear_ema_smoother);
+    RUN_TEST(test_nan_propagation_all_modes);
+    RUN_TEST(test_nan_propagation_pathological_params);
+    RUN_TEST(test_event_batching_accumulation);
+    RUN_TEST(test_event_batching_split_vs_combined);
+    RUN_TEST(test_speed_processor_all_distance_modes);
+    RUN_TEST(test_speed_processor_smoothing);
+    RUN_TEST(test_syn_dropped_reset_behavior);
+    RUN_TEST(test_syn_dropped_event_stream);
+    RUN_TEST(test_config_profiles_over_max);
+    RUN_TEST(test_config_empty_profiles);
+    RUN_TEST(test_config_missing_active_profile);
+    RUN_TEST(test_config_profiles_wrong_type_rejected);
+    RUN_TEST(test_config_save_preserves_permission_bits);
+    RUN_TEST(test_config_extreme_values);
+    RUN_TEST(test_config_duplicate_device_id);
+    RUN_TEST(test_check_duplicate_device_ids);
+    RUN_TEST(test_sanitize_nan_fields);
+    RUN_TEST(test_modify_subnormal_time);
 
     // R12 — untested code path coverage
-    test_classic_sign_flip();
-    test_classic_linear_path_cap();
-    test_power_cap_branch();
-    test_modifier_rotation_snap_combined();
-    test_speed_processor_lp_mode();
-    test_lookup_max_capacity();
-    test_ema_coefficient_zero();
-    test_modifier_directional_weight_blend();
-    test_classic_io_sign_with_cap();
-    test_power_offset_x_guard();
-    test_speed_clamp_path();
-    test_dir_mul_negative_direction();
-    test_synchronous_power_lt_one();
-    test_natural_legacy_mode();
-    test_config_output_dpi_sanitize();
-    test_rotation_negative_normalization();
-    test_json_int_overflow_safe();
+    RUN_TEST(test_classic_sign_flip);
+    RUN_TEST(test_classic_linear_path_cap);
+    RUN_TEST(test_power_cap_branch);
+    RUN_TEST(test_modifier_rotation_snap_combined);
+    RUN_TEST(test_speed_processor_lp_mode);
+    RUN_TEST(test_lookup_max_capacity);
+    RUN_TEST(test_ema_coefficient_zero);
+    RUN_TEST(test_modifier_directional_weight_blend);
+    RUN_TEST(test_classic_io_sign_with_cap);
+    RUN_TEST(test_power_offset_x_guard);
+    RUN_TEST(test_speed_clamp_path);
+    RUN_TEST(test_dir_mul_negative_direction);
+    RUN_TEST(test_synchronous_power_lt_one);
+    RUN_TEST(test_natural_legacy_mode);
+    RUN_TEST(test_config_output_dpi_sanitize);
+    RUN_TEST(test_rotation_negative_normalization);
+    RUN_TEST(test_json_int_overflow_safe);
 
     // R13 — lat_stats move safety + dpi_factor pre-compute
-    test_lat_stats_move_semantics();
-    test_dpi_factor_precompute();
-    test_output_dpi_applied();
+    RUN_TEST(test_lat_stats_move_semantics);
+    RUN_TEST(test_dpi_factor_precompute);
+    RUN_TEST(test_output_dpi_applied);
 
     // R14 — magnitude hypot overflow safety
-    test_magnitude_hypot();
+    RUN_TEST(test_magnitude_hypot);
 
     // R15 — comprehensive hardening tests
-    test_lut_binary_search_boundaries();
-    test_modifier_full_pipeline_stress();
-    test_ema_long_sequence_stability();
-    test_config_boundary_roundtrip();
-    test_rotate_direction_identity();
-    test_vec2_helpers_exhaustive();
-    test_lat_stats_stress();
-    test_all_modes_sanitize_init_apply();
-    test_config_unicode_names();
-    test_synchronous_edge_cases();
+    RUN_TEST(test_lut_binary_search_boundaries);
+    RUN_TEST(test_modifier_full_pipeline_stress);
+    RUN_TEST(test_ema_long_sequence_stability);
+    RUN_TEST(test_config_boundary_roundtrip);
+    RUN_TEST(test_rotate_direction_identity);
+    RUN_TEST(test_vec2_helpers_exhaustive);
+    RUN_TEST(test_lat_stats_stress);
+    RUN_TEST(test_all_modes_sanitize_init_apply);
+    RUN_TEST(test_config_unicode_names);
+    RUN_TEST(test_synchronous_edge_cases);
 
     // P86 — synchronous gain_apply UB fix regression
-    test_synchronous_huge_speed_no_ub();
+    RUN_TEST(test_synchronous_huge_speed_no_ub);
 
     // P91 — denormal/extreme-input hardening + known-deviation boundaries
-    test_p91_denormal_extreme_inputs();
-    test_p91_known_deviation_boundaries();
+    RUN_TEST(test_p91_denormal_extreme_inputs);
+    RUN_TEST(test_p91_known_deviation_boundaries);
 
     // P96 — DERİN TARAMA: accel accuracy sweep + power/jump fixes regression
-    test_p96_power_io_degenerate_cap();
-    test_p96_jump_smooth_extremes_finite();
-    test_p96_param_extreme_sweep();
+    RUN_TEST(test_p96_power_io_degenerate_cap);
+    RUN_TEST(test_p96_jump_smooth_extremes_finite);
+    RUN_TEST(test_p96_param_extreme_sweep);
 
     // CUR-3 — power GAIN overflow guard clamp (cap ceiling, not identity snap)
-    test_cur3_power_inf_guard();
+    RUN_TEST(test_cur3_power_inf_guard);
 
     // P99 — config-layer deep-scan regressions
-    test_p99_config_guards();
+    RUN_TEST(test_p99_config_guards);
 
     // P107 — set-param domain contract (CLI accepted-domain values survive sanitize)
-    test_p107_param_domain();
+    RUN_TEST(test_p107_param_domain);
 
     // O31-C2/C3 — config-layer regressions (LUT length pin + numeric gain/raw)
-    test_o31_config_c2_c3();
+    RUN_TEST(test_o31_config_c2_c3);
 
     // P106 — per-parameter-family sınır (uç değer) regresyon tablosu
-    test_p106_extremes_table();
+    RUN_TEST(test_p106_extremes_table);
 
     // P119 FAO-1 — sync motivity<1 × smooth grid (LEGACY math-ref pin + GAIN LUT envelope)
-    test_fao1_sync_motivity_grid();
+    RUN_TEST(test_fao1_sync_motivity_grid);
 
     // Logitech HID++ tests
-    test_logitech_receiver_discovery();
-    test_logitech_hidpp_packets();
-    test_logitech_hidpp_notification_classification();
-    test_logitech_hidpp_hardware_controls();
-    test_logitech_hidraw_discovery();
-    test_logitech_quirks_model_id_shape();
-    test_hidpp_short_payload_budget();
-    test_hidpp_hw_sync_guard();
-    test_hidpp_hw_queue_ownership();
-    test_hidpp_hw_queue_dedup();
-    test_hidpp_hw_queue_fifo();
+    RUN_TEST(test_logitech_receiver_discovery);
+    RUN_TEST(test_logitech_hidpp_packets);
+    RUN_TEST(test_logitech_hidpp_notification_classification);
+    RUN_TEST(test_logitech_hidpp_hardware_controls);
+    RUN_TEST(test_logitech_hidraw_discovery);
+    RUN_TEST(test_logitech_quirks_model_id_shape);
+    RUN_TEST(test_hidpp_short_payload_budget);
+    RUN_TEST(test_hidpp_hw_sync_guard);
+    RUN_TEST(test_hidpp_hw_queue_ownership);
+    RUN_TEST(test_hidpp_hw_queue_dedup);
+    RUN_TEST(test_hidpp_hw_queue_fifo);
 
     // P114 BUG-A: a --filter that matched nothing silently reported "0/0 geçti"
     // + exit 0 (a typo hid the whole suite behind a green gate). No match is a
@@ -10122,6 +10193,20 @@ int main(int argc, char** argv) {
         std::printf(" (%d section eşleşti, %d atlandı)",
                     g_sections_matched, g_skipped_sections);
     std::printf(" ===\n");
+
+    // C1 (L20-CRIT-1) — test kayıt defteri denetimi. Yalnızca TAM koşuda
+    // uygulanır: --list ve --filter kasıtlı olarak az fonksiyon koşar.
+    // Bir RUN_TEST satırı silinirse sayı düşer → rc=1; yeni bir test main'e
+    // eklenmeden bırakılırsa sayı artmaz → rc=1 (uyarı).
+    if (!g_list_only && !g_have_filter &&
+        g_test_functions_run != EXPECTED_TEST_FUNCTIONS) {
+        std::fprintf(stderr,
+                     "META-FAIL: %d/%d test fonksiyonu koştu — test kayıt "
+                     "defteri beklenenden farklı (bir RUN_TEST çağrısı "
+                     "silinmiş veya yeni test main'e eklenmemiş olabilir)\n",
+                     g_test_functions_run, EXPECTED_TEST_FUNCTIONS);
+        return 1;
+    }
 
     return g_failed ? 1 : 0;
 }

@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	const uint16_t voltage = read_be16(notification.payload.data());	const uint16_t voltage = (static_cast<uint16_t>(notification.payload.data()[0])\n                            | (static_cast<uint16_t>(notification.payload.data()[1]) << 8)); //MUT	N12 battery_voltage BE16 -> LE16

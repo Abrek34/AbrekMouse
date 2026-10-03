@@ -121,7 +121,17 @@ struct lookup {
         double y = static_cast<double>(pts[1]);
         if (velocity) {
             double x0 = static_cast<double>(pts[0]);
-            if (x0 <= 0) return 0.0; // port guard: avoid div-by-zero
+            // L02-01: a non-positive first point used to `return 0.0` here.
+            // In GAIN (velocity) mode that zero is a MULTIPLIER — the whole
+            // curve below the first point becomes "0 gain", i.e. a completely
+            // dead cursor for a table that merely has a degenerate first X.
+            // Return the identity instead: no division by zero, no dead
+            // mouse, and the constant-first-output behavior is preserved for
+            // valid tables (x0 > 0 still divides).  The differential oracle
+            // never reaches this guard: its lookup tables start at x0 = 0,
+            // and x <= 0 returns 0.0 earlier — for x0 = 0 this branch is
+            // unreachable, for x0 < 0 the binary search cannot fall through.
+            if (x0 <= 0) return 1.0;
             y /= x0;
         }
         return y;

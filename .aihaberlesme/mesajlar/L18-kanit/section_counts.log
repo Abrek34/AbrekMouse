@@ -1,0 +1,22 @@
+Logitech receiver discovery — capability     Sonuç: 11/11
+HID notification classification                Sonuç: 40/40
+Logitech HID packet serialization              Sonuç: 101/101
+Logitech hidraw device discovery               Sonuç: 6/6
+Logitech HID hardware-control rate             Sonuç: 84/84
+Logitech HID battery parsing stays             Sonuç: 7/7
+Logitech HID 1.0 register 0x07                 Sonuç: 3/3
+Logitech HID battery feature/register          Sonuç: 3/3
+Logitech HID firmware and transport-ID         Sonuç: 7/7
+O31-H2 — composed modelId                    Sonuç: 4/4
+O31-H2 — the "32" row                        Sonuç: 0/0
+O31-H2 — the two real 12-char                Sonuç: 7/7
+O31-H1 — onboard sector chunk                Sonuç: 50/50
+O31-H1 — long packet wire layout             Sonuç: 44/44
+O31-D1 — a never-pushed                      Sonuç: 8/8
+O31-D1 — 0 is an unambiguous                 Sonuç: 41/41
+O31-D1 — a changed field                     Sonuç: 4/4
+O31-D1 — a rebuilt transport                 Sonuç: 4/4
+O31-D1 — a full daemon sequence              Sonuç: 2/2
+job transport outlives                         Sonuç: 6/6
+same values twice                              Sonuç: 10/10
+slider drag                                    Sonuç: 6/6

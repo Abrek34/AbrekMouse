@@ -1,0 +1,1 @@
+include/logitech_hidpp.hpp	int         polling_rate = 0;         // 0 = never pushed	int         polling_rate = 1000; //MUT	sentinel polling_rate 0 -> 1000 (mouse_device varsayilani)

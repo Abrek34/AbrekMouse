@@ -1,0 +1,53 @@
+### (H1) MAX_PROFILES enforcement on the SAVE path (doc claims: "Every write path still refuses to go past MAX_PROFILES")
+  load_config(400-profile file) -> retained profiles = 400  (MAX_PROFILES=256, MAX_PROFILES_FILE=65536)
+  save_config(...)  -> wrote profiles = 400
+  => SAVE PATH DOES **NOT** ENFORCE MAX_PROFILES (doc at config.cpp:689-693 / rawaccel-base.hpp:39-42 is FALSE for src/config.cpp:832)
+  load+save 5000-profile file: retained=5000  written back=5000  size=12835111 bytes
+
+### (H2) lut_data without lut_length: silent loss, made permanent by the next save
+  file has lut_data=[10,20,30,40] (4 elements = 2 points) and NO lut_length key
+  load_config -> accel_x.length = 0  data[0..3] = 0 0 0 0
+  re-serialised JSON still contains lut_data? NO   <-- curve is GONE, no error, no warning
+  save_config() then grep the file for the curve values 10.0 / 20.0:
+
+### (H3) newer stored version: is the version preserved AND is the data kept?
+  stored version = "9.9.9" (RAWACCEL_VERSION=1.2.5)
+  after load:  cfg.version = "9.9.9"
+  after save:  file version = "9.9.9"   active_profile = "FUTURE"  accel_x.acceleration = 0.004
+  unknown keys kept? top='NO' in-profile='NO' in-accel='NO'  -> VERSION LIES: file claims 9.9.9 but contains 1.2.5-schema data (unknown keys gone)
+
+### (H4) partial vectors: a PRESENT value silently replaced by the default
+  cap:[500]                -> THROW: [json.exception.parse_error.101] parse error at line 1, column 39: syntax error while parsing object key - unexpected '{'; expected string literal
+  cap:[null,2]             -> THROW: [json.exception.parse_error.101] parse error at line 1, column 39: syntax error while parsing object key - unexpected '{'; expected string literal
+  cap:[24,"x"]             -> THROW: [json.exception.parse_error.101] parse error at line 1, column 39: syntax error while parsing object key - unexpected '{'; expected string literal
+  domain_weights:[3]       -> domain_weights={1,1} (default is {1,1})
+  domain_weights:[null,2]  -> domain_weights={1,2} (default is {1,1})
+  range_weights:[0.5,1,"z"] -> range_weights={0.5,1} (default is {1,1})
+
+### (H5) speed_processor partial object
+  {"whole":false} only -> whole=0 lp_norm=2 ih=0 sh=0 oh=0  (all others silently defaulted)
+  {"lp_norm":7} only   -> whole=1 lp_norm=7  (whole silently defaulted to TRUE)
+
+### (H6) accel_x / profile present but wrong container type
+  accel_x:"oops" -> SILENT: mode=6 len=0  (whole accel block replaced by defaults, no error)
+  profile:42 -> SILENT: inner name='default' all defaults
+
+### (H7) boolean fields fed a non 0/1 integer
+  gain=0   raw_passthrough=0   -> gain=0 raw_passthrough=0
+  gain=1   raw_passthrough=1   -> gain=1 raw_passthrough=1
+  gain=2   raw_passthrough=2   -> gain=1 raw_passthrough=0
+  gain=-1  raw_passthrough=-1  -> gain=1 raw_passthrough=0
+  gain=7   raw_passthrough=7   -> gain=1 raw_passthrough=0
+
+### (H8) top-level booleans + disable with a non-boolean value
+  use_raw_input="yes"  disable="yes"  -> use_raw_input=1 disable=0
+  use_raw_input=1      disable=1      -> use_raw_input=1 disable=0
+  use_raw_input=0      disable=0      -> use_raw_input=1 disable=0
+  use_raw_input=[]     disable=[]     -> use_raw_input=1 disable=0
+
+### (H9) dpi / polling_rate out of domain (silent clamp, no error)
+  dpi=0            polling_rate=0            -> dpi=1 polling_rate=125
+  dpi=-5           polling_rate=-5           -> dpi=1 polling_rate=125
+  dpi=99999        polling_rate=99999        -> dpi=32000 polling_rate=8000
+  dpi=1.7          polling_rate=1.7          -> dpi=1 polling_rate=125
+  dpi=2147483648   polling_rate=2147483648   -> dpi=32000 polling_rate=8000

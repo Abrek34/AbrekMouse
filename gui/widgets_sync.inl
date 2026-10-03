@@ -579,12 +579,18 @@ void on_profile_changed(GtkDropDown* dd, GParamSpec*, gpointer user_data) {
     int idx = (int)gtk_drop_down_get_selected(dd);
     if (idx < 0 || idx >= (int)S->config.profiles.size()) return;
 
-    // Warn in the status bar if switching away from a profile with unsaved changes.
-    // A modal dialog here would be too disruptive for a dropdown switch.
+    // Warn in the status bar if switching away from a profile with unsaved
+    // changes.  Those changes are NOT discarded: widgets_to_profile() has
+    // already written every edit into S->config.profiles[...] in memory, so
+    // only the on-disk copy is stale.  The flag must stay set — it is the
+    // close guard's only input (ui_builder.inl on_window_close_request) and
+    // the edits really are still unapplied; clearing it here silently disabled
+    // the "quit without saving?" prompt (L16-02).  A modal dialog would be
+    // too disruptive for a dropdown switch, hence the status bar.
     if (S->unsaved) {
-        set_status(S, trf("Warning: unsaved changes to \"%s\" were discarded.",
+        set_status(S, trf("Warning: profile '%s' has unsaved changes in memory "
+                          "— remember to Apply before closing.",
                           cur_prof(S).name.c_str()));
-        S->unsaved = false;
     }
 
     S->current_profile_idx = idx;

@@ -1,0 +1,1 @@
+src/logitech_hidpp.cpp	record.model_id = bytes_to_hex(payload.data() + 9, 6);	record.model_id = bytes_to_hex(payload.data() + 10, 5); //MUT	Q07 parse_firmware_record(): model_id dilimi 9/6 -> 10/5

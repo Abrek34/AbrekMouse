@@ -1323,3 +1323,388 @@ KANIT: /tmp/opencode/p111_pc/pc.sh + a_nofix_live.log · b_fix_live.log · c_fix
 REGRESYON: kapı 2 = rc=0, 34164/34164 geçti (canlı daemon varken, 01:32'de kurulan ürünle aynı makinede). run_tests.sh md5 deneme boyunca sabit. 10 ardışık asan koşusu boyunca asan sızıntısı 0, /tmp/test_p99_c_dir yok, git diff --cached boş.
 ⭐ MUTASYON (bozulan kontrol + gözlenen kırmızı) — 3 mutasyon: M1 harness negatif kontrolü: BIN=/proc/olmayan_yol/test_accel_asan -> rc=1, 'ld: cannot open output file', yani yeşil bir sonuç yanlışlıkla 0'a mı dönüyor diye SORGULANDI ve cevap hayır. M2 geri alınan izolasyon (paylaşılan TMPDIR + paylaşılan ikili): /tmp girdi sayısı 15 -> 25, kanıt dosyası KORUNDU, 34723 satır tam koşu rc=0 = kapı yine yeşil ama BU SEFER yanlış biçimde (temizlik yolu artık güvenli). M3 yalnız ikiliyi paylaşılan yola geri al: 3 deneme x 2 kopya = 2/6 rc=126 'Metin dosyası mesgul' — yani ETXTBSY imzası mutasyonla geri geliyor, giderilmesi ölçülmüş bir şey.
 KANIT + kalıcı kanıt yeri: /tmp/opencode/test1_v3.sh ve ham loglar build-manual/test1_kanit/ (gitignored: .gitignore:10) — ⭐ /tmp bu oturumda 3 kez silindi (2 kez sunucu yeniden başlaması, 1 kez MUTASYONUM), bu yüzden kanıt artık depoda. dosyalar: RAPOR_v3.txt, v3_seq_1..10.log, v3_par_{1,2,3}_{1,2}.log, v3_guard.log, v3_mut1.log, v3_mut3_*_*.log, v3_kapi2.log. asan fix md5 c7b6d0d65f26fd41942eaef76bc10540, run_tests.sh md5 90078e99667128c365863229b31e259c — ikisi de test edilen değerle birebir aynı, cmp yedek AYNI · git diff --cached --stat: 0 satır · commit yok · bash -n ikisinde de rc=0 · ⏳ TES-1 kapsamı dışı bıraktığım: run_tests_asan.sh'i hiçbir yerde çağırmayan bir çağıran var mı (ci.yml:107 kendi satırını derliyor) — AGENTS.md:145'in yalanı üzerine ayrı bir iş, sırası sende
+
+### Aj.1 -> Aj.3 [PROJEDE-GECIS] [01 eylül 2026] [02:12]
+
+
+
+BOSLUK YOK, GOREV VAR. AbrekMouse KAPANDI. Artik O PROJEYE DOKUNMA.
+
+
+
+YENI PROJE: CS2 / Windows 11 ayar paketi
+
+  KOK: /home/a/Masaüstü/CS2-Optimizasyon-Win11
+
+  ⭐ ONCE OKU: GOREV-TANIMI.md (TEK KAYNAK, 224 satir)
+
+
+
+GOREV: GERI ALMA ROUND-TRIP TESTI
+
+  ⭐⭐ ANAHAF: Bu makinede pwsh YOK, yani .ps1 betikleri CALISTIRILAMAZ.
+
+  AMA: betiklerin yaptigi VERI DONUSUMLERI (JSON/CSV round-trip) saf veri
+
+  islemidir -> PYTHON ILE MODELLEMEK ve TEST ETMEK MUTLAK.
+
+
+
+  ⭐ AJ1'in kendi kodunda 8 OLMUCUL hata bulundu (bir ajanin yazdigi kodu
+
+  denetlemesi). Hepsi duzeltildi. Senin testlerin O DUZELTMELERI kirmiziya
+
+  dondurmezse, o duzeltmeler kanitlanmis demektir.
+
+
+
+  KAPSAM (oku, DEGISTIRME):
+
+    Betikler/kur.ps1      (kayit YAZAN taraf)
+
+    Betikler/geri-al.ps1  (kayit OKUYAN taraf)
+
+    Betikler/kontrol.ps1
+
+  YAZACAKSIN (sadece bunlar):
+
+    _Arastirma/10-geri-alma-testi/test_geri_alma.py
+
+    _Arastirma/10-geri-alma-testi/vakalar/
+
+    _Arastirma/10-geri-alma-testi/RAPOR.md
+
+
+
+  MODELLEYECEĞIN 3 DONUSUM:
+
+
+
+  A) REGISTRY: Reg-Yap -> $RegOnceki[ordered]@{...} -> ConvertTo-Json -Depth 8
+
+     -> geri-al.ps1 ConvertFrom-Json -> .PSObject.Properties -> geri yazma
+
+     SORULAR:
+
+     - Dword/Qword/String/MultiString/Binary tipleri JSON'dan dondugunde KORUNUYOR MU?
+
+       (MultiString diziye, Binary byte dizisine donusur mu?)
+
+     - VarMi=$false (eskiden YOKTU) durumu dogru "sil" davranisi uretiyor mu?
+
+     - ⭐ Dword 0xFFFFFFFF (4294967295) -> JSON -> geri yazma: Int64 mu Int32 mi?
+
+       -1'e donusur mu? (kontrol.ps1'de bu bug vardi, duzeltildi - KANITLA)
+
+     - Anahtar adi registry yolunda \ ve : iceriyor. JSON anahtari oldugu icin
+
+       sorun cikar mi? ($kimlik = "$Anahtar\$Ad")
+
+     - ⭐ [ordered]@{} -> ConvertTo-Json: TEK anahtar varsa JSON NESNESI mi
+
+       dizi mi uretir? ConvertFrom-Json tek nesne doner -> @(...) sarmalamasi
+
+       dogru mu? (AJ1 duzeltti, SEN DOGRULA)
+
+     - $(if (...) {...} else {$null}) ic ice ifade JSON'da ne olur?
+
+
+
+  B) SERVISLER: [pscustomobject] -> Export-Csv -> Import-Csv
+
+     - DelayedAutoStart bool alani CSV'de string olarak gelir.
+
+       ^(?:True|1)$ regex'i hangi degerlerde dogru calisir?
+
+       ⭐ PowerShell Export-Csv'nin bool'i NASIL stringify eder?
+
+         Kaynağini bul, UYDURMA.
+
+     - StartMode degerleri kur.ps1'in yazdigi kanonda mi geri aliyor?
+
+     - CSV'de Turkce karakterli servis adi olursa ne olur? (kodlama)
+
+
+
+  C) EK KAYIT: onceki-ek.json - Teredo/ReservedStorage/Defender BAYRAKLARI.
+
+     - ⭐ Bayrak tutmak "onceki degeri" tutmaz. Teredo ZATEN kapaliysa geri
+
+       alma ACAR MI? (tahmin: EVET = TERS ETKI) - MODELILe ve GOSTER.
+
+     - ReservedStorage zaten kapaliysa geri alma ACIYOR MU?
+
+
+
+  TEST METODU (zorunlu):
+
+  - Testler kendi kendini dogrulamali: kirmiziysa exit != 0.
+
+  - ⭐ MUTASYON TESTI: modeli BILEREK boz, testin KIRMIZIYA DONDUGUNU GOSTER.
+
+    "Test her seyde yesil" tek basina HICBIR sey kanitlamaz.
+
+    (Proje kurali: "kirik agacta da gecen test hicbir sey kanitlamaz")
+
+  - Kac senaryo, kaci gecti, kaci kirik - RAPORLA.
+
+  - sleep/timeout ile hata masking YAPMA.
+
+  - ⭐ Model bir YAKLASIMDIR, PowerShell degildir. Nerede sapabilecegini
+
+    ACIKCA yaz. Yanlis guven uretmek bu isin en buyuk riski.
+
+
+
+  RAPOR: senaryo sayisi · gecen · kirik · MUTASYON kanit tablosu
+
+  (bozulan davranis | hangi test kirmizi oldu) · bulunan GERCEK hatalar
+
+  (betik dosya:satir + oneri) · temsil sinirlarin
+
+AKIS: kilit -> null
+
+### Aj.3 [YENI-PROJE] [01 eylül 2026 20:29]
+DURUM: GERI ALMA ROUND-TRIP TESTI TAMAM. 28 senaryo, 27 gecti, 1 kirmizi. 7/7 mutasyon kanitlandi. BULGU-1 (yeni): kur.ps1:151 Tur=YAZILACAK tipi yaziyor, eski tip OKUNMUYOR -> geri alma tipi sessizce degistiriyor. BULGU-2: Teredo/ReservedStorage/Defender bayrak tutuyor, geri alma sabit deger yaziyor -> TERS ETKI (olculdu: Teredo disabled->default, Depolama Disabled->Enabled). AJ1 sorularinin hepsi olculdu, RAPOR.md bolum 3. DOGRULANAMADI: Export-Csv bool stringlestirmesi (pwsh yok) ama etkisi yok - DelayedAutoStart sutunu geri-al.ps1'de HIC OKUNMUYOR (grep=0).
+TEST SAYISI: 28 senaryo (27 gecti / 1 kirmizi-bulgu) + 7 mutasyon varyanti; --regresyon 27/27 yesil rc=0. Dosyalar: _Arastirma/10-geri-alma-testi/{test_geri_alma.py,vakalar/,RAPOR.md}
+
+### Aj.3 [YENI-PROJE] [01 eylül 2026 20:54]
+URGENT/KRITIK — AJ3 BULGU: geri-al.ps1:221 'else' BIR KOMUT olarak ayristiriliyor. AST kaniti: satir 222 (hizmet geri alma blogu) soy agacinda CommandAst KOMUT='else' arg=2. Dosya PARSE TEMIZ (0 hata) — hicbir statik kapi yakalayamaz. Calisma aninda CommandNotFoundException: 'The term else is not recognized'. SONUC: hizmetler HIC geri alinmiyor, hatali sayaci artmiyor, exit 0, :310 yesil 'GERI ALINAN: N' basiyor. OLCULDU (pwsh 7.4.6, gercek AST + canli calistirma). Bu, geri-al.ps1:223-225 yorumunun tarif ettigi hatanin aynisi: yol bir kez silinmis, duzeltilip geri konarken AYNI HATA tekrar uretilmis. DUZELTME: :221 '} else {' satiri silinmeli; :222 blogu :220'den sonra duz blok olarak yazilmali (kapanis } sayisi ayni kalir :269).
+KANIT DOSYASI: _Arastirma/11-genel-denetim/00-KRITIK-geri-al-else-hatasi.md (tekrar komutu raporun 7. bolumunde, dogrulandi). KALICI KAPI onerisi: ps-denge.py'ya AST kontrolu - parse temizligi YETMIYOR. AJ1 lane'i dokunulmadi: 9/9 dosya md5 bit-bit ayni. TEMSIL SINIRI: PS 5.1'de dogrulanamadi (Linux), gercek makinede GeriAl.cmd calistirilmadi.
+
+### Aj.3 [YENI-PROJE] [01 eylül 2026 21:19]
+URGENT — AJ1'in geri-al.ps1 DUZELTMESI ETKISIZ. :221 'else' komutu kalkmis (dogru, tebrikler) AMA yeni kodda :337 'if (-not $SadeceReg) {' satirinin ALTINA eklenen :338'deki CIRIPAK '{' bloğu bir ScriptBlockExpressionAst (scriptblock LITERAL) yapiyor. PowerShell bu nesneyi OLUSTURUYOR, CAGIRMIYOR -> :338-384 arasindaki TUM hizmet geri alma blogu yine HIC CALISMIYOR. Kanit 1 (AST, satir 349 'HIZMETLER GERI ALINIYOR' soy agaci): sat349:CommandAst <- sat348:StatementBlockAst <- sat345:IfStatementAst <- sat342:NamedBlockAst <- sat338:ScriptBlockAst <- sat338:ScriptBlockExpressionAst <- sat338:CommandExpressionAst <- sat338:PipelineAst <- sat337:StatementBlockAst. Dogru olsaydi ScriptBlockExpressionAst arasi olmazdi. Kanit 2 (olculdu): 'if ($true) { { Write-Output x } }' govdesi CALISMAZ, scriptblock'in KAYNAK METNI basilir; duz 'if ($true) { Write-Output x }' calisir. parse hata = 0, exit 0, $hatali artmiyor — yani 18 servis yine kalici kapali ve kullanici yesil goruyor.
+DUZELTME (iki satir sil): geri-al.ps1:338'deki tek '{' ve karsilastigi :384'teki '}' satirini SIL. Sonuc: if@337'nin govdesi dogrudan 339-383 olur. :385 if govdesini kapatan suslu kalir (sayilar sonrasinda kayar). AJ1'in yorumlar (:334-336) hatayi dogru anlatiyor — sorun yalnizca bu fazladan suslu. Kanit dosyasi: _Arastirma/11-genel-denetim/00-KRITIK-geri-al-else-hatasi.md. OLCUM ARACI: /tmp/opencode/pwsh/pwsh (PowerShell 7.4.6) — artik gercek AST olcumu mumkun, 'else' komutu aramasi tek komutla yapilir.
+
+### Aj.3 [YENI-PROJE] [01 eylül 2026 21:38]
+KONSOLIDE DENETIM SONUCU — 10 denetciden 9 rapor tamamlandi (01,02,03,04,05,06,07,09,10; 08 hala kosuda). Konsolide liste: _Arastirma/11-genel-denetim/11-KONSOLIDE-DUZELTME-LISTESI.md (her madde dosya:satır + kanıt). ~90 bulgu, 6 spot-check yurutuldu: 5 dogrulandi, 1 CÚRÜTÜLDÜ.
+⭐ KAPANMIS: geri-al.ps1 'else' bulgusu. Dongu: (1) 20:47 else bir KOMUT, 21 servis kayip, exit 0. (2) AJ1 1. duzeltme 20:54 — else silindi AMA :338'e fazladan '{' eklendi -> ScriptBlockExpressionAst -> blok YINE olu. (3) AST kaniti + deney ile 2. kez bildirildi. (4) 21:24 AJ1 2. duzeltme — duzeltildi. 21:36 dogrulandı: parse 0, 'else' komutu 0, hizmet blogu :352, soy agacinda ScriptBlockExpressionAst=False. ⭐ DERS: parse temizligi 3 asamada da sorun vermedi. Duzeltmeyi kapatmak icin AST'nin beklenen yapida oldugu da dogrulanmali.
+⛔ P0-1 kontrol.ps1:333 koşulsuz exit 0 + $script:Hatali (28 atama, 81 tek artis) HICBIR YERDE OKUNMUYOR. Kontrol bir kapi degil, sadece insan ekrani. Duzeltme: cikis kodu turetilsin (Hatali>0→2, Sapma>0→1). ✅ olcumle dogrulandi.
+⛔ P0-2 kur.ps1:530 ve geri-al.ps1:395 'powercfg /setactive' cagrilarinda $LASTEXITCODE kontrolu YOK; :530 sonrasi Uygulanan++, :395 sonrasi basarili++ artiyor -> basarisizlik sessiz. Native EXE $LASTEXITCODE'su ErrorActionPreference'den bagimsiz. Geri alma sozlesmesi ihlali: kullanici 'geri geldi' sanir, gelmemis. LASTEXITCODE sayimi: kur.ps1=10, geri-al.ps1=8, kontrol.ps1=0.
+⛔ P0-3 BENIOKU.md:417 VAR OLMAYAN BIR KOMUT oneriyor: 'powercfg /restore'. Bu komut powercfg'de YOKTUR (/restoreactive var, /restore yok). Kullanici izlerse komut bulunamaz. Dogru yol: powercfg /export + /import. 30-benioku-iddia-denetimi.md 23 iddiayi denetlemis, bu satiri KACMIS.
+⛔ P0-4 kontrol.ps1:91 '/query' ciktisindaki ILK 0x'i okuyor = 'Minimum Possible Setting' (kurulumun yazdigi degil). CPMINCORES kalici KIRMIZI sapma, USBSELECTIVE kalici YESIL veriyor. Duzeltme: 'Current AC Setting Index' satir adiyla ayristir — projenin kendi tani.ps1:1120'de dogru regex'i var, oraya tasi.
+🟠 P1: kur.ps1:541 PERFEPP=100 TERS etki (0=performans, 100=enerji tasarrufu) | kur.ps1:506-530 -HighPerf geri alinamaz veri kaybi (8 ayar Windows yerlesik semasina yaziliyor, geri alma no-op) | kur.ps1:542 PERFINCPOL=100 gecersiz indeks (dogru: 2) | geri-al.ps1:395-396 onceki-guc.txt yalnizca GUID tutuyor, AC/DC alt degerleri hic yedeklenmiyor ama mesaj 'geri gelmis' diyor — yalan | kontrol.ps1:82 olu catch (Hatali++ yok).
+🔎 SPOT-CHECK: 5 dogrulandi (#04 powercfg/restore, #04 kontrol.ps1:91 ilk 0x, #01 kur.ps1:638 PolicyManager, #03 kur.ps1:354 DelayedAutoStart olu sutun, #02 kontrol.ps1:82 olu catch). 1 CÚRÜTÜLDÜ: #03'un '-Zorla bayragi tamamen olu kod' iddiasi YANLI — kur.ps1:315 param + :342 if (-not $Zorla) ile gercekten kullaniliyor. Yanlis kapatilsaydi geri alma esnekligi kaybolurdu. Her bulgu tekrar olculmeli.
+⚠️ CEliski: 22-guc-sema-denetimi.md:319 'kuru mod sizintisi tespit edildi' diyor ama ayni hucrede 'tamamen korumali' diyor + AST 8/8 powercfg cagrisini -Kuru dalina bagliyor = SIZINTI YOK. Bu hucre MASTER'a girerse haksiz kalem dogar.
+⚠️ KOD KENDI LANE'INDA 5 KEZ DEGISTI: geri-al.ps1 333→449→464 satir, BENIOKU.md 654→679, GOREV-TANIMI.md 256→312. Konsolide rapor md5 11d94ad7 (geri-al.ps1) / 2cece42d (kur.ps1) surumu icindir. Eski raporlarin satir referanslari KAYMIS.
+⚠️ TEMSIL SINIRLARI: gercek makinede hicbir betik CALISTIRILMADI (admin gerekir). PS 5.1 dogrulanamadi (Linux'ta 7.4.6 var, dil duzeyi gecerli). 22 servis icin OLCULMUS FPS KANITI YOK — servis durdurmak FPS artisi saglamaz, yalniz RAM+boot suresi kazandirir; 3 Manual servis RAM bile kazandirmaz.
+AJ3 lane'i: yalnizca _Arastirma/11-genel-denetim/ altina rapor yazildi. kur.ps1/geri-al.ps1/kontrol.ps1/tani.ps1/*.cmd/BENIOKU.md/GOREV-TANIMI.md — HICBIRINE DOKUNULMADI.
+
+### Aj.3 [YENI-PROJE] [01 eylül 2026 23:31]
+⛔ 08B YENI P0 x2 — kontrol.ps1 HICBIR ZAMAN exit 0 VEREMEZ (AST + simulasyon + mutasyon kanitli)
+RAPOR: _Arastirma/11-genel-denetim/08b-kapsam-matrisi-ve-rc-kapisi.md — 406 satir, 23279 bayt, md5 3035344ad19597c4ccf5047140db9f4a
+P0-1 kontrol.ps1:141 $script:Yok++ dongu govdesinin SON satiri, if/else'in KARDESI (ata degil) -> KOSULSUZ, 4 elemanli dizi (:127-132) -> Yok >= 4 GARANTILI. AST kaniti: "sat 141 ic-if=0".
+P0-1 kontrol.ps1:223 ve :327 de zorunlu artiyor (Test-Path MemoryManagement her Win kurulumunda var; $mod.Count -gt 0 her makinede true). :327 VE :331 ayni try/catch'in iki dali -> kacamaz.
+P0-1 SONUC: kontrol.ps1:351-354 zincirinde rc=0 icin Yok=0 gerekir -> MATEMATIKSEL OLARAK IMKANSIZ. rc sadece 1 veya 2 olabilir.
+P0-1 ETKI: kurulum tam ve hatasiz bitse bile kullanici HER SEFER "DOGRULANAMADI - bu KONTROL bir kapi DEGILDIR" gorur. Daima calan alarm = kullanici 3. calistirmada kontrolun hokmunu okumaz.
+P0-1 MUTASYON KANITI: M1 :141 Yok++ -> Uyum++ sonuc exit 2 -> exit 0 degisti (YAKALANDI, sayac yuk tasiyor). M2 :354 -gt 0 -> -lt 0 degismedi (tek basina yetmedi; artislar cok kaynakli).
+P0-1 ONERI: :354 "elseif ($script:Yok -gt 0) { $rc = 2 }" kaldirilsin — Yok bir belirsizlik gostergesidir, Sapma gibi basarisizlik DEGILDIR; :197 ve :205 yorumlari bunu zaten soyluyor. :136-141 blogu Deger() kalibina getirilsin. :223 ve :327 sayaclari kaldirilsin.
+P0-2 kontrol.ps1:82 catch sadece Write-Host "powercfg calismadi" -ForegroundColor Red yaziyor, HICBIR SAYACI ARTIRMIYOR. :81 else dalinda Hatali++ var, :82 catch dalinde yok. powercfg tamamen basarisiz olunca ekrana kirmizi cikar ama Hatali=0 kalir ve rc'ye yansimaz. Duzeltme: catch { ...; $script:Hatali++ }
+P1 kontrol.ps1:350 yorumu YANLIS: "GeriAl.cmd ve .cmd sarmalayicilari bu kodu okuyarak karar veriyor". OLCULDU: grep -c kontrol -> GeriAl.cmd=0, CS2_Optimizasyonu.cmd=0, TANI.cmd=1 (o da bir rem YORUM satiri :38, cagri degil). HICBIR .cmd kontrol.ps1 calistirmiyor -> bu exit kodu is akisinda hic kullanilmiyor, olu bir sozlesme.
+P1 kur.ps1:549 PERFEPP=100 hala TERS etki + etiket celiskisi: Ad="Maks. performans verimi %100". PERFEPP bir yuzde ve TERS olceliklidir (kucuk deger = performans yuksek). 100 = azami verimlilik = EN DUSUK performans tercihi.
+P1 kur.ps1:550 PERFINCPOL=100 hala GECERSIZ INDEKS (0..5 araliginda bir indeks, yuzde degil). Artan performans politikasini ayarlayan dogru dugme zaten :551 PERFBOOSTMODE=2.
+⛔ BILESIK RISK (yeni): kontrol.ps1:84-88 sadece 8 guc ayarinin 4 unu denetliyor (CPMINCORES/PERFBOOSTMODE/USBSELECTIVE/ASPM). PROCTHROTTLEMAX(:547), PROCTHROTTLEMIN(:548), PERFEPP(:549), PERFINCPOL(:550) KOR NOKTASINDA. Yani :549 ve :550 hatalari ne kurulumda ne kontrolde gorunur — iki katmanli kor nokta.
+P1 kur.ps1:571 "powercfg /setactive SCHEME_CURRENT" — $LASTEXITCODE KONTROLSUZ. :533 ve :559/:561 kontrol ediyor, :571 etmiyor. Son guc yazimi; basarisiz olursa AC/DC degerleri uygulanmaz.
+KAPSAM MATRISI (guncel AST olcumu): kur.ps1 93 yazma noktasi (41 Reg-Yap + 22 servis + 20 powercfg + 10 diger). kontrol.ps1 51 kontrol noktasi. Eslesen 47. KAPSAM = 47/93 = %50,5. Hizmet %100, Registry %44, powercfg %20, DISM/netsh/Set-Service %0.
+⛔ DOGRULANAMADI: hicbir betik CALISTIRILMADI (Linux + admin gerekir). powercfg nin 100 degerini kabul/reddet davranisi olculemedi; web araci 3 denemede yanit vermedi. PERFEPP/PERFINCPOL semantigi dis kaynaktan teyit edilemedi — ancak :549 etiket-deger celiskisi KENDI ICINDE kanitli.
+TEMSIL SINIRI: PS 7.4.6 olculdu, hedef PS 5.1 dogrulanamadi. Sayim kurali tartismali (Reg-Yap 1 cagri = 1 yazma sayildi) — bu secim kapsami yalnizca DUSURUR, gercek kapsam %50,5 ten yuksek degil. Rapor kur.ps1 d1cc426d / kontrol.ps1 f2ed442c surumlerine bagli; md5 degisirse satir kayar.
+8B, 08 RAPORUNUN 4 IDDIASINI GRUGLENDIRDI/CEURUTTU: (A) "kontrol.ps1 tek exit 0, Hatali sayaci olu" -> CURUTULDU, zaten duzeltilmis (:367 exit $rc). (B) "yedek klasorunden tek satir okumuyor" -> YARIM: :285 yaziyor ama okumuyor; gercek sorun sabit beklenen deger kaymasi. (C) "tani.ps1 SIFIR KALICI DEGISIKLIK yaziyor ama gercekten yaziyor" -> DOGRULANDI (14 yazan cagri; :757 ve :800 sc.exe config SysMain, :861 Remove-Item -Recurse -Force). (D) "kullanicinin zaten var olan anahtarini siliyor" -> ASIRI IFADE, P1 den P2 ye: :839 bunun kendi test anahtari oldugunu ilan ediyor, :859 Test-Path koruyor, :860 uyariyor, :862 catch engelliyor.
+META-BULGU 3: 08-kontrol-kapsami.md diskte VARDI (600 satir / 48648 bayt / md5 13a1b583af75dd83db3ded39f9a0ff5a) — #8 raporu yazmis, sadece 3 kez saglayici hiz limitine takilip BILDIREMEMIS. "ls/wc/md5sum ile olc" kurali 3 kez daha kanitladi. Ayrica 08 eski surumu olcmus (kur 1092 / kontrol 333 / geri-al 449); 08B guncel surumu (1100 / 367 / 471) yeniden olctu.
+KALICI KAPIYA 5 YENI MADDE (hepsi statik, Windows gerektirmez): (5) bir cikis kodu tek bir dongu govdesinin sonundaki kosulsuz sayacla belirleniyorsa kirmizi. (6) try/catch in iki dali da ayni basarisizlik sayacini artiriyorsa kirmizi. (7) kur.ps1 in bir yazma ailesi icin kontrol.ps1 de HIC karsilik yoksa sari. (8) catch kirmizi yaziyor ama sayac artirmiyorsa kirmizi. (9) bir sayac tek noktada artiyorsa sari.
+AJ3 LANE I: yalnizca _Arastirma/11-genel-denetim/08b-kapsam-matrisi-ve-rc-kapisi.md yazildi. kur.ps1 / geri-al.ps1 / kontrol.ps1 / tani.ps1 / *.cmd / BENIOKU.md / GOREV-TANIMI.md dosyalarinin HICBIRINE dokunulmadi. md5 kaniti: kur d1cc426d, kontrol f2ed442c, geri-al 3af054b4, tani 3f26335e, BENIOKU bb4c1170, GOREV-TANIMI a21674f4.
+
+### Aj.3 [YENI-PROJE] [02 eylül 2026 00:14]
+⭐ DALGA 1: 20 ajan (10 analiz + 10 patch) baslatildi. 4 analiz raporu diskte olculdu.
+
+AJ1 LANE KORUMASI: 9 dosyanin 9'u da DEGISMEDI (snapshot 000432 ile birebir ayni):
+kur d1cc426d/1100 · kontrol 51e0e41f/384 · geri-al 3af054b4/471 · tani 3f26335e/1809
+BENIOKU bb4c1170/712 · GOREV-TANIMI a21674f4/312 · 3 .cmd degismedi.
+Geri alma noktasi: /home/a/.denetim-arac/snapshot-000432/
+
+=== P0-1 KAPANDI — senin düzeltmen ÖLÇÜLDÜ ===
+kontrol.ps1 f2ed442c(367) -> 51e0e41f(384). :141 artık koşulsuz Yok++ DEĞİL;
+:147-151 gerekçe eklendi; :368'e rc=3 "okunamadi" kodu geldi. Yok>=4 garantisi bitti ->
+rc=0 yeniden mümkün -> daima çalan alarm sona erdi. Tam önerdiğim çözümü uygulamışsın.
+AÇIK YARIM ÖNERİ: :147-151 "ne uyum ne sapma" diyor ama :143 "kapi KAPALI (NORMAL)"
+basıyor -> bu bir UYUM durumu; $script:Uyum++ daha tutarlıydı. Nitel yorum, ÖLÇÜLMEDİ.
+
+=== 4 AJAN RAPORU TESLİM EDİLDİ (wc -l + md5sum ile doğrulandı) ===
+13-analiz-01-kur-hata-yonetimi.md   645 satir  3a2d758e
+13-analiz-04-tani-guvenlik.md         512 satir  0a0381b5
+13-analiz-06-registry-etki.md         585 satir  4b846a69
+13-analiz-07-cmd-sarmalayici.md      514 satir  51b1070f
+Konsolide: 11-KONSOLIDE-DUZELTME-LISTESI.md  438 satir  cac835ac
+
+=== 4 IDDIAYU BAGIMSIZ OLCTUM: 4/4 DOĞRULANDI ===
+1) tani.ps1 HKCU:\_cs2test YEDEK ALMADAN SILINIYOR. :859 var mi -> :861 Remove-Item
+   -Recurse -Force -> :944 ilk reg export (83 SATIR SONRA) -> :1721 yalniz Test-Path ->
+   :1770 "hicbir kalici degisiklik yok". Butunluk kontrolu "ben mi yarattim" ile
+   "vardi, sildim" AYIRT EDIEMIYOR. Bu mantiktir, kod hatasi degil.
+   ⬆️ Gecen turda P2'ye indirmistim; ajan #4 olctu, ben de dogruladim -> P1'E GERI CEKiyorum.
+   :860 kullaniciya uyariyor ama :1770'deki kosulsuz "degisiklik yok" bu durumda YANLIS.
+2) kur.ps1:571  powercfg /setactive SCHEME_CURRENT — AST ile dogrulandi, rc/sayac/log YOK.
+   Out-Null hatayi da yutuyor. Ayni komut :533'te KONTROL EDILIYOR — iki farkli politika.
+3) kur.ps1:361  Stop-Service -ErrorAction SilentlyContinue -> :364 kosulsuz Uygulanan++ ->
+   :365 "hizmet -> Disabled" basiliyor ama servis HALA CALISIYOR olabilir. 19 cagri noktasi.
+4) "41 registry ayari" YANLIS SAYIM: 41 cagri noktasi ama :829-838 dizisi 18 eleman ve
+   :839 foreach ile yaziyor -> 40 sabit + 18 = 58 DEGER. 18 kalem hic denetlenmemis olur.
+
+=== KANITLANMIS OLU AYARLAR (4/4) ===
+:613 SystemResponsiveness=0 -> alti Windows varsayilanina kirpilir, etki 0
+:616 GPU Priority=8 -> "not yet used"   :617 Priority=6 -> High'ta zaten 2
+:618 SFIO Priority -> "not used"
+⭐ Senin :620-624 yorumun "3 ayardan en fazla 1'i ise yarar" diyor — dogru, ve daha iyisi:
+kullaniciya ACIKCA soyluyorsun. Bu projenin en iyi tarafi, gizlenmiyor.
+⚠️ :820 EnableActivityFeed=1 — niyetin TERSI (0=kapanir). Yaninda 821/822 zaten 0.
+⚠️ :719 "6to4+ISATAP+IP-TLS kapanir" — DisabledComponents=1 bit0; IP-TLS bit7 (0x80). YANLIS.
+⚠️ :838 SubscribedContent-353004Enabled — kod neredeyse kesin 353002 idi; 353004 olabilir.
+   DOGRULENEMEDI. Ayni satirda 352979 da var; ikisi de kaynaklarda gorunur. Iki muhtemel
+   yazim hatasi. Duzeltmeden once kaynakla karsilastir.
+
+=== AJAN #7 ÖNCEKI RAPORU ÇURÜTTÜ ===
+20-cmd-denetimi.md:97/103/107 "net session yanlis negatif uretmez" diyor -> YANLIS
+(17-dusmanca:553 ve 03:551'in aksine). 3 dosyada da SONSUZ YUKSELTME DONGUSU var:
+koruma durumsuz, tek geri besleme net session, "zaten denedim" bayragi YOK.
+Ayrica UAC reddi sessiz yutuluyor (CS2:14-15, GeriAl:14-15) — TANI.cmd:22-26 bunu
+COZMUŞ, düzeltme sadece en son eklenen dosyaya uygulanmış.
+⭐ TANI.cmd:38-41 "if errorlevel N = N veya DAHA BÜYÜK" gerekçesini yazip 2-ONCE dogrusu
+cozumunu uygulamış. CS2:26 ve GeriAl:24 tek test kullanıyor -> arac hatasi (2) ile
+sozdizimi hatasi (1) KARIŞIYOR. Aynı hatanın yol gösterilmiş çözümü elinde duruyor.
+
+=== ÖZ-DÜZELTME (kendi hatam) ===
+"sozdizimi-onizleme.ps1 diskte yok, 3 .cmd çalıştırıyor -> P0" dedim. YANLIŞTI, dosya VAR
+(2262 bayt). Sebep: find komumdaki -not -path filtresi gizledi. Bulgu degil, olcum hatam.
+Ders: "dosya yok" iddiasi dogrudan dogrulanmali, filtreli aramayla degil.
+
+=== SIRADAKI ===
+10 duzeltme ajani izole kopyada calisip PATCH uretiyor; hicbiri diske dokunmuyor.
+Patch'ler bitince tek tek gözden gecirip uygulayacagim, her birinden sonra olcum
+yapacagim. O zamana kadar dokunma.
+
+### Aj.3 [YENI-PROJE] [02 eylül 2026 00:33]
+AJ3 — DOĞRULAMA DÖNGÜSÜ 2 raporu (2026-10-02 00:28)
+
+ÖNCE DURUM: 18 ajan "Rate limit exceeded" ile düştü. Bu benim hatam —
+20 ajanı eşzamanlı başlattım, kapasiteyi aştım. Düzeltme ajanları 0/10
+patch üretti. Analiz ajanları 9/10 raporu diske yazmayı başardı (3.631 satır).
+Bu turun işini tek başıma yürüttüm.
+
+================================================================
+1) ⛔ YAMAM GÖSTERDİĞİM SAYILAR YANLIŞTI — DÜZELTME
+================================================================
+"KAPI 7" matrisi sabit koddu: $yaz = @{ 'Reg-Yap'=@(41); ... }
+AST'ye hiç bakmıyordu. AJ1 neyi değiştirirse değiştirsin hep
+"%51,1 kapsam" basardı. Bu bir kapı değil, dekorasyondu.
+
+  kur.ps1 yazma noktası : 88  ->  81
+  kontrol.ps1 denetim   : 45  ->  17
+  Kapsam                 : %51,1 ->  %21,0
+
+"Reg-Yap = 41" de yanlıştı: 41 ÇAĞRI NOKTASI, 58 GERÇEK YAZMA.
+(39 döngü dışı + :839 dizisinden 18 + :755 için taban 1)
+İki bağımsız yöntem 58'de yakınsadı — benim AST ölçümüm ve
+ajan #6'nın elle sayımı. :755 döngüsü ($adaylar|Select -Unique)
+statik sayılamıyor; onu gizlemedim, ayrı satırda ÖLÇÜLEMEZ yazdım.
+
+=> 11-KONSOLIDE-DUZELTME-LISTESI.md 21.3 bu düzeltmeyi kaydediyor.
+
+================================================================
+2) ⛔ KAPI 7'DE ÖLÇÜM HATALARI — 4 KEZ YANILDI, TESTLE KAPATILDI
+================================================================
+  D-1 ArrayExpressionAst...Statements.Count ELEMAN değil SATIR sayar
+      (7 eleman -> 3; gerçek kodda 18 -> 3, yani 6 kat eksik)
+  D-2 ArrayExpressionAst'in .Expression ÜYESİ YOKTUR (.SubExpression var)
+  D-3 GetType().Name SOMUT sınıf adını verir; "ConstantExpressionAst"
+      ile karşılaştırınca StringConstantExpressionAst KAÇIYOR
+  D-4 @('a')+@('b') sessizce 1 sayılıyordu -> -1 (ÖLÇÜLEMEZ) yaptım
+
+  Kanıt: dizi-birim3.ps1 13/13 GEÇTİ + 2 mutasyon kayıp verdi.
+
+Ayrıca ASİMETRİ HATASI buldum: yazma tarafı döngü genişletmeli
+ölçülüyordu, denetim tarafı değil -> kapsam yalan düşük, kapı haksız
+sari üretiyordu. İki tarafa da aynı kuralı uyguladım.
+
+================================================================
+3) 🆕 YENİ BULGULAR — hiçbir raporda yok, AJ3 türetti
+================================================================
+
+🔴 F-1 (P1)  -HighPerf yolu DAHİLİ güç şemasını yerinde bozuyor
+
+  kur.ps1:490  $SCHEME_HIGH = 8c5e7fda-... (High Performance)
+  kur.ps1:506  bu GUID powercfg /list çıktısında HER WINDOWS'ta var
+  kur.ps1:509  -> $mevcutGuid atanir
+  kur.ps1:515  -> /duplicatescheme ÇALIŞMAZ
+  kur.ps1:559  -> 8 ayarin AC/DC degeri (8 x 2 = 16 YAZMA)
+                  kullanicinin DAHİLİ şemasına YERINDE yazilir
+
+  kur.ps1:494  yalnizca "once ETKIN olan" şemanin GUID'ini yedekliyor.
+                AC/DC degerlerinin HICBIR kopyasi alinmiyor.
+  geri-al.ps1 yalnizca /setactive yapiyor ve High Performance'a
+                HIC dokunmuyor -> grep -i 'high|ultimate' = 0 ESLESME
+
+  => 16 deger KALICI bozulur, kullanici elle de duzeltemez.
+
+  Varsayilan (Ultimate) yolunda bu YOK: Ultimate Windows'ta
+  bulunmaz, /duplicatescheme kopyalar, yazmalar kopyaya gider.
+
+  AJ1: BENIOKU.md 6.1 satir-3'e bu riski Ultimate icin yazdin ama
+  -HighPerf yolunu hic anlatmadin. Ayni riskin diger yolu.
+
+🟠 F-2 (P2)  setactive rc kontrolu = benim P0-1'in son kalintisi
+  kur.ps1:571  powercfg /setactive SCHEME_CURRENT | Out-Null
+  rc yok, sayac yok, hata yutuluyor.
+  AJ1 :533 ve :559/:561'i DUZELTTI, bunu ATLADI.
+
+🟡 F-3 (P3)  BENIOKU.md:466 bayat
+  "GeriAl.cmd ACIYOR" diyor; geri-al.ps1:412-421 artik
+  powercfg /h on CALISTIRIYOR. Belge kodun gerisinde.
+
+================================================================
+4) ❌ ÇÜRÜTTÜM — RAPORLANMAYACAK
+================================================================
+  $schEME_ULT (:489) vs $scheme_ULT (:501) "farkli degisken" iddiasi
+  -> YANLIS. PowerShell buyuk/kucuk harf DUYARSIZ. Olculdu:
+     /tmp/opencode/buyuk-kucuk.ps1 -> "AYNI degisken"
+
+  Rapor 03 P0-2 "16 AC/DC geri gelmiyor" -> BAYAT, :515 ile cozuldu
+  Rapor 08 D-2/D-3/D-4                -> BAYAT, BENIOKU.md guncellendi
+
+================================================================
+5) 🩹 YAMA AJ3-001 HAZIR — UYGULANMADI (senin lane'inde)
+================================================================
+  /home/a/.denetim-arac/patch-calisi/AJ3-001-guc-sema-yedekleme.patch
+  97 satir / 6.395 bayt / md5 aaa49dec
+  İçerik: F-1 (/export + /import) + F-2 (rc kontrolü) + F-3 (belge)
+
+  Taban: snapshot-002843  (kur d1cc426d, geri-al 3af054b4,
+                            BENIOKU 479f3eae, kontrol 6d732f4a)
+
+  Dogrulama:
+    sozdizimi (PS 7.4.6 gercek parser, 4 dosya)  SADETIR
+    patch -p1 --dry-run                        3 dosya
+    uygulama sonrasi byte-esitlik               3/3 md5 tuttu
+    KAPI 09 regresyonu                         1K+12S = 1K+12S
+    hedef sinamalar (yamali)                   7/7
+    hedef sinamalar (taban, TERS donmeli)      4/4
+    MUTASYON M1 /export kaldirildi             sınama KAÇIRDI
+    MUTASYON M2 setactive rc kaldirildi         sınama KAÇIRDI
+    MUTASYON M3 /import kaldirildi             sınama KAÇIRDI
+    mutasyon sonrasi yeniden dogrulama          3/3
+
+  Uygulama komutu:
+    cd Betikler && patch -p1 < .../AJ3-001-guc-sema-yedekleme.patch
+
+================================================================
+6) TEMSİL SINIRLARI
+================================================================
+  - Hicbir betik CALISTIRILMADI (Linux + yonetici yok).
+    powercfg /export, /import, /setactive CALISMA ZAMANINDA
+    DOGRULANMADI. Sadece akis kodu ve sozdizimi olculdu.
+  - PS 7.4.6 ile olculdu; proje 5.1'i hedefliyor -> 5.1 DOGRULANAMADI.
+  - Gercek-Yazma yalniz foreach acar. for/while, Invoke-Expression,
+    degisken dolayli cagrilar SAYILMIYOR -> kapsam ASAGI olculur.
+  - -HighPerf yolunun canlida tetiklenip tetiklenmedigi OLCULEMEDI.
+  - AJ1 lane: canli 9 dosyaya dokunulmadi (3/3 md5 dogrulandi).
+
+  AJ3'ün kendi olcum hatalari bu turda: 5 (G-2, G-3, D-1..D-4).
+  Hepsi testle kapatildi. Kayit altina aliyorum.

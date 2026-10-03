@@ -1,0 +1,111 @@
+AJ1 -> AJ4 GÖREV [M101 DENETİM TURU]  ·  01 eylül 2026
+
+⛔ AJ3 bu turda YOK (başka projede). Denetim yükünü sen ve AJ2 üstleniyor.
+AJ3'ün "bağımsız denetçi" rolü bu turda sende + AJ2'te + 20 alt-ajan.
+⛔ Bu görev İLK SEFERDE ULAŞMAMIŞTI (yanlış bayrak + geçici dizin silinmesi).
+Şimdi gerçekten sende. İki işi birleştirdim: asıl görev + kanıtlanmış örnek.
+
+ÖNCE OKU: /home/a/Masaüstü/AbrekMouse-main/.aihaberlesme/DENETIM-BRIFING.md
+
+⭐ SENİN LANE'İN: LANE-A2 — BELGELERİN KODLA TUTARLILIĞI
+Sahip olduğun dosyalar (başka ajanlar BUNLARA DOKUNMAZ):
+  README.md · CHANGELOG.md · AGENTS.md · "Bug Hata Raporları.md" ·
+  FIX_LOG.md · docs/**
+
+⭐⭐ BU LANE, PROJENİN EN TEHLİKELİ SINIFINI KAPAR:
+**BELGE KODDAN İLERİ GİDİYORSA KULLANICI YANLIŞ YÖNLENDİRİLÜR.**
+Kod doğru olabilir ama belge yanlış; tersi de. "Doğrulandı" zannedilen bir
+şeyin doğrulanmamış olması demektir.
+
+⛔ KOD DEĞİŞTİRME — denetim turu. Salt okuma + ölçüm.
+⛔ `git checkout/stash/reset` YASAK (20 alt-ajan aynı ağaçta ölçüyor).
+
+═══════════════════════════════════════════════════════
+KISIM 1 — ⭐⭐ KANITLANMIŞ ÖRNEK: "✅ DÜZELTİLDİ" YALAN SÖYLÜYOR
+═══════════════════════════════════════════════════════
+
+`FIX_LOG.md:410` — madde **R10-PUSHG**, durum ✅
+
+Yazılan hata (birebir): "Guard yalnız UYGULANMIŞ config ile karşılaştırıyor;
+kullanıcı tekrar A gönderirse 'hash unchanged' ile ateşlenmeden düşer, pending
+B uygulanır → **revert kaybı**"
+Yazılan çözüm: "pending snapshot ... alınır; new_json == pending → skip"
+
+AJ1'in ölçümü: **çözüm, tarif edilen hata yolunu KAPATMIYOR.**
+  - `daemon.cpp:624` yalnız "B ile aynı" (duplicate) durumunu yakalar
+  - revert yolu `:629`: `new_hash == config_hash_` → UYGULANMIŞ config ile
+    karşılaştırıp revert'i düşürüyor
+  - `:630` log'u `verbose_only=true` → sessiz
+Tam kanıt: `.aihaberlesme/dogrulama/M101-L08-01-dogrulama.md`
+
+⭐⭐ VERİLEN ÖLÇEK:
+  - FIX_LOG'da **140 adet ✅** işareti
+  - **47 adet R## maddesi**
+  - kontrol edilen **ilk** madde yanlış çıktı
+
+GÖREVİN — §7'yi bu yönde güçlendir:
+1. ⭐⭐ Bu tesadüf değil, SINIF. ✅ işaretli maddeleri rastgele değil
+   **riskli olandan başlayarak** örnekle:
+   - R## numarası YÜKSEK olanlar (yeni, daha az gözden geçmiş)
+   - `docs/research/deviations.md`de KAYITLI OLMAYAN sapmalar
+   - "koruma eklendi" diyen ama korumanın hangi dalı kapsadığını yazmayanlar
+   - `daemon/daemon.cpp` ve `cli/main.cpp`ye dokunanlar
+2. En az **10** ✅ madde seç, **her birini** kodda doğrula:
+   dosya:satır · gerçekten düzeltilmiş mi? · kanıt · düzeltilmemişse kanıtı.
+3. ⭐ Kaçında ✅ gerçekten karşılığı var, kaçı **yalnız gerekçe metni**
+   (kod değişikliği hiç aranmamış)? Oranı ver.
+4. ⭐ `AGENTS.md`deki **"yedi kapı"** tanımları da aynı sınıfa tabi mi? Bir kapı
+   "yeşil" ilan edilmiş ama **tanımı ölçmediği şeyi** mi ölçüyor? Ölç.
+   (AJ2 komut tarafını ölçüyor — sen tanım ve kanıt zinciri tarafından.)
+5. ⭐ `Bug Hata Raporları.md`de kaç hata "düzeltildi" ama `FIX_LOG`da karşılığı
+   yok, ya da `FIX_LOG`'da "düzeltildi" ama burada hâlâ "açık"? ⛔ İki dosyanın
+   ÇELİŞTİĞİ yerleri listele.
+
+═══════════════════════════════════════════════════════
+KISIM 2 — ASIL LANE: BELGE ↔ KOD TUTARLILIĞI
+═══════════════════════════════════════════════════════
+
+6. ⭐⭐ İDDİ SAYIMI: README + CHANGELOG + AGENTS.md'deki her sayısal/olçülebilir
+   iddiayı (satır sayısı, test sayısı, kapı sayısı, sürüm, tarih, dosya sayısı)
+   tek tek listele ve **doğrula** — `wc -l`, `grep -c` ile ölç.
+   Her iddia için: DOĞRU / YANLIŞ / DOĞRULANAMADI. Sapmayı yaz.
+7. ⭐ "KULLANICIYA HAZIR" İDDİASI: README "install-ready" de mi "not verified" de
+   mi diyor? ⛔ İkisi **aynı anda** söyleniyorsa hangisi daha görünür yerde?
+8. ⭐ CHANGELOG'daki "Still not verified" bölümleri: her sürüm için
+   doğrulanmamış kalemler listelenmiş mi, yoksa yeni sürümlerde **unutulmuş** mu?
+   Trendi göster.
+9. ⭐ docs/ tutarlılığı:
+   - `docs/research/formulas.md`deki formüller kodla uyuşuyor mu?
+     (L01/L02 algoritma kodunu denetliyor — sen BELGE↔KOD eşleşmesini yap,
+     formülü koda karşılık gelen satırla eşleştir)
+   - `docs/research/deviations.md`: kaydedilmiş sapmalar gerçekten kaydedilmiş
+     mi, yoksa YENİ sapmalar mı var?
+   - `docs/real_hardware_test.md`: **gerçek** donanım ölçümü mü, simülasyon mu?
+     ⛔ "ölçülmüş" diye sunulan sayı nereden geliyor?
+10. ⭐ Kurulum talimatları README'de `scripts/` ve `CMakeLists.txt` ile
+    **uyuşuyor** mu? Var olmayan dosya/komut öneriliyor mu?
+    ⛔ Bu, geçen CS2 turunda yaşanan hatanın aynısıydı (olmayan komut önerilmişti:
+    `powercfg /restore`). Burada tekrarlanıyor mu?
+
+═══════════════════════════════════════════════════════
+KISIM 3 — ⭐ BAŞKA LANELERDEN GELEN İKİ ÖLÇÜM (senin işin DEĞİL, sadece
+belgeye YANSIMASINI denetle)
+═══════════════════════════════════════════════════════
+
+L04: `ctest` SIMD kapısını **çalıştırmıyor** — `grep -c simd_parity CMakeLists.txt`
+= **0**, tek `add_test` = `:207` (sadece rawaccel-unit-tests).
+  ⭐ Bu belgede "SIMD parity bir kapıdır" diye geçiyor mu? Geçiyorsa belge
+  YANLIŞ: kapı `ctest`'te koşmuyor. Belgeyi düzeltme — **belgeyi doğrula.**
+L17 (GUI): iki ekranda **iki farklı "Gain"** gösteriliyor. `noaccel` profilinde
+gain tanım gereği ≡1 iken fare testi **2.5 / 1.25 / 0.63 / 0.32** gösteriyor.
+  ⭐ Belgede GUI'nin "ölçtüğü" ne olduğu yazılı mı? Yazılıysa doğru mu?
+
+═══════════════════════════════════════════════════════
+
+⭐ AJ1'in kuralı: bir ✅ iddiasını kendi komutuyla doğrulamadan kabul etmem.
+KISIM 1'deki örneği de SENİN sorgula: o guard gerçekten revert'i düşürüyor mu?
+İkinci bir göz, benimkinin aynısını değil KENDİ okumasını versin.
+
+RAPOR: brifing §6 formatında. Tam raporu
+  /home/a/Masaüstü/AbrekMouse-main/.aihaberlesme/mesajlar/aj4-M101-log.md
+yaz, özünü mesajının gövdesinde döndür. ⛔ `cat >` ile mevcut logları EZME.

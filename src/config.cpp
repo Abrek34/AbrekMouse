@@ -171,9 +171,18 @@ static accel_args accel_args_from_json(const json& j) {
         // O3: silently use default on missing element or wrong type instead of throwing.
         // Element type-guards (P99): a hand-edited `"cap": ["a","b"]` must degrade
         // to the default instead of throwing type_error and bricking the whole config.
-        if (cap.is_array() && cap.size() >= 2) {
+        // L05-02 (HIGH): the guard used to be `size() >= 2`, so a size-1 array
+        // (`{"cap":[500]}`) was rejected ENTIRELY and the written value was
+        // silently thrown away.  Accept size >= 1 and read each present element
+        // under its own type guard: `{"cap":[500]}` keeps x=500 (y stays at the
+        // struct default), `{"cap":[24,"x"]}` keeps x=24 with y at the default
+        // instead of the old y=0 — 0 is NOT a neutral default, it is the "no
+        // cap" sentinel (accel-classic.hpp: `cap.y > 0 ? ... : DBL_MAX`), so a
+        // typo used to silently turn the cap OFF.  Absent/invalid elements
+        // keep the struct default (silent degrade, never throws).
+        if (cap.is_array() && cap.size() >= 1) {
             if (cap[0].is_number()) a.cap.x = cap[0].get<double>();
-            if (cap[1].is_number()) a.cap.y = cap[1].get<double>();
+            if (cap.size() >= 2 && cap[1].is_number()) a.cap.y = cap[1].get<double>();
         }
     }
     if (j.contains("cap_mode") && j["cap_mode"].is_string()) {
@@ -186,21 +195,35 @@ static accel_args accel_args_from_json(const json& j) {
             throw std::runtime_error("unknown cap_mode: '" + cap_str + "'");
         a.cap_mode_val = str_to_cap(cap_str);
     }
-    if (j.contains("lut_data") && j["lut_data"].is_array() &&
-        j.contains("lut_length")) {
+    if (j.contains("lut_data") && j["lut_data"].is_array()) {
         // R6-1: no mode gate (was `&& a.mode == accel_mode::lookup`) so a
         // stored curve survives the lookup→other→lookup round-trip just like
         // the writer above.  The reader only ever consumes JSON-serialized
         // user state (never live device args), so loading a non-lookup profile
         // that carries a curve is safe — the engine simply ignores it until
         // the mode is lookup again.
+        //
+        // L05-03 (HIGH): the guard used to AND in `j.contains("lut_length")`,
+        // so `lut_data` alone was dropped entirely — length stayed 0 with no
+        // error, and the next save wrote the curve away permanently.  When
+        // lut_length is ABSENT, derive it from the element count instead:
+        // length = min(elements, LUT_RAW_DATA_CAPACITY).  (A lut_length key
+        // that is present but not a number keeps the old behaviour: length 0.)
+        //
         // BUG-5: nlohmann::json::get<int>() invokes UB when the JSON value
         // doesn't fit in `int` (libFuzzer + UBSan caught this with payloads
         // like `"lut_length": 1e26`).  Read as a double first, range-clamp,
         // then cast — the cast is now defined.
-        double raw = j["lut_length"].is_number()
-                     ? j["lut_length"].get<double>() : 0.0;
+        double raw = 0.0;
+        if (j.contains("lut_length"))
+            raw = j["lut_length"].is_number() ? j["lut_length"].get<double>() : 0.0;
+        else
+            raw = static_cast<double>(j["lut_data"].size()); // L05-03 derivation
         if (!std::isfinite(raw) || raw < 0) raw = 0;
+        // L12-03/B11: 514 is the full capacity (257 pairs) and must survive;
+        // the min(lut_length, element count, capacity) clamp below plus the
+        // even-pinning at the end yield exactly that (a 515-element table with
+        // lut_length 515 → length 514, never 513).
         if (raw > (double)LUT_RAW_DATA_CAPACITY) raw = LUT_RAW_DATA_CAPACITY;
         a.length = static_cast<int>(raw);
         auto& pts = j["lut_data"];
@@ -435,10 +458,18 @@ static void sanitize_accel_args(accel_args& a) {
     //   Negative + non-integer exponent produces NaN, but the classic constructor and
     //   motion_math NaN guard handle this downstream — don't clamp here.
     // MATH-1: negative acceleration with active cap (cap.y > 0) produces a degenerate
-    // curve (cap.x becomes negative, gain curve goes backward). Forbid this combo.
+    // curve (cap.x becomes negative, gain curve goes backward). Forbid this combo
+    // by disabling the CAP, not the acceleration.
+    // L03-02 interaction: the struct default is now cap.y = 1.5 (active, matching
+    // docs/oracle/default.json), so zeroing `acceleration` here — as the old code
+    // did — would silently erase an explicit `acceleration: -5` on every profile
+    // that does not override `cap`.  The CLI help and docs document negative
+    // acceleration as classic deceleration "only when NO input cap is set", so
+    // dropping the (possibly defaulted) cap restores exactly that documented
+    // state while keeping the value the user wrote.  test_accel_args_sanitize
+    // (cases 1 and 13) pins that negative acceleration survives sanitize.
     if (a.acceleration < 0 && a.cap.y > 0) {
-        a.acceleration = 0;
-        a.cap.y = 0; // disable cap to match the identity curve
+        a.cap.y = 0; // disable cap — deceleration is defined only without a cap
     }
     // scale: used as pow(scale * x, exp) in power mode.
     //   Negative scale * positive x → negative base → NaN with non-integer exp.
@@ -659,8 +690,18 @@ static device_profile device_profile_from_json(const json& j) {
     if (j.contains("match_app"))  dp.match_app = json_get_string_limited(j["match_app"], "", 128);
     if (j.contains("dpi"))          dp.dev_cfg.dpi   = json_get_int_safe(j["dpi"], 800);
     if (j.contains("polling_rate")) dp.dev_cfg.polling_rate = json_get_int_safe(j["polling_rate"], 1000);
-    if (j.contains("disable"))      dp.dev_cfg.disable = j["disable"].is_boolean()
-                                                         ? j["disable"].get<bool>() : false;
+    // L05-01 (CRIT): numeric 0/1 accepted for `disable` like the O31-C3
+    // pattern for gain/raw_passthrough/use_raw_input.  The old is_boolean()
+    // read fell back to `false` for `{"disable": 1}` — the exact opposite of
+    // what the user wrote — and the next save persisted the inversion.  A
+    // value that is neither bool nor integral 0/1 keeps the struct default
+    // (false), never throws.
+    if (j.contains("disable")) {
+        const auto& d = j["disable"];
+        if (d.is_boolean()) dp.dev_cfg.disable = d.get<bool>();
+        else if (d.is_number_integer() && (d.get<long long>() == 0 || d.get<long long>() == 1))
+            dp.dev_cfg.disable = (d.get<long long>() == 1);
+    }
     if (j.contains("profile") && j["profile"].is_object())
         dp.prof = profile_from_json_obj(j["profile"]);
     // Clamp to safe ranges after loading
@@ -723,8 +764,20 @@ static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
 
     if (j.contains("active_profile"))
         cfg.active_profile = json_get_string_limited(j["active_profile"], "default", MAX_NAME_LEN);
-    if (j.contains("use_raw_input") && j["use_raw_input"].is_boolean())
-        cfg.use_raw_input = j["use_raw_input"].get<bool>();
+    // L05-01 (CRIT): accept numeric 0/1 for use_raw_input exactly like the
+    // O31-C3 pattern used for `gain` above and `raw_passthrough` below.  A
+    // strict is_boolean() read silently kept the struct default (true) when a
+    // hand-edited config or an older exporter wrote `{"use_raw_input": 0}` —
+    // i.e. the OPPOSITE of the value the user wrote was loaded, and the next
+    // save made that inversion permanent.  A value that is neither a bool nor
+    // an integral 0/1 keeps the default (silent degrade, never throws), same
+    // contract as gain/raw_passthrough.
+    if (j.contains("use_raw_input")) {
+        const auto& r = j["use_raw_input"];
+        if (r.is_boolean()) cfg.use_raw_input = r.get<bool>();
+        else if (r.is_number_integer() && (r.get<long long>() == 0 || r.get<long long>() == 1))
+            cfg.use_raw_input = (r.get<long long>() == 1);
+    }
 
     if (j.contains("profiles")) {
         // K1 (config-presets denetimi): a `profiles` key that is present but is
@@ -822,14 +875,31 @@ app_config load_config(const std::string& path) {
     // rather than MAX_PROFILES.  A config with more than MAX_PROFILES entries
     // (hand-edited, or written by another tool) used to be silently truncated
     // here and the loss was then committed to disk by the next
-    // load->modify->save round trip.  Every write path still refuses to
-    // exceed MAX_PROFILES, so this ceiling only bounds a pathological file.
+    // load->modify->save round trip.  L05-04: the write paths enforce
+    // MAX_PROFILES for interactive commands (CLI/GUI) and save_config now also
+    // enforces MAX_PROFILES_FILE as a final guard, so this ceiling only bounds
+    // a pathological file — a file at exactly this bound still round-trips.
     app_config cfg = app_config_from_json_obj(json::parse(f), MAX_PROFILES_FILE);
     migrate_config(cfg);
     return cfg;
 }
 
 void save_config(const app_config& cfg, const std::string& arg_path) {
+    // L05-04 (HIGH): the loader has a file ceiling (MAX_PROFILES_FILE), but the
+    // write path had NO profile-count check at all — measured: a 5000-profile
+    // file loaded and was written back at 5000 (12.8 MB), and the doc comment
+    // on load_config claimed "every write path still refuses to exceed
+    // MAX_PROFILES", which was false.  Enforce the same ceiling here, BEFORE
+    // any file is touched: a config the loader would truncate must never be
+    // produced by the saver, and silently writing only part of it would destroy
+    // profiles.  Throw (callers already wrap save_config in try/catch:
+    // safe_save / daemon / GUI) so the previous config stays intact on disk.
+    if (cfg.profiles.size() > MAX_PROFILES_FILE)
+        throw std::runtime_error("too many profiles: " +
+                                 std::to_string(cfg.profiles.size()) +
+                                 " (maximum " + std::to_string(MAX_PROFILES_FILE) +
+                                 "); refusing to save");
+
     // O31-C5: an atomic tmp+rename overwrite of a SYMLINKED config path would
     // replace the symlink itself with a regular file, silently detaching the
     // user's `~/.config/rawaccel/settings.json -> /etc/rawaccel/settings.json`

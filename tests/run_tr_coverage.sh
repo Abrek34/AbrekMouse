@@ -17,6 +17,15 @@ SRC=(
   gui/mouse_test.inl
   gui/kwin_focus.inl
 )
+# C3 (L18 B-19): her kaynak dosyanın varlığını ÖNCE doğrula. Eksik bir dosya
+# CLI'ye hiç geçmezse tarayıcı onu sessizce atlar ve daha az anahtar taranır —
+# "hiç bulamadı ama PASS" sınıfının bir kolu. Eksik dosya META-FAIL'dir.
+for f in "${SRC[@]}"; do
+    if [ ! -f "$f" ]; then
+        echo "META-FAIL: $f missing" >&2
+        exit 1
+    fi
+done
 CXX="${CXX:-g++}"
 # Compile to a unique temp path (mktemp) instead of a predictable
 # /tmp/tr_coverage — a pre-created symlink there would let a local attacker

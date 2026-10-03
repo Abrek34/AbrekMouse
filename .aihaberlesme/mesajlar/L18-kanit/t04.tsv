@@ -1,0 +1,1 @@
+gui/ui_builder.inl	    tr_combo_fill(S->mode_combo, mode_names);	    tr_combo_fill(S->mode_combo, mode_names);\n    tr\n        ("L18 KONTROL parantez sonraki satirda");	tr( ... ) parantezi sonraki satirda -> tarayici gormez

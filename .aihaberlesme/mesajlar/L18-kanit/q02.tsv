@@ -1,0 +1,1 @@
+include/logitech_quirks.hpp	    if (!info.model_id.empty())\n        return info.model_id;	    if (false) return info.model_id; //MUT	Q02 logitech_compose_model_id() ham 12-char model_id"yi KULLANMIYOR

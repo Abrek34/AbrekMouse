@@ -61,7 +61,7 @@ AGENTS.md	The oracle's (\d+) rows	bash tests/oracle/run_oracle.sh 2>/dev/null | 
 AGENTS.md	rows compared, (\d+) documented deviations	bash tests/oracle/run_oracle.sh 2>/dev/null | sed -n 's/^documented deviations: \([0-9]*\) .*/\1/p'	belgelenen sapma (L288)
 AGENTS.md	(\d+) `test_` functions	grep -cE '^static void test_[A-Za-z0-9_]*\(\) \{' tests/test_accel.cpp	test_ fonksiyon (L344)
 AGENTS.md	integration tests \((\d+) functions	grep -cE '^static void test_[A-Za-z0-9_]*\(\) \{' tests/test_accel.cpp	AYNI sayi dosya tablosunda (L448)
-AGENTS.md	(\d+) `SECTION` groups, 34164 runtime assertions \(the	grep -cE '^[[:space:]]*SECTION\("' tests/test_accel.cpp	SECTION grubu (L344); satir sonu '(the' tekillik icin
+AGENTS.md	(\d+) `SECTION` groups, 34267 runtime assertions \(the	grep -cE '^[[:space:]]*SECTION\("' tests/test_accel.cpp	SECTION grubu (L344); satir sonu '(the' tekillik icin
 AGENTS.md	integration tests \(\d+ functions / (\d+) `SECTION`	grep -cE '^[[:space:]]*SECTION\("' tests/test_accel.cpp	AYNI sayi dosya tablosunda (L448)
 AGENTS.md	the source has (\d+) `EXPECT` call sites	grep -vE '^[[:space:]]*#define' tests/test_accel.cpp | grep -oE '\bEXPECT(_NEAR|_NEAR_REL|_TRUE|_LT|_LE|_GT|_GE)?[[:space:]]*\(' | wc -l	EXPECT cagri (L345); metin degistiginde regex de guncellenmeli
 AGENTS.md	(\d+) runtime assertions \(the	bash tests/run_tests.sh 2>/dev/null | sed -n 's/.*Sonuç: \([0-9][0-9]*\)\/[0-9]*.*/\1/p' | tail -1	kosudaki assertion (L344)

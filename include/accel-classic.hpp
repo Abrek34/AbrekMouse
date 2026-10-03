@@ -220,6 +220,26 @@ private:
         if (!std::isfinite(cap_x)) cap_x = DBL_MAX;
         if (!std::isfinite(cap_y)) cap_y = DBL_MAX;
         if (!std::isfinite(constant)) constant = 0;
+
+        // BUG-NEW-71 / L01-B01,B02 monotonicity guard for the GAIN tail.
+        //
+        // For x >= cap_x the tail is `constant/x + cap_y`.  Its derivative is
+        // -constant/x^2, so the tail is non-decreasing (monotone and
+        // cap-respecting) ONLY when constant <= 0:
+        //   constant == 0 -> flat cap_y;  constant < 0 -> rises towards cap_y.
+        // In the narrow band 1 < exponent_classic < 1.015625 the BUG-NEW-71
+        // exponent clamp (1/(power-1) clamped to 64) makes gain_accel() return
+        // a value whose derived base_fn(cap_x) EXCEEDS cap_y, i.e.
+        // constant = (base_fn(cap_x) - cap_y)*cap_x > 0 in the io branch (and
+        // symmetrically in the in/out branches if the body overshoots the cap
+        // there).  The tail then DECREASES from the body level towards cap_y —
+        // a monotonicity break the oracle grid does not reach (its classic
+        // gain cases use exponents 0.5/1.5/2.0) but which ships to real users
+        // since the GUI spinner accepts the band.  Collapse a positive
+        // constant to 0 so the tail sits flat at cap_y: never decreasing,
+        // never exceeding the requested cap.  Guarding here, after all three
+        // cap_mode branches converge, keeps every GAIN path monotone.
+        if (constant > 0) constant = 0;
     }
 
     double base_fn(double x, double ar, const accel_args& args) const {
