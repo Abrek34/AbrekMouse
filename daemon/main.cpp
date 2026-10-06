@@ -494,6 +494,15 @@ int main(int argc, char* argv[]) {
             // A corrupted PID file should never let us cast garbage to int.
             pid_t pid = (end > buf && errno == 0 && val > 0 &&
                          val <= INT_MAX) ? static_cast<pid_t>(val) : 0;
+            // T40-PID01: an unparseable (non-numeric) PID file yields pid==0.
+            // Such a file can never belong to a live daemon — treat it as
+            // stale and unlink, mirroring the 0-byte (PID-2) branch above;
+            // otherwise first write_pid() hits EEXIST and every boot is
+            // refused until a manual delete.
+            if (pid == 0) {
+                if (unlink(path) == 0) return true;
+                return false;
+            }
             // D-6: re-verify liveness right before the unlink.  The TOCTOU
             // window between pid_file_is_live() and here is re-checked so the
             // file is only removed when the recorded PID truly no longer

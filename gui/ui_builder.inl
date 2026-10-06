@@ -1253,10 +1253,9 @@ static std::vector<rawaccel_dev_t> kde_enumerate_rawaccel_devices() {
 /// `header` includes the brackets, e.g. "[Libinput]" or
 /// "[Libinput][3][1133][50498][Logitech ... (RawAccel)]".
 /// Section ends at the next line starting with '['.
-/// R2-01: previously every non-key line inside the section (user comments
-/// '#...'/'...', blank lines) was erased along with the keys, silently
-/// destroying user comments.  Now comments/blank lines inside the section
-/// are preserved and re-appended after the new keys.
+/// R2-01: comments/blank lines inside the section are preserved (not erased).
+/// T51-06: foreign key=value lines are now preserved too — previously every
+/// key not in `kv` was silently deleted from the section.
 static void kde_upsert_section(std::vector<std::string>& lines,
                                const std::string& header,
                                const std::vector<std::pair<std::string, std::string>>& kv) {
@@ -1273,26 +1272,43 @@ static void kde_upsert_section(std::vector<std::string>& lines,
         for (auto& [k, v] : kv) lines.push_back(k + "=" + v);
         return;
     }
-    // Walk the section body, separating key=value lines from content that must
-    // be preserved (comments, blanks).  INI keys are 'name=value'.
+    // Walk the section body, separating target keys from content that must
+    // be preserved (foreign key=value lines, comments, blanks).  INI keys
+    // are 'name=value'.  T51-06: previously every key line not in `kv` was
+    // erased, silently deleting user-set libinput options.
     size_t end = start + 1;
-    std::vector<std::string> preserved;      // comments / blank lines, in order
-    std::vector<std::string> body;           // new key=value lines
-    body.reserve(kv.size());
-    for (auto& [k, v] : kv) body.push_back(k + "=" + v);
+    std::vector<std::string> body;           // rebuilt body, in order
+    std::vector<bool> seen(kv.size(), false);
     while (end < lines.size() && lines[end][0] != '[') {
         std::string& ln = lines[end];
         bool is_key = !ln.empty() && ln[0] != '#' && ln[0] != ';' &&
                       ln.find('=') != std::string::npos;
-        if (!is_key)
-            preserved.push_back(ln);         // keep user comments/blank lines
+        if (is_key) {
+            std::string name = ln.substr(0, ln.find('='));
+            // trim surrounding spaces
+            size_t a = name.find_first_not_of(" \t");
+            size_t b = name.find_last_not_of(" \t");
+            name = (a == std::string::npos) ? "" : name.substr(a, b - a + 1);
+            bool handled = false;
+            for (size_t j = 0; j < kv.size(); j++) {
+                if (kv[j].first == name) {
+                    body.push_back(kv[j].first + "=" + kv[j].second);
+                    seen[j] = true;
+                    handled = true;
+                    break;
+                }
+            }
+            if (!handled) body.push_back(ln);   // foreign key: preserve
+        } else {
+            body.push_back(ln);                 // comment / blank: preserve
+        }
         end++;
     }
-    // Replace [start+1, end) content: new keys, then preserved comments.
+    for (size_t j = 0; j < kv.size(); j++)
+        if (!seen[j]) body.push_back(kv[j].first + "=" + kv[j].second);
+    // Replace [start+1, end) content with the rebuilt body.
     lines.erase(lines.begin() + (long)start + 1, lines.begin() + (long)end);
     lines.insert(lines.begin() + (long)start + 1, body.begin(), body.end());
-    lines.insert(lines.begin() + (long)start + 1 + (long)body.size(),
-                 preserved.begin(), preserved.end());
 }
 
 /// Atomically write a kwinrc-style INI file (with possibly nested sections)

@@ -1068,10 +1068,16 @@ const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const
     for (auto& p : config_.profiles)
         if (p.device_id.empty() && profile_matches_app(p, current_app_)) return &p;
     // 3. Active profile
+    //    (C29-N1: app gate — an app-bound profile must not be forced onto a
+    //    non-matching focus / no-focus state via the active_profile fallback.)
     for (auto& p : config_.profiles)
-        if (p.name == config_.active_profile) return &p;
+        if (p.name == config_.active_profile &&
+            profile_matches_app(p, current_app_)) return &p;
     // 4. First profile (last resort fallback)
-    if (!config_.profiles.empty()) return &config_.profiles[0];
+    //    (C29-N1: app gate — never hand an app-bound profile to a non-matching
+    //    app or a no-focus desktop.)
+    for (auto& p : config_.profiles)
+        if (profile_matches_app(p, current_app_)) return &p;
     return nullptr;
 }
 
@@ -1523,6 +1529,53 @@ void AccelDaemon::do_hotplug_scan() {
     prune_path_deny(path_deny_until_ms_, mice, nowt);
     prune_dev_deny(dev_deny_until_ms_, nowt);
 
+    // T35-DMN01: removal phase runs BEFORE the add phase.  On a kernel
+    // renumber (eventN -> eventM, same device_id) the add loop used to
+    // hit the HP-3 duplicate-skip on the new path first (id still in
+    // opened_device_ids_), and then the removal phase deleted the old
+    // path + cleared the id -- but with missed_any=false the new path
+    // was never retried.  Removing stale paths first frees
+    // opened_device_ids_/opened_paths_ so the renumbered node opens
+    // in the SAME scan.
+    // Remove devices whose path is no longer a physical mouse (disconnected)
+    // Collect handles to destroy outside the lock
+    std::vector<mouse_device> to_destroy;
+    {
+        std::lock_guard<std::mutex> lk(devices_mutex_);
+        auto it = devices_.begin();
+        while (it != devices_.end()) {
+            bool still_physical = false;
+            for (auto& p : mice)
+                if (p == it->path) { still_physical = true; break; }
+
+            if (!still_physical) {
+                log("Hot-plug: mouse disconnected: " + it->name + " (" + it->path + ")");
+                if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd_in, nullptr) < 0)
+                    log("hot-plug: epoll_ctl(del) failed for " + it->path + ": " +
+                        std::string(strerror(errno)), true);
+                opened_paths_.erase(it->path);
+                if (!it->device_id.empty())
+                    opened_device_ids_.erase(it->device_id);
+                to_destroy.push_back(std::move(*it));
+                it = devices_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Rebuild fd_to_dev_ index since vector indices shifted after erase
+        fd_to_dev_.clear();
+        for (size_t i = 0; i < devices_.size(); i++)
+            fd_to_dev_[devices_[i].fd_in] = i;
+    }
+    for (auto& dev : to_destroy) {
+        if (dev.uidev) libevdev_uinput_destroy(dev.uidev);
+        if (dev.fd_in >= 0) {
+            ioctl(dev.fd_in, EVIOCGRAB, 0);
+            close(dev.fd_in);
+        }
+    }
+
+
     for (auto& path : mice) {
         if (opened_paths_.count(path)) continue;
         // P121/BUG-02: skip paths still in a backoff window (recent I/O error).
@@ -1640,44 +1693,6 @@ void AccelDaemon::do_hotplug_scan() {
             std::lock_guard<std::mutex> lk(devices_mutex_);
             fd_to_dev_[dev.fd_in] = devices_.size();
             devices_.push_back(std::move(dev));
-        }
-    }
-
-    // Remove devices whose path is no longer a physical mouse (disconnected)
-    // Collect handles to destroy outside the lock
-    std::vector<mouse_device> to_destroy;
-    {
-        std::lock_guard<std::mutex> lk(devices_mutex_);
-        auto it = devices_.begin();
-        while (it != devices_.end()) {
-            bool still_physical = false;
-            for (auto& p : mice)
-                if (p == it->path) { still_physical = true; break; }
-
-            if (!still_physical) {
-                log("Hot-plug: mouse disconnected: " + it->name + " (" + it->path + ")");
-                if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd_in, nullptr) < 0)
-                    log("hot-plug: epoll_ctl(del) failed for " + it->path + ": " +
-                        std::string(strerror(errno)), true);
-                opened_paths_.erase(it->path);
-                if (!it->device_id.empty())
-                    opened_device_ids_.erase(it->device_id);
-                to_destroy.push_back(std::move(*it));
-                it = devices_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        // Rebuild fd_to_dev_ index since vector indices shifted after erase
-        fd_to_dev_.clear();
-        for (size_t i = 0; i < devices_.size(); i++)
-            fd_to_dev_[devices_[i].fd_in] = i;
-    }
-    for (auto& dev : to_destroy) {
-        if (dev.uidev) libevdev_uinput_destroy(dev.uidev);
-        if (dev.fd_in >= 0) {
-            ioctl(dev.fd_in, EVIOCGRAB, 0);
-            close(dev.fd_in);
         }
     }
 
@@ -2914,14 +2929,20 @@ for (size_t i = 0; i < read_count; ++i) {
         dev.pending_dx   += dx;
         dev.pending_dy   += dy;
         dev.has_pending_motion = true;
-        dev.pending_ev_count = 0;
+        // T38-HOT02: APPEND (mirror the pending_dx/dy += above) instead of
+        // resetting pending_ev_count.  A SYN_DROPPED park earlier in this
+        // same batch left its events in pending_events — wiping the buffer
+        // here and copying only the current queued_events silently dropped
+        // them (e.g. a queued BTN lost while pending_dx survived).
+        const size_t parked_before = dev.pending_ev_count;
         for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
             dev.pending_events[dev.pending_ev_count++] = queued_events[i];
         // L09-04: visibility for the deferred-event overflow (see the
         // SYN_DROPPED site for the full rationale).
-        if (queued_count > dev.pending_ev_count)
+        const size_t added = dev.pending_ev_count - parked_before;
+        if (queued_count > added)
             log("Deferred-event buffer overflow on " + dev.name + ": dropped " +
-                std::to_string(queued_count - dev.pending_ev_count) +
+                std::to_string(queued_count - added) +
                 " queued event(s) at frame deferral.");
     }
     // Close any frame that accumulated WRITTEN events (raw passthrough REL or

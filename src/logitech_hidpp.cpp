@@ -674,6 +674,13 @@ bool HidppTransport::write_packet(const uint8_t* data, size_t len) {
     if (fd_ < 0 || !data) return false;
     const uint8_t* p = data;
     size_t left = len;
+    // T37-HID01: the EAGAIN → poll(POLLOUT) retry below used to be unbounded,
+    // so a hidraw output queue that reports POLLOUT yet keeps returning EAGAIN
+    // spun this loop forever.  Bound the whole write on the same steady_clock
+    // budget the surrounding request path uses (500 ms); on expiry fail the
+    // write instead of retrying indefinitely.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (left > 0) {
         ssize_t written = write(fd_, p, left);
         if (written < 0 && errno == EINTR) continue;
@@ -682,14 +689,20 @@ bool HidppTransport::write_packet(const uint8_t* data, size_t len) {
             // device (output report queue full) returns EAGAIN instead of
             // blocking.  Previously this was treated as fatal and the request
             // dropped.  Wait briefly for POLLOUT and retry; only a dead/hung
-            // fd (POLLERR/HUP) or a hard error fails the write.
+            // fd (POLLERR/HUP), a hard error, or the overall deadline fails
+            // the write.
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) return false;
+            const int poll_ms = static_cast<int>(std::min<int64_t>(remaining.count(), 100));
             struct pollfd pfd = { fd_, POLLOUT, 0 };
             int pr;
             do {
-                pr = poll(&pfd, 1, 100);
+                pr = poll(&pfd, 1, poll_ms);
             } while (pr < 0 && errno == EINTR);
             if (pr <= 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
                 return false;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
             continue;
         }
         if (written <= 0) return false;

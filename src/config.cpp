@@ -4,6 +4,7 @@
 #define _GNU_SOURCE 1
 #include "config.hpp"
 #include "nlohmann/json.hpp"
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -475,9 +476,12 @@ static void sanitize_accel_args(accel_args& a) {
     //   Negative scale * positive x → negative base → NaN with non-integer exp.
     //   Zero → pow(0,x)=0 → gain≡0 (dead cursor) with no cap, or a silent
     //   1.5× constant boost with cap_mode=out (cap_x = gain_inverse(...,0) = 0).
-    //   MATH-2: floor to the same scale floor as the GUI spin (0.01), matching
+    //   MATH-2: floor at the same scale floor as the GUI spin (0.01), matching
     //   the exponent_power floor pattern — a zero curve is never reachable.
-    if (a.scale <= 0) a.scale = 0.01;
+    //   T44-01: the old `<= 0` floor let 0 < scale < 0.01 pass straight through,
+    //   still producing a (near-)dead curve / silent boost.  Floor the whole
+    //   sub-0.01 band: anything below the GUI minimum is snapped to it.
+    if (a.scale < 0.01) a.scale = 0.01;
     // decay_rate: natural mode divides by limit to get internal accel coefficient.
     //   Negative → exp(+large) → diverging gain.  Clamp to >= 0.
     if (a.decay_rate < 0) a.decay_rate = 0;
@@ -826,7 +830,24 @@ static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
                 throw std::runtime_error("config field 'profiles[" +
                     std::to_string(cfg.profiles.size()) +
                     "]' must be an object, got " + pj.type_name());
-            if (cfg.profiles.size() >= max_profiles) break;
+            if (cfg.profiles.size() >= max_profiles) {
+                // T43-05: asla sessizce budama (silent truncate) yok.  TRUSTED dosya yolunda
+                // (MAX_PROFILES_FILE ceiling) overflow is a hard error — the
+                // truncated tail must never be committed to disk by the next
+                // load->modify->save round trip.  On the UNTRUSTED IPC path
+                // (SEC-9 cap) count the dropped entries and warn on stderr;
+                // retention is still capped (memory DoS guard), but the drop
+                // is no longer invisible.
+                const size_t dropped = j["profiles"].size() - cfg.profiles.size();
+                if (max_profiles >= MAX_PROFILES_FILE)
+                    throw std::runtime_error("too many profiles: " +
+                        std::to_string(j["profiles"].size()) + " (maximum " +
+                        std::to_string(max_profiles) + "); refusing to load");
+                std::fprintf(stderr,
+                    "rawaccel: dropping %zu profile(s) beyond the retained cap of %zu (SEC-9)\n",
+                    dropped, max_profiles);
+                break;
+            }
             cfg.profiles.push_back(device_profile_from_json(pj));
         }
     }

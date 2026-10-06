@@ -5,6 +5,14 @@ set -o pipefail   # L-2: a forgotten gate in a pipeline must not pass silently
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
+
+# T53-01: temiz checkout'ta `build-manual/` dizininin YOKluğu koşuyu
+# patlatıyordu (eski sürüm `-o "$ROOT/build-manual/test_accel"` diyordu;
+# kardeş betikler `mkdir -p` yapıyordu — run_tests_asan.sh:61,
+# run_cli_sanitized.sh:43 — bu betik yapmıyordu).  İkili artık $TMPDIR'a
+# derleniyor (P106 madde 3), ama `build-manual/` hâlâ CLI/DAEMON kapıları ve
+# sonrasında gelen inşa adımları için gerekli — önce kur.
+mkdir -p "$ROOT/build-manual"
 # P106 madde 3 (AJ1): test ikilisi KOŞUYA ÖZEL bir yere yazılır, paylaşılan
 # `build-manual/`'a DEĞİL. Ölçüldü: iki ajan aynı anda 2. kapıyı koşunca ikisi
 # de `build-manual/test_accel` derliyor, yürütülme sırasında biri diğerinin
@@ -45,8 +53,9 @@ CXXFLAGS="-std=c++20 -O2 -Wall -Wextra -Wno-unused-parameter -I$ROOT/include -I$
 #
 # HÂLÂ PAYLAŞILAN (yani bu notun kapsamı DIŞINDA, ve ölçülmüş bir eksiklik):
 #   · `build-manual/rawaccel-cli` ve `rawaccel-daemon` (aşağıdaki CLI/DAEMON).
-#     Bu kapı onları ÇALIŞTIRIR ama DERLEMEZ; yani 2. kapı kendi başına
-#     ETXTBSY üretemez.  Eşzamanlı bir `scripts/build.sh` üretebilir.
+#     Bu kapı ikililer YOKSA önce `scripts/build.sh` çağırır (T53-01 —
+#     temiz checkout'ta artık patlamaz), sonra ÇALIŞTIRIR; normal koşuda
+#     derleme adımı yoktur, yani 2. kapı kendi başına ETXTBSY üretemez.
 #   · `/dev/shm` — SEC-2 bloğundaki sabit yollar.
 #   · `XDG_RUNTIME_DIR` — PID dosyası.
 #   · `run_tests_asan.sh` — 0 adet `export TMPDIR`, yani ASAN modu izole
@@ -185,6 +194,18 @@ ra_daemon_run () {
     esac
 }
 
+# Temiz checkout (veya silinen build-manual/): kapıların çalıştırdığı
+# CLI/DAEMON ikilileri henüz yoksa ÖNCE derle.  P114 BUG-B korunur:
+# sessiz SKIP hâlâ yok — ikili yoksa ve derlenemezse sert hata.
+# (T53-01: `rm -rf build-manual && bash tests/run_tests.sh` kendi kendine
+# toparlanmalı; es­kiden düz exit 1 ile “temiz checkout patlıyor”du.)
+if [ ! -x "$CLI" ] || [ ! -x "$DAEMON" ]; then
+    echo "CLI/DAEMON ikilisi yok — önce derleniyor (scripts/build.sh)..."
+    if ! bash "$ROOT/scripts/build.sh"; then
+        echo "Hata: scripts/build.sh başarısız oldu; CLI/DAEMON kapıları çalıştırılamadı." >&2
+        exit 1
+    fi
+fi
 if [ ! -x "$CLI" ]; then
     echo "Hata: CLI kapısı çalıştırılamadı: $CLI" >&2
     echo "      rawaccel-cli derlenmemiş — P83/P99/P107 kapıları SESSİZCE ATLANAMAZ." >&2

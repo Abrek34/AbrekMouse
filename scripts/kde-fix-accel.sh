@@ -101,11 +101,23 @@ def upsert_section(text, section_header, kv):
     # Sections in kwinrc are line-anchored.
     esc = re.escape(section_header)
     pattern = rf"(?ms)^{esc}\s*\n(.*?)(?=^\[|\Z)"
-    body_lines = "".join(f"{k}={v}\n" for k, v in kv)
-    new_block = f"{section_header}\n{body_lines}"
-    if re.search(pattern, text):
+    m = re.search(pattern, text)
+    if m:
+        # T51-06: preserve foreign keys/comments in the section body — only
+        # replace-or-append the target keys instead of rewriting the whole
+        # block (the old version silently deleted user-set libinput keys).
+        body = m.group(1)
+        for k, v in kv:
+            if re.search(rf"(?m)^{re.escape(k)}\s*=", body):
+                body = re.sub(rf"(?m)^{re.escape(k)}\s*=.*$", f"{k}={v}", body, count=1)
+            else:
+                if body and not body.endswith("\n"):
+                    body += "\n"
+                body += f"{k}={v}\n"
+        new_block = f"{section_header}\n{body}"
         return re.sub(pattern, new_block, text, count=1)
     sep = "" if text.endswith("\n") or not text else "\n"
+    new_block = f"{section_header}\n" + "".join(f"{k}={v}\n" for k, v in kv)
     return text + sep + "\n" + new_block
 
 kv = [("PointerAccelerationProfile", profile), ("PointerAcceleration", accel)]
@@ -311,10 +323,21 @@ text = "\n".join(out)
 def upsert(text, header, kv):
     esc = re.escape(header)
     pat = re.compile(r"(?ms)^%s\s*\n(.*?)(?=^\[|\Z)" % esc)
+    m = pat.search(text)
+    if m:
+        # T51-06: keep foreign keys — only replace-or-append target keys.
+        body = m.group(1)
+        for k, v in kv:
+            if re.search(r"(?m)^%s\s*=" % re.escape(k), body):
+                body = re.sub(r"(?m)^%s\s*=.*$" % re.escape(k), f"{k}={v}", body, count=1)
+            else:
+                if body and not body.endswith("\n"):
+                    body += "\n"
+                body += f"{k}={v}\n"
+        block = f"{header}\n{body}"
+        return pat.sub(block, text, count=1)
     body = "".join(f"{k}={v}\n" for k, v in kv)
     block = f"{header}\n{body}"
-    if pat.search(text):
-        return pat.sub(block, text, count=1)
     return text.rstrip("\n") + "\n\n" + block + "\n"
 
 text = upsert(text, "[Libinput]", [("PointerAccelerationProfile", "2"),

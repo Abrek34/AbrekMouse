@@ -37,7 +37,12 @@ struct power {
         auto n = exponent;
 
         if (args.cap_mode_val != cap_mode::io) {
-            scale = args.scale;
+            // MATH-2: a non-positive (or non-finite) scale must never reach the
+            // curve — args.scale <= 0 gives pow(0*x,n) == 0 (dead cursor) or a
+            // silent constant boost via gain_inverse(sc<=0 → 0).  sanitize floors
+            // accel_args at 0.01, but programmatically-built args bypass it, so
+            // the ctor treats an invalid scale as "no curve requested": identity.
+            scale = (args.scale > 0 && std::isfinite(args.scale)) ? args.scale : 1.0;
         } else if (args.cap.y <= 0 || (gain_mode && args.cap.x <= 0)) {
             // P155: io cap with cap.y <= 0 or (gain_mode && cap.x <= 0) is degenerate —
             // ref derives scale=0 from the "gain 0" output point, or produces a flat

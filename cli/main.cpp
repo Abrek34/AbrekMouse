@@ -968,6 +968,20 @@ static int cmd_validate(const std::string& config_path) {
                         clamp_warn("output_dpi", rpr, sp.prof.output_dpi);
                         clamp_warn("rotation", rpr, sp.prof.degrees_rotation);
                         clamp_warn("snap", rpr, sp.prof.degrees_snap);
+                        // CFG-2: speed_min > speed_max is silently equalized by
+                        // sanitize — clamp_warn can't see it (either value may
+                        // survive unchanged), so check the raw pair directly.
+                        if (rpr.contains("speed_min") && rpr.contains("speed_max") &&
+                            rpr["speed_min"].is_number() && rpr["speed_max"].is_number() &&
+                            rpr["speed_min"].get<double>() > rpr["speed_max"].get<double>()) {
+                            std::cerr << "WARNING: speed_min ("
+                                      << rpr["speed_min"].get<double>()
+                                      << ") > speed_max ("
+                                      << rpr["speed_max"].get<double>()
+                                      << ") in profile '" << sp.name
+                                      << "' — speed_max will be raised to speed_min on load\n";
+                            has_warnings = true;
+                        }
                     }
                     if (rp.contains("name") && rp["name"].is_string() &&
                         rp["name"].get<std::string>().size() > MAX_NAME_LEN) {
@@ -1911,6 +1925,7 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
     // previous dropped active_profile/use_raw_input/version, so round-tripping
     // a whole config silently lost which profile was active and the raw
     // passthrough default.  Restore those from the wrapper (type-guarded).
+    std::string import_version; // T45-IMP02: version context of the imported batch
     if (!wrapper_app.is_null()) {
         if (wrapper_app.contains("active_profile")) {
             if (wrapper_app["active_profile"].is_string())
@@ -1939,8 +1954,29 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                 std::cerr << "Warning: ignoring non-boolean use_raw_input in wrapper\n";
             }
         }
+        // T45-IMP02: do NOT overwrite cfg.version from the wrapper.  cfg was
+        // already migrated+stamped by load_config(); stamping the wrapper's
+        // (possibly stale) version here made the later migrate_config(cfg)
+        // re-run migrate_lookup_gain() over ALL profiles — including the
+        // already-migrated existing ones — double-scaling their lookup+gain
+        // y values (y*x is not idempotent → silent data corruption).
+        // Capture the wrapper version separately and use it as the migration
+        // context of the imported batch only.
         if (wrapper_app.contains("version") && wrapper_app["version"].is_string())
-            cfg.version = wrapper_app["version"].get<std::string>();
+            import_version = wrapper_app["version"].get<std::string>();
+    }
+    // T45-IMP02 / CFG-1: run the migration EXACTLY ONCE, on the imported batch
+    // only, in the wrapper's version context.  Non-wrapper imports (single
+    // profile object, JSON array, export line-stream) carry no app version —
+    // treat them as legacy (empty version) so a pre-0.4 `lookup+gain` profile
+    // still gets its one-time y*x normalization.  The existing cfg.profiles
+    // are never touched (they were already migrated at load).
+    {
+        app_config import_ctx;
+        import_ctx.version = import_version;
+        import_ctx.profiles = batch;
+        migrate_config(import_ctx);
+        batch = import_ctx.profiles;
     }
     for (auto& dp : batch) {
         cfg.profiles.push_back(dp);
@@ -1963,10 +1999,9 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
             cfg.active_profile.clear();
         }
     }
-    // CFG-1: import bypassed migrate_config() — old profiles (pre-0.4.0
-    // lookup+gain semantics) would be loaded without the y*x scaling migration.
-    // Run migration on the merged config so imported profiles get upgraded.
-    migrate_config(cfg);
+    // T45-IMP02: migration already ran on the imported batch above — never
+    // migrate the merged config again (that would double-scale the batch the
+    // second time and/or touch existing profiles).
     if (!safe_save(cfg, config_path)) return 1;
     return daemon_apply_if_enabled(cfg);
 }
