@@ -1239,6 +1239,7 @@ Odak: `include/accel-*.hpp`, `include/presets.hpp`, `tests/oracle/oracle_cases.h
 - Kategori: Sanitize gap / ulaşılabilir
 - Açıklama: (out, varsayılan cap={15,1.5}) → `cap_x = gain_inverse(1.5,n,0) = 0`; tail `gain ≡ cap.y = 1.5` her hızda → sessiz %50 boost "acceleration" kılığında. (cap yok/in-mod) → `base_fn = pow(0·x,n)+0 = 0` → `gain ≡ 0` → **ölü imleç**. GUI min 0.01 ama JSON/CLI ile ulaşılabilir.
 - Öneri: `if (a.scale <= 0) a.scale = SCALE_MIN` (exponent 1e-4 floor'u gibi) ya da ctor'da scale≤0→identity.
+- Durum: DÜZELTİLDİ — sanitize artık `if (a.scale < 0.01) a.scale = 0.01;` (GUI floor ile birebir, `(0,0.01)` bandı da kapıda); `power` ctor'unda scale<=0/NaN → identity (scale=1.0) güveni eklendi (`include/accel-power.hpp`). JSON/CLI ulaşılabilirliği sanitize+CLI `range_ok(0.01, SCALE_MAX)` ile kapalı.
 
 **INFO (TUR 22):**
 - Natural gain/legacy asimetri: gain modu `accel<1e-12→1.0` (54); legacy modu hâlâ exponansiyel eğriyi değerlendirir — yalnız accel tam 0'da aynı. GUI'den ulaşılamaz, zararsız.
@@ -1262,6 +1263,7 @@ Odak: `src/config.cpp` (971), `cli/main.cpp` (2415), `include/config.hpp`.
 - Kategori: Tanılama doğruluğu
 - Açıklama: `load_config` yükleme anında sanitize eder (DPI→[1,32000], poll→[125,8000], output_dpi→[0,32000], speed_max≥min eşitleme, isim 256 clamp). Bu yüzden şu uyarılar **asla tetiklenemez**: speed_min>speed_max, output_dpi range, dpi range, polling range, isim uzunluğu. `"dpi":999999, "speed_min":20,"speed_max":5, "output_dpi":50000` dosyası "Validation passed" çıkar; tool yapısal olarak problem göremez.
 - Öneri: Ham JSON üzerinde (sanitize öncesi) kontrol et; ya da clamp edilen gerçek değerleri uyarı olarak bas ("dpi 999999 → 32000 olarak saklanacak").
+- Durum: DÜZELTİLDİ (2026-10-07) — validate artık ham JSON (sanitize öncesi) değerlerini denetliyor: clamp edilen alanlar ("dpi 999999 → 32000") uyarı basar, `speed_min > speed_max` ham çiftten doğrudan raporlanır, isim 256 kırpması uyarılır.
 
 **CFG-3 · ORTA · `MAX_PROFILES` yalnız yüklemede; create/duplicate/import sınırsız yazıyor → sessiz kesinti**
 - Konum: `src/config.cpp:627` (load cap), `640-641` (hepsini yazar); `cli/main.cpp:472,548,579,1291` (cap kontrolü yok)
@@ -1485,6 +1487,7 @@ Odak: `daemon/daemon.cpp` (2779+), `daemon/main.cpp` (584), `daemon.hpp`, `lat_s
 - Kategori: IPC / çoklu-instance / güvenlik
 - Açıklama: `start_ipc_server` daha ilk satırda `ipc_sock_path_ = sock_path` yazar, sonra lstat/probe yapar. Probe canlı bir daemon bulunca `return false` — `ipc_sock_path_` temizlenmemiş kalır. İkinci örnek teardown'da (`main.cpp` üzerinden veya `~AccelDaemon` → `stop_ipc_server`) `ipc_sock_path_`'i unlink eder → **ilk (canlı) daemon'ın `/run/rawaccel.sock` dosyası silinir**; ilk daemon yeni istemci kabul edemez, GUI yalnız SIGHUP fallback'e düşer. PID-1 ile birleşince: ikinci instance hem ikinci uinput yaratır hem ilk daemon'ın socket'ini öldürür.
 - Öneri: Socket'i gerçekten bind edene kadar `ipc_sock_path_` boş tut; tüm early-return yollarında `clear()` et (mutex altında) veya stop'a "bound" bayrağı ekle.
+- Durum: DÜZELTİLDİ — `ipc_sock_path_` artık listen başarısından SONRA (worker thread başlamadan önce) atanıyor; erken-dönüş/başarısız start'ta stop'un unlink edeceği path boş kalıyor, ilk daemon'ın socket'i silinmiyor, stop aynı zamanda bir "bound" kanıtı olarak path'i yalnızca başarılı bind sonrası siliyor (`daemon/daemon.cpp`). Build 0 uyarı, test 34267/34267 ✓
 
 **D26-N2 · ORTA · `uinput_write_retry` bütçe(32) tükenince `done < nbytes` iken yine `true` dönüyor → frame sessizce düşüyor**
 - Konum: `daemon.cpp:1612-1646` (döngü sonu `return true;`), kullanan `flush_motion`/`flush_batch`
@@ -1604,6 +1607,7 @@ Odak: `src/config.cpp` (971), `cli/main.cpp` (2415), `include/config.hpp`, `daem
 - Kategori: Profil eşleme / cihaz davranışı
 - Açıklama: `match_app="firefox"` olan bir cihaz profili, `current_app_` boşken (masaüstü / kwin relay kapalı) her fareye ve her uygulamada uygulanır; krita odaktayken de döngü 1 (device_id + app) eşleşmeyince döngü 3 genel device_id eşleşmesi firefox profilini yakalar. Yorum (`:944-946`) "no app constraint" vaat ediyor ama uygulama-kısıtlı profilleri de içeriyor. Kullanıcı app-scope kurduğu halde her yerde o profil çalışır.
 - Öneri: Döngü 3/4'e `p.match_app.empty() || profile_matches_app(p, current_app_)` ekle; `have_app` false iken `match_app`'i boş olmayan profilleri atla.
+- Durum: DÜZELTİLDİ — `find_profile` döngü 3 (active_profile) ve döngü 4 (ilk profil) artık `profile_matches_app(p, current_app_)` kapısından geçiyor; app-bound profil non-matching/no-focus durumunda catch-all olamaz (`daemon/daemon.cpp`). Build 0 uyarı, test 34267/34267 ✓
 
 **C29-N2 · ORTA · `import`'"profiles" dizili dolu config'te `active_profile`/`use_raw_input`/`version`'u yutuyor**
 - Konum: `cli/main.cpp:1172-1176` (sadece profilleri alır)
@@ -2093,7 +2097,7 @@ Yöntem: Paralel daemon agent + satır doğrulama. HP-1/HP-2/HP-3, R10-EIO/REGRB
 - Kategori: Hot-plug / lifecycle
 - Açıklama: Kernel renumber'da (`eventN→eventM`, aynı `usb:VID:PID:serial`) add-döngüsü yeni yolu `opened_device_ids_` dolu diye `close+continue` eder (missed_any koymaz), aynı scan'in removal-fazı eskiyi siler. Sonuç `rescan_needed_=false` — yeni yol bir daha denenmez. Tek farede 2sn empty-rescan kurtarır; çok farede cihaz replug/restart'a kadar ölü.
 - Öneri: Removal-fazını add'den önce çalıştır veya duplicate-skip dalında `missed_any=true` koy.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `do_hotplug_scan` artık removal fazını add fazından ÖNCE çalıştırıyor; kernel renumber'da (`eventN→eventM`, aynı device_id) eski yol/id'ler add-döngüsünden önce serbest kalıyor, yeni yol HP-3 duplicate-skip'e takılmadan AYNI scan'de açılıyor (`daemon/daemon.cpp`). Build 0 uyarı, test 34267/34267 ✓
 
 **T35-DMN02 · ORTA · `release_device()` bloklayan syscall'ları `devices_mutex_` altında yapıyor**
 - Konum: `daemon/daemon.cpp:1167-1190` (tanım) ← `1202-1215` (`apply_new_config`) + `1065-1071` (`apply_active_app`)
@@ -2262,7 +2266,7 @@ Yöntem: Paralel HID++/scripts agent + satır doğrulama. N-SWID2/N-FDERR/N-EAGA
 - Kategori: Bloklama / DoS
 - Açıklama: POLLOUT hazır görünüp `write` sürekli EAGAIN veren takoz hidraw kuyruğunda sonsuz döner. Dış `send_feature_request` deadline'ı (500ms) `write_packet`'tan sonra başlıyor, bu beklemeyi sınırlamıyor. `uinput_write_retry` için D26-N2/N3 bütçe tartışıldı, HID++ yazma yolu için yok.
 - Öneri: Deneme sayacı veya `steady_clock` deadline (örn. 500ms) ile sınırla, aşımda `false` + throttled log.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `write_packet` EAGAIN/POLLOUT retry döngüsüne `steady_clock` tabanlı toplam 500 ms deadline eklendi (`src/logitech_hidpp.cpp`); deadline aşımında `false` dönüyor, poll beklemesi kalan süreyle kısıtlanıyor. Okuma tarafındaki timeout sabitleriyle uyumlu. Build 0 uyarı/0 hata, `tests/run_tests.sh` 34267/34267 geçti.
 
 **T37-HID02 · ORTA · Pil prob sırası centurion'ı atlıyor — GUI ile daemon ayrışır**
 - Konum: `src/logitech_hidpp.cpp:1492-1513` (kod: `unified→status→voltage→centurion`) vs `include/logitech_quirks.hpp:142-159` (`preferred_battery_source`: `unified→centurion→status→voltage`); `:1470-1471` yorumu "sıra eşleşti" diyor
@@ -2396,7 +2400,7 @@ Odak: `daemon/daemon.cpp` flush/process/SYN, `motion_math.hpp`, `lat_stats.hpp`,
 - Kategori: Event-loss
 - Açıklama: `pending_dx/dy +=` korunurken `pending_events` sıfırlanır. İz: `[BTN(queued=1), REL(5), SYN_DROPPED→park pending=[BTN], SYN clear, REL(3), EAGAIN]` → `pending_dx=8` doğru ama `pending=[BTN]` silinip `queued=0` kopyalanır → BTN kaybolur. RAC-4 parkın kendisi değil, ikinci deferin ezmesidir.
 - Öneri: `=0` yerine append yap veya doluysa erken-flush + throttled log; `dx` için yapılan `+=` korumanın olay simetriğini kur.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — batch-sonu defer artık `pending_ev_count = 0` ile sıfırlamıyor; queued event'leri mevcut SYN_DROPPED parkına append ediyor (`pending_dx/dy +=` ile simetrik), overflow'da L09-04 log'u korunuyor (daemon/daemon.cpp).
 
 **T38-HOT03 · ORTA · `pending_events(16)` taşması sessiz truncasyon (logsuz)**
 - Konum: `daemon/daemon.cpp:2383-2384` + `:2324-2325` + `:2573-2574` (`< size(16)` ile sessiz kesme) vs `:2528/:2549` (queued taşması erken-yazılır, düşürme yok)
@@ -2492,7 +2496,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: PID/lifecycle
 - Açıklama: `"abc\n"` gibi parse-edilemez içerik `pid==0` olur → hep `false` döner. İlk `write_pid` EEXIST ile düşer, `cleared/retry_ok=false` → her açılış "Another instance..." reddi, manuel silme gerekir. PID-2 yalnız 0-byte'ı kapsar.
 - Öneri: `pid==0` dosyayı da `unlink` ile stale say (kill ile canlı olamayacağı sabit).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `try_clear_stale` artık `pid==0` (parse-edilemez) içeriği de stale sayıp `unlink` ediyor; PID-2'nin 0-byte kapsamı parse-edilemez dosyaları da kapsıyor (daemon/main.cpp).
 
 **T40-PID02 · DÜŞÜK-ORTA · Fallback başarısında stale dosya leak olur**
 - Konum: `daemon/main.cpp:414-416,467-470` (`pid_written=write(xdg)||write(/run)||write(/tmp)`; `try_clear` yalnız `!pid_written` dalında)
@@ -2651,7 +2655,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Veri-kaybı
 - Açıklama: 257+ profil load'da düşer, sonraki `save` yalnız 256 yazar — kalıcı silinir.
 - Öneri: `stderr`/dönüş ile bildir veya kirli-budama bayrağı ile üzerine-yazmayı engelle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — trusted dosya yolunda aşım (>MAX_PROFILES_FILE) artık yüklemede hata (throw), budanan kuyruk save ile kalıcı silinemiyor; untrusted IPC yolunda SEC-9 capi korundu ancak düşen profil sayısı stderr'e sayımla yazılıyor; non-object girdi zaten throw (K1).
 
 **T43-06 · ORTA · Save yolu sanitize etmiyor (`NaN→null→throw` zinciri)**
 - Konum: `src/config.cpp:727,687-706` (`save` aynen dump; programatik NaN nlohmann'da `null`; sonraki load `require_number:148-150` throw → tüm config açılmaz)
@@ -2732,7 +2736,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Parity
 - Açıklama: MATH-2/P107 "floor 0.01" der ama kod yalnız `<=0` floor'lar. Üstte parity tamam (`100`).
 - Öneri: Sanitize'ı `if(scale<0.01)` yap veya CLI domain'i `(0,100]` + uyarıya çevir + help güncelle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — sanitize `if (a.scale < 0.01) a.scale = 0.01;` oldu (MATH-2 düzeltmesiyle aynı satır); JSON artık `(0,0.01)` bandını taşımıyor, CLI↔sanitize parity sağlandı.
 
 **T44-02 · DÜŞÜK · Global flag'ler değerleri yutuyor (`--json/--dry-run/--help`) + `--` belgesiz**
 - Konum: `cli/main.cpp:2870-2885,2864-2866` vs `:2693-2828` (`print_help`); `set-param p device_id --json`, `create --help` değer verilemez; kurtarıcı `--` (`:2880-2882`) help'te yok
@@ -2799,7 +2803,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Migration
 - Açıklama: CFG-1'in migrate-semantiği hatası (C29-N2 restore değil).
 - Öneri: `version`'u wrapper ile ezme; batch'i wrapper-versiyon bağlamında migre et (mevcut profillere dokunma).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `cli/main.cpp` cmd_import: wrapper `version` artık cfg'yi ezmiyor; import edilen batch, wrapper-versiyon bağlamında (wrapper'sız formatlarda legacy/empty → pre-0.4 lookup+gain tek seferlik y*x normalize) ayrı bir `app_config` içinde TAM BİR KEZ `migrate_config()` ile migre ediliyor ve mevcut profiller dokunulmuyor; birleşik config üzerindeki ikinci migrate çağrısı kaldırıldı. (2026-10-07)
 
 **T45-IMP03 · DÜŞÜK · Bare-array/wrapper elem-tip denetimsiz + `lut_length` yalanı**
 - Konum: `cli/main.cpp:1566-1572` + `:1626-1654` (yalnız `all[0].is_object()` bakılır, sonra körü körüne `dump()`; `[{},123,null]` `dp.name==""` ile yanlış hata) + `lut_length` hiç bakılmaz (`lut_length:514 + data:[2]` `length=2` sessiz düzelir)
@@ -2859,7 +2863,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Veri-kaybı
 - Açıklama: `[Libinput]` içindeki `PointerAccelerationSpeed, LeftHanded, NaturalScroll, ClickMethod` vb. fix sonrası kalıcı silinir. R2-01 yalnız yorum/boş satırı kurtarmıştı.
 - Öneri: `body` dışındaki `is_key` satırları da korunmalı veya merge edilmeli.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — T51-06 düzeltmesi (`kde_upsert_section` artık yabancı key=value satırlarını da koruyor) bu maddeyi de kapsıyor; /tmp kwinrc fixture doğrulamalı.
 
 **T46-02 · DÜŞÜK · `on_daemon_reload` gevşek `"ok"` eşleşmesi**
 - Konum: `gui/widgets_sync.inl:824-825` (`find("ok")`) vs `daemon_comm.inl:256-257,236-238` (strict `"ok":true/false`)
@@ -2926,7 +2930,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Dayanıklılık
 - Açıklama: XDG gölgelemesi sistem daemon'unu gizler; `daemon_running()` + `status` yanlış-negatif.
 - Öneri: `if (!complete) { close; continue; }` (connect/send ile simetrik).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ (2026-10-07) — recv sonrası koşulsuz `return` kaldırıldı; eksik/timeout yanıtta `continue` ile sonraki aday deneniyor (`if (!complete) continue; return resp;`). XDG ölü soket varken `/run` artık denenir.
 
 **T47-B2 · ORTA · `pid_probe` exe tam-eşleşme upgrade sonrası `(deleted)` daemon'u stale sayar**
 - Konum: `gui/daemon_comm.inl:288-294` (`strcmp(base,"rawaccel-daemon")==0`) + `:355` (`probe==0 → unlink`) — upgrade sonrası `/proc/.../exe` `"... (deleted)"` → `return 0` → canlı PID dosyası silinir, daemon "stopped" gösterilir (R12-PIDUNL `-1` koruması işlemez çünkü bu dal `0` üretir)
@@ -3028,7 +3032,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: UI-jank
 - Açıklama: Worker'a alınsa `last_app:120` (`std::string` atomsuz) yarışı doğar.
 - Öneri: PID→comm cache'le veya `*_async` + idle'a taşı; `last_app` mutex/atomik.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — GetConnectionUnixProcessID(2000ms) sender-doğrulaması ve set_active_app(150ms) IPC'i `focus_method_call` ana thread'inden alınıp `focus_worker` thread'ine taşındı (kwin_focus.inl: FocusJob kuyruğu + condition_variable; uninstall'da join). `last_app` std::mutex `last_app_mu` ile korunuyor (yazma/okuma/retry/resend tüm erişimler). D-Bus yanıtı worker'dan gönderiliyor (GDBus thread-safe); `GDBusMethodInvocation` ref'lenip reply sonrası unref ediliyor. Derleme uyarısız, run_tr_coverage PASS.
 
 **T48-06 · DÜŞÜK · Öngörülebilir script dosyası `fopen("w")` ile**
 - Konum: `gui/kwin_focus.inl:168-175` (`$RUNTIME/rawaccel/kwin_focus_relay.js` `fopen("w")` — `O_EXCL|O_NOFOLLOW` yok; repo `tr.inl:644`, `profile_mgr.inl:28-33` `O_NOFOLLOW|O_EXCL` kullanır; `dir 0700` düşük sömürü ama politika tutarsız + uninstall'da silinmiyor)
@@ -3218,11 +3222,11 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Durum: AÇIK (2026-09-13 bulundu)
 
 **T51-06 · YÜKSEK · `kde-fix-accel.sh` python yolu yabancı anahtarları siliyor (veri-kaybı)**
-- Konum: `scripts/kde-fix-accel.sh:95-109,111-114,311-318` (`new_block=header+body` + `re.sub` eski gövdeyi komple değiştirir, yalnız 2 anahtar bırakır; `PointerAccelerationSpeed` vb. `--fix` ve `--remove`'da silinir; `sed` fallback `:157-168` korur — iki yol farklı)
+- Konum: `scripts/kde-fix-accel.sh:95-109,111-114,311-318`, `gui/ui_builder.inl` (`kde_upsert_section`)
 - Kategori: Veri-kaybı
 - Açıklama: Kullanıcı ayarları kalıcı silinir.
 - Öneri: Gövdeyi parse edip yalnız 2 anahtarı upsert et, diğer satır/yorum aynen tut.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — python yolu (`--fix` + `--remove`) ve GUI `kde_upsert_section` artık yabancı key=value satırlarını da koruyor; /tmp kwinrc fixture'ı ile `--fix`/`--remove` doğrulandı (yabancı anahtar + yorum korunuyor), `bash -n` + build temiz.
 
 **T51-07 · ORTA · KDE yedek-rotasyonu çakışır + boşluklu yolda yanlış silme**
 - Konum: `scripts/kde-fix-accel.sh:47-49` (`ts=date+%S-$$` aynı sn+PID çakışır → ilk yedek ezilir; `ls -1t ... | tail +6 | xargs -r rm -f` boşluk/newline'da kelime-bölünmesi)
@@ -3433,7 +3437,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Robustness
 - Açıklama: Temiz klonda `g++ ... -o "$BIN"` "No such file" ile ölür.
 - Öneri: Derlemeden önce `mkdir -p "$ROOT/build-manual"` ekle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `tests/run_tests.sh` artık `mkdir -p "$ROOT/build-manual"` yapıyor (TMPDIR'a derlenen `$BIN` ayri tutularak P106 izolasyonu bozulmadı) ve CLI/DAEMON ikilileri yoksa önce `scripts/build.sh`'i çağırıp temiz checkout'ta kendi kendine toparlanıyor; doğrulama: `rm -rf build-manual && bash tests/run_tests.sh` → `=== Sonuç: 34267/34267 geçti ===`, exit 0.
 
 **T53-02 · DÜŞÜK · `run_tests.sh` + `run_tests_asan.sh` `-lpthread` link sırası (`--as-needed` riski)**
 - Konum: `tests/run_tests.sh:17`, `run_tests_asan.sh:23` (`$CXX $CXXFLAGS -lpthread <src> -o` → `--as-needed` soldan-sağa lib'i düşürebilir, sonraki nesneler çözümsüz kalır)
