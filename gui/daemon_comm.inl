@@ -203,7 +203,11 @@ static std::string daemon_ipc_send_raw(const std::string& req, int timeout_ms = 
             if (resp.find('\n') != std::string::npos) { complete = true; break; }
         }
         close(fd);
-        return complete ? resp : std::string();
+        // T47-B1: an incomplete/timeout response must NOT end the failover —
+        // a dead-but-listening XDG shadow socket would otherwise mask the
+        // real daemon on /run (daemon_running/status false negatives).
+        if (!complete) continue; // try the next candidate
+        return resp;
     }
     return {};
 }

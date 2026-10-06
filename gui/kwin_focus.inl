@@ -44,6 +44,19 @@ static const char* FOCUS_NODE_XML =
 
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
+// T48-05: a focus report is processed end-to-end on a worker thread (sender
+// verification GetConnectionUnixProcessID ~2000 ms + set_active_app 150 ms)
+// so the GTK main thread never blocks on Alt-Tab.
+struct FocusJob {
+    GDBusConnection*       conn = nullptr;
+    GDBusMethodInvocation* inv  = nullptr;  // g_object_ref'd by the poster
+    std::string            sender;
+    std::string            wm_class;
+};
 
 struct kwin_focus_ctx {
     GDBusConnection* session_conn  = nullptr;
@@ -53,11 +66,20 @@ struct kwin_focus_ctx {
     bool             installed     = false;
     // R8-RESEND: last WM_CLASS the relay reported (cache so the poll can
     // re-send it after a daemon down/up cycle).
+    // T48-05: written by the focus worker, read by the retry timeout and the
+    // resend poll (main thread) — every access MUST take last_app_mu.
+    std::mutex       last_app_mu;
     std::string      last_app;
     // GUI-Y2: keep the worker joinable instead of detached.  kwin_focus_uninstall
     // MUST join it before releasing session_conn — otherwise the worker may still
     // be mid-Call on a connection we have already unref'd (UAF).
     std::thread      worker;
+    // Focus-report queue drained by focus_worker (joined in uninstall).
+    std::thread                    focus_worker;
+    std::mutex                     focus_mu;
+    std::condition_variable        focus_cv;
+    std::queue<FocusJob>           focus_jobs;
+    bool                           focus_stop = false;
 };
 
 // ── GDBus method handler ─────────────────────────────────────────────────────
@@ -80,14 +102,66 @@ static void focus_method_call(GDBusConnection* conn, const gchar*,
             g_dbus_method_invocation_return_value(inv, nullptr);
             return;
         }
+        // R13-KWINARG: (b) sender filter note — the GetConnectionUnixProcessID
+        // + /proc check moved to the focus worker (T48-05) but keeps the same
+        // accept-on-error fallback contract.
         const gchar* sender = g_dbus_method_invocation_get_sender(inv);
-        if (sender) {
-            bool accepted = false;
+        const gchar* wm_class = nullptr;
+        g_variant_get(params, "(&s)", &wm_class);
+        auto* ctx = static_cast<kwin_focus_ctx*>(user_data);
+        if (!ctx) {
+            g_dbus_method_invocation_return_value(inv, nullptr);
+            return;
+        }
+        // T48-05: hand the report (sender verification + IPC + last_app
+        // update) to the focus worker — this is a GDBus main-context
+        // callback, so doing the 2000 ms GetConnectionUnixProcessID and the
+        // 150 ms set_active_app here froze the UI on every Alt-Tab.  The
+        // D-Bus reply is sent by the worker (GDBus is thread-safe); we hold
+        // our own ref on the invocation until then.
+        FocusJob job;
+        job.conn     = conn;
+        job.inv      = static_cast<GDBusMethodInvocation*>(g_object_ref(inv));
+        job.sender   = sender ? sender : "";
+        job.wm_class = wm_class ? wm_class : "";
+        {
+            std::lock_guard<std::mutex> lk(ctx->focus_mu);
+            ctx->focus_jobs.push(std::move(job));
+        }
+        ctx->focus_cv.notify_one();
+        return;
+    }
+    g_dbus_method_invocation_return_dbus_error(inv, "org.freedesktop.DBus.Error.UnknownMethod",
+                                               "Unknown method");
+}
+
+// T48-05: worker loop draining FocusJobs.  All blocking work lives here.
+static void focus_worker_main(kwin_focus_ctx* ctx) {
+    for (;;) {
+        FocusJob job;
+        {
+            std::unique_lock<std::mutex> lk(ctx->focus_mu);
+            ctx->focus_cv.wait(lk, [&] {
+                return ctx->focus_stop || !ctx->focus_jobs.empty();
+            });
+            if (ctx->focus_stop && ctx->focus_jobs.empty()) return;
+            job = std::move(ctx->focus_jobs.front());
+            ctx->focus_jobs.pop();
+        }
+        // (b) Best-effort sender filter: only accept calls whose sender
+        // resolves to a KWin process.  Any app on the session bus can
+        // otherwise flip the daemon's active-app profile to a spoofed class.
+        // If the sender CANNOT be identified (bus denial, /proc restricted)
+        // we accept — preserving the old best-effort contract rather than
+        // breaking legit setups.
+        bool accepted = true;
+        if (!job.sender.empty()) {
+            accepted = false;
             GError* derr = nullptr;
             GVariant* r = g_dbus_connection_call_sync(
-                conn, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                job.conn, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                 "org.freedesktop.DBus", "GetConnectionUnixProcessID",
-                g_variant_new("(s)", sender), G_VARIANT_TYPE("(u)"),
+                g_variant_new("(s)", job.sender.c_str()), G_VARIANT_TYPE("(u)"),
                 G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &derr);
             if (r) {
                 guint32 pid = 0;
@@ -108,48 +182,47 @@ static void focus_method_call(GDBusConnection* conn, const gchar*,
                 if (derr) g_error_free(derr);
                 accepted = true; // bus refused the lookup — fall back to accepting
             }
-            if (!accepted) {
-                // Non-KWin caller — spoofed or stale; ignore silently.
-                g_dbus_method_invocation_return_value(inv, nullptr);
-                return;
+        }
+        if (accepted) {
+            {
+                std::lock_guard<std::mutex> lk(ctx->last_app_mu);
+                ctx->last_app = job.wm_class;
+            }
+            {
+                // R12-STALERT: unify dropped-report handling for BOTH app-scoped
+                // and clear ("", no app focused) reports.  R11-FOCR only retried
+                // non-empty classes, so a dropped CLEAR left the previous
+                // app-scoped profile applied until the next focus change.
+                std::string reported = job.wm_class;
+                if (!daemon_ipc_set_active_app(reported)) {
+                    // A dropped report (the one-shot 150 ms IPC read timed out
+                    // against a busy serial daemon) is retried once after the
+                    // contention has likely cleared — but ONLY if focus is STILL
+                    // the class we queued at fire time.  A newer report that
+                    // already reached the daemon must never be overwritten by this
+                    // stale replay (that would REVERT the correct app-scoped
+                    // profile until the next focus change).  Retries stay bounded
+                    // to one: a failed replay is dropped, not re-queued.
+                    struct FocusRetry { kwin_focus_ctx* ctx; std::string queued; };
+                    auto* r = new FocusRetry{ctx, reported};
+                    g_timeout_add_full(G_PRIORITY_DEFAULT, 1000,
+                        [](gpointer p) -> gboolean {
+                            auto* R = static_cast<FocusRetry*>(p);
+                            std::string now = R->queued;
+                            if (R->ctx) {
+                                std::lock_guard<std::mutex> lk(R->ctx->last_app_mu);
+                                now = R->ctx->last_app;
+                            }
+                            bool same = (now == R->queued);
+                            if (same) daemon_ipc_set_active_app(now);
+                            return G_SOURCE_REMOVE; // destroy-notify then reclaims R
+                        }, r, [](gpointer p) { delete static_cast<FocusRetry*>(p); });
+                }
             }
         }
-        const gchar* wm_class = nullptr;
-        g_variant_get(params, "(&s)", &wm_class);
-        auto* ctx = static_cast<kwin_focus_ctx*>(user_data);
-        if (ctx) ctx->last_app = wm_class ? wm_class : "";
-        {
-            // R12-STALERT: unify dropped-report handling for BOTH app-scoped
-            // and clear ("", no app focused) reports.  R11-FOCR only retried
-            // non-empty classes, so a dropped CLEAR left the previous
-            // app-scoped profile applied until the next focus change.
-            std::string reported = wm_class ? wm_class : "";
-            if (!daemon_ipc_set_active_app(reported)) {
-                // A dropped report (the one-shot 150 ms IPC read timed out
-                // against a busy serial daemon) is retried once after the
-                // contention has likely cleared — but ONLY if focus is STILL
-                // the class we queued at fire time.  A newer report that
-                // already reached the daemon must never be overwritten by this
-                // stale replay (that would REVERT the correct app-scoped
-                // profile until the next focus change).  Retries stay bounded
-                // to one: a failed replay is dropped, not re-queued.
-                struct FocusRetry { kwin_focus_ctx* ctx; std::string queued; };
-                auto* r = new FocusRetry{ctx, reported};
-                g_timeout_add_full(G_PRIORITY_DEFAULT, 1000,
-                    [](gpointer p) -> gboolean {
-                        auto* R = static_cast<FocusRetry*>(p);
-                        std::string now = R->ctx ? R->ctx->last_app : R->queued;
-                        bool same = (now == R->queued);
-                        if (same) daemon_ipc_set_active_app(now);
-                        return G_SOURCE_REMOVE; // destroy-notify then reclaims R
-                    }, r, [](gpointer p) { delete static_cast<FocusRetry*>(p); });
-            }
-        }
-        g_dbus_method_invocation_return_value(inv, nullptr);
-        return;
+        g_dbus_method_invocation_return_value(job.inv, nullptr);
+        g_object_unref(job.inv);
     }
-    g_dbus_method_invocation_return_dbus_error(inv, "org.freedesktop.DBus.Error.UnknownMethod",
-                                               "Unknown method");
 }
 
 static const GDBusInterfaceVTable focus_vtable = {
@@ -262,8 +335,14 @@ static void on_name_lost(GDBusConnection*, const gchar*, gpointer user_data) {
 /// windows — re-send the last known WM_CLASS.
 static void kwin_focus_resend_current(AppState* S) {
     auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
-    if (!ctx || !ctx->installed || ctx->last_app.empty()) return;
-    daemon_ipc_set_active_app(ctx->last_app);
+    if (!ctx || !ctx->installed) return;
+    std::string last;
+    {
+        std::lock_guard<std::mutex> lk(ctx->last_app_mu);
+        last = ctx->last_app;
+    }
+    if (last.empty()) return;
+    daemon_ipc_set_active_app(last);
 }
 
 /// Install the KWin focus relay.  Best-effort: returns true if relay is active.
@@ -295,6 +374,12 @@ static bool kwin_focus_install(AppState* S) {
     ctx.worker = std::thread([ctxPtr = &ctx]() {
         ctxPtr->kwin_script_id = kwin_script_load_and_run_sync(ctxPtr->session_conn);
     });
+
+    // 4. Focus-report worker (T48-05): drains sender-check + IPC jobs off the
+    // main thread.  Joined in kwin_focus_uninstall before session_conn is
+    // unref'd (GUI-Y2 contract).
+    ctx.focus_stop = false;
+    ctx.focus_worker = std::thread(focus_worker_main, &ctx);
     ctx.installed = true;
 
     S->kwin_focus_ctx = &ctx;
@@ -310,6 +395,15 @@ static void kwin_focus_uninstall(AppState* S) {
     // holds a raw pointer to it while running D-Bus calls).  Its D-Bus calls
     // carry a timeout so the join completes within a bounded time.
     if (ctx->worker.joinable()) ctx->worker.join();
+    // T48-05: stop + join the focus worker before releasing session_conn —
+    // it may be mid GetConnectionUnixProcessID / IPC on conn (bounded by the
+    // call timeouts), and unref'ing conn under it would be UAF.
+    {
+        std::lock_guard<std::mutex> lk(ctx->focus_mu);
+        ctx->focus_stop = true;
+    }
+    ctx->focus_cv.notify_all();
+    if (ctx->focus_worker.joinable()) ctx->focus_worker.join();
     // Unload script (best-effort).
     int sid = ctx->kwin_script_id.load(std::memory_order_relaxed);
     if (ctx->session_conn && sid >= 0)
