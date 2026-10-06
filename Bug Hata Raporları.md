@@ -1332,6 +1332,7 @@ Odak: `src/logitech_*.cpp`, `setup.sh`, `scripts/*`, `.github/workflows/ci.yml`,
 - Kategori: CI sağlamlığı
 - Açıklama: `set -o pipefail` var ama `set -e` yok. `build.sh` cmake hatasıyla (ör. libevdev yok) düşerse output derleyici-tanı regex'ine uymaz → uyarı kapısı sessizce geçer → "Verify binaries" EKSİK der; gerçek hata görünmez.
 - Öneri: Adım başına `set -e` ekle ya da pipeline durumunu açıkça yakala.
+- Durum: DÜZELTİLDİ — `build-and-test`'in build adımında `set -e` + `set -o pipefail` mevcut ve korundu; sanitizer job'ının derleme adımına da `set -e`/`set -o pipefail` eklendi (`ci.yml` "Build & run tests with -fsanitize=address,undefined"), böylece sessiz derleyici/cmake hatası artık uyarı kapısını geçemez.
 
 **SH-1 · DÜŞÜK · `bench_hotpath.sh` non-x86'da `/proc/cpuinfo` 'model name' yokluğunda abort**
 - Konum: `scripts/bench_hotpath.sh:42` (`set -euo pipefail` altında grep)
@@ -2231,7 +2232,7 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Kategori: Help parity
 - Açıklama: C-5/PRE-2/PRE-3 değerleri değiştirdi, tablo kalmış. CLI-B domain metinlerini hizalamıştı, preset tablosu unutulmuş.
 - Öneri: `gaming [15.0,1.8]`, `precision [24.0,1.2]`, `apex 1.0` yaz.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — help preset tablosu presets.hpp ile hizalandı: gaming [15.0,1.8], precision [24.0,1.2], apex output-offset 1.0 (cli/main.cpp).
 
 **T36-CFG01 · DÜŞÜK · `match_app` trim parity (GUI kırpar, load kırpmaz)**
 - Konum: `gui/widgets_sync.inl:293-295` (trim) vs `src/config.cpp:634` (`json_get_string_limited` cap, trim yok)
@@ -2517,7 +2518,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Identity
 - Açıklama: Sürücü tam 256 byte NUL'suz dönerse `std::string(uniq)` stack OOB okur, `device_id` zehirlenir.
 - Öneri: `sizeof(uniq)-1` + `uniq[sizeof-1]='\0'` + dönüş kontrolü.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — EVIOCGUNIQ sizeof-1 ile çağrılıyor, NUL terminatör sabitleniyor, dönüş değeri kontrol ediliyor (daemon/daemon.cpp).
 
 **T40-SIG01 · DÜŞÜK · `SIGHUP` startup penceresinde kaybolur**
 - Konum: `daemon/main.cpp:116-134,492-497,610-611` (`SIGTERM/INT` latch var, `SIGHUP` `if(d) d->reload()` latch'siz; `g_daemon==nullptr` iken veya `start()` içi config/epoll sırasında gelen HUP sessizce düşer; `SIGUSR1` latch'li)
@@ -2937,7 +2938,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Identity
 - Açıklama: Yanlış-negatif.
 - Öneri: `" (deleted)"` sonekini soyup prefix-karşılaştır (`strncmp(...,15)`).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — pid_probe exe yolundan " (deleted)" soneki soyulup karşılaştırılıyor (gui/daemon_comm.inl); upgrade sonrası canlı daemon artık stale sayılmıyor.
 
 **T47-B3 · ORTA-DÜŞÜK · LUT gain tabanı `0.01` (gain=0 sessizce 0.01'e bozulur)**
 - Konum: `gui/graph.inl:478-481` + `ui_builder.inl:852` (`gain spin 0.01..10000`, `max(0.01,gain)`) vs sanitize `config.cpp:210-219` (0 yasaklamaz — gain=0 geçerli)
@@ -3233,7 +3234,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Robustness
 - Açıklama: Yedek kaybı / yanlış silme.
 - Öneri: `date +%S-%N` + `$RANDOM`/`mktemp`; rotasyonu `find -printf '%T@ %p\n'|sort` + `xargs -0/-d` ile yap.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — yedek adı %N-$$-$RANDOM ile benzersiz, rotasyon find -printf/sort -z/xargs -0 ile boşluk-güvenli (scripts/kde-fix-accel.sh).
 
 **T51-08 · ORTA · `--remove` kurulum-öncesi Flat tercihini adaptive'e zorlar**
 - Konum: `scripts/kde-fix-accel.sh:310-321,351` (global `[Libinput]` koşulsuz `profile=2,accel=-0.5`; öncesi Flat olanın tercihi geri gelmez)
@@ -3426,7 +3427,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: CI kapsamı
 - Açıklama: Sessiz drift.
 - Öneri: `build-and-test` sonuna `bash -n` + `cmake -B /tmp/cm -DCMAKE_INSTALL_PREFIX=/usr && DESTDIR=/tmp/pkg cmake --install` smoke + `printsrcinfo` diff (+ `namcap -i`).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `build-and-test` job'ına "Verify CMake build (T52-11)" adımı eklendi: `cmake -B build-ci -DRAWACCEL_PORTABLE=ON -DCMAKE_INSTALL_PREFIX=/usr && cmake --build build-ci -j"$(nproc)"` (aynı `RAWACCEL_PORTABLE` bayrağı, script build'iyle tutarlı). `cmake` paketi apt bağımlılıklarına eklendi; CMakeLists/paketleme kırığı artık CI'da kırmızı verir.
 
 ---
 

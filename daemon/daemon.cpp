@@ -733,7 +733,12 @@ bool AccelDaemon::open_input_device(mouse_device& dev) {
 
     // Read USB serial (EVIOCGUNIQ)
     char uniq[256] = {};
-    ioctl(dev.fd_in, EVIOCGUNIQ(sizeof(uniq)), uniq); // ignore error — may be empty
+    // T40-DEV01: like EVIOCGNAME above — bound the ioctl to sizeof-1, pin a
+    // NUL terminator and check the return, otherwise a driver that fills the
+    // buffer with no terminator lets std::string(uniq) read past the stack.
+    if (ioctl(dev.fd_in, EVIOCGUNIQ(sizeof(uniq) - 1), uniq) < 0)
+        uniq[0] = '\0'; // may be empty on devices without a serial
+    uniq[sizeof(uniq) - 1] = '\0';
 
     // Read vendor/product IDs (EVIOCGID)
     struct input_id iid = {};

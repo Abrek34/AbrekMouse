@@ -44,9 +44,16 @@ write_kwinrc() {
     # Create backup (keep only the newest 5 — M-2)
     if [[ -f "$KWINRC" ]]; then
         local ts
-        ts="$(date +%Y%m%d-%H%M%S)-$$"
+        # T51-07: %N + $RANDOM keeps backups distinct even for two
+        # snapshots inside the same second from the same PID; rotate via
+        # find/sort -z so paths with spaces or newlines can't be
+        # word-split (the old `ls -1t | xargs rm` could delete the wrong
+        # files or clobber the newest backup).
+        ts="$(date +%Y%m%d-%H%M%S)-%N-$$-${RANDOM}"
         cp -a "$KWINRC" "$KWINRC.rawaccel-backup.$ts"
-        ls -1t "$KWINRC".rawaccel-backup.* 2>/dev/null | tail -n +6 | xargs -r rm -f
+        find "$(dirname "$KWINRC")" -maxdepth 1 -name "$(basename "$KWINRC").rawaccel-backup.*" \
+            -printf '%T@ %p\0' 2>/dev/null | sort -z -k1,1rn | tail -z -n +6 \
+            | cut -z -d' ' -f2- | xargs -0 -r rm -f
     fi
 
     # Use python3 for clean INI manipulation (preserves comments/sections).

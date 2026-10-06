@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <climits>
 #include <charconv>
+#include <cstring>
 
 // ── KDE / libinput acceleration detection ────────────────────────────────────
 
@@ -296,6 +297,13 @@ static int pid_probe_rawaccel_daemon(pid_t pid) {
         ssize_t n = readlink(link, exe, sizeof(exe) - 1);
         if (n > 0) {
             exe[n] = '\0';
+            // T47-B2: after an upgrade the live daemon binary is unlinked, and
+            // /proc/<pid>/exe reads "/path/rawaccel-daemon (deleted)".  Strip
+            // the suffix so a LIVE daemon is still recognised instead of being
+            // judged stale (PID file unlinked, daemon shown "stopped",
+            // R12-PIDUNL's -1 conservatism never engaged).
+            char* deleted = strstr(exe, " (deleted)");
+            if (deleted) *deleted = '\0';
             const char* base = strrchr(exe, '/');
             base = base ? base + 1 : exe;
             if (strcmp(base, "rawaccel-daemon") == 0) return 1;

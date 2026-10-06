@@ -3136,13 +3136,13 @@ Options:
 
 Presets (values loaded by `create-preset <preset> <name>`):
   preset      mode            gain  exp-power  cap [in,out]  output-offset
-  gaming      classic         on    —          —             —
+  gaming      classic         on    —          [15.0, 1.8]  —
   office      natural         on    —          —             —
-  precision   classic         on    —          —             —
+  precision   classic         on    —          [24.0, 1.2]  —
   disable     raw-passthrough (noaccel, all processing bypassed)
   cs2         classic         on    —          [18.0, 1.6]   —
   valorant    natural         on    —          [30.0, 2.0]   —
-  apex        power           on    0.8        [28.0, 2.2]   0.9
+  apex        power           on    0.8        [28.0, 2.2]   1.0
   fps         classic         on    —          [20.0, 1.8]   —
   exp-power = power-mode exponent; classic/natural presets use
   exponent_classic/other defaults instead.  All presets: dpi 800, poll 1000.
