@@ -6,6 +6,44 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [1.2.7] — 2026-10-07
+
+Audit-round fix pack: 15 open bug-tracker items closed in one batch.
+Highlights:
+
+### Fixed — veri kaybı / doğruluk
+
+- **T45-IMP02 (import'ta çift-migrasyon).** Wrapper `version` artık
+  mevcut config'i ezmiyor; import edilen batch ayrı bir context'te tam
+  bir kez `migrate_config()`'den geçiyor → pre-0.4 `lookup+gain` profilleri
+  doğru normalize, mevcut profiller dokunulmuyor.
+- **T51-06 + T46-01 (kwinrc'de yabancı anahtar silme).** `kde-fix-accel.sh`
+  python yolları (`--fix`/`--remove`) ve GUI `kde_upsert_section` artık
+  bölüm gövdesindeki kullanıcı anahtarlarını ve yorumları koruyor.
+- **T43-05 (>256 profil sessiz silinme).** Güvenilir dosya yolunda
+  `MAX_PROFILES` aşımı yüklemede hata veriyor; IPC yolunda düşen profil
+  sayısı stderr'e yazılıyor.
+- **T38-HOT02 (SYN_DROPPED park ezilmesi).** Batch-sonu defer artık
+  parked frame'i ezmiyor → buton kaybı yok.
+
+### Fixed — daemon / CLI
+
+- **C29-N1** app-bound profiller catch-all olamaz; **T35-DMN01** replug
+  sırasında cihaz tek scan'de kaybolmaz; **D26-N1** ikinci instance'ın
+  teardown'u ilk daemon'un socket'ini silmez (kodda zaten kapalıydı,
+  rapor işlendi); **T40-PID01** parse-edilemez PID dosyası boot'u
+  kilitlemez; **MATH-2/T44-01** `scale=0` ölü imleç/gizli boost kapandı.
+- **T47-B1** ölü-ama-dinleyen XDG soketi sebebiyle IPC failover kırık;
+  **CFG-2** `validate` uyarıları artık ham değerlerle tetiklenir;
+  **T37-HID01** `write_packet`'e 500 ms deadline; **T53-01**
+  `run_tests.sh` temiz checkout'ta `build-manual/` oluşturur;
+  **T48-05** focus yolunda ana-thread bloklayıcı I/O worker thread'e
+  taşındı.
+
+All gates green: build 0 warnings, 34267/34267 unit tests, oracle
+byte-identical to reference, SIMD parity pass, CLI under ASan/UBSan clean,
+tracker bridge clean.
+
 ## [1.2.6] — 2026-10-03
 
 M101 denetim turunun (20 lane, `.aihaberlesme/mesajlar/denetim-L*.md`)
