@@ -732,6 +732,9 @@ Tips:
 
 > Deep-dive on the syscall model, polling/DPI/smoothing effect tables, and the
 > native-vs-baseline build choice: [docs/performance_tuning.md](docs/performance_tuning.md).
+> The packaged Arch build (`packaging/PKGBUILD`) is a baseline build
+> (`RAWACCEL_PORTABLE=1` — no `-march=native`), so the distributed binary does
+> not depend on the packager's CPU.
 
 RawAccel Linux processes mouse events with sub-microsecond latency in the daemon's hot path:
 

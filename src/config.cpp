@@ -382,6 +382,13 @@ static json device_profile_to_json(const device_profile& dp) {
     j["polling_rate"] = dp.dev_cfg.polling_rate;
     j["disable"]    = dp.dev_cfg.disable;
     j["profile"]    = profile_to_json_obj(dp.prof);
+    // CFG-1: stamp the schema version on every exported profile JSON.
+    // Previously profile exports carried NO version, so import had to guess:
+    // treating them as legacy re-scaled already-migrated lookup+gain y values
+    // (y*x is not idempotent), while treating them as current left true
+    // pre-0.4 files unmigrated.  With the stamp, import can run
+    // migrate_config() exactly once per profile, keyed on this field.
+    j["version"]    = RAWACCEL_VERSION;
     return j;
 }
 

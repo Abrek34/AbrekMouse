@@ -55,24 +55,36 @@ fi
 # ── Pause the running system daemon so it can't steal our synthetic source ──
 SYS_PID="$(pgrep -x rawaccel-daemon 2>/dev/null | head -n1 || true)"
 PRESERVED_PIDFILES=""
+WE_STOPPED=0
 if [[ -n "$SYS_PID" ]]; then
-    if kill -STOP "$SYS_PID" 2>/dev/null; then
+    # E2E/systemd pid-kilit: SIGSTOP'lu bir daemon (örn. önceki koşudan kalma)
+    # kill(pid,0)'a yanıt verir ama busy DEĞİLDİR — daemon artık /proc/<pid>/stat
+    # state alanını kontrol edip 'T'/'t' olanı lock-busy saymıyor. Biz de burada
+    # busy saymıyoruz ve dışarıdan durdurulmuş instance'ı OLDUĞU GİBİ koruyoruz
+    # (çıkışta SIGCONT YOK) — sadece bizim STOP'ladığımızı CONT ederiz.
+    SYS_STATE="$(sed -E 's/^.*\) //' "/proc/$SYS_PID/stat" 2>/dev/null | cut -c1)"
+    if [[ "$SYS_STATE" == "T" || "$SYS_STATE" == "t" ]]; then
+        echo "[INFO] system daemon (pid $SYS_PID) already SIGSTOPped — not counted busy, preserved as-is"
+    elif kill -STOP "$SYS_PID" 2>/dev/null; then
+        WE_STOPPED=1
         echo "[INFO] system daemon (pid $SYS_PID) paused for isolation"
-        # E2E-PID: the PID liveness gate scans EVERY candidate path, so a merely
-        # stopped system daemon still counts as "another running instance" and
-        # the clean-room test daemon could never start.  Remove the pid file(s)
-        # owned by the paused daemon and restore them on exit.  Only steal files
-        # whose stored PID matches $SYS_PID (never clobber a third daemon's lock).
-        for p in "${XDG_RUNTIME_DIR:-/run/user/0}/rawaccel.pid" /run/rawaccel.pid /tmp/rawaccel.pid; do
-            if [[ -f "$p" ]] && [[ "$(cat "$p" 2>/dev/null)" == "$SYS_PID" ]]; then
-                rm -f "$p"
-                PRESERVED_PIDFILES="$PRESERVED_PIDFILES $p"
-            fi
-        done
-        trap '[ -n "${SYS_PID:-}" ] && { for p in $PRESERVED_PIDFILES; do [ -f "$p" ] || echo "$SYS_PID" > "$p"; done; kill -CONT "$SYS_PID" 2>/dev/null || true; }; rm -rf /tmp/rawe2e-* 2>/dev/null || true' EXIT
     else
         echo "[WARN] could not pause system daemon — hot-plug may interfere"
     fi
+    # E2E-PID: the PID liveness gate scans EVERY candidate path, so a merely
+    # stopped system daemon still counts as "another running instance" and
+    # the clean-room test daemon could never start.  Remove the pid file(s)
+    # owned by the paused daemon and restore them on exit.  Only steal files
+    # whose stored PID matches $SYS_PID (never clobber a third daemon's lock).
+    # (Not: main.cpp artık T/t state'li instance'ı lock-stale saydığı için
+    # bu silme savunma amaçlı çift korumadır.)
+    for p in "${XDG_RUNTIME_DIR:-/run/user/0}/rawaccel.pid" /run/rawaccel.pid /tmp/rawaccel.pid; do
+        if [[ -f "$p" ]] && [[ "$(cat "$p" 2>/dev/null)" == "$SYS_PID" ]]; then
+            rm -f "$p"
+            PRESERVED_PIDFILES="$PRESERVED_PIDFILES $p"
+        fi
+    done
+    trap '[ -n "${SYS_PID:-}" ] && { for p in $PRESERVED_PIDFILES; do [ -f "$p" ] || echo "$SYS_PID" > "$p"; done; [ "${WE_STOPPED:-0}" = "1" ] && kill -CONT "$SYS_PID" 2>/dev/null || true; }; rm -rf /tmp/rawe2e-* 2>/dev/null || true' EXIT
 fi
 # T53-06: sistem daemon'ı duraklatılmadıysa da bayat workdir'leri süpür.
 if [[ -z "$(trap -p EXIT)" ]]; then

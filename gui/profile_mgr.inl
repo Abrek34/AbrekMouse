@@ -1,6 +1,7 @@
 // ── Profile management: CRUD dialogs (new / rename / delete / duplicate / reset) ──
 
 #include "../include/presets.hpp"
+#include "../include/nlohmann/json.hpp" // CFG-1: per-profile version stamp read on import
 
 #include <fstream>
 #include <cerrno>
@@ -658,6 +659,26 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
         set_status(S, tr("Import failed: profile has no \"name\"."));
         g_free(path);
         return;
+    }
+    // CFG-1: one-time, version-gated migration of the imported profile.
+    // The embedded "version" stamp (written by every export since it was
+    // added) decides: a current-format profile is a no-op, a pre-0.4
+    // lookup+gain profile gets exactly one y*x normalization, and a
+    // versionless legacy file is treated as pre-0.4 — same semantics as the
+    // CLI import, so the two paths can no longer diverge.
+    {
+        std::string import_version;
+        try {
+            auto rj = nlohmann::json::parse(content);
+            if (rj.is_object() && rj.contains("version") &&
+                rj["version"].is_string())
+                import_version = rj["version"].get<std::string>();
+        } catch (...) { /* legacy — treated as pre-0.4 */ }
+        app_config import_ctx;
+        import_ctx.version = import_version;
+        import_ctx.profiles = { dp };
+        migrate_config(import_ctx);
+        dp = import_ctx.profiles[0];
     }
     for (auto& existing : S->config.profiles) {
         if (existing.name == dp.name) {

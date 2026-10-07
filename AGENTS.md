@@ -66,8 +66,9 @@ Both `scripts/build.sh` and the CMake target apply the same hardening flags
 **`RAWACCEL_PORTABLE=1` means "no `-march=native`", not "runs on any CPU".**
 It exists so a build does not depend on which CPU the builder happens to be —
 GitHub runners do not guarantee a CPU level, and `-march=native` bakes whatever
-the runner has into the binary. The shipped release is the `-march=native` one
-(`packaging/PKGBUILD`); the flag is a CI/reproducibility knob, **not** a
+the runner has into the binary. The packaged Arch release does **not** use
+`-march=native` either — `packaging/PKGBUILD` builds with
+`-DRAWACCEL_PORTABLE=1` (T52-01). The flag is a CI/reproducibility knob, **not** a
 distribution-portability promise, and the docs used to claim otherwise in three
 places at once (fixed in `cece865a`'s follow-up: `scripts/build.sh:41`,
 `README.md`, `docs/performance_tuning.md`).
@@ -232,8 +233,9 @@ AVX2 build wrote `0.0` into the Y component and **vertical mouse movement was
 silently dead in the shipped daemon**. It reached production because at the time
 `tests/run_tests.sh` had no `-march` flag, `tests/oracle/run_oracle.sh`
 deliberately drops `-march`, and CI sets `RAWACCEL_PORTABLE=1` — so all three
-exercised SSE2 only, while `CMakeLists.txt` / `scripts/build.sh` add
-`-march=native` and shipped AVX2. `tests/run_simd_parity.sh` closed that gap;
+exercised SSE2 only, while `CMakeLists.txt` / `scripts/build.sh` could select
+AVX2 via `-march=native` (the packaged binary shipped it until T52-01 made
+PKGBUILD build `RAWACCEL_PORTABLE=1`). `tests/run_simd_parity.sh` closed that gap;
 it now runs **inside `tests/run_tests.sh`** as well as standalone in CI, so the
 documented "just run the tests" path exercises all three backends. A host that
 cannot execute the AVX2 binary makes the gate exit 77, and `run_tests.sh` prints
@@ -430,9 +432,13 @@ GitHub Actions workflow: `.github/workflows/ci.yml`
 
 Five jobs run on every push/PR (Ubuntu 24.04):
 - **build-and-test** — baseline build (`RAWACCEL_PORTABLE=1`, so the result never depends on the runner's CPU), warning-as-failure gate
-  via `grep -E "warning:|error:"`, then `tests/run_tests.sh`, then `tests/run_tr_coverage.sh`,
+  matching only compiler/linker diagnostic shapes (`:[0-9]+(:[0-9]+)?: (warning|fatal error|error):` plus `ld:`/`collect2:` diagnostics —
+  the old `grep -E "warning:|error:"` false-failed on innocent output, fixed R4-L-10), then `tests/run_tests.sh`, then `tests/run_tr_coverage.sh`,
   then the differential oracle (`bash tests/oracle/run_oracle.sh`) which fails if any
-  gain row drifts outside `tests/oracle/known_deviations.txt`.
+  gain row drifts outside `tests/oracle/known_deviations.txt`, then SIMD backend
+  parity (`bash tests/run_simd_parity.sh`) and a CMake configure+build gate
+  (`cmake -B build-ci -DRAWACCEL_PORTABLE=ON`, T52-11) so the packaging path can't
+  drift silently.
 - **sanitizers** — rebuilds tests with `-fsanitize=address,undefined` and runs them
   with `halt_on_error=1` so any leak/UB fails CI.
 - **sanitize-cli** — runs `tests/run_cli_sanitized.sh`, which builds and executes
@@ -452,14 +458,19 @@ Concurrency group cancels superseded runs on the same ref.
 
 ```bash
 # Build with -Wall -Wextra (should produce 0 warnings)
-bash scripts/build.sh 2>&1 | grep -E "warning:|error:"
+bash scripts/build.sh 2>&1 | tee build.log
+# Same diagnostic-shape filter CI uses (R4-L-10) — NOT the old
+# `grep -E "warning:|error:"`, which false-fails on innocent output:
+grep -E ":[0-9]+(:[0-9]+)?: (warning|fatal error|error):|(^|[^[:alnum:]_])(ld|collect2): (fatal error|error|warning):" build.log
 ```
 
 ## Version Update
 
 Version number lives in `include/rawaccel-base.hpp` → `RAWACCEL_VERSION` (propagates to
 daemon, CLI, and GUI at build time) and must be mirrored in `CMakeLists.txt` →
-`project(rawaccel-linux VERSION ...)`. Bump both together.
+`project(rawaccel-linux VERSION ...)` **and** `packaging/PKGBUILD` → `pkgver`
+(`packaging/.SRCINFO` is regenerated via `makepkg --printsrcinfo`). Bump all
+together — CHANGELOG documents the same three-way sync.
 
 ## File Responsibilities
 
@@ -789,7 +800,11 @@ compute sample staleness). Design keeps the hot path lock-free:
   `/dev/uinput` and is therefore **not run in CI** (CI builds/tests only). It
   SIGSTOPs a running system daemon for the duration (trap → SIGCONT) so the
   hot-plug scan can't steal the synthetic source's grab. Config/validation/
-  multi-profile logic stays covered by the integration tests.
+  multi-profile logic stays covered by the integration tests. A SIGSTOPped
+  daemon is NOT counted as busy by the PID liveness gate (`daemon/main.cpp`
+  reads `/proc/<pid>/stat` state: 'T'/'t' → stale lock, second instance may
+  start), and `run_e2e.sh` leaves an externally stopped daemon stopped (only
+  SIGCONTs the one it stopped itself).
 - Device discovery (daemon + GUI) filters only on REL_X+REL_Y and physical/virtual
   status — no name/type-based exclusion for TrackPoint / touchpad / stylus / pad.
   Deliberate policy (BUG-26/aj2): auto-exclusion by name risks silently disabling

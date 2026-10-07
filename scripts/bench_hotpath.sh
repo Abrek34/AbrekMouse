@@ -9,6 +9,23 @@
 
 set -euo pipefail
 
+# SH-5: bound total file growth for this process tree BEFORE anything runs.
+# RLIMIT_FSIZE caps fallocate()/truncate() extensions and every write that
+# grows a file past the limit (results output, accidental core-like dumps),
+# which is the only guard left when perf is unavailable.  256 MiB is ~1000x
+# the normal (~KB) benchmark output, so a healthy run is unaffected.  A
+# tighter limit the caller already set is respected; if the cap cannot be
+# installed, fail loudly instead of running unprotected.
+BENCH_MAX_FILE_KB="${BENCH_MAX_FILE_KB:-262144}"
+_cur_fsize="$(ulimit -f)"
+if [[ "$_cur_fsize" == "unlimited" || "$_cur_fsize" -gt "$BENCH_MAX_FILE_KB" ]]; then
+    if ! ulimit -f "$BENCH_MAX_FILE_KB"; then
+        echo "ERROR: could not set 'ulimit -f $BENCH_MAX_FILE_KB' (KiB); refusing to run unprotected" >&2
+        exit 1
+    fi
+fi
+unset _cur_fsize
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/build-manual"

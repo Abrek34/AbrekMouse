@@ -155,20 +155,31 @@ die() { echo "Hata: $*" >&2; exit 1; }   # L-BUG-41: unhelpful chatter→açıkl
 DAEMON_ISO=none
 DAEMON_ISO_PROBED=0
 
-# `daemon/main.cpp:441-446` `pid_file_is_live` ile AYNI mantık: `kill(pid,0)` 0
+# `daemon/main.cpp` `pid_file_is_live` ile AYNI mantık: `kill(pid,0)` 0
 # dönerse canlı; EPERM (sinyal gönderilemiyor) ise **yine canlı** sayılır —
 # "var ama doğrulanamıyor, bu yüzden reddet". ⚠️ bash'in `kill -0` komutu EPERM
 # ile ESRCH'i AYNI rc ile verdiği için ayrım `/proc/<pid>` varlığıyla yapılır
 # (hata metni çözüm yerelinden bağımsız değil: burada "İşleme izin verilmedi").
 # Bu ayrım olmadan canlı root daemon **ölü** görünür ve düzeltme sessizce hiç
 # devreye girmez — ölçüldü: ilk hâlde `kill -0 693` rc=1, `/proc/693` ise VAR.
+# 2026-10-07: SIGSTOP'lu (state T/t) instance busy SAYILMAZ — kill(pid,0)'a
+# yanıt verir ama olay döngüsü işlemez; daemon tarafı pid_file_is_live ile
+# aynı indirimi uygular (e2e/systemd pid-kilit).
 ra_pid_live () {
-    local f="$1" n
+    local f="$1" n state
     [ -r "$f" ] || return 1
     n=$(tr -dc '0-9' < "$f" 2>/dev/null) || return 1
     [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || return 1
-    kill -0 "$n" 2>/dev/null && return 0    # sinyal gidebiliyor = kesin canlı
-    [ -e "/proc/$n" ] && return 0           # EPERM: var ama sinyal gönderilemiyor
+    if kill -0 "$n" 2>/dev/null; then
+        state=$(sed -E 's/^.*\) //' "/proc/$n/stat" 2>/dev/null | cut -c1)
+        case "$state" in T|t) return 1 ;; esac   # SIGSTOP/trace-stop → busy değil
+        return 0    # sinyal gidebiliyor = kesin canlı
+    fi
+    if [ -e "/proc/$n" ]; then
+        state=$(sed -E 's/^.*\) //' "/proc/$n/stat" 2>/dev/null | cut -c1)
+        case "$state" in T|t) return 1 ;; esac   # EPERM olsa da durdurulmuş → busy değil
+        return 0            # EPERM: var ama sinyal gönderilemiyor
+    fi
     return 1
 }
 

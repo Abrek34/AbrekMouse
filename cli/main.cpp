@@ -2021,6 +2021,7 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
     }
 
     std::vector<device_profile> batch;
+    std::vector<std::string> batch_versions; // CFG-1: per-profile embedded version
     for (auto& fr : frags) {
         device_profile dp;
         try {
@@ -2029,6 +2030,17 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
             std::cerr << "Invalid profile JSON: " << e.what() << "\n";
             return 1;
         }
+        // CFG-1: the profile JSON itself may carry a "version" stamp (all
+        // exports do since the stamp was added).  Capture it for the one-time
+        // migration decision; empty means the file predates the stamp and is
+        // treated as legacy.
+        std::string embedded_version;
+        try {
+            auto rawv = nlohmann::json::parse(fr);
+            if (rawv.is_object() && rawv.contains("version") &&
+                rawv["version"].is_string())
+                embedded_version = rawv["version"].get<std::string>();
+        } catch (...) { /* version stays empty → legacy */ }
 
         // BUG-15-fix-followup: the LUT truncate warning was previously placed
         // AFTER profile_from_json() which calls sanitize_profile() →
@@ -2143,6 +2155,7 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                 return 1;
             }
         batch.push_back(dp);
+        batch_versions.push_back(embedded_version);
     }
 
     // CFG-3: SEC-9 caps profiles at MAX_PROFILES, enforced on load.  A batch
@@ -2212,18 +2225,22 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
         if (wrapper_app.contains("version") && wrapper_app["version"].is_string())
             import_version = wrapper_app["version"].get<std::string>();
     }
-    // T45-IMP02 / CFG-1: run the migration EXACTLY ONCE, on the imported batch
-    // only, in the wrapper's version context.  Non-wrapper imports (single
-    // profile object, JSON array, export line-stream) carry no app version —
-    // treat them as legacy (empty version) so a pre-0.4 `lookup+gain` profile
-    // still gets its one-time y*x normalization.  The existing cfg.profiles
-    // are never touched (they were already migrated at load).
-    {
+    // T45-IMP02 / CFG-1: run the migration EXACTLY ONCE, per imported profile.
+    // Version context precedence: the profile's own embedded "version" stamp
+    // (present on every export since the stamp was added) wins; otherwise fall
+    // back to the wrapper's top-level version (full-config exports); otherwise
+    // the file predates stamping and is treated as legacy (empty version) so a
+    // pre-0.4 `lookup+gain` profile still gets its one-time y*x normalization.
+    // A modern (current-version) profile import is therefore a no-op instead of
+    // a wrong re-scale, and the existing cfg.profiles are never touched (they
+    // were already migrated at load).
+    for (size_t i = 0; i < batch.size(); ++i) {
         app_config import_ctx;
-        import_ctx.version = import_version;
-        import_ctx.profiles = batch;
+        import_ctx.version = !batch_versions[i].empty() ? batch_versions[i]
+                                                        : import_version;
+        import_ctx.profiles = { batch[i] };
         migrate_config(import_ctx);
-        batch = import_ctx.profiles;
+        batch[i] = import_ctx.profiles[0];
     }
     for (auto& dp : batch) {
         cfg.profiles.push_back(dp);

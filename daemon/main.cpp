@@ -103,6 +103,32 @@ static int comm_state(pid_t pid, const char* expected) {
     return std::strcmp(buf, expected) == 0 ? 1 : 0;
 }
 
+// E2E/systemd pid-kilit (BUG-MED, 2026-10-07): bir daemon SIGSTOP ile
+// durdurulursa kill(pid,0) hâlâ başarı döner ve /proc/<pid>/comm okunur —
+// yani run_e2e.sh'nin (veya başka bir aracın) durdurduğu system daemon'ı
+// pid_file_is_live "canlı" sayıp clean-room test daemon'ını reddediyordu.
+// Bir SIGSTOP'lu süreç olay döngüsü, hot-plug ve IPC'yi işletemez; tek
+// instance kilidini fiilen tutmaz. /proc/<pid>/stat state alanı 'T'/'t' ise
+// instance busy SAYILMAZ (lock dosyası bayat kabul edilir).
+// Döndürür: 1 = durdurulmuş (T/t), 0 = çalışır durum, -1 = okunamadı.
+static int proc_stopped(pid_t pid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", static_cast<int>(pid));
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    // comm alanı boşluk/parantez içerebilir — son ')'dan sonraki ilk alan
+    // state'dir: "(comm) S ...".
+    const char* rp = std::strrchr(buf, ')');
+    if (!rp || rp[1] != ' ' || rp[2] == '\0') return -1;
+    const char state = rp[2];
+    return (state == 'T' || state == 't') ? 1 : 0;
+}
+
 // K3: atomic flag for SIGUSR1 — dump_latency_stats() is not async-signal-safe
 // (it uses cout), so we set a flag in the handler and call it from the main loop.
 static std::atomic<bool> g_dump_latency { false };
@@ -481,7 +507,14 @@ int main(int argc, char* argv[]) {
             // must be treated as a live daemon — clearing it deletes a running
             // instance's lock and lets a second daemon grab the devices.
             const int cs = comm_state(static_cast<pid_t>(val), "rawaccel-daemon");
-            if (cs == 1) return true;  // readable + ours → really up → refuse
+            if (cs == 1) {
+                // SIGSTOPlu (veya trace-stop'lu) daemon olay döngüsünü
+                // çalıştırmıyor → lock busy sayılmaz (e2e/systemd pid-kilit).
+                // comm OKUNAMIYORSA (cs == -1) bu indirim uygulanmaz —
+                // PID-3 konservatif kalır.
+                if (proc_stopped(static_cast<pid_t>(val)) == 1) return false;
+                return true;  // readable + ours → really up → refuse
+            }
             if (cs == 0) return false; // readable + different → recycled → stale
             return true;               // comm unreadable → stay conservative
         }
@@ -543,6 +576,14 @@ int main(int argc, char* argv[]) {
             // instead of a live daemon's PID file being deleted.  The follow-up
             // write_pid() is O_CREAT|O_EXCL, so at most one starter wins.
             if (pid > 0 && kill(pid, 0) != 0 && errno == ESRCH) {
+                unlink(path);
+                return true;
+            }
+            // SIGSTOPlu instance busy değildir: dosyası stale kabul edilip
+            // temizlenir ki e2e/temiz daemon başlayabilsin (e2e pid-kilit).
+            if (pid > 0 && kill(pid, 0) == 0 &&
+                comm_state(pid, "rawaccel-daemon") == 1 &&
+                proc_stopped(pid) == 1) {
                 unlink(path);
                 return true;
             }

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <map>
 #include <filesystem>
+#include <sys/resource.h>
 
 using namespace rawaccel;
 
@@ -197,6 +198,35 @@ double run_config_median(const char* name, int runs, int iterations,
 }
 
 int main(int argc, char** argv) {
+    // SH-5: bound file growth for this process (covers fallocate()
+    // extensions, truncate() and any write growing a file, plus core-sized
+    // dumps via RLIMIT_CORE below).  Scripts/bench_hotpath.sh sets the same
+    // cap for the whole tree; this covers direct binary invocations too.
+    // A tighter inherited soft limit is respected.  Failure is loud, not
+    // silent: an unprotected run aborts instead of risking disk fill.
+    {
+        const rlim_t kCap = 256 * 1024 * 1024;  // 256 MiB, ~1000x normal output
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_FSIZE, &rl) == 0 &&
+            (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > kCap)) {
+            rl.rlim_cur = kCap;
+            if (setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+                std::cerr << "ERROR: could not set RLIMIT_FSIZE to " << kCap
+                          << " bytes; refusing to run unprotected\n";
+                return 1;
+            }
+        }
+        if (getrlimit(RLIMIT_CORE, &rl) == 0 &&
+            (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur > kCap)) {
+            rl.rlim_cur = kCap;
+            if (setrlimit(RLIMIT_CORE, &rl) != 0) {
+                std::cerr << "ERROR: could not set RLIMIT_CORE to " << kCap
+                          << " bytes; refusing to run unprotected\n";
+                return 1;
+            }
+        }
+    }
+
     // C2 (L20-CRIT-2): baseline path resolution — no hard-coded absolute path.
     // Priority: explicit `--baseline PATH` → BENCH_BASELINE env var
     // (scripts/bench_hotpath.sh exports it) → paths relative to the executable

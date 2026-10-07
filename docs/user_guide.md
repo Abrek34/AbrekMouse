@@ -52,7 +52,7 @@ The 8 presets: `gaming`, `office`, `precision`, `disable`, `cs2`, `valorant`,
 |---------------|--------|-----|
 | **CS2 / tactical FPS (pro)** | `cs2` | Classic curve, early kick-in, cap 1.6 — micro-adjust headshots stay 1:1, flicks ramp up. Suits the pro eDPI band 560–1000. |
 | **Valorant** | `valorant` | Natural curve (TenZ-style base): smooth entry/exit, light gain, high cap 2.0 so panic flicks stay controlled. |
-| **Apex Legends** | `apex` | Power mode: fast 180° flicks, output offset 0.9 keeps slow tracking near 1:1. |
+| **Apex Legends** | `apex` | Power mode: fast 180° flicks, output offset 1.0 (true 1:1 base) with fast ramp. |
 | **Generic FPS / aim trainers** | `fps` | Balanced classic curve — safe starting point for most shooters. |
 | **General / browser / desktop** | `office` | Light natural acceleration (limit 1.3). |
 | **CAD / design / pixel work** | `precision` | Very low acceleration (0.002) for precise work. |
@@ -105,7 +105,8 @@ Value ranges to start from (see the table below for exact preset numbers).
 ## 5. First-try target values (per preset)
 
 Exact starting values each preset ships with (from `include/presets.hpp`
-`make_preset` — the real numbers, not guesses). Common to all: DPI 800,
+`make_preset` — the real numbers, not guesses; table re-synced to
+`presets.hpp` on 2026-10-07). Common to all: DPI 800,
 polling rate 1000 Hz, output_dpi 1000, `gain = true`, raw_passthrough off.
 
 | Parameter | `gaming` | `cs2` | `valorant` | `apex` | `fps` | `office` | `precision` | `disable` |
@@ -115,16 +116,21 @@ polling rate 1000 Hz, output_dpi 1000, `gain = true`, raw_passthrough off.
 | exponent_classic | 2.0 | 2.0 | — | — | 2.0 | — | 1.5 | — |
 | exponent_power | — | — | — | 0.8 | — | — | — | — |
 | scale | — | — | — | 2.2 | — | — | — | — |
-| limit | 1.8 | 1.6 | 1.3 | — | 1.8 | 1.3 | 1.2 | — |
+| limit | 1.8 | 1.6 | 1.3 | 2.2 | 1.8 | 1.3 | 1.2 | — |
 | decay_rate | — | — | 0.08 | — | — | 0.08 | — | — |
 | motivity | — | — | 1.2 | — | — | 1.2 | — | — |
 | input_offset | 0 | 0 | 0.02 | 0.02 | 0.01 | — | — | — |
-| output_offset | — | — | — | 0.9 | — | — | — | — |
-| cap (in, gain) | — | 18.0, 1.6 | 30.0, 2.0 | 28.0, 2.2 | 20.0, 1.8 | — | — | — |
-| cap_mode | — | out | out | out | out | — | — | — |
+| output_offset | — | — | — | 1.0 | — | — | — | — |
+| cap (in, gain) | 15, 1.8 | 18.0, 1.6 | 30.0, 2.0 | 28.0, 2.2 | 20.0, 1.8 | — | 24, 1.2 | — |
+| cap_mode | out | out | out | out | out | — | out | — |
 | raw_passthrough | off | off | off | off | off | off | off | **on** |
 
 `—` = left at the global default for that field. `--help` lists them all.
+`gaming`/`precision` don't set `cap_mode_val` explicitly — they inherit the
+struct default (`cap_mode::out`, `include/rawaccel-base.hpp`), which is shown
+above because the curve's asymptote depends on it. Likewise `apex`'s `limit`
+(2.2) is informational — power mode binds `cap.y`, not `limit` — but it now
+matches the cap, like every other preset.
 
 Fresh-install sanity: the shipped "default" profile has `acceleration = 0` /
 noaccel (no acceleration, linear); a strict raw 1:1 baseline is the `disable`
