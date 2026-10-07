@@ -192,6 +192,13 @@ install(FILES "${CMAKE_BINARY_DIR}/rawaccel-modules.conf"
         RENAME rawaccel.conf)
 
 # ── libinput quirks ───────────────────────────────────────────────────────────
+# T52-03: kde-fix-accel.sh was shipped in the repo but never installed by any
+# package path (optdepends pointed at a nonexistent file).  Install it as
+# rawaccel-kde-fix so the optdepends entry and docs have a real target.
+install(PROGRAMS scripts/kde-fix-accel.sh
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RENAME rawaccel-kde-fix)
+
 install(FILES scripts/rawaccel.quirks
         DESTINATION /usr/share/libinput
         RENAME 50-rawaccel.quirks)

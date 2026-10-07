@@ -267,6 +267,110 @@ int daemon_ipc_push_config(const std::string& json, std::string* resp_out) {
     return -1;
 }
 
+bool daemon_send_signal(int sig, std::string* err_out);  // fwd (defined below)
+
+// ── Async push (main-thread offload) ─────────────────────────────────────────
+// The set_config RPC can block for seconds (root daemon fsync).  Running it
+// on the GTK main thread freezes the whole window, so it is moved to a helper
+// thread; the status-line feedback (applied / rejected / daemon down) is
+// posted back via g_idle_add and the UI degrades gracefully instead of
+// blocking.  A monotonically increasing AppState::push_gen drops stale
+// results when the user saves again before a previous push finished.
+struct DaemonPushTask {
+    AppState*   S = nullptr;
+    int         gen = 0;
+    std::string json;
+    std::string config_path;
+    std::string dup_warn;
+    int         push_rc = -1;
+    std::string push_resp;
+    bool        applied = false;
+    bool        sighup_fallback = false;
+};
+
+static gpointer daemon_push_thread(gpointer data) {
+    auto* t = static_cast<DaemonPushTask*>(data);
+    std::string resp;
+    t->push_rc = daemon_ipc_push_config(t->json, &resp);
+    t->push_resp = resp;
+    t->applied = (t->push_rc == 1);
+    t->sighup_fallback = false;
+    // SIGHUP fallback ONLY for "no response" (pre-RPC daemon binary /
+    // daemon busy / daemon down).  On an explicit REJECTION a SIGHUP would
+    // make a root systemd daemon re-read its own STALE config file and
+    // fake success — keep the honest error instead.
+    if (t->push_rc < 0) {
+        std::string sig_err;
+        t->applied = daemon_send_signal(SIGHUP, &sig_err);
+        t->sighup_fallback = t->applied;
+    }
+    auto* t2 = new DaemonPushTask();
+    *t2 = std::move(*t);
+    delete t;
+    g_idle_add(+[](gpointer p) -> gboolean {
+        auto* r = static_cast<DaemonPushTask*>(p);
+        AppState* S = r->S;
+        // A newer save supersedes this one — never overwrite its result.
+        if (r->gen != S->push_gen || S->window_destroyed) {
+            delete r;
+            return G_SOURCE_REMOVE;
+        }
+        const bool rejected = (r->push_rc == 0);
+        std::string status_msg;
+        if (r->applied && !r->sighup_fallback) {
+            status_msg = trf("Applied & reloaded: %s", r->config_path.c_str());
+        } else if (r->applied && r->sighup_fallback) {
+            // SIGHUP only makes the daemon re-read its OWN config at
+            // /etc/rawaccel/settings.json — not the GUI's config file.
+            status_msg = trf("Saved locally & signaled daemon (reload only): %s", r->config_path.c_str());
+        } else if (rejected) {
+            // Daemon is up and explicitly refused the new config — the running
+            // daemon still has the OLD config.  Surface the daemon's reason.
+            std::string daemon_err;
+            const std::string pat = "\"error\":\"";
+            size_t e0 = r->push_resp.find(pat);
+            if (e0 != std::string::npos) {
+                size_t b = e0 + pat.size();
+                size_t e1 = r->push_resp.find('"', b);
+                if (e1 != std::string::npos)
+                    daemon_err = r->push_resp.substr(b, e1 - b);
+            }
+            status_msg = trf("Saved locally, but the daemon REJECTED the new config (old config kept): %s",
+                             r->config_path.c_str());
+            if (!daemon_err.empty())
+                status_msg += std::string(" — ") + daemon_err;
+        } else {
+            // Distinguish "daemon is down" from "daemon is up but unresponsive"
+            // — both mean the running daemon still has the OLD config.
+            status_msg = daemon_running()
+                ? trf("Saved locally, but the daemon was not updated: %s", r->config_path.c_str())
+                : trf("Saved locally, but the daemon is not running: %s", r->config_path.c_str());
+        }
+        if (!r->dup_warn.empty())
+            status_msg = r->dup_warn + " | " + status_msg;
+        set_status(S, status_msg);
+        delete r;
+        return G_SOURCE_REMOVE;
+    }, t2);
+    return nullptr;
+}
+
+void daemon_ipc_push_config_async(const std::string& json, AppState* S,
+                                  std::string dup_warn) {
+    ++S->push_gen;
+    auto* t = new DaemonPushTask();
+    t->S = S;
+    t->gen = S->push_gen;
+    t->json = json;
+    t->config_path = S->config_path;
+    t->dup_warn = std::move(dup_warn);
+    GThread* th = g_thread_new("rawaccel-push-config", daemon_push_thread, t);
+    // Fire-and-forget: the thread posts its result to the main context.  If
+    // the app shuts down mid-push the posted idle is dropped via
+    // S->window_destroyed/push_gen and the GThread handle self-frees.
+    g_thread_unref(th);
+}
+
 /// 1 = the process at /proc/<pid> is genuinely the rawaccel daemon,
 /// 0 = definitely NOT the daemon (a different readable binary, or the process
 ///     is gone),

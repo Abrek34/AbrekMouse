@@ -10,12 +10,13 @@ pkgbase = rawaccel-linux
 	makedepends = cmake
 	makedepends = pkgconf
 	makedepends = gcc
+	makedepends = make
 	depends = libevdev
 	depends = gtk4
 	depends = glib2
 	depends = polkit
 	depends = systemd
-	optdepends = python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)
+	optdepends = python: KDE compositor acceleration auto-fix (/usr/bin/rawaccel-kde-fix)
 	optdepends = qt6-tools: KWin live reconfigure during the KDE auto-fix (qdbus6)
 	backup = etc/rawaccel/settings.json
 

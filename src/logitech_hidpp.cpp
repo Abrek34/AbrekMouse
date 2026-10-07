@@ -794,7 +794,16 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
             if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
             continue;
         }
-        if (is_hidpp_error(buf, len)) return std::nullopt;
+        if (is_hidpp_error(buf, len)) {
+            // T49-01: correlate the error with this request — a stale error
+            // frame left on the shared hidraw by a different target/feature
+            // must not kill the in-flight request.  HID++ 2.0 errors echo
+            // the failed function id and software id in byte 3.
+            if (len >= 4 && buf[1] == request_device &&
+                (buf[3] & 0x0F) == request_sw_id)
+                return std::nullopt;
+            continue;
+        }
         if (len != 7 && len != 20 && len != 64) continue;
         if (buf[1] != request_device || buf[2] != feature_index ||
             (buf[3] >> 4) != wire_function ||
@@ -893,7 +902,17 @@ std::optional<hidpp_short_packet> HidppTransport::send_short(
         if (!read_packet(buf, sizeof(buf), len, remaining)) {
             if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
         } else {
-            if (is_hidpp_error(buf, len)) return std::nullopt;
+            if (is_hidpp_error(buf, len)) {
+                // T49-01: correlate with this request — a stale error from
+                // another target/feature on the shared hidraw must not kill
+                // it.  HID++ 2.0 errors echo function<<4|sw_id in byte 3.
+                if (len >= 4 && buf[1] == req.device_index &&
+                    (buf[3] & 0x0F) == req.software_id)
+                    return std::nullopt;
+                // fall through: stash notification check below? no — just
+                // treat the frame as noise and keep waiting.
+                continue;
+            }
             if (auto rsp = hidpp_short_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
                     rsp->function_id == req.function_id &&
@@ -943,7 +962,17 @@ std::optional<hidpp_long_packet> HidppTransport::send_long(
         if (!read_packet(buf, sizeof(buf), len, remaining)) {
             if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
         } else {
-            if (is_hidpp_error(buf, len)) return std::nullopt;
+            if (is_hidpp_error(buf, len)) {
+                // T49-01: correlate with this request — a stale error from
+                // another target/feature on the shared hidraw must not kill
+                // it.  HID++ 2.0 errors echo function<<4|sw_id in byte 3.
+                if (len >= 4 && buf[1] == req.device_index &&
+                    (buf[3] & 0x0F) == req.software_id)
+                    return std::nullopt;
+                // fall through: stash notification check below? no — just
+                // treat the frame as noise and keep waiting.
+                continue;
+            }
             if (auto rsp = hidpp_long_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
                     rsp->function_id == req.function_id &&
@@ -992,7 +1021,17 @@ std::optional<hidpp_very_long_packet> HidppTransport::send_very_long(
         if (!read_packet(buf, sizeof(buf), len, remaining)) {
             if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
         } else {
-            if (is_hidpp_error(buf, len)) return std::nullopt;
+            if (is_hidpp_error(buf, len)) {
+                // T49-01: correlate with this request — a stale error from
+                // another target/feature on the shared hidraw must not kill
+                // it.  HID++ 2.0 errors echo function<<4|sw_id in byte 3.
+                if (len >= 4 && buf[1] == req.device_index &&
+                    (buf[3] & 0x0F) == req.software_id)
+                    return std::nullopt;
+                // fall through: stash notification check below? no — just
+                // treat the frame as noise and keep waiting.
+                continue;
+            }
             if (auto rsp = hidpp_very_long_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
                     rsp->function_id == req.function_id &&
@@ -1043,7 +1082,12 @@ std::optional<std::vector<uint8_t>> HidppTransport::read_register(
             if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
             continue;
         }
-        if (is_hidpp_error(buf, len)) return std::nullopt;
+        if (is_hidpp_error(buf, len)) {
+            // T49-01: only a device error from the queried target is fatal;
+            // a stale error for another node on the shared hidraw is noise.
+            if (len >= 2 && buf[1] == target) return std::nullopt;
+            continue;
+        }
         if ((len != 7 && len != 20) || buf[1] != target ||
             buf[2] != request[2] || buf[3] != request[3])
             continue;
@@ -1221,8 +1265,10 @@ std::vector<hidpp_notification> HidppTransport::drain_notifications(
     return notifications;
 }
 
-std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
-    const uint8_t target = device_index_.load(std::memory_order_relaxed);
+std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata(uint8_t target_device_index) {
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index
+        : device_index_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(feature_mutex_);
         const auto it = feature_metadata_sets_.find(target);
@@ -1300,14 +1346,16 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata() {
     return features;
 }
 
-std::vector<std::pair<uint16_t, uint8_t>> HidppTransport::get_feature_set() {
-    const uint8_t target = device_index_.load(std::memory_order_relaxed);
+std::vector<std::pair<uint16_t, uint8_t>> HidppTransport::get_feature_set(uint8_t target_device_index) {
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index
+        : device_index_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(feature_mutex_);
         const auto it = feature_sets_.find(target);
         if (it != feature_sets_.end()) return it->second;
     }
-    const auto metadata = get_feature_metadata();
+    const auto metadata = get_feature_metadata(target);
     std::vector<std::pair<uint16_t, uint8_t>> features;
     features.reserve(metadata.size());
     for (const auto& item : metadata)
@@ -1329,7 +1377,7 @@ bool HidppTransport::supports_feature(uint16_t feature_id) {
 }
 
 std::optional<hidpp_device_info> HidppTransport::get_device_info(uint8_t target_device_index) {
-    const auto features = get_feature_set();
+    const auto features = get_feature_set(target_device_index);
     const auto has_feature = [&](hidpp_feature_index feature) {
         const auto id = static_cast<uint16_t>(feature);
         return std::find_if(features.begin(), features.end(),
@@ -1493,7 +1541,11 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
     // advertise one of the battery features below instead; prefer advertised
     // features so an unrelated register probe cannot be mistaken for a
     // successful battery read.
-    const auto features = get_feature_set();
+    // T50-02: capability gate must follow the query target, not the cached
+    // transport device index — otherwise a second mouse on the same hidraw
+    // (e.g. 0x02 with only voltage support) probed while 0x01's unified
+    // feature set is cached would take the wrong branch.
+    const auto features = get_feature_set(target_device_index);
     const auto has_feature = [&](hidpp_feature_index feature) {
         const auto id = static_cast<uint16_t>(feature);
         return std::find_if(features.begin(), features.end(),

@@ -999,8 +999,114 @@ static int cmd_validate(const std::string& config_path) {
                     if (rp.contains("profile") && rp["profile"].is_object()) {
                         const auto& rpr = rp["profile"];
                         clamp_warn("output_dpi", rpr, sp.prof.output_dpi);
-                        clamp_warn("rotation", rpr, sp.prof.degrees_rotation);
-                        clamp_warn("snap", rpr, sp.prof.degrees_snap);
+                        // T45-VAL01: the raw keys are degrees_rotation /
+                        // degrees_snap (see profile_to_json_obj) — the old
+                        // "rotation"/"snap" lookups never matched anything.
+                        clamp_warn("degrees_rotation", rpr, sp.prof.degrees_rotation);
+                        clamp_warn("degrees_snap", rpr, sp.prof.degrees_snap);
+                        clamp_warn("speed_min", rpr, sp.prof.speed_min);
+                        clamp_warn("speed_max", rpr, sp.prof.speed_max);
+                        clamp_warn("yx_output_dpi_ratio", rpr, sp.prof.yx_output_dpi_ratio);
+                        clamp_warn("lr_output_dpi_ratio", rpr, sp.prof.lr_output_dpi_ratio);
+                        clamp_warn("ud_output_dpi_ratio", rpr, sp.prof.ud_output_dpi_ratio);
+                        if (rpr.contains("domain_weights") && rpr["domain_weights"].is_array() && rpr["domain_weights"].size() >= 2) {
+                            if (rpr["domain_weights"][0].is_number() &&
+                                std::fabs(rpr["domain_weights"][0].get<double>() - sp.prof.domain_weights.x) >= 1e-9) {
+                                std::cerr << "WARNING: 'domain_weights[0]' = "
+                                          << rpr["domain_weights"][0].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.domain_weights.x << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                            if (rpr["domain_weights"][1].is_number() &&
+                                std::fabs(rpr["domain_weights"][1].get<double>() - sp.prof.domain_weights.y) >= 1e-9) {
+                                std::cerr << "WARNING: 'domain_weights[1]' = "
+                                          << rpr["domain_weights"][1].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.domain_weights.y << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                        }
+                        if (rpr.contains("range_weights") && rpr["range_weights"].is_array() && rpr["range_weights"].size() >= 2) {
+                            if (rpr["range_weights"][0].is_number() &&
+                                std::fabs(rpr["range_weights"][0].get<double>() - sp.prof.range_weights.x) >= 1e-9) {
+                                std::cerr << "WARNING: 'range_weights[0]' = "
+                                          << rpr["range_weights"][0].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.range_weights.x << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                            if (rpr["range_weights"][1].is_number() &&
+                                std::fabs(rpr["range_weights"][1].get<double>() - sp.prof.range_weights.y) >= 1e-9) {
+                                std::cerr << "WARNING: 'range_weights[1]' = "
+                                          << rpr["range_weights"][1].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.range_weights.y << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                        }
+                        if (rpr.contains("speed_processor") && rpr["speed_processor"].is_object()) {
+                            const auto& rsp = rpr["speed_processor"];
+                            clamp_warn("lp_norm", rsp, sp.prof.speed_processor_args.lp_norm);
+                            clamp_warn("input_speed_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.input_speed_smooth_halflife);
+                            clamp_warn("scale_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.scale_smooth_halflife);
+                            clamp_warn("output_speed_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.output_speed_smooth_halflife);
+                        }
+                        // T45-VAL01: accel_args fields sanitize clamps but
+                        // validate never looked at — a 1e9 scale/acceleration
+                        // used to print "All checks OK".
+                        for (int ai = 0; ai < 2; ++ai) {
+                            const char* axkey = ai == 0 ? "accel_x" : "accel_y";
+                            if (!rpr.contains(axkey) || !rpr[axkey].is_object()) continue;
+                            const auto& rax = rpr[axkey];
+                            const auto& sax = ai == 0 ? sp.prof.accel_x : sp.prof.accel_y;
+                            const char* axis = ai == 0 ? "X" : "Y";
+                            auto accel_warn = [&](const char* field, double stored) {
+                                if (!rax.contains(field) || !rax[field].is_number()) return;
+                                double rawv = rax[field].get<double>();
+                                if (std::fabs(rawv - stored) < 1e-9) return;
+                                std::cerr << "WARNING: '" << field << "' = " << rawv
+                                          << " (" << axis << " axis) in profile '"
+                                          << sp.name << "' will be stored as "
+                                          << stored << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            };
+                            accel_warn("acceleration",     sax.acceleration);
+                            accel_warn("scale",            sax.scale);
+                            accel_warn("decay_rate",       sax.decay_rate);
+                            accel_warn("motivity",         sax.motivity);
+                            accel_warn("gamma",            sax.gamma);
+                            accel_warn("sync_speed",       sax.sync_speed);
+                            accel_warn("smooth",           sax.smooth);
+                            accel_warn("exponent_classic", sax.exponent_classic);
+                            accel_warn("exponent_power",   sax.exponent_power);
+                            accel_warn("limit",            sax.limit);
+                            accel_warn("input_offset",     sax.input_offset);
+                            accel_warn("output_offset",    sax.output_offset);
+                            if (rax.contains("cap") && rax["cap"].is_array()) {
+                                if (rax["cap"].size() >= 1 && rax["cap"][0].is_number() &&
+                                    std::fabs(rax["cap"][0].get<double>() - sax.cap.x) >= 1e-9) {
+                                    std::cerr << "WARNING: 'cap[0]' = "
+                                              << rax["cap"][0].get<double>()
+                                              << " (" << axis << " axis) in profile '"
+                                              << sp.name << "' will be stored as "
+                                              << sax.cap.x << " (sanitize clamps on load)\n";
+                                    has_warnings = true;
+                                }
+                                if (rax["cap"].size() >= 2 && rax["cap"][1].is_number() &&
+                                    std::fabs(rax["cap"][1].get<double>() - sax.cap.y) >= 1e-9) {
+                                    std::cerr << "WARNING: 'cap[1]' = "
+                                              << rax["cap"][1].get<double>()
+                                              << " (" << axis << " axis) in profile '"
+                                              << sp.name << "' will be stored as "
+                                              << sax.cap.y << " (sanitize clamps on load)\n";
+                                    has_warnings = true;
+                                }
+                            }
+                        }
                         // CFG-2: speed_min > speed_max is silently equalized by
                         // sanitize — clamp_warn can't see it (either value may
                         // survive unchanged), so check the raw pair directly.
@@ -1961,10 +2067,47 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
         }
         // C-2: enforce the same MAX_NAME_LEN cap that every other
         // profile-create/rename path enforces (P82-MED-1 symmetric cap).
-        if (dp.name.size() > MAX_NAME_LEN) {
-            std::cerr << "Imported profile name is " << dp.name.size()
-                      << " chars (max " << MAX_NAME_LEN << ").\n";
-            return 1;
+        // T45-IMP01: the old check on dp.name was DEAD — profile_from_json()
+        // already truncates to MAX_NAME_LEN/256/128 via
+        // json_get_string_limited(), so a 300-char name always passed here
+        // and got silently shrunk.  Gate on the RAW JSON instead: over-cap
+        // name / device_id / match_app / inner profile.name must REJECT the
+        // import (rc=1), exactly like create/duplicate/rename reject.
+        try {
+            const auto rawp = nlohmann::json::parse(fr);
+            auto raw_str_over = [](const nlohmann::json& parent,
+                                   const char* key, size_t cap) -> long {
+                if (!parent.contains(key) || !parent[key].is_string()) return -1;
+                const long n = static_cast<long>(parent[key].get<std::string>().size());
+                return n > static_cast<long>(cap) ? n : -1;
+            };
+            struct { const char* field; size_t cap; const nlohmann::json* host; }
+                fields[] = {
+                {"name",      MAX_NAME_LEN, &rawp},
+                {"device_id", 256,          &rawp},
+                {"match_app", 128,          &rawp},
+            };
+            for (auto& fl : fields) {
+                long nn;
+                if ((nn = raw_str_over(*fl.host, fl.field, fl.cap)) >= 0) {
+                    std::cerr << "ERROR: imported profile '" << fl.field
+                              << "' is " << nn << " chars (max " << fl.cap
+                              << ") — import rejected.\n";
+                    return 1;
+                }
+            }
+            if (rawp.contains("profile") && rawp["profile"].is_object()) {
+                long nn;
+                if ((nn = raw_str_over(rawp["profile"], "name", MAX_NAME_LEN)) >= 0) {
+                    std::cerr << "ERROR: imported profile.name is " << nn
+                              << " chars (max " << MAX_NAME_LEN
+                              << ") — import rejected.\n";
+                    return 1;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: could not inspect raw profile name fields: "
+                      << e.what() << "\n";
         }
         for (auto& existing : cfg.profiles) {
             if (existing.name == dp.name) {
@@ -2008,8 +2151,19 @@ static int cmd_import(app_config& cfg, const std::string& config_path, const std
                 std::cerr << "Warning: ignoring non-string active_profile in wrapper\n";
         }
         if (wrapper_app.contains("use_raw_input")) {
-            if (wrapper_app["use_raw_input"].is_boolean()) {
-                const bool v = wrapper_app["use_raw_input"].get<bool>();
+            const auto& ur = wrapper_app["use_raw_input"];
+            bool ok = ur.is_boolean();
+            bool v = false;
+            if (ok) v = ur.get<bool>();
+            // T43-04: accept numeric 0/1 (int or float) like every other
+            // boolean field — a legacy exporter writing `"use_raw_input": 0`
+            // must not be silently ignored here.
+            else if (ur.is_number()) {
+                const double d = ur.get<double>();
+                if (d == 0.0) { ok = true; v = false; }
+                else if (d == 1.0) { ok = true; v = true; }
+            }
+            if (ok) {
                 // L13-07: a well-formed `false` used to be applied SILENTLY —
                 // the import itself ran, rc=0, and the daemon then grabbed no
                 // devices at all (global acceleration dead) with no warning.

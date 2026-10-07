@@ -451,8 +451,10 @@ public:
                                       uint8_t target_device_index = 0xFF);
 
     // Root feature: get feature set
-    std::vector<std::pair<uint16_t, uint8_t>> get_feature_set();
-    std::vector<hidpp_feature_metadata> get_feature_metadata();
+    std::vector<std::pair<uint16_t, uint8_t>> get_feature_set(
+        uint8_t target_device_index = 0xFF);
+    std::vector<hidpp_feature_metadata> get_feature_metadata(
+        uint8_t target_device_index = 0xFF);
     bool supports_feature(uint16_t feature_id);
 
     // Set target device index for subsequent queries

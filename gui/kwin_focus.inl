@@ -350,42 +350,50 @@ static void kwin_focus_resend_current(AppState* S) {
 
 /// Install the KWin focus relay.  Best-effort: returns true if relay is active.
 static bool kwin_focus_install(AppState* S) {
-    static kwin_focus_ctx ctx;
-    if (ctx.installed) return true;
+    // LIFECYCLE: ctx is heap-allocated and owned by the AppState (previously a
+    // function-static — the detached teardown thread could touch it while a
+    // second install/uninstall cycle mutated it, and its storage fought with
+    // the detached thread at exit).  It is intentionally NOT freed on
+    // uninstall: the (joinable, but main-thread-blocked-late) cleanup thread
+    // and any pending focus-retry timeout may still reference it.  The
+    // process reclaims it at exit.
+    auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
+    if (!ctx) ctx = new kwin_focus_ctx();
+    S->kwin_focus_ctx = ctx;
+    if (ctx->installed) return true;
 
     // 1. Own the GDBus name on the session bus (non-blocking).
-    ctx.bus_name_id = g_bus_own_name(
+    ctx->bus_name_id = g_bus_own_name(
         G_BUS_TYPE_SESSION, "org.rawaccel.Focus",
         G_BUS_NAME_OWNER_FLAGS_NONE,
-        on_bus_acquired, nullptr, on_name_lost, &ctx, nullptr);
-    if (ctx.bus_name_id == 0) return false;
+        on_bus_acquired, nullptr, on_name_lost, ctx, nullptr);
+    if (ctx->bus_name_id == 0) return false;
 
     // 2. Connect to session bus (needed for KWin D-Bus calls and our relay).
     GError* err = nullptr;
-    ctx.session_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
-    if (!ctx.session_conn) {
+    ctx->session_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
+    if (!ctx->session_conn) {
         g_clear_error(&err);
         // R13-KWINOWN: we already own the name — release it so this failed
         // install cannot leave org.rawaccel.Focus owned for the whole session
         // (a second instance's g_bus_own_name would then always fail).
-        if (ctx.bus_name_id) { g_bus_unown_name(ctx.bus_name_id); ctx.bus_name_id = 0; }
+        if (ctx->bus_name_id) { g_bus_unown_name(ctx->bus_name_id); ctx->bus_name_id = 0; }
         return false;
     }
 
     // 3. Load + run the KWin script on a worker thread (can block ~200–500 ms).
-    ctx.kwin_script_id.store(-1, std::memory_order_relaxed);
-    ctx.worker = std::thread([ctxPtr = &ctx]() {
+    ctx->kwin_script_id.store(-1, std::memory_order_relaxed);
+    ctx->worker = std::thread([ctxPtr = ctx]() {
         ctxPtr->kwin_script_id = kwin_script_load_and_run_sync(ctxPtr->session_conn);
     });
 
     // 4. Focus-report worker (T48-05): drains sender-check + IPC jobs off the
     // main thread.  Joined in kwin_focus_uninstall before session_conn is
     // unref'd (GUI-Y2 contract).
-    ctx.focus_stop = false;
-    ctx.focus_worker = std::thread(focus_worker_main, &ctx);
-    ctx.installed = true;
+    ctx->focus_stop = false;
+    ctx->focus_worker = std::thread(focus_worker_main, ctx);
+    ctx->installed = true;
 
-    S->kwin_focus_ctx = &ctx;
     return true;
 }
 
@@ -397,11 +405,17 @@ static void kwin_focus_uninstall(AppState* S) {
     // T48-07: the join + script-unload sequence below can block for seconds
     // (KWin D-Bus timeouts up to ~7-9 s), and this runs on the GUI main
     // thread from the window-destroy handler — the window would freeze on
-    // close.  Move the whole sequence onto a detached thread.  ctx is
-    // function-static so it outlives the detached thread, and session_conn
-    // is still unref'd only AFTER both workers are joined (GUI-Y2/T48-05
-    // ordering preserved).
-    std::thread([ctx]() {
+    // close.  Move the whole sequence onto a SEPARATE thread — but keep it
+    // JOINABLE (stored in AppState) instead of detached: a detached
+    // std::thread can still be mid-unload when the process exits, and
+    // main() now joins it at shutdown.  ctx is heap-owned by AppState (not
+    // function-static), so the teardown thread never races a second
+    // install/uninstall over shared static storage.  session_conn is
+    // unref'd only AFTER both workers are joined (GUI-Y2/T48-05 ordering
+    // preserved), and ctx itself is kept alive (AppState owns it, freed
+    // never/at-exit) so a late focus-retry timeout cannot UAF.
+    if (S->kwin_cleanup_thread) return;  // a teardown is already in flight
+    auto* t = new std::thread([ctx]() {
         // GUI-Y2: join the loader worker BEFORE touching session_conn (the
         // worker holds a raw pointer to it while running D-Bus calls).
         if (ctx->worker.joinable()) ctx->worker.join();
@@ -422,5 +436,18 @@ static void kwin_focus_uninstall(AppState* S) {
         if (ctx->bus_name_id) g_bus_unown_name(ctx->bus_name_id);
         if (ctx->session_conn) g_object_unref(ctx->session_conn);
         ctx->session_conn = nullptr;
-    }).detach();
+    });
+    S->kwin_cleanup_thread = t;
+}
+
+/// LIFECYCLE: wait for the KWin focus teardown thread to finish (called once
+/// from main() after the GtkApplication quits).  Joining — instead of the
+/// previous .detach() — guarantees no teardown thread outlives the AppState
+/// it references.
+static void kwin_focus_join_cleanup(AppState* S) {
+    if (!S || !S->kwin_cleanup_thread) return;
+    auto* t = static_cast<std::thread*>(S->kwin_cleanup_thread);
+    if (t->joinable()) t->join();
+    delete t;
+    S->kwin_cleanup_thread = nullptr;
 }

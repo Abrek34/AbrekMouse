@@ -18,8 +18,8 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/rawaccel-linux/rawaccel-linux"
 license=('custom')
 depends=('libevdev' 'gtk4' 'glib2' 'polkit' 'systemd')
-makedepends=('cmake' 'pkgconf' 'gcc')
-optdepends=('python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)'
+makedepends=('cmake' 'pkgconf' 'gcc' 'make')
+optdepends=('python: KDE compositor acceleration auto-fix (/usr/bin/rawaccel-kde-fix)'
             'qt6-tools: KWin live reconfigure during the KDE auto-fix (qdbus6)')
 install="$pkgname.install"
 # /etc/rawaccel/settings.json is user state (their profiles): pacman must not
@@ -73,6 +73,11 @@ package() {
     printf 'uinput\n' > "$srcdir/rawaccel.conf"
     install -Dm644 "$srcdir/rawaccel.conf" \
         "$pkgdir/usr/lib/modules-load.d/rawaccel.conf"
+
+    # KDE compositor acceleration auto-fix (T52-03: previously no package path
+    # installed it; optdepends referenced a file that did not exist).
+    install -Dm755 scripts/kde-fix-accel.sh \
+        "$pkgdir/usr/bin/rawaccel-kde-fix"
 
     # libinput quirk: disable desktop acceleration over virtual mouse
     install -Dm644 scripts/rawaccel.quirks \

@@ -216,12 +216,26 @@ struct HwNotificationTask {
     int devs_version = 0;
 };
 
-// Fire-and-forget GLib thread.  We do not join; GLib frees the handle once the
-// thread has finished (g_thread_unref drops our reference).
-static GThread* hw_thread(const char* name, GThreadFunc fn, gpointer task) {
+// GLib thread tracked in AppState for a safe teardown.  The GThread handle
+// is kept (NOT unref'd) so the destroy path can g_thread_join() it — a
+// detached worker could otherwise still be touching AppState-owned data
+// (S->window widgets, hidpp_devs) after the window is gone.
+static GThread* hw_thread(AppState* S, const char* name, GThreadFunc fn, gpointer task) {
     GThread* t = g_thread_new(name, fn, task);
-    g_thread_unref(t);
+    S->hw_threads.push_back(t);
     return t;
+}
+
+/// LIFECYCLE: stop accepting new results and wait for every in-flight HID++
+/// worker to finish.  Called from the window-destroy handler BEFORE widgets
+/// are dropped: hw_cancel makes the posted idle callbacks bail (they only
+/// delete their result), and the join guarantees no worker is still inside
+/// a HID++ transaction that references AppState.
+void hidpp_workers_join(AppState* S) {
+    S->hw_cancel.store(true, std::memory_order_relaxed);
+    for (GThread* t : S->hw_threads)
+        if (t) g_thread_join(t);  // also frees the GThread handle
+    S->hw_threads.clear();
 }
 
 // Enumerate Logitech hidraw devices.  Runs off the main thread.
@@ -714,7 +728,7 @@ static bool hw_start_pending_apply(AppState* S) {
     S->hw_busy = true;
     hw_update_ui_state(S);
     hw_set_status(S, tr("Applying queued settings…"));
-    hw_thread("rawaccel-hw-apply", hw_apply_thread, t);
+    hw_thread(t->S, "rawaccel-hw-apply", hw_apply_thread, t);
     return true;
 }
 
@@ -822,7 +836,7 @@ static gboolean hw_notification_tick(gpointer user_data) {
     task->features = S->hidpp_devs[idx].features;
     task->legacy_protocol = S->hidpp_devs[idx].info.protocol_version < 2;
     task->devs_version = S->hw_devs_version;
-    hw_thread("rawaccel-hw-notify", hw_notification_thread, task);
+    hw_thread(task->S, "rawaccel-hw-notify", hw_notification_thread, task);
     return G_SOURCE_CONTINUE;
 }
 
@@ -859,7 +873,7 @@ void hw_start_scan(AppState* S) {
     hw_set_status(S, tr("Scanning HID++ devices…"));
     auto* task = new HwScanTask();
     task->S = S;
-    hw_thread("rawaccel-hw-scan", hw_scan_thread, task);
+    hw_thread(task->S, "rawaccel-hw-scan", hw_scan_thread, task);
 }
 
 /// Background query of the currently selected device's onboard settings.
@@ -886,7 +900,7 @@ void hw_query_current(AppState* S) {
     task->features = S->hidpp_devs[idx].features;         // P169 battery source
     task->hidpp10 = S->hidpp_devs[idx].info.protocol_version < 2;
     task->devs_version = S->hw_devs_version;
-    hw_thread("rawaccel-hw-query", hw_query_thread, task);
+    hw_thread(task->S, "rawaccel-hw-query", hw_query_thread, task);
 }
 
 void on_hw_dev_selected(GtkDropDown*, GParamSpec*, gpointer user_data) {
@@ -945,5 +959,5 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
     }
     S->hw_busy = true;
     hw_update_ui_state(S);
-    hw_thread("rawaccel-hw-apply", hw_apply_thread, task);
+    hw_thread(task->S, "rawaccel-hw-apply", hw_apply_thread, task);
 }

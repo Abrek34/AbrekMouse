@@ -2560,14 +2560,14 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Validasyon / yanlış genelleme
 - Açıklama: `input_offset` power (`accel-power.hpp:30-115` hiç kullanmıyor) ve jump (`accel-jump.hpp:24-30,42-83` hiç bakmıyor) için tanımsız; classic out için `cap.x` kullanılmıyor (`accel-classic.hpp:102-113,173-199`). `jump cap.x=5 + input_offset=10` save/load'da `5→10` olur, step sessizce kayar.
 - Öneri: Gate'le: `if (mode==classic && (cap_mode==io||in) && cap.x < input_offset)`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `sanitize_accel_args` clamp'i artık `mode==classic && cap_mode_val in {io,in}` ile kapılı; power/jump ve classic `out` profilleri artik save/load'da mutasyona uğramıyor. (2026-10-07)
 
 **T41-02 · ORTA · `acceleration` üst sınırı yok (P120 yarım)**
 - Konum: `src/config.cpp:433-436` (üst yok), `include/config.hpp:18-22` (`ACCEL_MAX` yok) vs GUI `ui_builder.inl:238,409` `0..20`, R15 boundary `20.0`
 - Kategori: Sanitize eksikliği
 - Açıklama: JSON `accel=1e6..1e300` sağ kalır. `accel-classic.hpp:88-89,105-106` `pow(acc,exp-1)` Inf→0 sessiz identity veya ~1e105 astronomik gain üretir.
 - Öneri: `ACCEL_MAX=20.0` ekle + sanitize üst clamp.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `include/config.hpp` ACCEL_MAX=20.0 ve `sanitize_accel_args` üst clamp'i (AJ4-K7 ile, bu turda Durum güncellendi). (2026-10-07)
 
 **T41-03 · DÜŞÜK · `smooth` üst sınırı yok (`[0,1]` referans ihlali)**
 - Konum: `src/config.cpp:459-460` (yalnız `<0` →0) vs ref `accel-jump.hpp:13` `[0,1]`, GUI `ui_builder.inl:247` `0..1`
@@ -2652,7 +2652,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Sanitize eksikliği
 - Açıklama: Programatik/IPC `data[i]=NaN/Inf/1e308` `sanitize:944-946`'dan aynen geçer. `sort:380` `NaN>kx==false` sıralamayı bozar, `lookup` yanlış sonuç, `save` ile diske yazılır.
 - Öneri: `sanitize_accel_args` içinde `for i<length: finite_or+FLT clamp` + sonra `sort`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `sanitize_accel_args` artık payload'ı (`data[0..length)`) NaN/Inf→0 ve ±FLT clamp ile temizleyip `sort_lut_data` çağırıyor; programatik/IPC yolu JSON yoluyla aynı disipline kavuştu. (2026-10-07)
 
 **T43-03 · DÜŞÜK-ORTA · Tek `length` normalize edilmiyor (load→save→load kayıplı)**
 - Konum: `src/config.cpp:406-407,227,96-102` (`length=513` kabul; `sort:372` 256 nokta kullanır; yazar 513 yazar, okuyucu 512'ye floorlar → her tur 1 float kaybı; `check_import:921` reddederken load sessiz budar)
@@ -2666,7 +2666,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Type-guard tutarsızlığı
 - Açıklama: `"whole":1` sessizce default'a düşer; `"gain":0.0` yanlış `true` kalır.
 - Öneri: Tüm bool'larda `is_boolean || (is_number && v==0/1)` birleştir.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `bool_from_json_lenient` eklendi; gain/raw_passthrough/disable/use_raw_input/whole ve import wrapper `use_raw_input` artik bool veya 0/1 (int ya da 1.0/0.0 float) kabul ediyor. (2026-10-07)
 
 **T43-05 · ORTA · `MAX_PROFILES` aşımı + non-object sessiz budama, save ile kalıcı silinme**
 - Konum: `src/config.cpp:678-682,687-705` (`if(!is_object) continue; if(size>=256) break;` — hata/sayaç yok) + `rawaccel-base.hpp:28`
@@ -2814,7 +2814,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Validasyon
 - Açıklama: P82-MED-1 simetrisi bozuk.
 - Öneri: Ham JSON re-parse ile `raw["name"/"device_id"/"match_app"/"profile"."name"]` >cap ise `rc=1` reddet.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — import döngüsü ham JSON'u tekrar parse edip `name`>256, `device_id`>256, `match_app`>128, `profile.name`>256 aşımında rc=1 reddediyor; dp.name üzerindeki ölü kontrol kaldırıldı. (2026-10-07)
 
 **T45-IMP02 · YÜKSEK · Import migrate etkisiz / çift-çalışır (veri-bozulması)**
 - Konum: `cli/main.cpp:1745-1749` + `:1708-1723` vs `src/config.cpp:1083-1084,1106-1108,1000-1023` (tekil/array importta `version==1.2.0` → `return false` no-op → pre-0.4 `lookup+gain` hiç ölçeklenmez; wrapper importta `version` koşulsuz ezilir → mevcut 256 profil dahil tümü tekrar `y*x` → çift-migrasyon; `migrate_lookup_gain` idempotent değil)
@@ -2835,7 +2835,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: False-PASS
 - Açıklama: Örn. `scale:1e9` → `100` uyarısız. CFG-2 dpi-kapsamı değil, kalan-alan boşluğu.
 - Öneri: `clamp_warn`'u sanitize üst/alt-sınır tablosuyla genişlet.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — validate artik accel_x/accel_y'deki 12 alanı (acceleration/scale/decay_rate/motivity/gamma/sync_speed/smooth/exponent_classic/exponent_power/limit/input_offset/output_offset), cap[0]/cap[1], speed_processor (lp_norm + 3 halflife), domain/range_weights ve dpi-ratio alanlarını da ham-vs-stored karşılaştırıyor; ayrıca ölü `rotation`/`snap` anahtarları gerçek JSON anahtarlarına (`degrees_rotation`/`degrees_snap`) düzeltildi. (2026-10-07)
 
 **T45-VAL02 · DÜŞÜK-ORTA · Validate LUT-tek uyarısı ölü + id/match_app kırpması uyarısız**
 - Konum: `cli/main.cpp:782-791` (`length%2` sanitize-sonrası bakılır ama loader daima çift yapar `:227` → 515 uyarısız 514'e iner) + `:829-836` (isim uyarılır, `device_id>256`, `match_app>128` uyarısız)
@@ -3022,7 +3022,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Concurrency
 - Açıklama: Scan/query + apply aynı hidraw'da eşzamanlı; ilk biten `busy=false` yapınca üçüncü iş araya girer.
 - Öneri: Apply da `pending` kuyruğuna girsin; `Result` içine `devs_version+idx` taşınıp idle'da drop edilsin.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — scan/query/apply tek `hw_busy` slotuyla serialize ediliyor; Apply `hw_pending_apply`, seçim değişimi `hw_pending_query` kuyruğuna giriyor, in-flight sonuçlar `devs_version` taşıyıp idle'da stale ise drop ediliyor (bayat değerler ekrana düşmüyor) (2026-10-07).
 
 **T48-02 · ORTA · Dokunulmayan kontrol için yazılmış gibi status**
 - Konum: `gui/hidpp_panel.inl:606-612,824-841,569-580` (`rate_hz==0` "değişiklik yok" sentinel ama idle her durumda `Rate→%d Hz`/`LOD→...` basar; desteklemeyen cihazda `Rate→0 Hz`/`LOD→Low` yazılmamış değeri yazılmış gibi raporlar)
@@ -3064,7 +3064,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Responsiveness
 - Açıklama: Join doğruluğu hariç yeni açı (bloklama süresi).
 - Öneri: Join'i `g_timeout_add` ile asenkronlaştır veya timeout'ları kısalt/`g_cancellable` ile iptal.
-- Durum: DÜZELTİLDİ — `kwin_focus_uninstall` join+unload dizisini detached bir thread'e taşıdı; ana thread bloklanmıyor, session_conn join'lerden sonra unref'leniyor (sıra korundu) (2026-10-07).
+- Durum: DÜZELTİLDİ — `kwin_focus_uninstall` join+unload dizisini ana thread'den AYRILIK bir thread'e taşdı (ana thread bloklanmıyor, session_conn join'lerden sonra unref'leniyor) (2026-10-07). ⚠ 2026-10-07 TUR54-02 ile revize: teardown thread artık DETAÇLI DEĞİL, `S->kwin_cleanup_thread`'de tutulup çıkışta join ediliyor (function-static ctx da kaldırıldı) — bkz. T54-02.
 
 **T48-08 · ORTA · Import boy kontrolü load'dan sonra (GB allocate)**
 - Konum: `gui/profile_mgr.inl:577-592` (`g_file_get_contents:580` tüm dosyayı heap'e alır, `MAX_IMPORT_BYTES:586` `:587`'de → GB yanlışlıkla seçilse kontrol öncesi allocate)
@@ -3103,7 +3103,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Yanıt-eşleştirme
 - Açıklama: Tek hidraw `0xFF/0x00/0x01..0x06` paylaşırken başka hedefe ait bayat hata mevcut isteği anında öldürür; doğru cevap deadline'a kadar beklemek yerine kaybolur.
 - Öneri: Önce `buf[1]!=request_device` ise `continue` (+ hata-echo feature/function/sw_id eşleşmiyorsa stash/continue); yalnız eşleşen hata `nullopt` dönsün.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — hata paketleri `send_feature_request`/`send_short`/`send_long`/`send_very_long`/`read_register`'da cihaz indexi + echo'lanan function<<4|sw_id ile mevcut isteğe bağlanıyor; eşleşmeyen (bayat, başka hedefe ait) hata kadrosu `continue` ile atlanıyor (2026-10-07).
 
 **T49-02 · ORTA · `get_feature_set()` hedefsiz — cross-target capability-gate yanlış**
 - Konum: `src/logitech_hidpp.cpp:1298,1462,1288` + `:1269-1270,:1191` (hep `device_index_` kullanır) vs `feature_request:1070-1077` N-09 düzeltmesi burada yok — current=`0xFF` iken `get_device_info(0x01)` receiver-shell setine bakar (false-negative `nullopt` veya sahte `protocol_version=2`)
@@ -3156,7 +3156,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Hedef karışması
 - Açıklama: Önbellek `0x01`'de kalmışken `0x02` yanlış kapıdan girer.
 - Öneri: Kapıyı hedef-duyarlı yap (`resolve_feature_index` dene) veya `get_feature_set(target)` overload; en azından daemon sorgudan önce `set_device_index` yapsın.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `get_feature_set(target)`/`get_feature_metadata(target)` hedef-duyarlı overload oldu; `get_battery_status` ve `get_device_info` yetenek kapısı artık sorgu hedefinin feature setini kullanıyor (`0xFF`→transport indexine düşer) (2026-10-07).
 
 **T50-03 · DÜŞÜK-ORTA · `decode_dpi_levels` ızgara-dışı `last`'ı düşürüyor**
 - Konum: `src/logitech_hidpp.cpp:91-99` (`for(;next<=last;next+=step)` → `400,400,1500` örneğinde `[400,800,1200]`, `1500` yok; OpenLogi `while next<last push + push(last)` → `[400,800,1200,1500]`)
@@ -3170,7 +3170,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Oran ayrıştırma
 - Açıklama: Combo dolar veya boş kalır.
 - Öneri: GUI ayrıştırıcıyı transport maskesine çek (ortak `hidpp_parse_report_rates()` helper) + çift çağrıyı tekle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — GUI oran ayrıştırıcısı transport maskesini kullanıyor (extended: 2-bayt BE bitmask, legacy: 1-bayt bitmask → Hz); kod-listesi sayıp bayt bayt `code_to_hz` yapan yol kaldırıldı, `get_polling_rate` tek çağrı (2026-10-07).
 
 **T50-05 · DÜŞÜK-ORTA · GUI Apply DPI'sız cihazda oran/LOD değişimini engelliyor**
 - Konum: `gui/hidpp_panel.inl:812-815` vs `:750-751` (`update_ui` `dpi_ok||rate_ok||lod_ok` ile açar, `on_apply` `if(!c.dpi) reject` ile çıkar → oran-sadece cihazda buton açık ama her tıklama red)
@@ -3300,21 +3300,21 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Systemd
 - Açıklama: No-op ordering.
 - Öneri: System unit'ten kaldır; gerekiyorsa user unit veya udev tetiklemesi, yorumu düzelt.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `Wants/After=plasma-kwin_wayland.service` system unit'ten kaldırıldı; yoruma user-session unit olduğu ve system manager'da no-op olduğu yazıldı.
 
 **T51-15 · ORTA · `rawaccel.service` `uinput` sırası yok + `ExecStartPre` yorumu kodsuz**
 - Konum: `scripts/rawaccel.service:9,26-27` (`After=systemd-udevd` var, `systemd-modules-load/modprobe` sırası yok → ilk boot `/dev/uinput` hazır değilse `Restart` döngüsü; yorum `:23-26` “`ExecStartPre` below” der ama dosyada yok)
 - Kategori: Systemd
 - Açıklama: İlk-boot yarışı.
 - Öneri: `After=systemd-modules-load.service` veya `ExecStartPre=/sbin/modprobe uinput` (`-`/`|| true`); yorumu hizala.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `After=systemd-udevd.service systemd-modules-load.service` eklendi; `ExecStartPre=-/sbin/modprobe uinput` (başarısızlık-toleranslı) eklendi; bayat "ExecStartPre below" yorumu düzeltildi.
 
 **T51-16 · DÜŞÜK · `rawaccel.service` `ReadWritePaths=/run` aşırı-geniş**
 - Konum: `scripts/rawaccel.service:61` (tüm `/run` yazılabilir; daemon yalnız `/run/rawaccel.pid/.sock` yazar)
 - Kategori: Hardening
 - Açıklama: Gereksiz genişlik.
 - Öneri: Dar yol (`/run/rawaccel.sock|pid`) veya `RuntimeDirectory=rawaccel`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `ReadWritePaths=/etc/rawaccel /run/rawaccel.pid /run/rawaccel.sock` ile sınırlandı.
 
 **T51-17 · ORTA · `99-rawaccel.rules` `uinput` `uaccess` aşırı-yetki (her aktif kullanıcı enjekte edebilir)**
 - Konum: `scripts/99-rawaccel.rules:19` (`KERNEL=="uinput" TAG+="uaccess"`; `input` grubu zaten ekleniyor; ayrıca `SUBSYSTEM` yok)
@@ -3381,14 +3381,14 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Derleme
 - Açıklama: `setup.sh` Arch dalı `base-devel` kurduğu için orada görünmez.
 - Öneri: `make` ekle (veya `base-devel` varsayımını yoruma yaz).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `makedepends` listesine `make` eklendi.
 
 **T52-03 · DÜŞÜK-ORTA · `kde-fix-accel.sh` hiçbir paket yoluna kurulmuyor (`optdepends` ölü)**
 - Konum: `packaging/PKGBUILD:22-23,62-79`, `CMakeLists.txt:158-191` (kurulum yok; `optdepends` `python/kde-fix` + `qt6-tools/qdbus6` vaat eder; `setup.sh:443` repo-içi yol kullanır)
 - Kategori: Özellik eksikliği
 - Açıklama: Paket kullanıcısında dosya yoktur.
 - Öneri: `/usr/bin/rawaccel-kde-fix` (755) olarak kur + açıklamayı yola bağla veya optdepends'tan düşür.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `kde-fix-accel.sh` artık CMake `install(PROGRAMS ... RENAME rawaccel-kde-fix)` ve PKGBUILD `package()` ile `/usr/bin/rawaccel-kde-fix` (755) olarak kuruluyor; optdepends metni yola bağlandı.
 
 **T52-04 · DÜŞÜK · `setup.sh` GUI'ye `KILL` atmıyor (inatçı GUI upgrade'i gölgeler)**
 - Konum: `setup.sh:196-201` (daemon `TERM→0.3→KILL`, GUI yalnız `TERM`; `uninstall.sh:30-37` her ikisine `TERM+KILL` (R4-L-8) → `TERM` yoksayan GUI eski inode altında yaşar, "güncelledim değişmedi" sanılır)
@@ -3561,3 +3561,34 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Açıklama: Yapısal tekrar riski.
 - Öneri: `SRC=(gui/main.cpp gui/*.inl)` glob (+ `nullglob`) veya listeyi dizinle çapraz-doğrulayan bekçi.
 - Durum: DÜZELTİLDİ — `run_tr_coverage.sh` kaynak listesini elle yazmıyor: `gui/main.cpp` + `gui/*.inl` glob (nullglob) + tekilleştirme; glob beklenenden az dosya verirse META-FAIL.
+---
+
+# TUR 54 — GUI Lifecycle / IPC / Single-instance (2026-10-07)
+
+**T54-01 · ORTA · HID++ worker thread'leri join değil detach**
+- Konum: `gui/hidpp_panel.inl` (`hw_thread` g_thread_new + g_thread_unref → fire-and-forget) + `gui/app_state.hpp` (`hw_cancel` plain bool)
+- Kategori: Lifecycle / threading
+- Açıklama: Pencere kapanırken HID++ scan/query/apply/notify worker'ları pencere/AppState ile yarışırdı; `hw_cancel` plain bool → data race.
+- Öneri: GThread handle'larını AppState'te topla, destroy'da join et; `hw_cancel` atomik.
+- Durum: DÜZELTİLDİ — `hw_thread` artık GThread* handle'ını `S->hw_threads`'e ekliyor (unref yok); `hidpp_workers_join()` destroy handler'da `hw_cancel` (artık `std::atomic<bool>`) set edip tüm handle'ları `g_thread_join()` ediyor; main() çıkışında da idempotent olarak tekrar join.
+
+**T54-02 · ORTA · KWin focus uninstall detached std::thread + function-static ctx**
+- Konum: `gui/kwin_focus.inl` (`kwin_focus_uninstall` `.detach()` + `static kwin_focus_ctx ctx`)
+- Kategori: Lifecycle / UAF
+- Açıklama: Detached teardown thread process exit'te hâlâ çalışabilir; function-static ctx ikinci install/uninstall ile ortak storage yarışı; `task->detach()`'daki gibi thread handle yönetisiz.
+- Öneri: ctx'i heap'e taşı (AppState sahipliği), teardown thread'ini joinable yap, uygulama çıkışında join.
+- Durum: DÜZELTİLDİ — ctx artık `S->kwin_focus_ctx` heap nesnesi (function-static kaldırıldı); uninstall join+unload dizisini `S->kwin_cleanup_thread`'e taşıyor (joinable, detach YOK); `kwin_focus_join_cleanup()` `main()`'de `g_application_run` dönüşü join ediyor; `hw_cancel`-benzeri idempotent destroy yolu korunuyor.
+
+**T54-03 · ORTA · Daemon IPC main thread'i bloklar (set_config 5 sn)**
+- Konum: `gui/main.cpp` (`save_config_now` senkron `daemon_ipc_push_config` 5000 ms)
+- Kategori: UI-jank
+- Açıklama: Save sırasında root daemon fsync beklerken pencere donardı.
+- Öneri: IPC'i async helper'a taşı; sonucu g_idle_add ile ana thread'e bildir, degraded status göster.
+- Durum: DÜZELTİLDİ — `daemon_ipc_push_config_async()` set_config RPC'ini GLib worker'a alıyor; sonuç (Applied/Rejected/down) idle ile status'a yazılıyor; `AppState::push_gen` bayat yanıtları düşürüyor; SIGHUP fallback yalnız "response yok" dalında.
+
+**T54-04 · DÜŞÜK · Single-instance ikinci başlatma sessiz çıkıyor**
+- Konum: `gui/main.cpp` (flock conflict → yalnız stderr + `return 0`)
+- Kategori: UX
+- Açıklama: .desktop launcher'da stderr görünmez → kullanıcı hiçbir şey görmez; rc=0 sessiz.
+- Öneri: Görünür modda küçük bilgi dialog'u; headless'ta stderr yeterli; rc != 0.
+- Durum: DÜZELTİLDİ — flock çakışmasında stderr mesajı korunuyor + `gtk_init_check()` başarılıysa kullanıcıya bilgi penceresi (15 sn auto-dismiss) gösteriliyor, rc 1.

@@ -1045,9 +1045,13 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             // operation initiated by the user completes in the background.
             pkexec_watch_detach(S2, /*kill_child=*/false);
             // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
-            S2->hw_cancel = true;
+            S2->hw_cancel.store(true, std::memory_order_relaxed);
             S2->hw_pending_query = -1;
             if (S2->hw_pending_apply) { delete S2->hw_pending_apply; S2->hw_pending_apply = nullptr; }
+            // LIFECYCLE: join every in-flight HID++ worker before widgets are
+            // dropped — previously the workers were detached (g_thread_unref)
+            // and could outlive the window / touch AppState-owned data.
+            hidpp_workers_join(S2);
             // O31-G1: the async KDE-fix idle callback must also bail — it has
             // no source id to remove, so flag the window as destroyed and let
             // kde_fix_finish() drop its result instead of touching widgets.

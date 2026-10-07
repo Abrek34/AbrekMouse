@@ -89,56 +89,16 @@ void save_config_now(AppState* S) {
         // daemon that is /etc/rawaccel/settings.json — and live-applies it.
         // A plain SIGHUP only makes the daemon re-read its own (stale) config.
         // Fall back to SIGHUP for old daemons that predate the IPC RPC.
+        // ASYNC: the blocking RPC (up to a 5 s timeout while a root daemon
+        // fsyncs) must not freeze the GTK main thread — it runs on a helper
+        // thread and the degraded status feedback arrives via g_idle_add.
         std::string json = app_config_to_json(S->config);
-        std::string push_resp;
-        int push_rc = daemon_ipc_push_config(json, &push_resp);
-        bool applied = (push_rc == 1);
-        bool rejected = (push_rc == 0);
-        bool sighup_fallback = false;
-        // SIGHUP fallback ONLY for "no response" (pre-RPC daemon binary /
-        // daemon busy / daemon down).  On an explicit REJECTION a SIGHUP would
-        // make a root systemd daemon re-read its own STALE config file and
-        // fake success — keep the honest error instead.
-        if (push_rc < 0) {
-            std::string sig_err;
-            applied = daemon_send_signal(SIGHUP, &sig_err);
-            sighup_fallback = applied;
-        }
-        // Check for duplicate device IDs and prepend warning to status
         std::string dup_warn = check_duplicate_device_ids(S->config);
-        std::string status_msg;
-        if (applied && !sighup_fallback) {
-            status_msg = trf("Applied & reloaded: %s", S->config_path.c_str());
-        } else if (applied && sighup_fallback) {
-            // SIGHUP only makes the daemon re-read its OWN config at
-            // /etc/rawaccel/settings.json — not the GUI's config file.
-            status_msg = trf("Saved locally & signaled daemon (reload only): %s", S->config_path.c_str());
-        } else if (rejected) {
-            // Daemon is up and explicitly refused the new config — the running
-            // daemon still has the OLD config.  Surface the daemon's reason.
-            std::string daemon_err;
-            const std::string pat = "\"error\":\"";
-            size_t e0 = push_resp.find(pat);
-            if (e0 != std::string::npos) {
-                size_t b = e0 + pat.size();
-                size_t e1 = push_resp.find('"', b);
-                if (e1 != std::string::npos)
-                    daemon_err = push_resp.substr(b, e1 - b);
-            }
-            status_msg = trf("Saved locally, but the daemon REJECTED the new config (old config kept): %s",
-                             S->config_path.c_str());
-            if (!daemon_err.empty())
-                status_msg += std::string(" — ") + daemon_err;
-        } else {
-            // Distinguish "daemon is down" from "daemon is up but unresponsive"
-            // — both mean the running daemon still has the OLD config.
-            status_msg = daemon_running()
-                ? trf("Saved locally, but the daemon was not updated: %s", S->config_path.c_str())
-                : trf("Saved locally, but the daemon is not running: %s", S->config_path.c_str());
-        }
+        daemon_ipc_push_config_async(json, S, dup_warn);
         if (!dup_warn.empty())
-            status_msg = dup_warn + " | " + status_msg;
-        set_status(S, status_msg);
+            set_status(S, dup_warn + tr(" | Saving…"));
+        else
+            set_status(S, tr("Saving…"));
     } catch (std::exception& e) {
         set_status(S, trf("Save error: %s", e.what()));
     }
@@ -296,7 +256,45 @@ int main(int argc, char* argv[]) {
                 "RawAccel GUI is already running (config lock: %s). Exiting.\n",
                 lock_path.c_str());
         close(lock_fd);
-        return 0;
+        // LIFECYCLE/UX: a second launch used to exit SILENTLY — the stderr
+        // line above goes nowhere under a desktop (.desktop) launcher, so
+        // the user saw nothing at all.  Surface it: show a small modal
+        // dialog when a display is available; fall back to stderr only when
+        // headless (gtk_init_check fails).  A non-zero exit status lets
+        // shell callers notice too.
+        std::string msg = "RawAccel GUI is already running (config lock: " + lock_path + ").";
+        if (gtk_init_check()) {
+            GtkWindow* win = GTK_WINDOW(gtk_window_new());
+            gtk_window_set_title(win, "RawAccel");
+            gtk_window_set_default_size(win, 420, 80);
+            gtk_window_set_resizable(win, FALSE);
+            GtkWidget* lbl = gtk_label_new(msg.c_str());
+            gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+            gtk_widget_set_margin_start(lbl, 12);
+            gtk_widget_set_margin_end(lbl, 12);
+            gtk_widget_set_margin_top(lbl, 12);
+            gtk_widget_set_margin_bottom(lbl, 12);
+            gtk_window_set_child(win, lbl);
+            // Run a private main loop so the user can actually read it;
+            // close/click anywhere to dismiss.
+            GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
+            g_signal_connect(win, "close-request", G_CALLBACK(+[](GtkWindow*, gpointer data) -> gboolean {
+                g_main_loop_quit(static_cast<GMainLoop*>(data));
+                return FALSE;
+            }), loop);
+            gtk_window_present(win);
+            // Safety net: auto-dismiss after ~15 s so a forgotten dialog
+            // cannot wedge a scripted double-launch forever.
+            guint timeout_id = g_timeout_add(15000, +[](gpointer data) -> gboolean {
+                g_main_loop_quit(static_cast<GMainLoop*>(data));
+                return G_SOURCE_REMOVE;
+            }, loop);
+            g_main_loop_run(loop);
+            if (timeout_id) g_source_remove(timeout_id);
+            g_main_loop_unref(loop);
+            gtk_window_destroy(win);
+        }
+        return 1;
     }
 
     GtkApplication* app = gtk_application_new(
@@ -304,6 +302,12 @@ int main(int argc, char* argv[]) {
     // Pass &state as user_data — on_activate receives it via gpointer.
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), &state);
     int ret = g_application_run(G_APPLICATION(app), argc, argv);
+    // LIFECYCLE: the window-destroy handler already stopped the HID++ workers
+    // and the focus teardown; join both here as well so NO detached/late
+    // thread can outlive the AppState it references (idempotent — both are
+    // no-ops when the destroy handler already ran).
+    hidpp_workers_join(&state);
+    kwin_focus_join_cleanup(&state);
     if (lock_fd >= 0) {
         flock(lock_fd, LOCK_UN);
         close(lock_fd);

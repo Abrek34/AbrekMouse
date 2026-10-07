@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <vector>
+#include <atomic>
 #include <sstream>
 #include <iomanip>
 #include <cstdint>   // std::int64_t (STALE-1 config mtime)
@@ -117,6 +118,9 @@ struct AppState {
 
     // Daemon state
     guint       daemon_poll_id = 0;
+    // LIFECYCLE: bumped per config-push so a late IPC response from an older
+    // save can never overwrite the status line of a newer one (async push).
+    int         push_gen = 0;
 
     // inotify — /dev/input hot-plug monitoring
     int         inotify_fd  = -1;
@@ -281,7 +285,16 @@ struct AppState {
     GtkWidget* hw_status_lbl    = nullptr;    // read-only current/result label
     bool       hw_busy          = false;      // a scan/apply thread is running
     bool       hw_notify_busy   = false;      // bounded notification poll worker
-    bool       hw_cancel        = false;      // set on destroy: idle callbacks must bail
+    // LIFECYCLE: atomic — HID++ worker threads read it while the main thread
+    // sets it at destroy time, so a plain bool would be a data race.
+    std::atomic<bool> hw_cancel{false}; // set on destroy: idle callbacks must bail
+    // LIFECYCLE: joinable GLib worker handles (scan/query/apply/notify).
+    // They used to be fire-and-forget (g_thread_unref immediately), so a
+    // window close could leave a HID++ worker touching AppState-owned data
+    // past the intended teardown.  The destroy handler now sets hw_cancel and
+    // g_thread_join()s every handle before widgets are dropped
+    // (hidpp_workers_join).
+    std::vector<GThread*> hw_threads;
     // GUI-Y3: combo index of a device the user selected WHILE hw_busy was set.
     // hw_query_current() used to silently drop such selections, leaving the
     // onboard DPI/rate/LOD widgets showing the previous device's values.  The
@@ -332,6 +345,10 @@ struct AppState {
     std::vector<InputDeviceInfo> mice_list;
     // P-APP: KWin focus relay internal context (kwin_focus.inl)
     void* kwin_focus_ctx = nullptr;
+    // LIFECYCLE: teardown thread spawned by kwin_focus_uninstall (kept
+    // joinable, NOT detached).  main() joins it after the GtkApplication
+    // has quit — the ctx that thread touches lives until that join.
+    void* kwin_cleanup_thread = nullptr;
 };
 
 // ── Global app state pointer (defined in main.cpp) ───────────────────────────
@@ -356,6 +373,10 @@ pid_t read_daemon_pid();
 bool  daemon_running(bool* ipc_ok = nullptr);
 bool  daemon_send_signal(int sig, std::string* err_out = nullptr);
 int  daemon_ipc_push_config(const std::string& json, std::string* resp_out = nullptr);
+// LIFECYCLE: the blocking 5 s set_config RPC runs on a helper thread; the
+// result is posted back to the GTK main context (daemon_comm.inl).
+void daemon_ipc_push_config_async(const std::string& json, AppState* S,
+                                  std::string dup_warn);
 void  update_daemon_status(AppState* S);
 /// Re-send the last known WM_CLASS to a (re)started daemon (defined in
 /// kwin_focus.inl, which is included AFTER daemon_comm.inl).

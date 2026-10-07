@@ -104,6 +104,21 @@ static json accel_args_to_json(const accel_args& a) {
     return j;
 }
 
+// T43-04: lenient bool read shared by every boolean config field.  Accepts
+// native JSON booleans and ANY numeric that is exactly 0 or 1 — covering
+// `1`/`0` ints (older exporters) as well as `1.0`/`0.0` floats (e.g.
+// `"gain": 0.0` used to be rejected by the integer-only guard and silently
+// kept the default).  Anything else falls back to the struct default.
+static bool bool_from_json_lenient(const json& v, bool fallback) {
+    if (v.is_boolean()) return v.get<bool>();
+    if (v.is_number()) {
+        const double d = v.get<double>();
+        if (d == 0.0) return false;
+        if (d == 1.0) return true;
+    }
+    return fallback;
+}
+
 static accel_args accel_args_from_json(const json& j) {
     accel_args a;
     // B4 (P43): type-guard string fields so malformed JSON (wrong type) yields
@@ -130,12 +145,8 @@ static accel_args accel_args_from_json(const json& j) {
     // used to accept; a strict is_boolean check since P120 silently dropped
     // such values back to the default.  Anything that is neither bool nor an
     // integral 0/1 keeps the default (never throws).
-    if (j.contains("gain")) {
-        const auto& g = j["gain"];
-        if (g.is_boolean()) a.gain = g.get<bool>();
-        else if (g.is_number_integer() && (g.get<long long>() == 0 || g.get<long long>() == 1))
-            a.gain = (g.get<long long>() == 1);
-    }
+    if (j.contains("gain"))
+        a.gain = bool_from_json_lenient(j["gain"], a.gain);
     // P120-FAZ2 (A5-02): the 12 numeric accel_args fields are strictly
     // validated.  Administrative decision: a wrong-typed (string/object/array)
     // or non-finite (NaN/Inf, incl. overflow like 1e999) value for ANY of them
@@ -304,12 +315,8 @@ static profile profile_from_json_obj(const json& j) {
     // would also leave the daemon falling back to defaults).
     // O31-C3: accept numeric 0 / 1 for raw_passthrough as well as booleans
     // (symmetric with gain above) — never throws on a wrong type.
-    if (j.contains("raw_passthrough")) {
-        const auto& rp = j["raw_passthrough"];
-        if (rp.is_boolean()) p.raw_passthrough = rp.get<bool>();
-        else if (rp.is_number_integer() && (rp.get<long long>() == 0 || rp.get<long long>() == 1))
-            p.raw_passthrough = (rp.get<long long>() == 1);
-    }
+    if (j.contains("raw_passthrough"))
+        p.raw_passthrough = bool_from_json_lenient(j["raw_passthrough"], p.raw_passthrough);
     if (j.contains("domain_weights")) {
         auto& dw = j["domain_weights"];
         if (dw.is_array() && dw.size() >= 2) {
@@ -348,8 +355,8 @@ static profile profile_from_json_obj(const json& j) {
     if (j.contains("speed_processor") && j["speed_processor"].is_object()) {
         auto& sp_j = j["speed_processor"];
         auto& sp   = p.speed_processor_args;
-        if (sp_j.contains("whole") && sp_j["whole"].is_boolean())
-            sp.whole = sp_j["whole"].get<bool>();
+        if (sp_j.contains("whole"))
+            sp.whole = bool_from_json_lenient(sp_j["whole"], sp.whole);
         if (sp_j.contains("lp_norm") && sp_j["lp_norm"].is_number())
             sp.lp_norm = sp_j["lp_norm"].get<double>();
         if (sp_j.contains("input_speed_smooth_halflife") && sp_j["input_speed_smooth_halflife"].is_number())
@@ -430,6 +437,27 @@ static void sanitize_accel_args(accel_args& a) {
     if (a.length < 0) a.length = 0;
     if (static_cast<size_t>(a.length) > LUT_RAW_DATA_CAPACITY) a.length = LUT_RAW_DATA_CAPACITY;
 
+    // T43-02: scrub the LUT payload itself, mirroring the JSON reader
+    // (accel_args_from_json).  Programmatic/IPC-built profiles could carry
+    // NaN/Inf/1e308 floats through the old sanitize untouched — NaN breaks
+    // the sort comparison (NaN > kx == false leaves the table unordered),
+    // lookup() then returns wrong gains, and `save` would persist them.
+    // Non-finite → 0, then clamp to the float-representable range so a
+    // later double→float conversion can never produce ±Inf.
+    {
+        constexpr float FLT_HI = std::numeric_limits<float>::max();
+        for (int i = 0; i < a.length; i++) {
+            float v = a.data[i];
+            if (!std::isfinite(v)) v = 0.0f;
+            if (v > FLT_HI)  v = FLT_HI;
+            if (v < -FLT_HI) v = -FLT_HI;
+            a.data[i] = v;
+        }
+        // ...and keep the table ordered even when the payload arrived
+        // unsorted (sanitize_profile() sorts again after this — idempotent).
+        sort_lut_data(a);
+    }
+
     // NaN / Inf guard: NaN silently passes comparison guards (NaN < 0 → false),
     // so we must replace non-finite values with safe defaults first.
     a.acceleration    = finite_or(a.acceleration, 0);
@@ -509,10 +537,19 @@ static void sanitize_accel_args(accel_args& a) {
     // cap values: negative caps are meaningless.
     if (a.cap.x < 0) a.cap.x = 0;
     if (a.cap.y < 0) a.cap.y = 0;
-    // BUG-7 fix: classic GAIN/io requires cap.x >= input_offset, otherwise
+    // BUG-7 fix: classic GAIN mode requires cap.x >= input_offset, otherwise
     // base_fn(cap_x) gets a non-positive base and the accelerated tail silently
     // collapses (accel-classic.hpp init_gain::io).  Clamp breakpoint up.
-    if (a.cap.x < a.input_offset) a.cap.x = a.input_offset;
+    // T41-01: the clamp is now gated to the combinations that actually read
+    // cap.x (classic GAIN io/in).  `input_offset` is undefined for power and
+    // jump (neither algorithm reads it), and classic `cap_mode::out` never
+    // consults cap.x — so the old universal clamp silently mutated jump/power/
+    // out profiles on every save/load (e.g. jump cap.x=5 + input_offset=10
+    // came back as 10 and the step shifted).
+    if (a.mode == accel_mode::classic &&
+        (a.cap_mode_val == cap_mode::io || a.cap_mode_val == cap_mode::in) &&
+        a.cap.x < a.input_offset)
+        a.cap.x = a.input_offset;
 
     // P120-FAZ2 (Aj8 BUG-3): cap the gain-driving fields at the GUI gauge
     // maxima (SCALE_MAX / EXP_POWER_MAX / CAP_X_MAX / CAP_Y_MAX /
@@ -700,12 +737,8 @@ static device_profile device_profile_from_json(const json& j) {
     // what the user wrote — and the next save persisted the inversion.  A
     // value that is neither bool nor integral 0/1 keeps the struct default
     // (false), never throws.
-    if (j.contains("disable")) {
-        const auto& d = j["disable"];
-        if (d.is_boolean()) dp.dev_cfg.disable = d.get<bool>();
-        else if (d.is_number_integer() && (d.get<long long>() == 0 || d.get<long long>() == 1))
-            dp.dev_cfg.disable = (d.get<long long>() == 1);
-    }
+    if (j.contains("disable"))
+        dp.dev_cfg.disable = bool_from_json_lenient(j["disable"], dp.dev_cfg.disable);
     if (j.contains("profile") && j["profile"].is_object())
         dp.prof = profile_from_json_obj(j["profile"]);
     // Clamp to safe ranges after loading
@@ -776,12 +809,8 @@ static app_config app_config_from_json_obj(const json& j, size_t max_profiles) {
     // save made that inversion permanent.  A value that is neither a bool nor
     // an integral 0/1 keeps the default (silent degrade, never throws), same
     // contract as gain/raw_passthrough.
-    if (j.contains("use_raw_input")) {
-        const auto& r = j["use_raw_input"];
-        if (r.is_boolean()) cfg.use_raw_input = r.get<bool>();
-        else if (r.is_number_integer() && (r.get<long long>() == 0 || r.get<long long>() == 1))
-            cfg.use_raw_input = (r.get<long long>() == 1);
-    }
+    if (j.contains("use_raw_input"))
+        cfg.use_raw_input = bool_from_json_lenient(j["use_raw_input"], cfg.use_raw_input);
 
     if (j.contains("profiles")) {
         // K1 (config-presets denetimi): a `profiles` key that is present but is

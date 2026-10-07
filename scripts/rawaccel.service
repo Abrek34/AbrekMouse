@@ -2,13 +2,14 @@
 Description=RawAccel Linux Mouse Acceleration Daemon
 # Start after udevd so that udev rules (99-rawaccel.rules) are already loaded.
 # No dependency on network.target — this is an input daemon.
-# On KDE Wayland sessions, KWin must be up before mice are grabbed so that
-# the virtual uinput device is visible to the compositor.  We cannot hard-depend
-# on plasma-kwin_wayland here (not present on X11), so we use Wants= + After=
-# to express a soft ordering: start after KWin if it is running, skip otherwise.
-After=systemd-udevd.service
-Wants=plasma-kwin_wayland.service
-After=plasma-kwin_wayland.service
+# On KDE Wayland sessions, KWin should be up before mice are grabbed so that
+# the virtual uinput device is visible to the compositor.  NOTE (T51-14):
+# plasma-kwin_wayland.service is a USER-session unit — referencing it with
+# Wants=/After= in a system unit evaluated by the SYSTEM manager is a no-op
+# (the name does not exist there).  Kept out of this unit; if ordering is
+# needed it belongs in a user unit or is guaranteed in practice because KWin
+# starts at graphical-session time, before a user enables rawaccel.service.
+After=systemd-udevd.service systemd-modules-load.service
 Documentation=https://github.com/rawaccel-linux/rawaccel-linux
 # SVC-1: make the restart burst limit explicit (systemd defaults are
 # StartLimitIntervalSec=10s / StartLimitBurst=5 — an invisible surprise if
@@ -23,7 +24,15 @@ Type=simple
 # Config is stored in /etc/rawaccel/settings.json when running as a system service.
 # The GUI/CLI store settings in ~/.config/rawaccel/settings.json for the user;
 # run `rawaccel-cli` or the GUI to create/edit profiles, then they are copied to
-# /etc/rawaccel/ by the install script or symlinked via ExecStartPre below.
+# /etc/rawaccel/ by the install script.
+# T51-15: guarantee the uinput module is loaded before the daemon opens
+# /dev/uinput, otherwise the first boot after fresh install can hit a
+# /dev/uinput-missing Restart loop.  systemd-modules-load.service (above, via
+# /usr/lib/modules-load.d/rawaccel.conf) does the real load; the ExecStartPre
+# below is a belt-and-suspenders fallback and intentionally failure-tolerant
+# ('-' prefix) because ProtectKernelModules=true may block a second modprobe
+# attempt — that is fine, the primary path is modules-load.
+ExecStartPre=-/sbin/modprobe uinput
 ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -58,7 +67,8 @@ SystemCallArchitectures=native
 # to 0600 / dirs 0700 instead of world-readable.  The IPC socket is chmod'd
 # to 0660 explicitly after creation, so this doesn't break the GUI/CLI access.
 UMask=0077
-ReadWritePaths=/etc/rawaccel /run
+# T51-16: /run must stay read-only except the two files the daemon writes.
+ReadWritePaths=/etc/rawaccel /run/rawaccel.pid /run/rawaccel.sock
 # Capability bounding set: only what the daemon actually exercises.
 #   CAP_CHOWN              : chown(IPC socket) to root:input
 #   CAP_DAC_OVERRIDE       : open /dev/uinput + /dev/input/event* as root
