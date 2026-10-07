@@ -338,6 +338,7 @@ struct AppState {
     GtkWidget* accel_params_frame = nullptr;
     GtkWidget* lut_list_box       = nullptr;
     bool       lut_graph_mode     = false;
+    GtkWidget* lut_axis_combo     = nullptr;  // T36-GUI04: X/Y selector for the LUT editor
 
     // Device assignment
     GtkWidget* device_id_combo = nullptr;

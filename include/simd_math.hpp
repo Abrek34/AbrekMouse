@@ -24,6 +24,19 @@
 #include <cmath>
 #include <cfloat>
 
+// T-BUILD: intrinsic headers must be included at GLOBAL scope.  They used to
+// sit inside `namespace rawaccel::simd`, so __m128d/__m256d were declared as
+// rawaccel::simd::__m128d — any later standard header relying on the global
+// type (e.g. <random> → opt_random.h's _mm_set1_pd usage) then failed with
+// "'__m128i' does not name a type".  Hoist them here; the `using v2d = …`
+// aliases below still bind the global types inside the namespace.
+#if defined(__AVX2__) || defined(__AVX512F__)
+#include <immintrin.h>
+#endif
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 namespace rawaccel {
 namespace simd {
 
@@ -130,7 +143,7 @@ namespace simd {
 // ============================================================================
 
 #if RAWACCEL_HAVE_AVX2
-#include <immintrin.h>
+
 
 using v2d = __m256d;  // 4 doubles, we use lanes 0,1 for X,Y
 
@@ -243,7 +256,7 @@ static inline void v2d_rotate(v2d& v, v2d dir) {
 }
 
 #elif RAWACCEL_HAVE_SSE2
-#include <emmintrin.h>
+
 
 using v2d = __m128d;  // 2 doubles exactly
 

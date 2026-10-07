@@ -455,7 +455,8 @@ public:
         uint8_t target_device_index = 0xFF);
     std::vector<hidpp_feature_metadata> get_feature_metadata(
         uint8_t target_device_index = 0xFF);
-    bool supports_feature(uint16_t feature_id);
+    bool supports_feature(uint16_t feature_id,
+                          uint8_t target_device_index = 0xFF);
 
     // Set target device index for subsequent queries
     void set_device_index(uint8_t idx);

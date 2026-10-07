@@ -634,9 +634,14 @@ static void sanitize_profile(profile& p) {
     if (p.ud_output_dpi_ratio > 100)  p.ud_output_dpi_ratio = 100;
     if (p.yx_output_dpi_ratio < 0.01) p.yx_output_dpi_ratio = 0.01;
     if (p.yx_output_dpi_ratio > 100)  p.yx_output_dpi_ratio = 100;
-    // speed_min / speed_max: non-negative; max >= min if both nonzero
+    // speed_min / speed_max: non-negative; max >= min if both nonzero.
     if (p.speed_min < 0) p.speed_min = 0;
     if (p.speed_max < 0) p.speed_max = 0;
+    if (p.speed_max > 0 && p.speed_max < p.speed_min)
+        p.speed_max = p.speed_min;
+    // T46-05: shared ceiling with the GUI gauge + CLI domain (SPEED_MAX).
+    if (p.speed_min > SPEED_MAX) p.speed_min = SPEED_MAX;
+    if (p.speed_max > SPEED_MAX) p.speed_max = SPEED_MAX;
     if (p.speed_max > 0 && p.speed_max < p.speed_min)
         p.speed_max = p.speed_min;
     // lp_norm: must be > 0

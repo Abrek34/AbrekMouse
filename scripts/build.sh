@@ -7,6 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
 BUILD="$ROOT/build-manual"
+# T51-01: the CMake path uses its OWN directory — sharing build-manual let
+# CMake's CMakeCache/Makefile/CMakeFiles mix with the direct-path binaries.
+BUILD_CMAKE="$ROOT/build-cmake"
 
 # PGO/LTO support
 USE_PGO="${RAWACCEL_PGO:-0}"
@@ -146,14 +149,22 @@ ALL_CXXFLAGS="$BASE_CXXFLAGS $PERF_FLAGS $HARDENING $PGO_FLAGS $LTO_FLAGS"
 ALL_LDFLAGS="$LDFLAGS_HARDEN $LTO_FLAGS"
 
 if [ "${USE_CMAKE:-0}" = "1" ]; then
-    # CMake build path
-    mkdir -p "$BUILD"
-    cd "$BUILD"
-    cmake .. -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_DAEMON=ON -DBUILD_CLI=ON -DBUILD_GUI=ON -DBUILD_TESTS=ON \
+    # CMake build path (T51-01: separate dir; T51-02: graceful GTK4-less skip)
+    # T51-02: mirror the direct path — if GTK4 dev files are absent, configure
+    # with BUILD_GUI=OFF instead of hard-failing inside pkg_check_modules(GTK4
+    # REQUIRED).
+    GUI_FLAG="-DBUILD_GUI=ON"
+    if [ "$HAVE_GTK4" != "1" ]; then
+        echo "[3/3] Skipping rawaccel-gui (GTK4 development files not found)."
+        GUI_FLAG="-DBUILD_GUI=OFF"
+    fi
+    mkdir -p "$BUILD_CMAKE"
+    cmake -S "$ROOT" -B "$BUILD_CMAKE" -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_DAEMON=ON -DBUILD_CLI=ON $GUI_FLAG -DBUILD_TESTS=ON \
         2>&1
-    make -j$(nproc) 2>&1
-    cd -
+    make -C "$BUILD_CMAKE" -j$(nproc) 2>&1
+    echo ""
+    echo "Build complete! Binaries in $BUILD_CMAKE/"
 else
     # Direct compilation path (original behavior)
     mkdir -p "$BUILD"

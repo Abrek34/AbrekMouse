@@ -3,6 +3,22 @@
 // Forward declaration — lut_get_points() is defined later in this file.
 static std::vector<std::pair<double,double>> lut_get_points(const accel_args& ax);
 
+// T36-GUI04: LUT editor axis selection (X/Y) for unlinked profiles.
+static bool lut_edit_y(AppState* S) {
+    return S->lut_axis_combo &&
+           gtk_drop_down_get_selected(GTK_DROP_DOWN(S->lut_axis_combo)) == 1;
+}
+accel_args& lut_args(AppState* S) {
+    auto& dp = cur_prof(S);
+    return lut_edit_y(S) ? dp.prof.accel_y : dp.prof.accel_x;
+}
+void lut_mirror_link(AppState* S) {
+    if (!S->xy_linked) return;
+    auto& dp = cur_prof(S);
+    if (lut_edit_y(S)) dp.prof.accel_x = dp.prof.accel_y;
+    else               dp.prof.accel_y = dp.prof.accel_x;
+}
+
 /// LUT gain mode (reference `lookup::velocity`): stored y is an output speed,
 /// so the effective gain is y / speed. These helpers convert between the stored
 /// value and the gain the editor/graph shows.
@@ -255,9 +271,9 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
         cairo_save(cr);
         cairo_rectangle(cr, GRAPH_ML, GRAPH_MT, PW, PH);
         cairo_clip(cr);
-        auto& dp2 = cur_prof(S);
-        bool  vel = dp2.prof.accel_x.gain;
-        auto  pts = lut_get_points(dp2.prof.accel_x);
+        const accel_args& lax = lut_args(S);
+        bool  vel = lax.gain;
+        auto  pts = lut_get_points(lax);
         for (auto& p : pts) {
             // BUG-NEW-50: to_cx() has no vertical-style clamp — a zoomed-out
             // point beyond max_speed would draw over the right margin/labels.
@@ -352,7 +368,7 @@ void on_graph_motion(GtkEventControllerMotion*, double cx, double cy, gpointer u
     // scale cannot change between draws (L-BUG-17).
     double max_gain = S->graph_last_max_gain;
 
-    const auto& ax = cur_prof(S).prof.accel_x;
+    const accel_args& ax = lut_args(S);
     auto pts = lut_get_points(ax);
 
     bool near = false;
@@ -427,12 +443,12 @@ void on_lut_row_delete(GtkButton*, gpointer row_ptr) {
     auto* S = static_cast<AppState*>(g_object_get_data(G_OBJECT(list_box), "app-state"));
     if (!S) return;
     int idx   = gtk_list_box_row_get_index(row);
-    auto& ax  = cur_prof(S).prof.accel_x;
+    auto& ax  = lut_args(S);
     auto pts  = lut_get_points(ax);
     if (idx >= 0 && idx < (int)pts.size()) {
         pts.erase(pts.begin() + idx);
         lut_set_points(ax, pts);
-        if (S->xy_linked) cur_prof(S).prof.accel_y = ax;
+        lut_mirror_link(S);
         S->unsaved = true;
         rebuild_lut_list(S);
         gtk_widget_queue_draw(S->graph_area);
@@ -468,7 +484,7 @@ void rebuild_lut_list(AppState* S) {
     while ((child = gtk_widget_get_first_child(S->lut_list_box)) != nullptr)
         gtk_list_box_remove(GTK_LIST_BOX(S->lut_list_box), child);
 
-    auto& ax  = cur_prof(S).prof.accel_x;
+    auto& ax  = lut_args(S);
     bool  vel = ax.gain;
     auto  pts = lut_get_points(ax);
 
@@ -530,7 +546,7 @@ void rebuild_lut_list(AppState* S) {
 void lut_list_changed(AppState* S) {
     if (!S->lut_list_box) return;
     S->unsaved = true; // LUT spin changes also count as unsaved
-    auto& ax = cur_prof(S).prof.accel_x;
+    auto& ax = lut_args(S);
     bool  vel = ax.gain;
     std::vector<std::pair<double,double>> pts;
 
@@ -557,7 +573,7 @@ void lut_list_changed(AppState* S) {
     auto pts_before = pts;
     // lut_set_points sorts — the daemon uses binary search; unsorted data produces wrong acceleration
     lut_set_points(ax, pts);
-    if (S->xy_linked) cur_prof(S).prof.accel_y = ax;
+    lut_mirror_link(S);
     gtk_widget_queue_draw(S->graph_area);
 
     // If the *order* of points changed, rebuild the list so rows move to their
@@ -585,7 +601,7 @@ void lut_list_changed(AppState* S) {
 /// Called when the "Add Point" button is pressed.
 void on_lut_add_point(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
-    auto& ax = cur_prof(S).prof.accel_x;
+    auto& ax = lut_args(S);
     auto  pts = lut_get_points(ax);
     if ((int)pts.size() >= (int)LUT_POINTS_CAPACITY) {
         set_status(S, tr("Maximum number of points reached."));
@@ -604,7 +620,7 @@ void on_lut_add_point(GtkButton*, gpointer user_data) {
         : lut_stored_to_gain(pts.back().first, pts.back().second, ax.gain);
     pts.push_back({new_speed, lut_gain_to_stored(new_speed, new_gain, ax.gain)});
     lut_set_points(ax, pts);
-    if (S->xy_linked) cur_prof(S).prof.accel_y = ax;
+    lut_mirror_link(S);
     S->unsaved = true;
     rebuild_lut_list(S);
     gtk_widget_queue_draw(S->graph_area);
@@ -614,9 +630,28 @@ void on_lut_add_point(GtkButton*, gpointer user_data) {
 /// The normal parameters frame is owned by update_mode_sensitivity().
 void update_lut_visibility(AppState* S) {
     if (!S->lut_frame || !S->accel_params_frame) return;
-    bool is_lut = (idx_to_mode((int)gtk_drop_down_get_selected(
-                        GTK_DROP_DOWN(S->mode_combo))) == accel_mode::lookup);
+    accel_mode xmode = idx_to_mode((int)gtk_drop_down_get_selected(
+                        GTK_DROP_DOWN(S->mode_combo)));
+    accel_mode ymode = S->xy_linked ? xmode
+        : idx_to_mode((int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->mode_combo_y)));
+    bool x_lut = (xmode == accel_mode::lookup);
+    bool y_lut = (ymode == accel_mode::lookup);
+    bool is_lut = x_lut || y_lut;  // T36-GUI04: Y lookup also shows the LUT editor
     S->lut_graph_mode = is_lut;
     gtk_widget_set_visible(S->lut_frame, is_lut);
+    if (S->lut_axis_combo) {
+        // Follow the axes that actually use lookup: if the selected axis's
+        // mode is not lookup but the other one is, switch the editor to it.
+        if (!S->xy_linked) {
+            int  sel  = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->lut_axis_combo));
+            bool sel_lut = (sel == 1) ? y_lut : x_lut;
+            bool oth_lut = (sel == 1) ? x_lut : y_lut;
+            if (!sel_lut && oth_lut) {
+                S->updating = true;
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(S->lut_axis_combo), sel == 1 ? 0 : 1);
+                S->updating = false;
+            }
+        }
+    }
     if (is_lut) rebuild_lut_list(S);
 }

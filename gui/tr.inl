@@ -175,6 +175,8 @@ static const char* tr(const char* key) {
              "<small>Sol tık: grafiğe nokta ekler\n"
              "Sağ tık: grafikten nokta siler\n"
              "Noktalar hız (ips) → kazanım çiftleridir.</small>"},
+            {"<small>Axis:</small>",
+             "<small>Eksen:</small>"},
             {"<small>Set Max to 0 to disable speed clamping.</small>",
              "<small>Hız sınırlamayı kapatmak için Maks değerini 0 yapın.</small>"},
             {"<small>HL = EMA half-life in ms. 0 = smoothing off.\n"

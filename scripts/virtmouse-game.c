@@ -68,26 +68,52 @@ static int create_mouse(const char* name) {
     if (ioctl(fd, UI_SET_PHYS, "usb:0e0f:1337:") < 0)
         perror("UI_SET_PHYS (warn only)");
 
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
-    ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
-    ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE);
-    ioctl(fd, UI_SET_EVBIT, EV_REL);
-    ioctl(fd, UI_SET_RELBIT, REL_X);
-    ioctl(fd, UI_SET_RELBIT, REL_Y);
-    ioctl(fd, UI_SET_RELBIT, REL_WHEEL);
+    /* T51-11: fail fast on any setup ioctl error — a half-configured device
+     * would otherwise look like a valid laptop node. */
+    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
+        ioctl(fd, UI_SET_KEYBIT, BTN_MIDDLE) < 0 ||
+        ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0) {
+        perror("UI_SET_EVBIT/KEYBIT/RELBIT");
+        close(fd);
+        return -1;
+    }
 
     if (ioctl(fd, UI_DEV_SETUP, &setup) < 0) { perror("UI_DEV_SETUP"); close(fd); return -1; }
     if (ioctl(fd, UI_DEV_CREATE) < 0) { perror("UI_DEV_CREATE"); close(fd); return -1; }
     return fd;
 }
 
+/* T51-10/T51-11: open the fd O_NONBLOCK (a full uinput queue must not hang
+ * the generator), but count dropped writes.  A uinput fd that silently
+ * drops every event produces an EMPTY daemon histogram, which reads as a
+ * "perfect" latency — an invalid measurement, not a pass. */
+static long g_dropped_writes = 0;
+static long g_write_errors = 0;
+
 static void emit(int fd, unsigned type, unsigned code, int val) {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.type = type; ev.code = code; ev.value = val;
     ev.time.tv_sec = 0; ev.time.tv_usec = 0;
-    if (write(fd, &ev, sizeof(ev)) < 0) { /* ignore */ }
+    ssize_t n = write(fd, &ev, sizeof(ev));
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            g_dropped_writes++;   /* queue full — accounted, never silent */
+        } else {
+            g_write_errors++;
+        }
+        return;
+    }
+    if ((size_t)n != sizeof(ev)) {
+        /* T51-11: short (torn) write — the kernel accepted less than one
+         * full event; the daemon would parse a corrupt stream. */
+        g_write_errors++;
+    }
 }
 
 static void emit_rel(int fd, int dx) {
@@ -104,11 +130,18 @@ int main(int argc, char** argv) {
     errno = 0;
     char* endp = NULL;
     long dur = strtol(argv[2], &endp, 10);
-    if (endp == argv[2] || *endp != '\0') {
+    if (endp == argv[2] || *endp != '\0' || errno == ERANGE) {
         fprintf(stderr, "error: duration must be an integer number of seconds\n");
         return 2;
     }
-    int duration = dur <= 0 ? 5 : (int)dur;
+    /* T51-13: validate instead of silently substituting 5 s or truncating
+     * a huge value into a negative (which used to produce an empty run). */
+    if (dur <= 0 || dur > 86400) {
+        fprintf(stderr, "error: duration must be in 1..86400 seconds (got %ld)\n", dur);
+        fprintf(stderr, "usage: %s <flick|pan|mix|precision> <duration_sec>\n", argv[0]);
+        return 2;
+    }
+    int duration = (int)dur;
 
     /* P121/BUG-10: graceful shutdown on Ctrl-C / SIGTERM. */
     struct sigaction sa;
@@ -201,9 +234,20 @@ int main(int argc, char** argv) {
     }
 
     sleep(1); /* allow drain */
-    ioctl(fd, UI_DEV_DESTROY);
-    close(fd);
+    /* T51-11: check UI_DEV_DESTROY — a ghost uinput node means every
+     * "no ghost device" claim (P121/BUG-10) is void. */
+    int rc = 0;
+    if (ioctl(fd, UI_DEV_DESTROY) < 0) {
+        perror("UI_DEV_DESTROY");
+        rc = 1;
+    }
+    if (close(fd) < 0) { perror("close"); rc = 1; }
     printf("[virtmouse] done. injected %ld s of %s motion.\n",
            (now_us() - t0) / 1000000L, scenario);
-    return 0;
+    if (g_dropped_writes > 0 || g_write_errors > 0) {
+        printf("[virtmouse] WARNING: %ld writes dropped (EAGAIN/EINTR), %ld write errors — the daemon histogram is UNRELIABLE for this run.\n",
+               g_dropped_writes, g_write_errors);
+        if (g_write_errors > 0) rc = 1;
+    }
+    return rc;
 }

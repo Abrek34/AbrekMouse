@@ -260,7 +260,18 @@ struct speed_processor {
         const bool prev_input  = speed_flags.should_smooth_input;
         const bool prev_scale  = speed_flags.should_smooth_scale;
         const bool prev_output = speed_flags.should_smooth_output;
+        // T42-EMA01: track whole↔separate transitions.  In whole mode the
+        // Y smoothers never advance (calc_speed_whole only touches
+        // smoother_x; scale/output feed only the x channel of a combined
+        // speed in the whole branch of modify()), so a separate→whole→
+        // separate round trip would evaluate Y from stale EMA state.
+        // Reset on the transition so the transient never surfaces.
+        const bool prev_whole = (speed_flags.dist_mode != distance_mode::separate);
         init_coeff(in_args);
+        const bool now_whole = (speed_flags.dist_mode != distance_mode::separate);
+        if (prev_whole != now_whole) {
+            reset_smoothers();
+        }
         if (speed_flags.should_smooth_input  && !prev_input) {
             smoother_x.input_speed_smoother.reset();
             smoother_y.input_speed_smoother.reset();

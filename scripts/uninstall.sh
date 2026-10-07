@@ -115,7 +115,9 @@ if [[ -f "$KDE_FIX" ]]; then
         echo "      Removing kwinrc traces for user '$user'..."
             # H-3: sudo resets session env by default; preserve the KDE
             # detection variables or --remove silently no-ops.
-            if out="$(sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+            # T51-09: also carry the TARGET user's HOME through — otherwise
+            # HOME=/root survives and the script edits /root's kwinrc.
+            if out="$(HOME="$home" sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR,HOME \
                 bash "$KDE_FIX" --remove 2>&1)"; then
                 # R4-L-8: success path may still print diagnostics — surface
                 # genuine error/failure lines instead of hiding the stream.

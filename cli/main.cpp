@@ -560,6 +560,15 @@ static void print_profile(const device_profile& dp) {
                      "daemon skips the device; toggling a live device applies on "
                      "the next rescan; full 1:1 bypass = set-param <profile> raw true)\n";
     std::cout << "  device_id:    " << (dp.device_id.empty() ? "(all)" : dp.device_id) << "\n";
+    // T45-SHOW01: match_app was invisible in show/list — an app-scoped
+    // profile looked identical to a global one, and two lookup profiles
+    // with different curves looked identical too.  Surface both.
+    if (!dp.match_app.empty())
+        std::cout << "  match_app:    \"" << dp.match_app << "\"\n";
+    if (p.accel_x.length > 0)
+        std::cout << "  lut:          " << (p.accel_x.length / 2) << " points (X)\n";
+    if (p.accel_y.length > 0 && p.accel_x != p.accel_y)
+        std::cout << "  lut:          " << (p.accel_y.length / 2) << " points (Y)\n";
     if (p.raw_passthrough) {
         std::cout << "  raw:          true  (all processing bypassed)\n";
         std::cout << "  dpi:          " << dp.dev_cfg.dpi         << "\n";
@@ -1341,20 +1350,16 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     // value than the user asked for while exiting 0 — a script checking $?
     // would see "success" for e.g. `snap 90` that actually stored 45.
     // Domains mirror the sanitize ranges in src/config.cpp exactly.
-    // Intentionally unconstrained (accept any finite value): acceleration
-    // (negative is a legit classic-decel feature) and rotation (any angle is
+    // Intentionally unconstrained (accept any finite value): rotation (any angle is
     // normalized into [0,360) — documented aliasing).  Non-numeric keys
     // (mode/gain/cap_mode/raw/distance_mode/device_id) never reach here.
+    // T43-11: acceleration keeps its negative (classic-decel) band accepted
+    // but is upper-clamped at ACCEL_MAX, and sync_speed is bounded at
+    // SYNC_SPEED_MAX — both mirror sanitize now.
     auto range_ok = [&](const char* k, double lo, double hi) -> bool {
         if (v >= lo && v <= hi) return true;
         std::cerr << "Invalid value for '" << k << "': " << val
                   << "  (valid range: " << lo << ".." << hi << ")\n";
-        return false;
-    };
-    auto min_ok = [&](const char* k, double lo) -> bool {
-        if (v >= lo) return true;
-        std::cerr << "Invalid value for '" << k << "': " << val
-                  << "  (must be >= " << lo << ")\n";
         return false;
     };
     auto int_ok = [&](const char* k, double lo, double hi) -> bool {
@@ -1390,8 +1395,20 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     } else if (key == "exponent_power") {
         // P120-FAZ2 (Aj8 BUG-3): clipped at the GUI gauge max (EXP_POWER_MAX).
         if (!range_ok(key.c_str(), 1e-4, EXP_POWER_MAX)) return 1;
+    } else if (key == "acceleration") {
+        // T43-11: sanitize clamps acceleration to <= ACCEL_MAX at load, so
+        // the CLI must reject the same out-of-range band (P107 byte
+        // correctness).  Negatives stay accepted: classic deceleration is a
+        // documented feature (no sanitize lower bound exists), so only the
+        // upper domain is shared.
+        if (v > ACCEL_MAX) {
+            std::cerr << "Invalid value for 'acceleration': " << val
+                      << "  (must be <= " << ACCEL_MAX << ")\n";
+            return 1;
+        }
     } else if (key == "sync_speed") {
-        if (!min_ok(key.c_str(), 1e-4)) return 1;
+        // T43-11: mirror the sanitize domain [1e-4, SYNC_SPEED_MAX].
+        if (!range_ok(key.c_str(), 1e-4, SYNC_SPEED_MAX)) return 1;
     } else if (key == "lp_norm") {
         if (v <= 0) {
             std::cerr << "Invalid value for 'lp_norm': " << val
@@ -1443,9 +1460,11 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
                                                 : SMOOTH_MAX;
         if (!range_ok(key.c_str(), 0, hi)) return 1;
     } else if (key == "speed_min" || key == "speed_max") {
-        // speed_min/speed_max have no sanitize ceiling (only >= 0), so they
-        // stay min-only — an upper bound here would invent a new domain.
-        if (!min_ok(key.c_str(), 0)) return 1;
+        // T46-05: engine/CLI used to accept any finite value while the GUI
+        // spin was capped — JSON/CLI > spin silently truncated on next GUI
+        // save.  Shared ceiling SPEED_MAX mirrors sanitize, so the CLI domain
+        // is now byte-correct with both.
+        if (!range_ok(key.c_str(), 0, SPEED_MAX)) return 1;
     } else if (key == "input_offset") {
         // O31-L2: sanitize clamps input_offset to CAP_X_MAX at load, so the
         // CLI domain must mirror [0, CAP_X_MAX] for P107 byte-correctness.

@@ -340,6 +340,25 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         gtk_widget_set_margin_bottom(lut_vbox, 6);
         gtk_frame_set_child(GTK_FRAME(S->lut_frame), lut_vbox);
 
+        // T36-GUI04: axis selector for the LUT editor (X/Y)
+        {
+            GtkWidget* axis_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+            GtkWidget* axis_lbl = trmlbl("<small>Axis:</small>");
+            gtk_box_append(GTK_BOX(axis_box), axis_lbl);
+            const char* axis_items[] = {"X", "Y", nullptr};
+            S->lut_axis_combo = gtk_drop_down_new_from_strings(axis_items);
+            gtk_widget_set_hexpand(S->lut_axis_combo, TRUE);
+            g_signal_connect(S->lut_axis_combo, "notify::selected",
+                G_CALLBACK(+[](GObject*, GParamSpec*, gpointer ud) {
+                    auto* S2 = static_cast<AppState*>(ud);
+                    if (S2->updating) return;
+                    rebuild_lut_list(S2);
+                    gtk_widget_queue_draw(S2->graph_area);
+                }), S);
+            gtk_box_append(GTK_BOX(axis_box), S->lut_axis_combo);
+            gtk_box_append(GTK_BOX(lut_vbox), axis_box);
+        }
+
         // Bilgi etiketi
         GtkWidget* info_lbl = trmlbl(
             "<small>Left click: add point on graph\n"
@@ -373,10 +392,10 @@ void build_ui(AppState* S, GtkApplication* gapp) {
         trtip(sort_btn, "Sort points by speed value (ascending)");
         g_signal_connect(sort_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer ud) {
             auto* S2 = static_cast<AppState*>(ud);
-            auto& ax = cur_prof(S2).prof.accel_x;
+            auto& ax = lut_args(S2);
             auto pts = lut_get_points(ax);
             lut_set_points(ax, pts); // lut_set_points already sorts
-            if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            lut_mirror_link(S2);
             S2->unsaved = true; // P-BUG-4: sort also mutates the LUT
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);
@@ -455,8 +474,8 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     // widget edit.  100000 is far above any physical speed (8000 Hz * 32000
     // DPI eventually saturates the clamp domain) and removes the data-loss
     // window for realistic configs while keeping the spin usable.
-    S->speed_min_spin = make_spin(0, 100000, 1, 0, 0);
-    S->speed_max_spin = make_spin(0, 100000, 1, 0, 0);
+    S->speed_min_spin = make_spin(0, SPEED_MAX, 1, 0, 0);
+    S->speed_max_spin = make_spin(0, SPEED_MAX, 1, 0, 0);
     connect_spin(S->speed_min_spin, S);
     connect_spin(S->speed_max_spin, S);
     grid_row(sg, 0, "Min (ips):", S->speed_min_spin);
@@ -856,7 +875,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             spd  = std::min(spd, LUT_CLICK_SPEED_MAX);
             gain = std::max(0.01, gain);
 
-            auto& ax = cur_prof(S2).prof.accel_x;
+            auto& ax = lut_args(S2);
             if (ax.length / 2 >= (int)LUT_POINTS_CAPACITY) {
                 set_status(S2, tr("Maximum number of points reached."));
                 return;
@@ -868,7 +887,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             // stored/speed).  Matches on_lut_spin_changed / on_lut_add_point.
             pts.push_back({spd, lut_gain_to_stored(spd, gain, ax.gain)});
             lut_set_points(ax, pts);
-            if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            lut_mirror_link(S2);
             S2->unsaved = true; // P-BUG-3: graph add must count as unsaved too
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);
@@ -894,7 +913,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             max_speed = std::max(max_speed, 5.0);
             double max_gain = compute_max_gain(S2, max_speed);
 
-            auto& ax = cur_prof(S2).prof.accel_x;
+            auto& ax = lut_args(S2);
             auto  pts = lut_get_points(ax);
             if (pts.empty()) return;
 
@@ -922,7 +941,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             if (best_idx < 0) return;
             pts.erase(pts.begin() + best_idx);
             lut_set_points(ax, pts);
-            if (S2->xy_linked) cur_prof(S2).prof.accel_y = ax;
+            lut_mirror_link(S2);
             S2->unsaved = true; // P-BUG-3: graph remove must count as unsaved too
             rebuild_lut_list(S2);
             gtk_widget_queue_draw(S2->graph_area);

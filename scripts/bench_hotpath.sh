@@ -100,8 +100,16 @@ OUTPUT_FILE="${OUTPUT_FILE:-${POS_OUTPUT:-$PROJECT_ROOT/bench_hotpath_results.tx
 # flag is also supported if a caller wants to point at another file.
 export BENCH_BASELINE="$BASELINE_FILE"
 
-# Build benchmark if needed
+# Build benchmark if needed (T51-03: also rebuild when the source is newer
+# than the binary — a changed bench_hotpath.cpp must not run stale).
+REBUILD=0
 if [[ ! -f "$BENCH_BIN" ]]; then
+    REBUILD=1
+elif [[ "$PROJECT_ROOT/tests/bench_hotpath.cpp" -nt "$BENCH_BIN" ]]; then
+    echo "bench_hotpath.cpp changed — rebuilding..."
+    REBUILD=1
+fi
+if [[ "$REBUILD" -eq 1 ]]; then
     echo "Building benchmark..."
     cd "$PROJECT_ROOT"
     if [[ "${RAWACCEL_PORTABLE:-0}" = "1" ]]; then

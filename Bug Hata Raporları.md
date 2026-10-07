@@ -2192,7 +2192,7 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Kategori: LUT / Y-axis
 - Açıklama: X=`classic`, Y=`lookup` (unlinked) iken `lut_frame` gizli, Y eğrisi çizilir ama noktası çizilmez/düzenlenemez. CLI'da `lut-data` anahtarı yok, Y-LUT fiilen import-only. G2 + N-YLUT veriyi korur ama editörü eklemez.
 - Öneri: `update_lut_visibility`'yi `X||Y lookup` yap + editörü eksen-seçici yap; kısa vadede Y-lookup iken uyarı bas.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — LUT editörü artık eksen-seçici (lut_axis_combo: X/Y): `update_lut_visibility` `X||Y` lookup'ta açılıyor, `lut_args`/`lut_mirror_link` tüm LUT düzenlemelerini (list, add/remove/sort, grafik tıkla-ekle/sil, hover hit-test) seçili eksene yönlendiriyor; xy_linked'de iki tarafa da mirror ediliyor. (2026-10-07)
 
 **T36-GUI05 · DÜŞÜK · Unlinked-Y skaler alanlar koşulsuz X→Y eziyor (N-YLUT tutarsızlığı)**
 - Konum: `gui/widgets_sync.inl:184-194` (11 alan koşulsuz) vs `:205-208` (LUT `if (ay.length==0)` koşullu)
@@ -2213,7 +2213,7 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Kategori: CLI parity / eksik özellik
 - Açıklama: `disable` (PAS-2) hiçbir UI'dan ayarlanamaz (yalnız hand-JSON); `match_app` yalnız GUI; `use_raw_input` yalnız GUI. P107 "bilinmeyen anahtar → Unknown key" der, bu üçü bilinen-ama-reddedilen değil bilinmeyen.
 - Öneri: `disable` (strict-bool), `match_app` (trim+128 cap) ekle; `use_raw_input` için profil-dışı komut veya "CLI'dan yönetilemez" notu.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — set-param artık `disable` (strict-bool), `match_app` (trim + 128 cap) anahtarlarını kabul ediyor; `use_raw_input` açık bir "profil-dışı ayar, set-param değiştiremez" reddiyle biliniyor. (2026-10-07)
 
 **T36-CLI02 · DÜŞÜK · `diff` domain/range weight'te epsilon'u baypas ediyor (sahte fark)**
 - Konum: `cli/main.cpp:1506-1509` (`sval(dnum(x)+","+dnum(y))`) vs `:1390-1396` (`dbl` `>DBL_EPSILON_CMP`), `include/rawaccel-base.hpp:72-73`
@@ -2599,7 +2599,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: State tutarlılığı
 - Açıklama: `whole` modda Y-input/scale/output hiç ilerlemez; `separate→whole→separate` sonrası Y eski/0 değerde kalır, sonraki frame'lerde Y-gain yanlış noktadan değerlendirilir (~halflife asimetrik sönüm). SM-5'ten farklı (o resetle/koru politikası; bu Y kanalının hiç ilerlememesi).
 - Öneri: Whole'da iki kanalı da aynı `speed` ile ilerlet veya `reconfigure`'da `dist_mode` değişiminde Y-smoother'ları resetle/kopyala.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `reconfigure` artık `dist_mode`/whole↔separate geçişini izliyor; mod değişiminde `reset_smoothers()` ile her iki eksenin smoother state'i sıfırlanıyor, böylece separate→whole→separate dönüşünde Y kanalı bayat EMA ile değerlendirilmiyor. (2026-10-07)
 
 **T42-SMO01 · DÜŞÜK · EMA `NaN speed` / `time=Inf+coeff==1` kalıcı state zehirlenmesi**
 - Konum: `include/rawaccel.hpp:50-58,108-150` (guard yalnız `!(time>0)`; `twc=1-exp2(log2*time)`)
@@ -2715,7 +2715,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Sanitize / GUI-parite
 - Açıklama: P120 gerekçesi burada uygulanmamış. CLI de aynı alanlarda `min_ok(0)` / unconstrained.
 - Öneri: GUI `make_spin` max'larını sabite taşı, sanitize+CLI domain'e ekle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — CLI domain'i sanitize ile eşitlendi: `sync_speed` artık [1e-4, SYNC_SPEED_MAX], `acceleration` > ACCEL_MAX reddediliyor (negatif classic-decel bandı açık); sanitize tarafı zaten tüm P120-FAZ2 alanlarını kısıyordu. (2026-10-07)
 
 **T43-12 · ORTA · `migrate_lookup_gain` double-finite ama float-Inf üretebilir + re-sanitize yok**
 - Konum: `src/config.cpp:1000-1024,712-724` (`product=y*x` double-finite ise float cast; `1e39` double-finite ama `FLT_MAX` üstü → Inf LUT; migrate sanitize'den sonra çalışır, re-sanitize yok → dump `null` → sonraki tur 0)
@@ -2849,7 +2849,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Parity
 - Açıklama: `status` human-notu ayrı (CLI-1).
 - Öneri: `match_app` boş-değilse `app: "<v>"` + `lut.length>0` ise `lut: <n> points` satırı ekle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `show`/`list` (print_profile) artık boş-değilse `match_app` satırını ve `lut` point sayısını (X/Y eksen) basıyor. (2026-10-07)
 
 **T45-DUP01 · DÜŞÜK-ORTA · `duplicate` `match_app`'i koruyor (app-çakışması)**
 - Konum: `cli/main.cpp:649-655` (`dst=*src; dst.name=...; device_id.clear();` — `match_app` kopyalanır → aynı app'li iki profil first-match-wins ile ikincisi gölgelenir)
@@ -2909,7 +2909,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Range-parity
 - Açıklama: JSON/CLI `speed_max=2000` → spin `500` gösterir → kaydet `500` yazar.
 - Öneri: Spin max yükselt veya sanitize/CLI'ya üst sınır + P107 reddi; ara çözüm clamp-uyarısı.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `SPEED_MAX` (100000) config.hpp'de tek tavan oldu; GUI spin, sanitize clamp ve CLI domain'i aynı sabiti kullanıyor. (2026-10-07)
 
 **T46-06 · DÜŞÜK · `Battery: unknown` markup'sız + registry-dışı**
 - Konum: `gui/ui_builder.inl:954-957` (`gtk_label_new(tr("<b>..."))` markup işlemez → literal `<b>` görünür; `trlbl/trmlbl` kayıtsız → `refresh_language` çevirmez) vs doğru kullanım `daemon_comm.inl:575-579`
@@ -3029,14 +3029,14 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Misleading-feedback
 - Açıklama: `lod` destekten bağımsız combo'dan alınır (`:838-839`).
 - Öneri: `rate_hz==0` / `!supports_lod` dallarını atla (`n/a` veya yalnız yazılanları listele).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — Apply sonucu status'ta yalnız gerçekten yazılanlar raporlanıyor: `rate_hz==0` (değişiklik yok) 'Rate→...' satırını bassmıyor, `supports_lod=false` 'LOD→(unsupported)' diyor; desteklemeyen cihazda asla yazılmamış değerler yazılmış gibi görünmüyor. (2026-10-07)
 
 **T48-03 · ORTA · Bilinmeyen rate `0` seçimine zorlanıyor (istenmeyen yazma)**
 - Konum: `gui/hidpp_panel.inl:438-447` (`cur.rate_hz==0` → `set_selected(dd,0)`; DPI tarafı `:424-426` `cur.dpi>0` korur, rate korumaz → dokunmadan Apply en düşük rate'e düşürür)
 - Kategori: Correctness
 - Açıklama: İstenmeyen yazma.
 - Öneri: Bilinmeyende seçim yapma (önceki seçimi koru veya `INVALID` + Apply'da `rate_hz==0` → yazma).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `cur.rate_hz==0` (cihaz rate bildirmedi) artık combo'da seçimi geçersiz (`GTK_INVALID_LIST_POSITION`) bırakıyor ve 'rate unknown' gösteriliyor; dokunulmadan Apply yapılırsa `rate_hz=0` → yazma yok. DPI tarafındaki koruma ile aynı davranış. (2026-10-07)
 
 **T48-04 · ORTA · `GError` yaşam-döngüsü ihlali**
 - Konum: `gui/kwin_focus.inl:184,191-207,218` (`if(!result) g_error_free(err)` guardsız (`err==NULL` kritik); `free` sonrası `err=NULL` yokken aynı `&err` ile `loadScript` → GLib `*err==NULL` ihlali; `:204` sızıntı; `:218` dangling `err`)
@@ -3110,7 +3110,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Capability-gate
 - Açıklama: `get_dpi_info` hedef-duyarlı (`target<<16|id`), battery/device_info kapısı hedefsiz.
 - Öneri: `get_feature_set(target)/get_feature_metadata(target)` overload + `resolve_feature_index(feature,target)` kapısına indirgeme.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ (2026-10-07; `get_feature_set()`/`get_feature_metadata()` hedefsiz çağrıları kaldırıldı — `identify_hidpp20_target`/`identify_logitech_device` çözülmüş `target`'ı açıkça geçiyor; `HidppTransport::supports_feature(feature_id, target)` capability-gate'i sorgu hedefinin feature setine indirgendi. T49-02)
 
 **T49-03 · DÜŞÜK-ORTA · `resolve_feature_index` cache-key vs request-device ayrışması**
 - Konum: `src/logitech_hidpp.cpp:798-800` vs `:816-818` (`target` çözülüp `cache_key=(target<<16)|id` ama `send_feature_request(...,target_device_index)` orijinal sentinel (`0xFF`) iletilir; arada `set_device_index()` girerse yanlış hedeften gelen index yanlış key'e yazılır)
@@ -3209,21 +3209,21 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Build
 - Açıklama: CMake `Cache/Makefile/CMakeFiles` artıkları ile manuel binaryler karışır; yoldan yola geçişte bayat cache ile kirli derleme.
 - Öneri: CMake yolu için ayrı dizin (`build-cmake`) veya `cmake -S .. -B`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — CMake yolu artık ayrı `build-cmake` dizinini kullanıyor (`cmake -S .. -B build-cmake`); `build-manual` yalnız direkt derleme binaryleri içeriyor (scripts/build.sh).
 
 **T51-02 · ORTA · CMake yolu GTK4 yoksa hard-fail (direkt yol zarif geçer)**
 - Konum: `scripts/build.sh:93-94` vs `:123-134` + `CMakeLists.txt:82-84` (direkt `HAVE_GTK4=1` ise derler yoksa `rm -f gui` geçer; cmake koşulsuz `-DBUILD_GUI=ON` → `pkg_check_modules(GTK4 REQUIRED)` hard-fail)
 - Kategori: Tutarsızlık
 - Açıklama: GTK4sız makinede manuel başarılı, `USE_CMAKE=1` başarısız.
 - Öneri: `HAVE_GTK4` kontrol edip `-DBUILD_GUI=OFF` geç veya aynı `Skipping GUI` davranışı.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — CMake yolu da `HAVE_GTK4` kontrolü yapıyor; GTK4 yoksa `-DBUILD_GUI=OFF` ile `Skipping GUI` mesajı veriyor, hard-fail yok (scripts/build.sh).
 
 **T51-03 · ORTA · `bench_hotpath.sh` bayat-binary ile koşar**
 - Konum: `scripts/bench_hotpath.sh:17-38` (`if [[ ! -f $BENCH_BIN ]]; then build; fi` — `bench_hotpath.cpp` değişince rebuild yok → perf-gate bayat sayılar)
 - Kategori: Bench
 - Açıklama: Yanlış perf kararı.
 - Öneri: `[[ cpp -nt BIN ]]` ise rebuild veya her zaman rebuild.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `bench_hotpath.sh` artık `bench_hotpath.cpp` binary'den yeniyse rebuild ediyor; bayat sayı riski kapandı.
 
 **T51-04 · DÜŞÜK · `bench_hotpath.sh` aynı binary 3 kez koşuyor (israf)**
 - Konum: `scripts/bench_hotpath.sh:65,77,90` (timing + `perf stat` + özet üçü aynı `$BENCH_BIN $ITERATIONS`)
@@ -3258,28 +3258,28 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Kullanıcı-tercihi
 - Açıklama: Dayatma.
 - Öneri: Yedekteki önceki değerleri restore et, yoksa adaptive'e düş.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `--remove` en yeni `rawaccel-backup` dosyasından kurulum-öncesi `PointerAccelerationProfile`/`PointerAcceleration` değerlerini geri yükler; yedek yoksa adaptive'e düşer (scripts/kde-fix-accel.sh).
 
 **T51-09 · ORTA · `KWINRC` hedefi `sudo -u` altında `/root`'a kayar (yanlış-dosya)**
 - Konum: `scripts/kde-fix-accel.sh:17` + `scripts/uninstall.sh:117` (`KWINRC=${XDG:-$HOME/.config}/kwinrc`; `uninstall:117` `preserve-env` listede `HOME/XDG` yok; `HOME=/root` kalırsa `--remove` `/root/.config/kwinrc` düzeltip `for user` raporlar)
 - Kategori: Env
 - Açıklama: Yanlış dosya + yanlış rapor.
 - Öneri: `HOME=$(getent passwd $user|cut -d: -f6)` türet veya `preserve-env=HOME,XDG_CONFIG_HOME`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `kde-fix-accel.sh` KWINRC hedefini artık efektif kullanıcının passwd tabanından türetiyor (`getent passwd $(id -un)`), `sudo -u` altında HOME `/root`'a kaysa bile doğru dosyaya gidiyor; uninstall.sh da hedef kullanıcının HOME'unu preserve-env ile taşıyor.
 
 **T51-10 · ORTA · `virtmouse-game.c` `EAGAIN` sessiz yutulur (geçersiz ölçüm)**
 - Konum: `scripts/virtmouse-game.c:57,90` (`open(O_NONBLOCK)` + `emit(): if(write<0){/*ignore*/}`; daemon sink `uinput_write_retry` absorbe ederken kaynak etmez → histogram boşluklu, latans geçersiz)
 - Kategori: Reliability
 - Açıklama: Sessiz kayıp.
 - Öneri: Kaynak fd blocking aç veya EAGAIN sınırlı retry + sayaç.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `virtmouse-game.c` EAGAIN/EINTR/EWOULDBLOCK düşüşlerini sessizce yutmuyor, sayıyor; koşu sonunda düşen write'ları raporluyor ve write-error varsa exit 1 dönüyor.
 
 **T51-11 · ORTA · `virtmouse-game.c` `SET_EVBIT` kontrolsüz + yırtık-write + `DESTROY` kontrolsüz**
 - Konum: `scripts/virtmouse-game.c:71-78,90,204` (`UI_SET_*` dönüş kontrolsüz; `0<ret<sizeof` yırtık ` <0` testinden kaçar; `UI_DEV_DESTROY` kontrolsüz → hayalet düğüm, `P121/BUG-10` iddiası boşa çıkar)
 - Kategori: Error-handling
 - Açıklama: Hayalet düğüm riski.
 - Öneri: Her `ioctl(SET_*)` kontrol + fail-fast; `write != sizeof` hata; `DESTROY` `perror` + nonzero exit.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — tüm `UI_SET_*`/`UI_SET_*BIT` ioctl'leri fail-fast kontrol ediliyor; kısa (yırtık) write hata sayılıyor; `UI_DEV_DESTROY` ve `close()` kontrol edilip hata durumunda exit 1.
 
 **T51-12 · DÜŞÜK · `virtmouse-game.c` yalnız `REL_X` (diagonal yollar uyarılmaz)**
 - Konum: `scripts/virtmouse-game.c:93-96` (`emit_rel` yalnız `REL_X+SYN`; `REL_Y` yok → öklid/rotasyon/Y-smoothing/diagonal hiç uyarılmaz)

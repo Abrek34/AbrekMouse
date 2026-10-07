@@ -62,6 +62,14 @@ static constexpr double MOTIVITY_MAX      = 10.0;
 static constexpr double GAMMA_MAX         = 10.0;
 static constexpr double SYNC_SPEED_MAX    = 100.0;
 static constexpr double SMOOTH_MAX        = 1.0;
+// T46-05: speed_min/speed_max had NO shared ceiling — the GUI spin said 500
+// (later 100000 via L16-01), sanitize only enforced >= 0, and the CLI was
+// min-only, so a JSON/CLI value > spin-max became silent truncation on the
+// next GUI save.  100000 ips is far above any physical input domain (8000 Hz
+// × 32000 DPI saturates the clamp long before it) and is exactly the value
+// L16-01 already chose for the GUI spin — make it the single source of truth
+// shared by GUI gauge, sanitize clamp and the CLI domain.
+static constexpr double SPEED_MAX         = 100000.0;
 // NOT clamped (reported, not fixed — GUI-side, AJ4→AJ1):
 //   input_offset — gui/ui_builder.inl:242 gauge is 0..100 but sanitize and the
 //   CLI both permit [0, CAP_X_MAX] = [0,500] (O31-L2, tests/run_tests.sh:161

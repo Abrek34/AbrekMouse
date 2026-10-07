@@ -14,6 +14,19 @@
 set -euo pipefail
 
 # ── Config file location ──────────────────────────────────────────────────────
+# T51-09: under `sudo -u <user>` the caller's HOME (e.g. /root) survives
+# and XDG_CONFIG_HOME may leak from another account, so a plain
+# "$HOME/.config/kwinrc" would silently edit the WRONG file (and uninstall
+# would report fixing the target user's setup while it fixed /root's).
+# Derive the effective user's home from the passwd database instead.
+_eff_user="$(id -un 2>/dev/null || true)"
+_eff_home="$(getent passwd "$_eff_user" 2>/dev/null | cut -d: -f6 || true)"
+if [[ -n "$_eff_home" && "${HOME:-}" != "$_eff_home" ]]; then
+    if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == "${HOME:-/nonexistent}"* ]]; then
+        XDG_CONFIG_HOME="$_eff_home/.config"
+    fi
+    HOME="$_eff_home"
+fi
 KWINRC="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrc"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -290,10 +303,27 @@ PYEOF
     # global [Libinput] to adaptive (profile=2, accel=-0.5), exactly matching
     # what --undo promises.  (Backups written by write_kwinrc are kept; they
     # are the user's own restorable snapshots.)
+    # T51-08: restore the user's pre-install [Libinput] values from the
+    # newest rawaccel backup instead of unconditionally day-0-forcing
+    # adaptive — a user who preferred Flat (or a custom accel) must get
+    # their preference back. Adaptive is only the fallback.
+    RESTORE_PROFILE="2"
+    RESTORE_ACCEL="-0.5"
+    newest_backup="$(ls -1t "$KWINRC".rawaccel-backup.* 2>/dev/null | head -1 || true)"
+    if [[ -n "$newest_backup" ]]; then
+        bp="$(awk '/^\[Libinput\]/{found=1; next} /^\[/{if(found) exit} found && /^PointerAccelerationProfile=/{print $0; exit}' "$newest_backup" | cut -d= -f2)"
+        ba="$(awk '/^\[Libinput\]/{found=1; next} /^\[/{if(found) exit} found && /^PointerAcceleration=/{print $0; exit}' "$newest_backup" | cut -d= -f2)"
+        [[ -n "$bp" ]] && RESTORE_PROFILE="$bp"
+        [[ -n "$ba" ]] && RESTORE_ACCEL="$ba"
+        echo "  Restoring pre-install values from $(basename "$newest_backup"): profile=$RESTORE_PROFILE accel=$RESTORE_ACCEL"
+    else
+        echo "  No rawaccel backup found — falling back to adaptive (profile=2, accel=-0.5)."
+    fi
     if command -v python3 &>/dev/null; then
-        python3 - "$KWINRC" << 'PYEOF'
+        python3 - "$KWINRC" "$RESTORE_PROFILE" "$RESTORE_ACCEL" << 'PYEOF'
 import sys, os, re, tempfile
 kwinrc = sys.argv[1]
+RESTORE_PROFILE, RESTORE_ACCEL = sys.argv[2], sys.argv[3]
 try:
     with open(kwinrc) as f:
         text = f.read()
@@ -347,8 +377,8 @@ def upsert(text, header, kv):
     block = f"{header}\n{body}"
     return text.rstrip("\n") + "\n\n" + block + "\n"
 
-text = upsert(text, "[Libinput]", [("PointerAccelerationProfile", "2"),
-                                   ("PointerAcceleration", "-0.5")])
+text = upsert(text, "[Libinput]", [("PointerAccelerationProfile", RESTORE_PROFILE),
+                                   ("PointerAcceleration", RESTORE_ACCEL)])
 # Atomic rename, O31-H5 (HIDPP C3): mirror the --fix writer's pattern
 # (mkstemp + realpath + fsync, kde-fix-accel.sh:122-145) instead of a fixed
 # "kwinrc.tmp" name + plain os.replace.  The old path replaced the symlink
@@ -375,13 +405,13 @@ except Exception:
     except OSError:
         pass
     raise
-print(f"  ✓ Removed (RawAccel) per-device sections and restored adaptive global.")
+print(f"  ✓ Removed (RawAccel) per-device sections and restored global values.")
 PYEOF
     else
-        write_kwinrc "2" "-0.5"
+        write_kwinrc "$RESTORE_PROFILE" "$RESTORE_ACCEL"
     fi
     reload_kwin
-    echo "  ✓ RawAccel traces removed from kwinrc (profile=2, accel=-0.5)."
+    echo "  ✓ RawAccel traces removed from kwinrc (profile=$RESTORE_PROFILE, accel=$RESTORE_ACCEL)."
     ;;
 
 --fix)

@@ -1367,9 +1367,13 @@ std::vector<std::pair<uint16_t, uint8_t>> HidppTransport::get_feature_set(uint8_
     return features;
 }
 
-bool HidppTransport::supports_feature(uint16_t feature_id) {
+bool HidppTransport::supports_feature(uint16_t feature_id,
+                                     uint8_t target_device_index) {
     if (feature_id == 0) return false;
-    const auto features = get_feature_set();
+    // T49-02: capability gate must follow the queried target, not the
+    // transport's current device_index_ — a cached feature set of another
+    // node behind the same hidraw would mis-gate this request.
+    const auto features = get_feature_set(target_device_index);
     return std::find_if(features.begin(), features.end(),
                         [feature_id](const auto& item) {
                             return item.first == feature_id;
@@ -2335,7 +2339,10 @@ std::optional<hidpp_device> identify_hidpp20_target(HidppTransport& transport,
                                                    const std::string& hidraw_path,
                                                    uint8_t target) {
     transport.set_device_index(target);
-    auto features = transport.get_feature_set();
+    // T49-02: pass the explicit target so the capability probe, the feature
+    // set cache key and get_device_info all agree on the same node even if
+    // device_index_ drifts mid-identification.
+    auto features = transport.get_feature_set(target);
     if (features.empty()) return std::nullopt;
     auto info = transport.get_device_info(target);
     if (!info) return std::nullopt;
@@ -2347,7 +2354,7 @@ std::optional<hidpp_device> identify_hidpp20_target(HidppTransport& transport,
     device.device_index = target;
     device.info = *info;
     device.features = std::move(features);
-    device.feature_metadata = transport.get_feature_metadata();
+    device.feature_metadata = transport.get_feature_metadata(target);
     device.connected = true;
     return device;
 }
@@ -2447,11 +2454,11 @@ std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_p
     // every add and must stay cheap).  Receivers normally use 0xFF, while
     // directly connected peripherals commonly use 0x00.  Probe both without
     // assuming the endpoint topology.
-    auto features = transport.get_feature_set();
     uint8_t target = transport.device_index();
+    auto features = transport.get_feature_set(target);
     if (features.empty() && target != 0x00) {
         transport.set_device_index(0x00);
-        features = transport.get_feature_set();
+        features = transport.get_feature_set(0x00);
         target = 0x00;
     }
 
@@ -2466,7 +2473,7 @@ std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_p
         if (!info) return std::nullopt;
         device.info = *info;
         device.features = std::move(features);
-        device.feature_metadata = transport.get_feature_metadata();
+        device.feature_metadata = transport.get_feature_metadata(target);
         device.connected = true;
         return device;
     }
