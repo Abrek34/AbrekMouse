@@ -696,35 +696,45 @@ Durum: Yeni bulgular eklendi (PERF-1..PERF-8, POLL-1..POLL-5, TS-1..TS-4, ALG-1.
 
 ### BS-1 · YÜKSEK · setup.sh clean_old_install modprobe.conf'u temizlemiyor
 - Konum: `setup.sh:213-214`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — `clean_old_install` dosyalar listesine `/etc/modprobe.d/rawaccel.conf` eklenmiş (`setup.sh:222`); modüller/quirks/polkit kalıntılarıyla birlikte siliniyor.
 
 ### BS-2 · YÜKSEK · setup.sh build → clean order: stale .o ABI mismatch riski
 - Konum: `setup.sh:537-541`
 - **Açıklama:** Build, clean'den önce çalışıyor. Eski GCC version)object files varsa ABI mismatch.
+- Durum: ✅ KASITLI + doğrulandı (2026-10-07, triage) — build-önce-clean sırası M-BUG-20 notuyla bilinçli: eski kurulum ancak yeni build doğrulanınca temizleniyor. Doğrudan derleme yolunda `build.sh` tek `g++` çağrımıyla derlediğinden bayat `.o` birikmez; cmake yolunda da bayrak değişiminde yeniden derleme yapar.
 
 ### BS-3 · YÜKSEK · ASan build logitech dosyalarını kapsamıyor
 - Konum: `tests/run_tests_asan.sh:23-28`
 - **Açıklama:** logitech_receiver.cpp ve logitech_hidpp.cpp Sanity test altında compile edilmiyor.
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — `run_tests_asan.sh` artık `src/logitech_receiver.cpp` ve `src/logitech_hidpp.cpp`'yi ASan+UBSan derlemesine dahil ediyor.
 
 ### BS-4 · YÜKSEK · setup.sh GTK4 yoksa verify_install "EKSİK" raporluyor
 - Konum: `setup.sh:538`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — `verify_install` GUI binary'sini yalnız `build-manual/rawaccel-gui` derlenmişse zorunlu tutuyor; derlenmemişse "GUI atlandı" mesajı veriyor.
 
 ### BS-5 · ORTA · run_fuzz.sh unquoted $FUZZ_FLAGS + eksik logitech kaynakları
 - Konum: `tests/run_fuzz.sh:25,28,37`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — `FUZZ_FLAGS` artık dizi (`"${FUZZ_FLAGS[@]}"`); `fuzz_accel` derlemesine `logitech_receiver.cpp` + `logitech_hidpp.cpp` eklenmiş; `DURATION` sayısal doğrulanıyor.
 
 ### BS-6 · ORTA · setup.sh backup timestamp collision (aynı saniye)
 - Konum: `setup.sh:296-300`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — yedek adı PID soneki alıyor (`settings.json.bak.$(date +%Y%m%d-%H%M%S).$$`, `setup.sh:312`); aynı saniyede tekrar kurulum önceki yedeği ezmiyor.
 
 ### BS-7 · ORTA · udevadm control --reload-rules container'da fail oluyor
 - Konum: `setup.sh:312`
+- Durum: ✅ DÜZELTİLDİ (FIX_LOG BS-7, aj1+big-pickle 09-12) — `udevadm control`/`trigger` `2>/dev/null || warn` korumasında; container kurulumu abort etmiyor.
 
 ### BS-8 · ORTA · build.sh unquoted compiler vars
 - Konum: `scripts/build.sh:97,107,117`
+- Durum: ✅ KASITLI (2026-10-07, triage) — `$CXX` tırnaklı (`"$CXX"`); tırnaksız `$ALL_CXXFLAGS`/`$EVDEV_CFLAGS`/`$HARDENING` bayrak listesi olduğundan kasıtlı kelime-bölünür. `CXX="ccache g++"` desteği de aynı sebeple.
 
 ### BS-9 · ORTA · bench_hotpath.sh hardening flags eksik
 - Konum: `scripts/bench_hotpath.sh:17-31`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — bench derlemesi artık `HARDENING` (stack protector, clash, FCF, FORTIFY, GLIBCXX_ASSERTIONS, PIE, format-security) + `LDFLAGS_HARDEN` kullanıyor (`scripts/bench_hotpath.sh:116-117,129-133`).
 
 ### BS-10 · ORTA · perf-gate CI job eksik dependency
 - Konum: `.github/workflows/ci.yml:136-153`
+- Durum: ✅ DÜZELTİLDİ (2026-10-07, triage) — perf-gate job'ı artık `build-essential pkg-config libevdev-dev python3` kuruyor ve skip edilen her durumda `::warning::` ile görünür hale getiriliyor.
 
 ### BS-11 · ORTA · PIDFile dead config (Type=simple)
 - Konum: `scripts/rawaccel.service:24`
