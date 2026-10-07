@@ -790,7 +790,10 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
             deadline - std::chrono::steady_clock::now());
         if (remaining.count() <= 0) break;
         size_t len = 0;
-        if (!read_packet(buf, sizeof(buf), len, remaining)) continue;
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
+            continue;
+        }
         if (is_hidpp_error(buf, len)) return std::nullopt;
         if (len != 7 && len != 20 && len != 64) continue;
         if (buf[1] != request_device || buf[2] != feature_index ||
@@ -887,7 +890,9 @@ std::optional<hidpp_short_packet> HidppTransport::send_short(
         if (remaining.count() <= 0) break;
 
         size_t len = 0;
-        if (read_packet(buf, sizeof(buf), len, remaining)) {
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
+        } else {
             if (is_hidpp_error(buf, len)) return std::nullopt;
             if (auto rsp = hidpp_short_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
@@ -935,7 +940,9 @@ std::optional<hidpp_long_packet> HidppTransport::send_long(
         if (remaining.count() <= 0) break;
 
         size_t len = 0;
-        if (read_packet(buf, sizeof(buf), len, remaining)) {
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
+        } else {
             if (is_hidpp_error(buf, len)) return std::nullopt;
             if (auto rsp = hidpp_long_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
@@ -982,7 +989,9 @@ std::optional<hidpp_very_long_packet> HidppTransport::send_very_long(
         if (remaining.count() <= 0) break;
 
         size_t len = 0;
-        if (read_packet(buf, sizeof(buf), len, remaining)) {
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
+        } else {
             if (is_hidpp_error(buf, len)) return std::nullopt;
             if (auto rsp = hidpp_very_long_packet::from_bytes(buf, len)) {
                 if (rsp->feature_index == req.feature_index &&
@@ -1030,7 +1039,10 @@ std::optional<std::vector<uint8_t>> HidppTransport::read_register(
             deadline - std::chrono::steady_clock::now());
         if (remaining.count() <= 0) break;
         size_t len = 0;
-        if (!read_packet(buf, sizeof(buf), len, remaining)) continue;
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return std::nullopt; // T49-04: dead fd fast-fail
+            continue;
+        }
         if (is_hidpp_error(buf, len)) return std::nullopt;
         if ((len != 7 && len != 20) || buf[1] != target ||
             buf[2] != request[2] || buf[3] != request[3])
@@ -1070,7 +1082,10 @@ bool HidppTransport::probe_hidpp10(uint8_t target_device_index) {
             deadline - std::chrono::steady_clock::now());
         if (remaining.count() <= 0) break;
         size_t len = 0;
-        if (!read_packet(buf, sizeof(buf), len, remaining)) continue;
+        if (!read_packet(buf, sizeof(buf), len, remaining)) {
+            if (!is_open()) return false; // T49-04: dead fd fast-fail
+            continue;
+        }
         if ((len != 7 && len != 20) || buf[1] != target) continue;
         if (buf[2] == 0x81 && buf[3] == 0x00) return true; // success echo
         if (buf[2] == 0x8F && buf[3] == 0x00) return true; // register error

@@ -47,7 +47,8 @@ build() {
     cmake -B build -S . \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTS=OFF \
-        -DCMAKE_INSTALL_PREFIX=/usr
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DRAWACCEL_PORTABLE=1
     cmake --build build -j"$(nproc)"
 }
 

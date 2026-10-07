@@ -206,8 +206,16 @@ void show_new_profile_dialog(AppState* S) {
         };
     g_object_set_data_full(G_OBJECT(dlg), "ctx", ctx,
                            [](gpointer p) { delete (NewProfileCtx*)p; });
+    // T36-GUI01: let do_ok bail when the main window was torn down while the
+    // modal was alive — the cb writes destroyed widgets/config otherwise.
+    g_object_set_data(G_OBJECT(dlg), "app-state", S);
 
     auto do_ok = +[](GtkWidget*, gpointer dlg_ptr) {
+        auto* S2 = static_cast<AppState*>(g_object_get_data(G_OBJECT(dlg_ptr), "app-state"));
+        if (S2 && S2->window_destroyed) {
+            gtk_window_destroy(GTK_WINDOW(dlg_ptr));
+            return;
+        }
         GtkWidget* d = GTK_WIDGET(dlg_ptr);
         auto* ctx = static_cast<NewProfileCtx*>(g_object_get_data(G_OBJECT(d), "ctx"));
         std::string name = trim_profile_name(gtk_editable_get_text(GTK_EDITABLE(ctx->entry)));
@@ -589,6 +597,25 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
     g_object_unref(file);
     if (!path) return;
 
+    // T48-08: gate on file SIZE before loading anything into the heap —
+    // otherwise a GB-sized selection is fully allocated before MAX_IMPORT_BYTES
+    // is checked.
+    constexpr gsize MAX_IMPORT_BYTES = 4 * 1024 * 1024; // 4 MiB
+    {
+        GFile* gf = g_file_new_for_path(path);
+        GFileInfo* gi = g_file_query_info(gf, G_FILE_ATTRIBUTE_STANDARD_SIZE,
+                                          G_FILE_QUERY_INFO_NONE, nullptr, nullptr);
+        g_object_unref(gf);
+        if (gi) {
+            goffset fsize = g_file_info_get_size(gi);
+            g_object_unref(gi);
+            if (fsize > (goffset)MAX_IMPORT_BYTES) {
+                set_status(S, tr("Import failed: file too large."));
+                g_free(path);
+                return;
+            }
+        }
+    }
     GError* err2 = nullptr;
     gchar* data = nullptr;
     gsize   len  = 0;
@@ -598,7 +625,6 @@ static void import_profile_done(GObject* src, GAsyncResult* res, gpointer ud) {
         g_free(path);
         return;
     }
-    constexpr gsize MAX_IMPORT_BYTES = 4 * 1024 * 1024; // 4 MiB
     if (len > MAX_IMPORT_BYTES) {
         set_status(S, tr("Import failed: file too large."));
         g_free(data);

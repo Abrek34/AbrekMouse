@@ -152,6 +152,19 @@ static void prune_dev_deny(std::unordered_map<std::string, double>& dev_deny,
     }
 }
 
+/// T40-HP02: does the open fd still refer to the SAME kernel node the path
+/// (usually a stable /dev/input/by-id/... symlink) currently resolves to?
+/// String equality on the by-id path cannot answer this: on a kernel
+/// renumber/replug the symlink is re-pointed at the new eventN node while
+/// the string stays identical.  Compare rdev of the open fd vs the path's
+/// current target instead.
+static bool open_fd_matches_path(int fd, const std::string& path) {
+    struct stat fd_st{}, path_st{};
+    if (fstat(fd, &fd_st) < 0) return false;
+    if (stat(path.c_str(), &path_st) < 0) return false;
+    return fd_st.st_rdev == path_st.st_rdev;
+}
+
 /// Extract the event number from a /dev/input/eventN or /dev/input/by-id/... path.
 /// Returns -1 on failure.
 static int event_num_from_path(const std::string& path) {
@@ -1592,10 +1605,26 @@ void AccelDaemon::do_hotplug_scan() {
         while (it != devices_.end()) {
             bool still_physical = false;
             for (auto& p : mice)
-                if (p == it->path) { still_physical = true; break; }
-
+                // T40-HP02: by-id string match alone masked replug/renumber —
+                // the symlink is re-pointed at the new node, the string stays
+                // the same, the stale fd survived and the new node was
+                // duplicate-skipped.  Require rdev continuity with the open fd.
+                if (p == it->path && open_fd_matches_path(it->fd_in, it->path)) {
+                    still_physical = true; break;
+                }
             if (!still_physical) {
-                log("Hot-plug: mouse disconnected: " + it->name + " (" + it->path + ")");
+                // T40-HP02: a string-equal but rdev-mismatched path means the
+                // device replugged/renumbered (a healthy node is waiting).
+                // That is NOT an error — tear down quietly so nothing
+                // 5 s deny penalty lands on the replacement node.
+                bool string_equal = false;
+                for (auto& p : mice)
+                    if (p == it->path) { string_equal = true; break; }
+                if (string_equal)
+                    log("Hot-plug: mouse replugged under same path, re-opening: " +
+                        it->name + " (" + it->path + ")");
+                else
+                    log("Hot-plug: mouse disconnected: " + it->name + " (" + it->path + ")");
                 if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, it->fd_in, nullptr) < 0)
                     log("hot-plug: epoll_ctl(del) failed for " + it->path + ": " +
                         std::string(strerror(errno)), true);
@@ -2228,13 +2257,35 @@ void AccelDaemon::run_loop() {
                     opened_paths_.erase(dit->path);
                     if (!dit->device_id.empty())
                         opened_device_ids_.erase(dit->device_id);
-                    // P121/BUG-02: an I/O error often means the node is dead but
-                    // still listed in /dev/input.  Deny immediate re-open so the
-                    // ~2 s empty-rescan doesn't re-grab/uinput-churn it forever.
-                    // P131: also deny by stable device_id so a kernel
-                    // renumber (eventN → eventM) can't bypass the backoff.
-                    deny_reopen(dit->path, dit->device_id,
-                                path_deny_until_ms_, dev_deny_until_ms_);
+                    // T40-HP02: only back off when the failure is on the SAME
+                    // kernel node that the by-id path still resolves to.  If
+                    // the path already points at a different rdev, the device
+                    // replugged/renumbered — a healthy node is waiting and
+                    // must NOT eat the 5 s deny (by path or by device_id).
+                    // If the path no longer resolves at all (real unplug), a
+                    // replug later must also start clean, so skip the deny and
+                    // clear any stale entry instead.
+                    struct stat fd_st{};
+                    struct stat path_st{};
+                    const bool fd_ok   = fstat(dit->fd_in, &fd_st) == 0;
+                    const bool path_ok = stat(dit->path.c_str(), &path_st) == 0;
+                    const bool same_node = fd_ok && path_ok &&
+                                           fd_st.st_rdev == path_st.st_rdev;
+                    if (same_node) {
+                        // P121/BUG-02: an I/O error on a still-listed dead
+                        // node — deny immediate re-open so the ~2 s
+                        // empty-rescan doesn't re-grab/uinput-churn it
+                        // forever.  P131: also deny by stable device_id so a
+                        // kernel renumber can't bypass the backoff.
+                        deny_reopen(dit->path, dit->device_id,
+                                    path_deny_until_ms_, dev_deny_until_ms_);
+                    } else {
+                        path_deny_until_ms_.erase(dit->path);
+                        if (!dit->device_id.empty())
+                            dev_deny_until_ms_.erase(dit->device_id);
+                        log("Disconnect: not denying re-open (node gone or "
+                            "replugged): " + dit->name, true);
+                    }
                     // R10-EIO: a transient I/O error dropped this device from
                     // the grab set while another device is still open.  Kick
                     // the self-heal rescan so it is revisited once the 5 s
@@ -2390,7 +2441,7 @@ static inline bool uinput_write_retry_ev(libevdev_uinput* uidev,
 /// out in a single syscall.  Order is preserved ([motion…][buttons…][SYN]); a
 /// full buffer only forces an early flush, so no event is ever dropped.
 struct write_batch {
-    input_event evs[16];
+    input_event evs[mouse_device::kPendingEventsMax];
     size_t      n = 0;
     // R5-A: invoked when the bounded EAGAIN budget runs out and a whole frame
     // tail (usually the closing SYN) is dropped.  Set by process_device to the
@@ -2403,7 +2454,7 @@ struct write_batch {
     std::function<void(double)> on_write_us;
 
     bool add(unsigned int type, unsigned int code, int value) {
-        if (n >= 16) return false;
+        if (n >= mouse_device::kPendingEventsMax) return false;
         input_event& e = evs[n++];
         e       = {};
         e.type  = type;
@@ -2416,7 +2467,7 @@ struct write_batch {
     /// false only on a hard uinput write error (caller disconnects the device).
     bool add_flush_if_full(libevdev_uinput* uidev, unsigned int type,
                            unsigned int code, int value) {
-        if (n >= 16 && !flush(uidev)) return false;
+        if (n >= mouse_device::kPendingEventsMax && !flush(uidev)) return false;
         return add(type, code, value);
     }
 
@@ -2727,7 +2778,7 @@ void AccelDaemon::process_device(mouse_device& dev) {
     // the measured time_ms (→2×–4× speed → spiked gain).  They are buffered and
     // written once as a group at the frame's real SYN_REPORT, preserving the
     // kernel's own frame grouping.
-    std::array<input_event, 16> queued_events;
+    std::array<input_event, mouse_device::kPendingEventsMax> queued_events;
     size_t queued_count = 0;
 
     // BUG-18: syn_dropped is now a device-state field (mouse_device::syn_dropped)
@@ -2769,8 +2820,25 @@ void AccelDaemon::process_device(mouse_device& dev) {
         dy = dev.pending_dy;
         has_motion = true;
         if (dev.pending_ev_count > 0) {
-            for (size_t i = 0; i < dev.pending_ev_count && queued_count < queued_events.size(); ++i)
+            const size_t want = dev.pending_ev_count;
+            for (size_t i = 0; i < want && queued_count < queued_events.size(); ++i)
                 queued_events[queued_count++] = dev.pending_events[i];
+            // T38-HOT03: this merge used to truncate SILENTLY — a parked
+            // tail longer than the queued-events room lost its buttons with
+            // no counter and no log.  Count it and log, throttled.
+            if (want > queued_count) {
+                const size_t lost = want - queued_count;
+                dev.ev_tail_overruns += lost;
+                static double merge_last_log = -1e9;
+                const double merge_now = now_ms();
+                if (merge_last_log < 0 || merge_now - merge_last_log >= 2000.0) {
+                    merge_last_log = merge_now;
+                    log("Deferred-event buffer overflow on " + dev.name +
+                        ": dropped " + std::to_string(lost) +
+                        " queued event(s) when merging the parked tail (total " +
+                        std::to_string(dev.ev_tail_overruns) + ").");
+                }
+            }
         }
         dev.has_pending_motion = false;
         dev.pending_dx = dev.pending_dy = 0.0;
@@ -2834,12 +2902,22 @@ for (size_t i = 0; i < read_count; ++i) {
                     // L09-04: the loop cap used to make an overflow SILENT (no
                     // counter, no log).  Report when queued non-motion events
                     // did not fit, so lost buttons/wheel are diagnosable.
+                    // T38-HOT03: count every truncated event and throttle the
+                    // log (~2 s) so a persistent overflow can't flood.
                     const size_t parked = dev.pending_ev_count - parked_before;
-                    if (queued_count > parked)
-                        log("Deferred-event buffer overflow on " + dev.name +
-                            ": dropped " +
-                            std::to_string(queued_count - parked) +
-                            " queued event(s) after SYN_DROPPED.");
+                    if (queued_count > parked) {
+                        const size_t lost = queued_count - parked;
+                        dev.ev_tail_overruns += lost;
+                        static double park_last_log = -1e9;
+                        const double  park_now      = now_ms();
+                        if (park_last_log < 0 || park_now - park_last_log >= 2000.0) {
+                            park_last_log = park_now;
+                            log("Deferred-event buffer overflow on " + dev.name +
+                                ": dropped " + std::to_string(lost) +
+                                " queued event(s) after SYN_DROPPED (total " +
+                                std::to_string(dev.ev_tail_overruns) + ").");
+                        }
+                    }
                     queued_count = 0;
                 }
                 dx = dy = 0;
@@ -3041,12 +3119,22 @@ for (size_t i = 0; i < read_count; ++i) {
         for (size_t i = 0; i < queued_count && dev.pending_ev_count < dev.pending_events.size(); ++i)
             dev.pending_events[dev.pending_ev_count++] = queued_events[i];
         // L09-04: visibility for the deferred-event overflow (see the
-        // SYN_DROPPED site for the full rationale).
+        // SYN_DROPPED site for the full rationale).  T38-HOT03: counted and
+        // the log throttled (~2 s) like the park site above.
         const size_t added = dev.pending_ev_count - parked_before;
-        if (queued_count > added)
-            log("Deferred-event buffer overflow on " + dev.name + ": dropped " +
-                std::to_string(queued_count - added) +
-                " queued event(s) at frame deferral.");
+        if (queued_count > added) {
+            const size_t lost = queued_count - added;
+            dev.ev_tail_overruns += lost;
+            static double defer_last_log = -1e9;
+            const double  defer_now      = now_ms();
+            if (defer_last_log < 0 || defer_now - defer_last_log >= 2000.0) {
+                defer_last_log = defer_now;
+                log("Deferred-event buffer overflow on " + dev.name + ": dropped " +
+                    std::to_string(lost) +
+                    " queued event(s) at frame deferral (total " +
+                    std::to_string(dev.ev_tail_overruns) + ").");
+            }
+        }
     }
     // Close any frame that accumulated WRITTEN events (raw passthrough REL or
     // forwarded SYN subtypes) but never saw a SYN.  This is the only remaining

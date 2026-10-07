@@ -235,6 +235,9 @@ static const GDBusInterfaceVTable focus_vtable = {
 /// (blocks until KWin has evaluated the script).  Best-effort: fails silently.
 static int kwin_script_load_and_run_sync(GDBusConnection* conn) {
     if (!conn) return -1;
+    // T48-04: GLib GError contract — every call_sync gets &err with err==nullptr
+    // (guaranteed by g_clear_error resetting to nullptr after each failure path),
+    // so no dangling/unset error object is ever reused.
     GError* err = nullptr;
 
     // 1. Write the script to a temp file.

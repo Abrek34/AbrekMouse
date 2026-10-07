@@ -52,7 +52,7 @@ echo "[2/4] Removing service file..."
 rm -f /usr/lib/systemd/system/rawaccel.service
 rm -f /etc/systemd/system/rawaccel.service
 rm -f /etc/systemd/user/rawaccel.service
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || true
 
 # Remove binaries (setup.sh → /usr/bin; PKGBUILD → /usr/bin; /usr/local/bin
 # is a legacy location kept for cleaning old installs)
@@ -64,10 +64,14 @@ rm -f /usr/bin/rawaccel-daemon
 rm -f /usr/bin/rawaccel-cli
 rm -f /usr/bin/rawaccel-gui
 # M-1: user-level binaries shadow system ones on PATH.
+# T51-21: enumerate real home dirs via getent (covers /root and LDAP
+# users whose HOME is outside /home) instead of /home/* only.
 shopt -s nullglob
-rm -f /home/*/.local/bin/rawaccel-daemon \
-      /home/*/.local/bin/rawaccel-cli \
-      /home/*/.local/bin/rawaccel-gui
+while IFS=: read -r _ _ _ _ _ home _; do
+    rm -f "$home/.local/bin/rawaccel-daemon" \
+          "$home/.local/bin/rawaccel-cli" \
+          "$home/.local/bin/rawaccel-gui"
+done < <(getent passwd)
 shopt -u nullglob
 
 # Remove system files
@@ -103,15 +107,12 @@ echo "NOTE: User config ~/.config/rawaccel/ was not touched."
 # "(RawAccel)" libinput overrides + restore adaptive global), matching
 # setup.sh --uninstall which runs kde-fix-accel.sh --remove for $REAL_USER.
 KDE_FIX="$(cd "$(dirname "$0")" && pwd)/kde-fix-accel.sh"
-if [[ -x "$KDE_FIX" ]]; then
-    shopt -s nullglob
-    homes=(/home/*/.config/kwinrc)
-    shopt -u nullglob
-    if [[ ${#homes[@]} -gt 0 ]]; then
-        for home in /home/*; do
-            [[ -f "$home/.config/kwinrc" ]] || continue
-            user="$(basename "$home")"
-            echo "      Removing kwinrc traces for user '$user'..."
+if [[ -f "$KDE_FIX" ]]; then
+    # T51-21: scan every real user's home (incl. /root, non-/home HOMEs)
+    # for kwinrc traces, not just /home/*.
+    while IFS=: read -r user _ _ _ _ home _; do
+        [[ -f "$home/.config/kwinrc" ]] || continue
+        echo "      Removing kwinrc traces for user '$user'..."
             # H-3: sudo resets session env by default; preserve the KDE
             # detection variables or --remove silently no-ops.
             if out="$(sudo -u "$user" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
@@ -123,6 +124,5 @@ if [[ -x "$KDE_FIX" ]]; then
             else
                 echo "      (kwinrc trace cleanup failed for '$user': $(head -1 <<<"$out"))"
             fi
-        done
-    fi
+    done < <(getent passwd)
 fi

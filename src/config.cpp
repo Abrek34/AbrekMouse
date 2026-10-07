@@ -938,7 +938,22 @@ void save_config(const app_config& cfg, const std::string& arg_path) {
     if (!parent_path.empty())
         fs::create_directories(parent_path);
 
-    json j = app_config_to_json_obj(cfg);
+    // T43-06: the load path sanitizes, but a programmatically-built app_config
+    // (GUI panel / IPC push) can still carry NaN/Inf doubles.  nlohmann dumps
+    // those as `null`, and the next load throws on require_number — one bad
+    // field renders the WHOLE config unloadable, saved over the last good one.
+    // Sanitize a copy (and re-run migration/re-sanitize via migrate_config)
+    // before serializing so the committed file is always loadable.
+    app_config cleaned = cfg;
+    // NB: NO migrate_config() here.  Migration is version-gated and runs on
+    // the load path; a programmatically-built cfg has an empty version but
+    // already carries the new data semantics, so migrating at save would
+    // re-scale lookup+gain LUT data by x on every save (P43-BF1 class).
+    for (auto& dp : cleaned.profiles) {
+        sanitize_device_config(dp.dev_cfg);
+        sanitize_profile(dp.prof);
+    }
+    json j = app_config_to_json_obj(cleaned);
 
     // Write to a temp file first, then rename — atomic on Linux (same filesystem).
     // This prevents the daemon from reading a half-written/truncated JSON.
@@ -982,10 +997,21 @@ void save_config(const app_config& cfg, const std::string& arg_path) {
         // file (symlink, dir, fifo, device) therefore keeps the 0600 default.
         struct stat pst = {};
         mode_t mode = 0600;
+        uid_t keep_uid = static_cast<uid_t>(-1);
+        gid_t keep_gid = static_cast<gid_t>(-1);
         int pfd = ::open(path.c_str(), O_PATH | O_CLOEXEC | O_NOFOLLOW);
         if (pfd >= 0) {
-            if (::fstat(pfd, &pst) == 0 && S_ISREG(pst.st_mode))
+            if (::fstat(pfd, &pst) == 0 && S_ISREG(pst.st_mode)) {
                 mode = pst.st_mode & 0777;
+                // T43-07: preserving only the mode is not enough — the atomic
+                // tmp+rename replaces the inode, so the new live file is owned
+                // by the saver (often root when the daemon rewrites the
+                // user's config).  The user's older inode kept its owner and
+                // the user loses sudo-less write access.  Remember the old
+                // owner and fchown the replacement best-effort.
+                keep_uid = pst.st_uid;
+                keep_gid = pst.st_gid;
+            }
             ::close(pfd);
         }
         int fd = ::open(tmp_path.c_str(),
@@ -1018,6 +1044,15 @@ void save_config(const app_config& cfg, const std::string& arg_path) {
         // with the umask-narrowed mode, which is the pre-existing (safe) side of
         // the asymmetry — open() can only ever narrow, never widen.
         (void)::fchmod(fd, mode);
+        // T43-07: copy the old inode's owner onto the temp file BEFORE the
+        // rename; ownership survives rename(2), so the live config keeps the
+        // user's uid/gid even though a root daemon performed the save.
+        // Best-effort: a non-root saver without CAP_CHOWN fails quietly and
+        // the pre-existing single-user behaviour is unchanged.
+        if (keep_uid != static_cast<uid_t>(-1) &&
+            ::fchown(fd, keep_uid, keep_gid) != 0) {
+            /* best-effort */
+        }
         const char* p = content.c_str();
         size_t left = content.size();
         while (left > 0) {
@@ -1236,7 +1271,13 @@ static void migrate_lookup_gain(app_config& cfg) {
                 // NaN propagation in the acceleration pipeline.  Drop the
                 // point (leave the old value) if the product is non-finite.
                 double product = y * x;
-                if (std::isfinite(product))
+                // T43-12: the double-level isfinite check alone is not enough —
+                // a double-finite product (e.g. 1e39) narrows to Inf/+-Inf
+                // in the float LUT, and the migration ran after sanitize with
+                // no re-sanitize, so that Inf was dumped as `null` and the
+                // next load came back as 0.  Require the float cast itself to
+                // stay finite (also catches the FLT_MAX overflow band).
+                if (std::isfinite(product) && std::isfinite((float)product))
                     a.data[i * 2 + 1] = static_cast<float>(product);
             }
             // ORTA-BUG-MOTION-04: the odd-length trailing element needs no
@@ -1331,6 +1372,17 @@ bool migrate_config(app_config& cfg) {
     if (cfg.version.empty() || version_lt(cfg.version, "0.4.0")) {
         migrate_lookup_gain(cfg);
         migrated = true;
+    }
+
+    // T43-12: migration runs AFTER load-time sanitize, and migrate_lookup_gain
+    // rescales LUT entries by x — without a re-sanitize a stale/overflowed
+    // value survives to the next save.  Sanitize once more so the migrated
+    // config always satisfies the same invariants as the load path.
+    if (migrated) {
+        for (auto& dp : cfg.profiles) {
+            sanitize_device_config(dp.dev_cfg);
+            sanitize_profile(dp.prof);
+        }
     }
 
     // Update to current version

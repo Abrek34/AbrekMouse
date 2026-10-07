@@ -2171,7 +2171,7 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Kategori: GTK lifecycle / UAF
 - Açıklama: `export/import_done` ve `update_daemon_status` ve `kde_fix_finish` `window_destroyed` bakıyor; 5 CRUD diyaloğu bakmıyor. Hepsi heap ctx içinde çiğ `AppState* S` tutup yıkılmış `status_bar`/`profile_combo`'ya yazıyor. Tetik: diyalog açıkken ana pencere WM ile kapat → diyalog yaşar, OK'ye bas → yıkılmış widget'a yazım.
 - Öneri: Her 5 cb girişine `if (S->window_destroyed) { gtk_window_destroy(...); return; }` veya destroy'da açık diyalogları takip edip yık.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — 5 CRUD diyaloğunun cb/do_ok girişlerine `S->window_destroyed` kapısı eklendi (destroy'da modal yıkılır, yıkık widget/config'e yazım yok); New do_ok dahil hepsinde tutarlı. (2026-10-07)
 
 **T36-GUI02 · INFO · Ölü `AppState` üyeleri (hiç inşa edilmiyor)**
 - Konum: `gui/app_state.hpp:137-140` (`dpi_detected_lbl`, `polling_detected_lbl`, `dpi_autofill_btn`, `polling_autofill_btn` = `nullptr`)
@@ -2425,7 +2425,7 @@ Odak: `daemon/daemon.cpp` flush/process/SYN, `motion_math.hpp`, `lat_stats.hpp`,
 - Kategori: Tanılanabilirlik
 - Açıklama: `pending(16)` taşması log/sayaçsız düşer. Buton/wheel kaybı "ara-sıra tutmayan tık" olur, journal iz bırakmaz.
 - Öneri: Truncasyon dalına throttled `log()` + sayaç; 16 sabitini `daemon.hpp:80-81` ile tek `constexpr` yap.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — 16 sabiti tek `mouse_device::kPendingEventsMax` constexpr (daemon.hpp); `queued_events` + `write_batch` da aynı sabiti kullanıyor; sessiz truncate dallarına `ev_tail_overruns` sayacı + ~2 sn throttled log (SYN_DROPPED park, frame deferral, tail merge). (2026-10-07)
 
 **T38-HOT04 · DÜŞÜK · `EVIOCSCLOCKID` yok — ev.time REALTIME varsayımı NTP sıçramasına dayanıksız**
 - Konum: `daemon/daemon.cpp:48-56` + `:2105-2113` (`ev_now_us()` REALTIME, `EVIOCSCLOCKID` hiç çağrılmıyor — grep ile doğrulandı)
@@ -2549,7 +2549,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Hot-plug
 - Açıklama: Temiz unplug (deny yok) ile hatalı disconnect (deny var) ayrımı by-id alias yüzünden yapılamaz.
 - Öneri: Kopuşu string değil `realpath`/`stat(st_rdev)`/fd geçerliliği ile karşılaştır veya replug (aynı id farklı rdev) için deny muafiyeti.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — kopma kontrolü artık rdev sürekliliği (`open_fd_matches_path`, fd fstat vs path stat); by-id yeniden yönlendirilince (renumber/replug) eski fd sessizce tutulmuyor, deny uygulanmadan re-open ediliyor; disconnect cleanup'ta deny yalnız aynı kernel node hâlâ listenin başındayken veriliyor, node gitmiş/yenilenmişse deny kaldırılıyor. (2026-10-07)
 
 ---
 
@@ -2680,14 +2680,14 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Atomic-save
 - Açıklama: Out-of-range de clampsız yazılır.
 - Öneri: `save` içinde copy+sanitize+migrate sonra dump.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `save_config` artık dump öncesi cfg'nin kopyasını sanitize ediyor (programatik NaN→null→throw zinciri kapanıyor); migrate BİLEREK save'de çalışmıyor — boş versiyonlu ama yeni-semantik veriyle save her turda LUT'yi x ile tekrar ölçeklerdi (P43-BF1 sınıfı).
 
 **T43-07 · ORTA · Atomic-replace `uid/gid`'yi korumuyor (mode korunuyor)**
 - Konum: `src/config.cpp:776-784,854-864` (mode `&0777` kopyalanır, `fchown` yok → root daemon user-owned dosyayı `root:root` yapar, kullanıcı sudo'suz yazamaz)
 - Kategori: Sahiplik
 - Açıklama: `.bak` eski sahibi tutar ama live yol değişir.
 - Öneri: `fstat` `st_uid/gid` + `fchown(fd,...)` best-effort.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — save yolu fstat'tan st_uid/st_gid'yi de saklayıp tmp fd'ye best-effort fchown uyguluyor; rename sonrası canlı dosya eski sahibiyle kalıyor.
 
 **T43-08 · DÜŞÜK · `pid`-sonekli tmp aynı proses içi thread'leri ayırmıyor + prosesler arası kilitsiz**
 - Konum: `src/config.cpp:762,832-843,785-791` (`tmp=path.pid.tmp`; iki thread aynı pid → ikinci `O_EXCL→EEXIST→unlink→retry` kardeş tmp'yi ezer; prosesler arası `flock` yok → last-writer-wins)
@@ -2722,7 +2722,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Migration
 - Açıklama: Mevcut double-`isfinite` kontrolünün float-aralık boşluğu.
 - Öneri: `if(!isfinite(product)||fabs(product)>FLT_MAX) skip;` + migrate sonunda `sanitize` tekrarı.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — koşul `std::isfinite(product) && std::isfinite((float)product)` oldu; migrate_config migrate sonrası profilleri tekrar sanitize ediyor (re-sanitize).
 
 **T43-13 · DÜŞÜK · Non-kanonik eşdeğer versiyon hiç normalize olmuyor**
 - Konum: `src/config.cpp:1083-1116,1028-1077` (`version==RAWACCEL_VERSION` exact-match; `"01.02.00"` semantik `1.2.0` ama `migrated=false` → dosya hiç kanonikleşmez)
@@ -2895,7 +2895,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Veri-kaybı
 - Açıklama: Unlinked ayrışmış `ay.mode/accel/limit/offset/cap.y/LUT` onaysız X ile ezilir, undo yok.
 - Öneri: Link açarken `ay!=ax` ise confirm dialog veya yedek + status uyarısı.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — XY Link açılırken `accel_x != accel_y` ise onay modalı ("Link and Overwrite"/Cancel); Cancel'da checkbox geri alınır, OK'de yalnız onayla X→Y kopyalanır + status uyarısı. (2026-10-07)
 
 **T46-04 · DÜŞÜK-ORTA · `Raw Input` toggle bekleyen editi düşürüyor**
 - Konum: `gui/widgets_sync.inl:611-617` (`widgets_to_profile()` çağırmadan `save_config_now()`; `main.cpp:44-106` aynen yazar → `unsaved=true` edit dosyaya yazılmaz)
@@ -3043,7 +3043,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: GLib-contract
 - Açıklama: Reload hiç denenmeden `NULL` dönebilir.
 - Öneri: Her `free` sonrası `err=nullptr`, her `call_sync` öncesi `nullptr` garantile; `:184`/`:204` `if(err)` guard.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — tüm yollarda `g_clear_error` (serbest bırak + NULL'a çek); her `call_sync` öncesi `err=nullptr` garantisi; `err` tekrar kullanım öncesi reset; dangling erişim yok. (2026-10-07)
 
 **T48-05 · ORTA · Focus yolunda bloklayan senkron I/O (Alt-Tab 2sn blok)**
 - Konum: `gui/kwin_focus.inl:87-91,120-127` + `daemon_comm.inl:236-238` (her `windowActivated`'da `GetConnectionUnixProcessID(2000ms)` + `set_active_app(150ms IPC)` ana thread'de — obje `session_conn` ana context'te kayıtlı)
@@ -3071,7 +3071,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Resource-exhaustion
 - Açıklama: LUT-boy kapısı ayrı (R12-IMPLUT), bu dosya-boyutu.
 - Öneri: Önce `g_file_query_info(STANDARD_SIZE)` ile bak, `>4MiB` ise okumadan reddet.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — import artık `g_file_get_contents` öncesi `g_file_query_info(STANDARD_SIZE)` ile boyu ölçer, `>4 MiB` dosyayı okumadan reddeder; heap yüklemesi yalnız küçük dosyalarda. (2026-10-07)
 
 **T48-09 · DÜŞÜK · Export salt-okunur değil, `unsaved` kirletir**
 - Konum: `gui/profile_mgr.inl:527-535` + `widgets_sync.inl:150-152` (`export_done:528` `widgets_to_profile` → `:152` `unsaved=true`; save yok, flag temizlenmez → hiç edit yapmadan export alan çıkışta "Unsaved Changes" görür)
@@ -3124,7 +3124,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: CPU spin
 - Açıklama: Her `get_feature_metadata` indeksi başına tekrarlanır.
 - Öneri: `!read_packet` sonrası `if(!is_open()) break/return nullopt` ekle (tüm `send_*`, `read_register`, `probe_hidpp10`).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ (2026-10-07; `send_feature_request`, `send_short`, `send_long`, `send_very_long`, `read_register`, `probe_hidpp10` — `!read_packet` sonrası `!is_open()` ise fast-fail `nullopt`/`false`; hot-spin kaldırıldı. T49-04)
 
 **T49-05 · DÜŞÜK-ORTA · `set_device_index/clear_feature_cache` `pending_notifications_`'u temizlemiyor**
 - Konum: `src/logitech_hidpp.cpp:645-660` + `logitech_hidpp.hpp:464-470,445-451` (3 feature map temizlenir, `pending_notifications_` max 16 korunur → `drain:1147-1158` eski cihaz stash'i iade eder; replug'da eski index yeni cihazla çakışırsa yanlış map ile sınıflandırılır)
@@ -3335,21 +3335,21 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Taşınabilirlik
 - Açıklama: Yarım-temizlik.
 - Öneri: `2>/dev/null || true`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `systemctl daemon-reload` `2>/dev/null || true` ile korundu.
 
 **T51-20 · ORTA · `uninstall.sh:106` exec-bit ister (zip/tar'da atlanan temizlik)**
 - Konum: `scripts/uninstall.sh:106` (`if [[ -x $KDE_FIX ]]` ama çağrı `bash $KDE_FIX --remove` → exec gereksiz; bit düşerse kwinrc temizliği sessizce atlanır; `install.sh:12` doğru desen `[[ -f ... ]]`)
 - Kategori: Uninstall
 - Açıklama: Sessiz atlama.
 - Öneri: `[[ -f $KDE_FIX ]]`.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `[[ -x ... ]]` → `[[ -f ... ]]`; exec bit'i düşmüş zip/tar kurulumunda da kwinrc temizliği çalışır.
 
 **T51-21 · ORTA · `uninstall.sh` `/root` + LDAP `HOME`'ları atlar**
 - Konum: `scripts/uninstall.sh:68-70,111-112` (binary süpürme `/home/*/.local/bin` + kwinrc `for home in /home/*` → `/root`, `getent` dışı HOME'lar atlanır)
 - Kategori: Kapsam-deliği
 - Açıklama: Kalıntı bırakır.
 - Öneri: `getent passwd|cut -d: -f6` üzerinden dön, `/root` dahil.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `/home/*` döngüleri `getent passwd` (kullanıcı:HOME çiftleri) üzerinden; `/root` ve LDAP HOME'ları da kapsanıyor.
 
 **T51-22 · DÜŞÜK · `uninstall.sh` `pkill TERM→0.3s→KILL` grab'ı yarıda kesebilir**
 - Konum: `scripts/uninstall.sh:35-37` (yükte 300ms yetmezse `KILL` grab/uinput destroy'u yarıda kesip hayalet düğüm bırakır)
@@ -3374,7 +3374,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Tekrarüretilebilirlik
 - Açıklama: Arch kılavuzu `native` yasaklar.
 - Öneri: `cmake -B build ... -DRAWACCEL_PORTABLE=ON` ekle.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — PKGBUILD build'e `-DRAWACCEL_PORTABLE=1` eklendi; AUR paketi artık `-march=native` gömmez.
 
 **T52-02 · ORTA · PKGBUILD `makedepends` `make` eksik**
 - Konum: `packaging/PKGBUILD:21` vs `:51` (`cmake --build` default `Unix Makefiles` → `make` ister; `makedepends=(cmake pkgconf gcc)` içinde `make` yok → `base-devel`'siz chroot'ta `CMAKE_MAKE_PROGRAM not found`)

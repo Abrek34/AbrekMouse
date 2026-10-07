@@ -82,8 +82,16 @@ struct mouse_device {
     double pending_dx        = 0.0;
     double pending_dy        = 0.0;
     bool   has_pending_motion = false;
-    std::array<input_event, 16> pending_events;
+    // T38-HOT03: the deferred-event queue capacity is a single named constant
+    // shared with `queued_events` / write_batch in daemon.cpp, so the three
+    // "16" literals can no longer drift apart.
+    static constexpr size_t kPendingEventsMax = 16;
+    std::array<input_event, kPendingEventsMax> pending_events;
     size_t pending_ev_count    = 0;
+    // T38-HOT03: non-motion events silently truncated because a pending/
+    // queued buffer filled up.  Counts every drop; the accompanying log line
+    // is throttled (per site, ~2 s) so a stuck consumer can't flood the log.
+    uint64_t ev_tail_overruns  = 0;
 
     // SM-1: kernel ev.time (µs) of the last frame we closed with a SYN_REPORT.
     // Running frame-to-frame intervals off the kernel timestamp instead of the
