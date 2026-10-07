@@ -30,13 +30,16 @@ Measured on the v1.2.7 tree (2026-10-07):
 - E2E: **ALL PASS**
 
 Caveat: the GitHub Actions CI account billing lock is unchanged — none of the
-above ran in CI (see the note above).
+above ran in CI (see the note above). For a local equivalent of the full gate
+set, run:
+
+```bash
+bash tests/ci_local.sh   # writes logs/ci_local_<timestamp>/*.log, exit 0/1/77
+```
 
 **Open KRİTİK/YÜKSEK shortlist (triaged against CHANGELOG/FIX_LOG, v1.2.7):**
 
-- `T40-HP01` (YÜKSEK): two same-model mice with empty `serial_no` share one
-  `device_id`, so the second one is never grabbed (`daemon/daemon.cpp`). Real,
-  still open.
+- No confirmed open KRİTİK/YÜKSEK items remain.
 - Legacy entries from TUR 15/16 with no closure record and no status line
   (needs re-triage, not counted as confirmed-open): `C-6`, `BS-1`, `BS-2`,
   `BS-3`, `BS-4`.
