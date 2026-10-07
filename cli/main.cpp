@@ -41,6 +41,36 @@ static bool resolve_config_target(const std::string& path,
     if (target_exists) *target_exists = false;
 
     char buf[PATH_MAX] = {};
+    // T44-03: the not-yet-existing tail is re-appended verbatim, so a ".."
+    // lurking beneath a missing directory survives into the "canonical" path
+    // and is later resolved by stat()/the kernel — bypassing the prefix ban in
+    // check_config_path_policy() (e.g. /tmp/nonexist/../proc/foo.json).
+    // Try to canonicalise the parent directory too; if even that fails and a
+    // ".." component remains, reject the path instead of trusting it.
+    char buf2[PATH_MAX] = {};
+    auto normalise_parent = [&]() -> bool {
+        std::string parent = *out;
+        const size_t slash = parent.find_last_of('/');
+        parent = (slash == std::string::npos) ? std::string(".")
+                : (slash == 0) ? std::string("/") : parent.substr(0, slash);
+        if (realpath(parent.c_str(), buf2) != nullptr) {
+            const std::string filename = out->substr(out->find_last_of('/') + 1);
+            *out = std::string(buf2);
+            if (out->back() != '/') *out += '/';
+            *out += filename;
+            return true;
+        }
+        std::string cur;
+        for (size_t i = 0; i <= out->size(); ++i) {
+            if (i == out->size() || (*out)[i] == '/') {
+                if (cur == "..") return false;
+                cur.clear();
+            } else {
+                cur += (*out)[i];
+            }
+        }
+        return true;
+    };
     if (realpath(path.c_str(), buf) != nullptr) {
         *out = buf;
         if (target_exists) *target_exists = true;
@@ -55,6 +85,7 @@ static bool resolve_config_target(const std::string& path,
             // Relative path with no directory part: resolve the CWD and re-join.
             if (realpath(".", buf) != nullptr) {
                 *out = std::string(buf) + "/" + tail;
+                if (!normalise_parent()) return false;
                 return true;
             }
             break;
@@ -69,10 +100,12 @@ static bool resolve_config_target(const std::string& path,
                 if (out->back() != '/') *out += '/';
                 *out += tail;
             }
+            if (!normalise_parent()) return false;
             return true;
         }
     }
     *out = path;   // nothing on the way resolved — hand back what we were given
+    if (!normalise_parent()) return false;
     return true;
 }
 

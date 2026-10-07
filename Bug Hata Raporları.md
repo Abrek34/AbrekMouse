@@ -2175,7 +2175,7 @@ Yöntem: Paralel GUI+CLI agent + satır doğrulama. O31-G1..G6, R11-MAXP/SPMIN/P
 - Kategori: Spin ↔ sanitize parity
 - Açıklama: `scale/cap/cap_y/output_offset/power_exp` GUI max'ları sanitize ile birebir; yalnız `input_offset` `100` vs `500`. CLI/JSON `input_offset 400` yüklenir → spin `100` gösterir → kaydet `100` yazar (classic/natural eğri kayması). O31-G4 yalnız min'leri hizalamıştı. R9-DPI/N-HLMAX ile aynı sınıf.
 - Öneri: `make_spin(0,500,…)` (X+Y).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — X spin'i zaten 500'dü, Y spin'i de 500 yapıldı; sanitize (`config.cpp` CAP_X_MAX=500) ve CLI domaini ile birebir (2026-10-07). Build 0 uyarı/0 hata, run_tests/oracle/tr_coverage/tracker_bridge yeşil.
 
 **T36-GUI04 · ORTA · Unlinked-Y `lookup`'ın editörü yok (LUT yalnız X)**
 - Konum: `gui/graph.inl:595-601` (`is_lut` yalnız X `mode_combo`), `:238-240`, `:451-453`, `:513`,`:568`, `ui_builder.inl:828-872,878-925` (click handler'lar yalnız `ax`)
@@ -2281,14 +2281,14 @@ Yöntem: Paralel HID++/scripts agent + satır doğrulama. N-SWID2/N-FDERR/N-EAGA
 - Kategori: Tutarlılık / yanlış pil
 - Açıklama: Her iki feature'ı ilan eden cihazda daemon `status/voltage`, GUI capability `centurion` çözer — N-BATTORD'un centurion kardeşi.
 - Öneri: `centurion` probunu `voltage`'dan önceye al (quirks sırasıyla birebir).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `get_battery_status` prob sırası `preferred_battery_source()` ile aynı: unified → centurion → battery_status → voltage (2026-10-07).
 
 **T37-HID03 · ORTA · 8-hedef identify süpürmesinde global bütçe yok — yorum yanlış**
 - Konum: `src/logitech_hidpp.cpp:2211-2221` + `:29` + `:2209-2210` (`candidates={0xFF,0x00,0x01..0x06}`, her hedef kendi `kIdentifyBudget(20s)` + streak-3)
 - Kategori: Gecikme / hang
 - Açıklama: `:2209` "kIdentifyBudget bounds the whole sweep" diyor ama kod hedef-başına bütçe — ölü node'da ~8x20s ≈ dakikalar. Çağıranlar `cli/main.cpp:2249,2404,2556` ve `gui/hidpp_panel.inl:229` — panel/CLI dakikalarca takılır.
 - Öneri: Süpürme başına tek `deadline=now+kIdentifyBudget`, her hedefte kontrol; yorumu düzelt.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — süpürmeye tek `sweep_deadline = now + kIdentifyBudget` eklendi; her hedef öncesi kontrol, ölü node'da toplam süre ~20 s ile sınırlı (2026-10-07).
 
 **T37-HID04 · DÜŞÜK (latent) · Onboard write son-chunk sıfır dolduruyor + boyutsuz**
 - Konum: `src/logitech_hidpp.cpp:2111-2121` (`params(2+chunk,0)` sabit 16 bayt; `n=min(14,kalan)` kopyalanıp `size()=16` gönderiliyor)
@@ -2401,7 +2401,7 @@ Odak: `daemon/daemon.cpp` flush/process/SYN, `motion_math.hpp`, `lat_stats.hpp`,
 - Kategori: Ölçüm yanlılığı
 - Açıklama: `out.add_rel()` yalnız batche kopyalar; final SYN `write` sonradan olur. Sonraki `process_device` `lat_anchor`ı yeniden kurar (`:2253`) → final write süresi hiçbir örneğe girmez. Compositor stall'da p99/max sistematik düşük görünür. MED-4'ten farklı (o batch-içi ikinci flush; bu batch-sonu write'ın tamamen kaybolması).
 - Öneri: `out.flush()` çevresini `now_ns()` ile ölçüp ekle veya anchor'ı flush sonrasına kaydır; yorumu düzelt.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `write_batch::flush()` gerçek uinput `write()` süresini `on_write_us` callback'i ile `dev.lat.record()`'a ekliyor; p99/max artık batch-sonu write'ı da kapsar (2026-10-07).
 
 **T38-HOT02 · YÜKSEK · SYN_DROPPED parkı batch-sonu defer tarafından eziliyor (BTN kaybı)**
 - Konum: `daemon/daemon.cpp:2383-2384` (park append, count korunur) vs `:2572-2574` (defer `pending_ev_count=0` reset + yalnız güncel queued kopyası) vs `:2324-2325` (merge)
@@ -2429,7 +2429,7 @@ Odak: `daemon/daemon.cpp` flush/process/SYN, `motion_math.hpp`, `lat_stats.hpp`,
 - Kategori: Contention/jitter
 - Açıklama: T35-DMN02/04'ten farklı; okuyucunun uzun kritik-seksiyonu yazıcının per-event lookup'unu geciktirir. GUI 250ms poll + monitor ile periyodik ~10µs stall 8kHz'de ~80 frame penceresine denk gelir.
 - Öneri: `fd_to_dev_` lookup'u lock-free yap veya status kritik-seksiyonunu cihaz-başına böl (kopyala-bırak-işle).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `mouse_device::telemetry` shared_ptr'a çevrildi; seqlock 64-spin okuması `devices_mutex_` bırakıldıktan SONRA yapılıyor, kritik-seksiyon yalnız histogram kopyası (2026-10-07).
 
 **T38-HOT06 · DÜŞÜK · Raw dalı kısmi telemetri örneği (yeni dx + eski gain) + okuyucu ayrışması**
 - Konum: `daemon/daemon.cpp:2060-2091` (raw dalı `dx/dy/wall` yazar + çift-bump, `speed/out/gain` yazmaz) vs `:2617-2618` (dump raw'ı `has_data=false` sayar) vs `:2876-2885` (status `count>0` ise `lat_*` basar)
@@ -2758,7 +2758,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Hardening
 - Açıklama: Validasyon yalan söyler (pratikte `save` zaten `/proc`'a yazamaz).
 - Öneri: Yok-dalda da parent'ı `realpath` dene, çözülemezse `..` içeriyorsa reddet.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `resolve_config_target()` artık parent'ı `realpath` ile kanonikleştiriyor; çözülemez ve kuyrukta `..` varsa reddediyor (hem `cli/main.cpp` hem `daemon/main.cpp`) (2026-10-07).
 
 **T44-04 · DÜŞÜK-ORTA · Son profil silinince local vs daemon ıraksar (boş config push)**
 - Konum: `cli/main.cpp:595-607` (`{active:"",profiles:[]}` `safe_save` + `daemon_apply_if_enabled` push) vs `daemon/daemon.cpp:590-656` (boş profili reddetmez) vs `validate` (`ERROR: No profiles`)
@@ -3054,7 +3054,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Responsiveness
 - Açıklama: Join doğruluğu hariç yeni açı (bloklama süresi).
 - Öneri: Join'i `g_timeout_add` ile asenkronlaştır veya timeout'ları kısalt/`g_cancellable` ile iptal.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ — `kwin_focus_uninstall` join+unload dizisini detached bir thread'e taşıdı; ana thread bloklanmıyor, session_conn join'lerden sonra unref'leniyor (sıra korundu) (2026-10-07).
 
 **T48-08 · ORTA · Import boy kontrolü load'dan sonra (GB allocate)**
 - Konum: `gui/profile_mgr.inl:577-592` (`g_file_get_contents:580` tüm dosyayı heap'e alır, `MAX_IMPORT_BYTES:586` `:587`'de → GB yanlışlıkla seçilse kontrol öncesi allocate)

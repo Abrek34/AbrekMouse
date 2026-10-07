@@ -391,28 +391,33 @@ static void kwin_focus_uninstall(AppState* S) {
     auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
     if (!ctx || !ctx->installed) return;
     ctx->installed = false;
-    // GUI-Y2: join the loader worker BEFORE touching session_conn (the worker
-    // holds a raw pointer to it while running D-Bus calls).  Its D-Bus calls
-    // carry a timeout so the join completes within a bounded time.
-    if (ctx->worker.joinable()) ctx->worker.join();
-    // T48-05: stop + join the focus worker before releasing session_conn —
-    // it may be mid GetConnectionUnixProcessID / IPC on conn (bounded by the
-    // call timeouts), and unref'ing conn under it would be UAF.
-    {
-        std::lock_guard<std::mutex> lk(ctx->focus_mu);
-        ctx->focus_stop = true;
-    }
-    ctx->focus_cv.notify_all();
-    if (ctx->focus_worker.joinable()) ctx->focus_worker.join();
-    // Unload script (best-effort).
-    int sid = ctx->kwin_script_id.load(std::memory_order_relaxed);
-    if (ctx->session_conn && sid >= 0)
-        kwin_script_unload_sync(ctx->session_conn);
-    // Release GDBus name + unregister the /Focus object (R13-KWINOWN — symmetry
-    // with on_bus_acquired; the object would otherwise die only at exit).
-    if (ctx->obj_reg_id && ctx->session_conn)
-        g_dbus_connection_unregister_object(ctx->session_conn, ctx->obj_reg_id);
-    if (ctx->bus_name_id) g_bus_unown_name(ctx->bus_name_id);
-    if (ctx->session_conn) g_object_unref(ctx->session_conn);
-    ctx->session_conn = nullptr;
+    // T48-07: the join + script-unload sequence below can block for seconds
+    // (KWin D-Bus timeouts up to ~7-9 s), and this runs on the GUI main
+    // thread from the window-destroy handler — the window would freeze on
+    // close.  Move the whole sequence onto a detached thread.  ctx is
+    // function-static so it outlives the detached thread, and session_conn
+    // is still unref'd only AFTER both workers are joined (GUI-Y2/T48-05
+    // ordering preserved).
+    std::thread([ctx]() {
+        // GUI-Y2: join the loader worker BEFORE touching session_conn (the
+        // worker holds a raw pointer to it while running D-Bus calls).
+        if (ctx->worker.joinable()) ctx->worker.join();
+        // T48-05: stop + join the focus worker before releasing session_conn.
+        {
+            std::lock_guard<std::mutex> lk(ctx->focus_mu);
+            ctx->focus_stop = true;
+        }
+        ctx->focus_cv.notify_all();
+        if (ctx->focus_worker.joinable()) ctx->focus_worker.join();
+        // Unload script (best-effort).
+        int sid = ctx->kwin_script_id.load(std::memory_order_relaxed);
+        if (ctx->session_conn && sid >= 0)
+            kwin_script_unload_sync(ctx->session_conn);
+        // Release GDBus name + unregister the /Focus object (R13-KWINOWN).
+        if (ctx->obj_reg_id && ctx->session_conn)
+            g_dbus_connection_unregister_object(ctx->session_conn, ctx->obj_reg_id);
+        if (ctx->bus_name_id) g_bus_unown_name(ctx->bus_name_id);
+        if (ctx->session_conn) g_object_unref(ctx->session_conn);
+        ctx->session_conn = nullptr;
+    }).detach();
 }
