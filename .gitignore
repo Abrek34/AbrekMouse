@@ -34,3 +34,4 @@ __pycache__/
 
 # AJ5 ölçüm gölge kopyası: include/ + daemon/ kopyası, depoya girmez
 olcum/aj5/shadow/
+logs/
