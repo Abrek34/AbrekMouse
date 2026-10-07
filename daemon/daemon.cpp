@@ -2396,6 +2396,11 @@ struct write_batch {
     // tail (usually the closing SYN) is dropped.  Set by process_device to the
     // daemon's log() so the silent-drop case becomes diagnosable.
     std::function<void(const std::string&)> drop_report;
+    // T38-HOT01: invoked with the wall time of every real uinput write() so
+    // the latency histogram can carry the FINAL flush too — previously the
+    // last write() of a frame never entered any sample and p99/max was
+    // systematically optimistic.
+    std::function<void(double)> on_write_us;
 
     bool add(unsigned int type, unsigned int code, int value) {
         if (n >= 16) return false;
@@ -2433,9 +2438,13 @@ struct write_batch {
         if (n == 0) return true;
         const int fd = uinput_fd(uidev);
         if (fd < 0) return false;
+        const uint64_t w0 = now_ns();
         const bool ok = uinput_write_retry(fd, evs, n * sizeof(input_event),
                                            drop_report);
+        const uint64_t w1 = now_ns();
         n = 0;
+        if (on_write_us)
+            on_write_us(static_cast<double>(w1 - w0) / 1000.0);
         return ok;
     }
 };
@@ -2453,9 +2462,11 @@ struct write_batch {
 /// Apply acceleration to accumulated (dx,dy) and write REL events to uidev.
 /// Updates dev timing and subpixel remainder. Does NOT write SYN.
 /// Measures processing latency in µs as time from lat_anchor_ns (initially the
-/// process_device() read-batch start) to this last write; the anchor is then
+/// process_device() read-batch start) to this flush entry; the anchor is then
 /// moved up to t_now so a SECOND flush in the same batch quantifies its own
-/// work instead of re-measuring the whole batch (MED-4).
+/// work instead of re-measuring the whole batch (MED-4).  The final uinput
+/// write() duration is measured separately by write_batch::flush() via its
+/// on_write_us callback (T38-HOT01).
 /// frame_ev_us = kernel ev.time (µs, CLOCK_REALTIME) of the SYN_REPORT that
 /// closed this frame — the SM-1 interval is measured as
 /// DELTA(last_frame_ev_us → frame_ev_us), the true USB poll period.  Wall
@@ -2669,8 +2680,9 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
 
     // Record processing latency (µs): time from the latency anchor (initially
     // the process_device() read-batch start — button/wheel work included — to
-    // this last write).  A subsequent flush in the same batch is measured from
-    // this write instead (MED-4), so each flush quantifies only its own work.
+    // this flush entry).  A subsequent flush in the same batch is measured from
+    // this point instead (MED-4), so each flush quantifies only its own work.
+    // The write() itself is timed separately via on_write_us (T38-HOT01).
     double lat_us = static_cast<double>(t_now - lat_anchor_ns) / 1000.0;
     lat_anchor_ns = t_now;
     dev.lat.record(lat_us);
@@ -2690,6 +2702,8 @@ void AccelDaemon::process_device(mouse_device& dev) {
     // ONE write() at the real SYN_REPORT instead of one syscall per event.
     write_batch out;
     out.drop_report = [this](const std::string& m) { log(m); };
+    // T38-HOT01: every batched uinput write() is also a latency sample.
+    out.on_write_us = [&dev](double us) { dev.lat.record(us); };
 
     // R1-08: a pathological/foreign device that never signals EAGAIN could
     // spin this drain loop forever and hold the whole loop thread.  Cap each
@@ -3054,8 +3068,10 @@ for (size_t i = 0; i < read_count; ++i) {
 
 void AccelDaemon::dump_latency_stats() {
     // Called on SIGUSR1 from the main thread — prints to stdout (journald captures it).
-    // Stats cover flush_motion processing time (modifier math + uinput write),
-    // NOT the full kernel→userspace round-trip latency.
+    // Stats cover flush_motion processing time (modifier math up to the batch
+    // copy) PLUS the real uinput write() durations, which write_batch::flush()
+    // records as separate samples via on_write_us (T38-HOT01).  NOT the full
+    // kernel→userspace round-trip latency.
     // TH-3: snapshot all device data under the lock, then release it before
     // doing any stdout I/O.  This prevents the loop thread from being starved
     // by a slow journald pipe (or a blocking stdout) while the lock is held.
@@ -3262,6 +3278,9 @@ struct DevSnap {
         bool     telem_ok = false;   // counters matched under seqlock read
         double   telem_speed_ips = 0, telem_out_ips = 0, telem_gain = 0;
         double   telem_dx = 0, telem_dy = 0, telem_wall_ms = 0;
+        // T38-HOT05: shared ownership of the telemetry block so the seqlock
+        // spin loop below can run AFTER devices_mutex_ is released.
+        std::shared_ptr<mouse_device::telemetry_state> telem_ptr;
     };
 
     std::string cfg_path_snap;
@@ -3285,38 +3304,47 @@ struct DevSnap {
             // devices_mutex_ is released, so the motion thread's lat.record()
             // and reload/hotplug paths never wait on O(BUCKETS) scans.
             // copy() takes lat.mtx itself — do NOT hold llk here (would deadlock).
+            // T38-HOT05: only copy the histogram + keep a shared_ptr to the
+            // telemetry block here.  The up-to-64-spin seqlock read below is
+            // moved OUT of the devices_mutex_ critical section — the shared_ptr
+            // keeps the block alive even if the device is erased meanwhile.
             s.lat_snap = dev.lat.copy();
             s.has_lat  = (s.lat_snap.count > 0);
-
-            // Live telemetry (seqlock-style read): flush_motion() increments
-            // telem_samples to an odd value before writing, writes the fields,
-            // then increments to an even value.  8 spins was too few under a
-            // very fast writer (~1 kHz+, BUG D-5) and silently dropped the
-            // sample; 64 bounded spins keep the read window cheap without ever
-            // blocking the writer.
-            for (int attempts = 0; attempts < 64; attempts++) {
-                const uint64_t s1 = dev.telemetry->samples.load(std::memory_order_acquire);
-                if (s1 == 0) break; // no motion yet
-                if ((s1 & 1) != 0) continue; // write in progress (odd counter) — spin
-                const double t_speed = dev.telemetry->speed_ips.load(std::memory_order_relaxed);
-                const double t_out   = dev.telemetry->out_ips.load(std::memory_order_relaxed);
-                const double t_gain  = dev.telemetry->gain.load(std::memory_order_relaxed);
-                const double t_dx    = dev.telemetry->dx.load(std::memory_order_relaxed);
-                const double t_dy    = dev.telemetry->dy.load(std::memory_order_relaxed);
-                const double t_wall  = dev.telemetry->wall_ms.load(std::memory_order_relaxed);
-                const uint64_t s2 = dev.telemetry->samples.load(std::memory_order_acquire);
-                if (s1 == s2) {
-                    s.telem_ok = true;
-                    s.telem_speed_ips = t_speed;
-                    s.telem_out_ips   = t_out;
-                    s.telem_gain      = t_gain;
-                    s.telem_dx        = t_dx;
-                    s.telem_dy        = t_dy;
-                    s.telem_wall_ms   = t_wall;
-                    break;
-                }
-            }
+            s.telem_ptr = dev.telemetry;
             snaps.push_back(s);
+        }
+    }
+
+    // Live telemetry (seqlock-style read, T38-HOT05: NO devices_mutex_ held —
+    // the motion thread's per-event fd_to_dev_ lookup never waits on this):
+    // flush_motion() increments telem_samples to an odd value before writing,
+    // writes the fields, then increments to an even value.  8 spins was too
+    // few under a very fast writer (~1 kHz+, BUG D-5) and silently dropped the
+    // sample; 64 bounded spins keep the read window cheap without ever
+    // blocking the writer.
+    for (auto& s : snaps) {
+        if (!s.telem_ptr) continue;
+        for (int attempts = 0; attempts < 64; attempts++) {
+            const uint64_t s1 = s.telem_ptr->samples.load(std::memory_order_acquire);
+            if (s1 == 0) break; // no motion yet
+            if ((s1 & 1) != 0) continue; // write in progress (odd counter) — spin
+            const double t_speed = s.telem_ptr->speed_ips.load(std::memory_order_relaxed);
+            const double t_out   = s.telem_ptr->out_ips.load(std::memory_order_relaxed);
+            const double t_gain  = s.telem_ptr->gain.load(std::memory_order_relaxed);
+            const double t_dx    = s.telem_ptr->dx.load(std::memory_order_relaxed);
+            const double t_dy    = s.telem_ptr->dy.load(std::memory_order_relaxed);
+            const double t_wall  = s.telem_ptr->wall_ms.load(std::memory_order_relaxed);
+            const uint64_t s2 = s.telem_ptr->samples.load(std::memory_order_acquire);
+            if (s1 == s2) {
+                s.telem_ok = true;
+                s.telem_speed_ips = t_speed;
+                s.telem_out_ips   = t_out;
+                s.telem_gain      = t_gain;
+                s.telem_dx        = t_dx;
+                s.telem_dy        = t_dy;
+                s.telem_wall_ms   = t_wall;
+                break;
+            }
         }
     }
 

@@ -409,7 +409,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     S->accel_spin_y      = make_spin(0,   20,   0.001, 0.005);
     S->exponent_spin_y   = make_spin(1,   10,   0.05,  2.0);
     S->limit_spin_y      = make_spin(0,   100,  0.05,  1.5);   // O31-G4: min == sanitize limit floor (0)
-    S->offset_spin_y     = make_spin(0,   100,  0.5,   0.0);
+    S->offset_spin_y     = make_spin(0,   500,  0.5,   0.0);   // T36-GUI03: Y spin == X spin == sanitize domain [0,500]; 100'lük gauge geçerli değeri sessizce kırpıyordu
     S->cap_y_spin_y      = make_spin(0,   100,  0.05,  1.5);
     for (auto* s : {S->accel_spin_y, S->exponent_spin_y,
                     S->limit_spin_y, S->offset_spin_y, S->cap_y_spin_y})

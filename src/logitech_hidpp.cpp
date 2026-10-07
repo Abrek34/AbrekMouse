@@ -1487,10 +1487,11 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
     };
 
     // R6-3: probe order must match preferred_battery_source()
-    // (logitech_quirks.hpp) — unified_battery → battery_status → voltage — so
-    // the GUI's capability/source display and the daemon's active battery query
-    // decode the SAME feature on devices advertising several.  Previously this
-    // probed battery_status first, disagreeing with the GUI's preference.
+    // (logitech_quirks.hpp) — unified_battery → centurion → battery_status →
+    // voltage — so the GUI's capability/source display and the daemon's active
+    // battery query decode the SAME feature on devices advertising several.
+    // Previously this probed battery_status first and skipped centurion ahead
+    // of voltage (T37-HID02), disagreeing with the GUI's preference.
     // BATTERY_STATUS fn 0 and UNIFIED_BATTERY fn 0x10 stay separate: their
     // first three bytes look similar but the middle byte means "next discharge
     // level" only for BATTERY_STATUS.
@@ -1501,6 +1502,18 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
                 target_device_index)) {
             if (auto info = hidpp_parse_unified_battery(*payload)) return info;
         }
+    // Centurion battery (0x0104) — PRO X 2 LIGHTSPEED, G515 LS TKL, etc.
+    // T37-HID02: probe BEFORE battery_status/voltage, matching
+    // preferred_battery_source() (unified → centurion → status → voltage).
+    // [soc, soc_duplicate, charging_status].  Try it before legacy registers.
+    if (has_feature(hidpp_feature_index::centurion_battery_soc))
+        if (auto payload = feature_request(
+                static_cast<uint16_t>(hidpp_feature_index::centurion_battery_soc), 0x00,
+                nullptr, 0, std::chrono::milliseconds(500),
+                target_device_index)) {
+            if (auto info = parse_centurion_battery(*payload)) return info;
+        }
+
     if (has_feature(hidpp_feature_index::battery_status))
         if (auto payload = feature_request(
                 static_cast<uint16_t>(hidpp_feature_index::battery_status), 0x00,
@@ -1518,17 +1531,6 @@ std::optional<hidpp_battery_info> HidppTransport::get_battery_status(uint8_t tar
             // millivolts rather than a direct charge percentage.
             const bool charging = (rsp->params[2] & 0x80) != 0;
             return battery_info_from_voltage(voltage, charging);
-        }
-
-    // Centurion battery (0x0104) — PRO X 2 LIGHTSPEED, G515 LS TKL, etc.
-    // This is a separate feature from UNIFIED_BATTERY with a 3-byte payload:
-    // [soc, soc_duplicate, charging_status].  Try it before legacy registers.
-    if (has_feature(hidpp_feature_index::centurion_battery_soc))
-        if (auto payload = feature_request(
-                static_cast<uint16_t>(hidpp_feature_index::centurion_battery_soc), 0x00,
-                nullptr, 0, std::chrono::milliseconds(500),
-                target_device_index)) {
-            if (auto info = parse_centurion_battery(*payload)) return info;
         }
 
     // Legacy devices advertise either register.  Solaar probes
@@ -2303,11 +2305,16 @@ std::vector<hidpp_device> identify_logitech_devices(const std::string& hidraw_pa
     // for on indexes 1..6 (Solaar uses the same sweep).  Probing only
     // 0xFF/0x00 used to surface just the receiver shell — which carries no
     // DPI/polling-rate features — and never the actual mice behind it, so the
-    // HID++ panel disabled every control.  kIdentifyBudget bounds the whole
-    // sweep for nodes that never answer.
+    // HID++ panel disabled every control.  T37-HID03: kIdentifyBudget bounds
+    // the WHOLE sweep — one shared deadline checked before each target —
+    // instead of each target burning its own ~20 s (8 × 20 s ≈ minutes on a
+    // dead node).
     static constexpr uint8_t candidates[] = {0xFF, 0x00, 0x01, 0x02, 0x03,
                                              0x04, 0x05, 0x06};
+    const auto sweep_deadline =
+        std::chrono::steady_clock::now() + kIdentifyBudget;
     for (uint8_t candidate : candidates) {
+        if (std::chrono::steady_clock::now() >= sweep_deadline) break;
         auto device = identify_hidpp20_target(transport, hidraw_path, candidate);
         if (!device) continue;
         const bool duplicate = std::any_of(

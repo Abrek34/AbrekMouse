@@ -121,9 +121,13 @@ struct mouse_device {
     // thread).  Every field is atomic: the generation counter provides a
     // consistent snapshot while the atomics themselves avoid the C++ data
     // race/UB that a seqlock over plain doubles would have.  The state is
-    // held via unique_ptr so mouse_device remains movable.
-    std::unique_ptr<telemetry_state> telemetry =
-        std::make_unique<telemetry_state>();
+    // held via shared_ptr so mouse_device remains movable AND so the IPC
+    // thread can keep a live pointer (shared ownership) into a device that
+    // may already be erased from devices_ — that lets status_json() run the
+    // seqlock spin loop AFTER releasing devices_mutex_, shortening the
+    // per-event fd_to_dev_ lookup stall (T38-HOT05).
+    std::shared_ptr<telemetry_state> telemetry =
+        std::make_shared<telemetry_state>();
     // ── Latency statistics — see lat_stats.hpp for the full implementation ──
     // Thread safety: flush_motion() (loop thread) writes; dump_latency_stats()
     // (main thread, on SIGUSR1) reads and resets.  lat_stats::mtx serialises access.
