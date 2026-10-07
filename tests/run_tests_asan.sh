@@ -62,12 +62,16 @@ mkdir -p "$ROOT/build-manual"
 
 echo "=== RawAccel Linux Birim Testleri (ASan + UBSan) ==="
 echo "Derleniyor..."
-$CXX $CXXFLAGS -lpthread \
+# T53-02: -lpthread nesnelerden SONRAYA (as-needed riski).
+if ! $CXX $CXXFLAGS \
     "$ROOT/tests/test_accel.cpp" \
     "$ROOT/src/config.cpp" \
     "$ROOT/src/logitech_receiver.cpp" \
     "$ROOT/src/logitech_hidpp.cpp" \
-    -o "$BIN"
+    -o "$BIN" -lpthread; then
+    echo "Hata: test_accel_asan derlemesi başarısız (rc=$?)" >&2
+    exit 1
+fi
 
 echo "Çalıştırılıyor..."
 echo ""

@@ -89,27 +89,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     modifier mod;
 
-    // Clamp time
-    if (time_val <= 0 || !std::isfinite(time_val)) time_val = 1.0;
-    if (time_val > 100.0) time_val = 100.0;
-    milliseconds time_ms = time_val;
-
-    // Clamp dx/dy to prevent meaningless huge values
-    if (!std::isfinite(dx)) dx = 0;
-    if (!std::isfinite(dy)) dy = 0;
-    if (dx > 10000) dx = 10000;
-    if (dx < -10000) dx = -10000;
-    if (dy > 10000) dy = 10000;
-    if (dy < -10000) dy = -10000;
+    // T53-13: girdiyi pipeline'a değmeden törpüleme — eski kod dx/dy'yi
+    // ±10000'e kelepçeleyip NaN→0, time<=0/Inf→1.0 yapınca daemon'un
+    // 0.0625ms altı, subnormal/0/Inf (IPS_FACTOR_MAX), 1e300 (hypot),
+    // NaN-yayılım koruma kolları bu harness'ta ERİŞİLEMEZ oluyordu.
+    // Şimdi aynı bitler iki yola girer: HAM (kelepçesiz) ve hijyenik.
+    const double raw_time = time_val;
+    const double raw_dx = dx, raw_dy = dy;
 
     // ── Path 1: modifier::modify() ──────────────────────────────────────────
     {
-        vec2d input = { dx, dy };
+        vec2d input = { raw_dx, raw_dy };
         double dpi_factor = NORMALIZED_DPI / static_cast<double>(dp.dev_cfg.dpi);
-        mod.modify(input, sp, settings, dpi_factor, time_ms);
+        milliseconds t = raw_time;
+        mod.modify(input, sp, settings, dpi_factor, t);
 
-        // NaN must never escape the pipeline
-        if (std::isnan(input.x) || std::isnan(input.y)) __builtin_trap();
+        // T53-14: Inf de NaN kadar sessiz kaçış — !isfinite tuzağı.
+        if (!std::isfinite(input.x) || !std::isfinite(input.y)) __builtin_trap();
     }
 
     // ── Path 2: apply_motion_math() ─────────────────────────────────────────
@@ -122,11 +118,38 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         speed_processor sp2;
         sp2.init(dp.prof.speed_processor_args);
 
-        apply_motion_math(mod, sp2, settings, dpi_factor, time_ms,
-                          dx, dy, rx, ry, ox, oy);
+        milliseconds t = raw_time;
+        apply_motion_math(mod, sp2, settings, dpi_factor, t,
+                          raw_dx, raw_dy, rx, ry, ox, oy);
 
-        // NaN in remainder is a bug
-        if (std::isnan(rx) || std::isnan(ry)) __builtin_trap();
+        // T53-14: remainder NaN veya Inf ise bug (eski: yalnız isnan).
+        if (!std::isfinite(rx) || !std::isfinite(ry)) __builtin_trap();
+    }
+
+    // ── Path 3: hijyenik yol — kelepçeli, deterministik (eski davranış) ─────
+    {
+        if (time_val <= 0 || !std::isfinite(time_val)) time_val = 1.0;
+        if (time_val > 100.0) time_val = 100.0;
+        milliseconds time_ms = time_val;
+        if (!std::isfinite(dx)) dx = 0;
+        if (!std::isfinite(dy)) dy = 0;
+        if (dx > 10000) dx = 10000;
+        if (dx < -10000) dx = -10000;
+        if (dy > 10000) dy = 10000;
+        if (dy < -10000) dy = -10000;
+
+        vec2d input = { dx, dy };
+        double dpi_factor = NORMALIZED_DPI / static_cast<double>(dp.dev_cfg.dpi);
+        mod.modify(input, sp, settings, dpi_factor, time_ms);
+        if (!std::isfinite(input.x) || !std::isfinite(input.y)) __builtin_trap();
+
+        double rx = 0, ry = 0;
+        int ox = 0, oy = 0;
+        speed_processor sp3;
+        sp3.init(dp.prof.speed_processor_args);
+        apply_motion_math(mod, sp3, settings, dpi_factor, time_ms,
+                          dx, dy, rx, ry, ox, oy);
+        if (!std::isfinite(rx) || !std::isfinite(ry)) __builtin_trap();
     }
 
     return 0;

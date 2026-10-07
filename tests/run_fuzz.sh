@@ -15,6 +15,14 @@ CORPUS="$SCRIPT_DIR/corpus_config"
 CORPUS_ACCEL="$SCRIPT_DIR/corpus_accel"
 DURATION="${1:-60}"
 
+# T53-15: DURATION libFuzzer'a doğrulanmadan geçiriliyordu — "foo"/"-5"/""
+# kriptik argüman hatası veriyordu. Sayısal doğrula (0 = süresiz izinli).
+if [[ ! "$DURATION" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "Hata: DURATION pozitif tamsayı (saniye) olmalı veya 0 (süresiz) — alınan: '$DURATION'" >&2
+    echo "Kullanım: bash tests/run_fuzz.sh [süre_sn|0]" >&2
+    exit 2
+fi
+
 if ! command -v clang++ &>/dev/null; then
     echo "Error: clang++ not found. Install clang to use fuzz testing."
     exit 1

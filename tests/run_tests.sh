@@ -100,13 +100,30 @@ trap cleanup_tmp EXIT   # P114 BUG-H: hiçbir fail-erken çıkışta /tmp kalmas
 echo "=== RawAccel Linux Birim Testleri ==="
 echo "Derleniyor..."
 
+# T53-03: kurulum/derleme adımlarını görünür kıl — set -e'nin suskun çıkışı
+# hangi kapının/derlemenin kırıldığını logda bırakmaz. Her adımın rc'si
+# denetlenip net teşhis basılır.
+run_gate_step() {
+    local desc="$1"; shift
+    echo "[adım] $desc"
+    if ! "$@"; then
+        echo "Hata: $desc başarısız (rc=$?)" >&2
+        exit 1
+    fi
+}
+
 # config.cpp ayrı derleme birimi olarak derlenir (M2: ODR sorununu önler)
-$CXX $CXXFLAGS -lpthread \
+# T53-02: -lpthread NESNElerden SONRAYA — --as-needed sol-sağ okur, öne
+# konursa lib düşürülüp sonraki nesneler çözümsüz kalabilir.
+if ! $CXX $CXXFLAGS \
     "$ROOT/tests/test_accel.cpp" \
     "$ROOT/src/config.cpp" \
     "$ROOT/src/logitech_receiver.cpp" \
     "$ROOT/src/logitech_hidpp.cpp" \
-    -o "$BIN"
+    -o "$BIN" -lpthread; then
+    echo "Hata: test_accel derlemesi başarısız (rc=$?)" >&2
+    exit 1
+fi
 
 echo "Çalıştırılıyor..."
 echo ""
@@ -235,6 +252,7 @@ PY
         echo "FAIL: seed config baslatilamadi (rc=$SRC)"
         exit 1
     fi
+    echo "[adım] seed config baslatildi (rc=$SRC)"
     # 256 char: kabul (create-preset siniri MAX_NAME_LEN = 256)
     set +e
     OUT=$("$CLI" -c "$TMPCFG" --no-daemon create-preset cs2 "$(cat "$TMPN256")" 2>&1)
@@ -300,7 +318,8 @@ PY
     TMPP=$(mktemp --suffix=.json)   # SEC-2: config path must end in .json
     TMP_FILES+=( "$TMPP" "$TMPP.bak" )
     rm -f "$TMPP" "$TMPP.bak"
-    "$CLI" -c "$TMPP" --no-daemon create-preset gaming g >/dev/null 2>&1
+    run_gate_step "P107 seed create-preset gaming" \
+        "$CLI" -c "$TMPP" --no-daemon create-preset gaming g
     set +e
     "$CLI" -c "$TMPP" --no-daemon set-param g snap 20 >/dev/null 2>&1
     RC_OK=$?
@@ -348,7 +367,8 @@ PY
         echo "FAIL: O31-L2 'input_offset 30' with cap_x 15 accepted (rc=$RC): $OUT"
         exit 1
     fi
-    "$CLI" -c "$TMPP" --no-daemon set-param g cap_x 30 >/dev/null 2>&1
+    run_gate_step "O31-L2 cap_x 30" \
+        "$CLI" -c "$TMPP" --no-daemon set-param g cap_x 30
     set +e
     "$CLI" -c "$TMPP" --no-daemon set-param g input_offset 30 >/dev/null 2>&1
     RC=$?
@@ -411,9 +431,9 @@ PY
     TMPD1=$(mktemp --suffix=.json)
     TMP_FILES+=( "$TMPD1" "$TMPD1.bak" )
     rm -f "$TMPD1" "$TMPD1.bak"
-    "$CLI" -c "$TMPD1" --no-daemon create d1 >/dev/null 2>&1
+    run_gate_step "diff seed create d1" "$CLI" -c "$TMPD1" --no-daemon create d1
     rm -f "$TMPD1.bak"
-    "$CLI" -c "$TMPD1" --no-daemon create d2 >/dev/null 2>&1
+    run_gate_step "diff seed create d2" "$CLI" -c "$TMPD1" --no-daemon create d2
     # özdeş profiller önce: rc 0 + "no differences" (isimler farklı ise isim farkı sayılır)
     set +e
     OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 d1 2>&1)
@@ -424,7 +444,7 @@ PY
         exit 1
     fi
     # tek bir alanı değiştir: tam o alan + rc 1
-    "$CLI" -c "$TMPD1" --no-daemon set-param d1 cap_x 77 >/dev/null 2>&1
+    run_gate_step "diff set-param d1 cap_x 77" "$CLI" -c "$TMPD1" --no-daemon set-param d1 cap_x 77
     set +e
     OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 d2 2>&1)
     RC=$?
@@ -438,10 +458,12 @@ PY
         exit 1
     fi
     # geri al → özdeş; dosya-karşılaştırma formu da aynı sonucu vermeli
-    "$CLI" -c "$TMPD1" --no-daemon set-param d2 cap_x 77 >/dev/null 2>&1
+    run_gate_step "diff set-param d2 cap_x 77" "$CLI" -c "$TMPD1" --no-daemon set-param d2 cap_x 77
     TMPDF=$(mktemp --suffix=.json)
     TMP_FILES+=( "$TMPDF" )
-    "$CLI" -c "$TMPD1" --no-daemon export d2 > "$TMPDF"
+    # T53-03: export'un JSON'ı stdout'u kirletmesin; [adım] satırı da TMPDF'e
+    # karışmasın diye CLI çıktısı ayrı bir kabukta dosyaya yönlendirilir.
+    run_gate_step "diff export d2" bash -c '"$1" -c "$2" --no-daemon export d2 > "$3"' _ "$CLI" "$TMPD1" "$TMPDF"
     set +e
     OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d2 "$TMPDF" 2>&1)
     RC=$?

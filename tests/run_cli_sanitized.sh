@@ -47,12 +47,16 @@ echo "Derleniyor..."
 
 # Kaynak seti = run_tests_asan.sh'inin seti, test_accel.cpp yerine cli/main.cpp.
 # (logitech_receiver/hidpp olmadan linklenmiyor: CLI hidpp-set-dpi vb. çağırıyor.)
-$CXX $CXXFLAGS -lpthread \
+# T53-02: -lpthread nesnelerden SONRAYA (--as-needed riski).
+if ! $CXX $CXXFLAGS \
     "$ROOT/cli/main.cpp" \
     "$ROOT/src/config.cpp" \
     "$ROOT/src/logitech_receiver.cpp" \
     "$ROOT/src/logitech_hidpp.cpp" \
-    -o "$BIN"
+    -o "$BIN" -lpthread; then
+    echo "Hata: rawaccel-cli-sanitized derlemesi başarısız (rc=$?)" >&2
+    exit 1
+fi
 
 # Sanitizer imzaları. UBSan "runtime error:" satırı, ASan/LSan "ERROR: <x>".
 SAN_RE='ERROR: AddressSanitizer|ERROR: LeakSanitizer|runtime error:|SUMMARY: (Address|UndefinedBehavior)Sanitizer'

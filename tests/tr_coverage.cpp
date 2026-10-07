@@ -91,6 +91,15 @@ static bool is_c_ident(char c) {
            (c >= '0' && c <= '9');
 }
 
+// T53-10: boşluk sınıfı TEK yerde — ' ', '\t', '\n', '\r' hepsi atlanır;
+// call-site'larda "yalnız ' '" atlayan tarama sahte PASS üretiyordu.
+static bool is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+static void skip_ws_at(const std::string& s, size_t* i) {
+    while (*i < s.size() && is_ws(s[*i])) (*i)++;
+}
+
 static std::string line_of(const std::string& src, size_t off) {
     size_t ln = 1;
     for (size_t i = 0; i < off && i < src.size(); i++)
@@ -138,6 +147,37 @@ static bool in_comment(const std::string& src, size_t off) {
         i++;
     }
     return false;
+}
+
+// T53-12: dize/yorum farkındalıklı eşleşen '}' konumu — çeviri sözlüğündeki
+// '}' içeren değerler sınırlayıcıyı erken kesmesin.
+static size_t find_match_brace(const std::string& src, size_t open) {
+    if (open >= src.size() || src[open] != '{') return std::string::npos;
+    int depth = 0;
+    size_t i = open;
+    while (i < src.size()) {
+        char c = src[i];
+        if (c == '"' || c == '\'') {
+            char q = c; i++;
+            while (i < src.size() && src[i] != q) { if (src[i] == '\\') i++; i++; }
+            if (i < src.size()) i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) i++;
+            i = (i + 1 < src.size()) ? i + 2 : src.size();
+            continue;
+        }
+        if (c == '{') depth++;
+        else if (c == '}') { depth--; if (depth == 0) return i; }
+        i++;
+    }
+    return std::string::npos;
 }
 
 // P114 BUG-G: braced combo-array definitions are recognized in every spelling.
@@ -241,8 +281,7 @@ int main(int argc, char** argv) {
                     // `tr\t("...")` biçimindeki bir çağrı '(' sanılıp sessizce
                     // atlanıyordu (stil değişikliğiyle gerçek bir çağrı görünmez
                     // olabilir). Satır sonu / sekme / CR de boşluk sayılır.
-                    while (j < src.size() && (src[j] == ' ' || src[j] == '\t' ||
-                                              src[j] == '\n' || src[j] == '\r'))
+                    while (j < src.size() && is_ws(src[j]))
                         j++;
                     if (j < src.size() && src[j] == '(') {
                         size_t arg = j + 1;
@@ -254,15 +293,17 @@ int main(int argc, char** argv) {
                         if (parse_string_seq(src, &arg, &key)) {
                             if (std::getenv("TRC_DEBUG"))
                                 std::fprintf(stderr, "DBG call %s @%zu in %s: %s\n", ident.c_str(), start, path.c_str(), key.c_str());
-                            used.insert(key);
+                            // T53-11: yorum-içi tr("…") used'e girmesin —
+                            // yokken "// tr(\"eski\")" MISSING üretiyordu.
+                            if (!in_comment(src, start))
+                                used.insert(key);
                         } else {
                             // P114 BUG-F: boş-string literal ("") ayrı kanal; geri
                             // kalan değişken/ifade anahtarlar site'lenip uyarılır.
                             // Yorumlardaki tr(...) söz öbeği sayılmaz.
                             if (!in_comment(src, start)) {
                                 size_t sp = arg;
-                                while (sp < src.size() && (src[sp] == ' ' || src[sp] == '\t' ||
-                                                           src[sp] == '\n' || src[sp] == '\r')) sp++;
+                                while (sp < src.size() && is_ws(src[sp])) sp++;
                                 if (sp + 1 < src.size() && src[sp] == '"' && src[sp + 1] == '"') {
                                     empty_str_calls++;
                                 } else {
@@ -275,16 +316,18 @@ int main(int argc, char** argv) {
                 } else if (ident == "tr_combo_fill") {
                     size_t j = i2;
                     // C4: aynı boşluk sınıfı burada da geçerli.
-                    while (j < src.size() && (src[j] == ' ' || src[j] == '\t' ||
-                                              src[j] == '\n' || src[j] == '\r'))
+                    while (j < src.size() && is_ws(src[j]))
                         j++;
                     if (j < src.size() && src[j] == '(') {
                         size_t arg = j + 1;
                         // first arg: widget expr; second arg: array name (or tr())
-                        size_t comma = src.find(',', arg);
-                        if (comma != std::string::npos) {
-                            size_t k = comma + 1;
-                            while (k < src.size() && (src[k] == ' ' || src[k] == '\n' || src[k] == '\t')) k++;
+                        // T53-12: iç-içe virgül araması yerine ilk argümanı
+                        // parantez/dize farkındalıklı atlayıp virgülü bul.
+                        size_t arg2 = arg;
+                        skip_first_arg(src, &arg2);
+                        if (arg2 < src.size() && src[arg2] == ',') {
+                            size_t k = arg2 + 1;
+                            while (k < src.size() && is_ws(src[k])) k++;
                             // If second arg is an identifier (array), grab it
                             char kc = src[k];
                             if (is_c_ident(kc)) {
@@ -323,12 +366,19 @@ for (const auto& an : combo_arrays) {
                 if (std::getenv("TRC_DEBUG"))
                     std::fprintf(stderr, "DBG combo %s @%zu in %s\n", an.c_str(), open, fp.first.c_str());
                 size_t cur = open + 1;
-                while (cur < src.size() && src[cur] != '}') {
+                // T53-12: '}' araması dize-farkındalıklı olsun — çeviri
+                // değerinin içindeki '}' dizgeyi erken kesmesin.
+                size_t close_brace = find_match_brace(src, open);
+                size_t guard = (close_brace == std::string::npos) ? src.size() : close_brace;
+                while (cur < guard) {
                     std::string lit;
+                    const size_t lit_start = cur;
                     if (parse_string_seq(src, &cur, &lit)) {
                         if (std::getenv("TRC_DEBUG"))
                             std::fprintf(stderr, "DBG combo-item %s in %s: %s\n", an.c_str(), fp.first.c_str(), lit.c_str());
-                        used.insert(lit);
+                        // T53-11: yorum-içi literal sayılmaz.
+                        if (!in_comment(src, lit_start))
+                            used.insert(lit);
                     }
                     else cur++;
                 }
@@ -349,32 +399,49 @@ for (const auto& an : combo_arrays) {
     std::string trsrc = slurp(tr_path);
     std::set<std::string> dict_keys;
     {
-        size_t block = trsrc.find("D = {");
+        // T53-12: "D = {" sabit arama yerine sembol-tabanlı bul: bir 'D'
+        // tanımlayıcısı, ardından ws + '=' + ws + '{'.
+        size_t block = std::string::npos;
+        for (size_t p = trsrc.find('D'); p != std::string::npos; p = trsrc.find('D', p + 1)) {
+            if (p > 0 && is_c_ident(trsrc[p - 1])) continue;
+            size_t q = p + 1;
+            while (q < trsrc.size() && is_ws(trsrc[q])) q++;
+            if (q >= trsrc.size() || trsrc[q] != '=') continue;
+            q++;
+            while (q < trsrc.size() && is_ws(trsrc[q])) q++;
+            if (q < trsrc.size() && trsrc[q] == '{') { block = q; break; }
+        }
         if (block == std::string::npos) {
             std::cerr << "tr.inl: 'D = {' block not found\n";
             return 2;
         }
-        size_t cur = block + 5;
-        size_t close = trsrc.find("};", cur);
+        size_t cur = block + 1;
+        // '};' veya dize-içi '}' yerine eşleşen kapanış süslüsü.
+        size_t close = find_match_brace(trsrc, block);
+        if (close == std::string::npos) {
+            std::cerr << "tr.inl: 'D' bloğunun kapanışı bulunamadı\n";
+            return 2;
+        }
         while (cur < close) {
             // skip to '{'
             while (cur < close && trsrc[cur] != '{') cur++;
             if (cur >= close) break;
+            size_t entry_open = cur;
             cur++; // '{'
             std::string key;
             if (!parse_string_seq(trsrc, &cur, &key)) {
                 // P114 BUG-F: boş-string sözlük girdisi {"", ...} ayrı yakalanır.
                 size_t e = cur;
-                while (e < trsrc.size() && (trsrc[e] == ' ' || trsrc[e] == '\t' ||
-                                            trsrc[e] == '\n' || trsrc[e] == '\r')) e++;
+                while (e < trsrc.size() && is_ws(trsrc[e])) e++;
                 if (e + 1 < trsrc.size() && trsrc[e] == '"' && trsrc[e + 1] == '"')
                     dict_has_empty = true;
                 cur++; // non-literal first element — skip to next '{'
                 continue;
             }
             dict_keys.insert(key);
-            // skip the rest of this entry up to the matching '}'
-            size_t rc = trsrc.find('}', cur);
+            // skip the rest of this entry up to its matching '}'
+            // (find('}') yerine eşleşen süslü — dize-içi '}' sayılmaz)
+            size_t rc = find_match_brace(trsrc, entry_open);
             if (rc == std::string::npos || rc > close) break;
             cur = rc + 1;
         }

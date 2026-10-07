@@ -4,19 +4,20 @@
 # Exit 0 = full coverage; exit 1 = missing translations.
 set -e
 cd "$(dirname "$0")/.."
-SRC=(
-  gui/main.cpp
-  gui/tr.inl
-  gui/devices.inl
-  gui/daemon_comm.inl
-  gui/graph.inl
-  gui/widgets_sync.inl
-  gui/profile_mgr.inl
-  gui/ui_builder.inl
-  gui/hidpp_panel.inl
-  gui/mouse_test.inl
-  gui/kwin_focus.inl
-)
+# T53-16: liste elle-kodluydu — dizine yeni .inl eklendiğinde sessizce
+# denetim-dışı kalıyordu. Artık gui/*.inl glob'u otomatik taranır; ana
+# kaynaklar açıkça eklenir, yinelenenler ayıklanır.
+SRC=(gui/main.cpp)
+shopt -s nullglob
+for f in gui/*.inl; do SRC+=("$f"); done
+shopt -u nullglob
+# yinelenenleri ayıkla (ör. gui/tr.inl açıkça eklenmiş olsaydı)
+SRC=($(printf '%s\n' "${SRC[@]}" | awk '!seen[$0]++'))
+# Bekçi: gui/ altında .inl varken glob boş kalırsa tarama gizlice daralır.
+if [ ${#SRC[@]} -lt 3 ]; then
+    echo "META-FAIL: gui/*.inl taraması ${#SRC[@]} dosya verdi — glob kırık olabilir" >&2
+    exit 1
+fi
 # C3 (L18 B-19): her kaynak dosyanın varlığını ÖNCE doğrula. Eksik bir dosya
 # CLI'ye hiç geçmezse tarayıcı onu sessizce atlar ve daha az anahtar taranır —
 # "hiç bulamadı ama PASS" sınıfının bir kolu. Eksik dosya META-FAIL'dir.

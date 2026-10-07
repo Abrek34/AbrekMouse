@@ -31,6 +31,17 @@ if [[ ! -w /dev/uinput ]]; then
     exit 77
 fi
 
+# T53-04: daemon binary'si bayat mı denetle — daemon/**, include/** veya
+# src/** altında binary'den YENİ kaynak varsa sonuç yeni koda yansımaz.
+stale_src="$(find "${ROOT}/daemon" "${ROOT}/include" "${ROOT}/src" \
+    \( -name '*.cpp' -o -name '*.hpp' -o -name '*.c' -o -name '*.h' \) \
+    -newer "$DAEMON" 2>/dev/null | head -n1)"
+if [[ -n "$stale_src" ]]; then
+    echo "[WARN] daemon binary'si bayat görünüyor: $stale_src daha yeni —"
+    echo "       'bash scripts/build.sh' çalıştırman önerilir; aksi hâlde sonuç"
+    echo "       ESKİ koda aitmiş gibi raporlanır."
+fi
+
 # Build the harness if stale.
 if [[ ! -x "$HARNESS" || "$CPP_HARNESS" -nt "$HARNESS" ]]; then
     echo "[INFO] building harness..."
@@ -58,18 +69,37 @@ if [[ -n "$SYS_PID" ]]; then
                 PRESERVED_PIDFILES="$PRESERVED_PIDFILES $p"
             fi
         done
-        trap '[ -n "${SYS_PID:-}" ] && { for p in $PRESERVED_PIDFILES; do [ -f "$p" ] || echo "$SYS_PID" > "$p"; done; kill -CONT "$SYS_PID" 2>/dev/null || true; }' EXIT
+        trap '[ -n "${SYS_PID:-}" ] && { for p in $PRESERVED_PIDFILES; do [ -f "$p" ] || echo "$SYS_PID" > "$p"; done; kill -CONT "$SYS_PID" 2>/dev/null || true; }; rm -rf /tmp/rawe2e-* 2>/dev/null || true' EXIT
     else
         echo "[WARN] could not pause system daemon — hot-plug may interfere"
     fi
 fi
+# T53-06: sistem daemon'ı duraklatılmadıysa da bayat workdir'leri süpür.
+if [[ -z "$(trap -p EXIT)" ]]; then
+    trap 'rm -rf /tmp/rawe2e-* 2>/dev/null || true' EXIT
+fi
+
+E2E_PHASE_TIMEOUT="${E2E_PHASE_TIMEOUT:-120}"
 
 run_phase() {
     local phase=$1
     echo
     echo "── phase: $phase ──"
-    "$HARNESS" --daemon "$DAEMON" --phase "$phase"
-    local rc=$?
+    local rc
+    # T53-05: her faza üst sınır — grab/poll asılması CI'yı sonsuza kilitlemesin.
+    # 124 = timeout; FAIL sayılır (77 çevre atlaması ayrı propagates).
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$E2E_PHASE_TIMEOUT" "$HARNESS" --daemon "$DAEMON" --phase "$phase"
+        rc=$?
+        if [[ $rc -eq 124 ]]; then
+            echo "[ERR] phase '$phase' ${E2E_PHASE_TIMEOUT}s içinde bitmedi — FAIL"
+            rc=1
+        fi
+    else
+        echo "[WARN] 'timeout' komutu yok — faz asılırsa CI kilitlenir" >&2
+        "$HARNESS" --daemon "$DAEMON" --phase "$phase"
+        rc=$?
+    fi
     # T30-N2: rc=77 ("environment unusable") is NOT a failed check — it must
     # propagate as a skip (exit 77) so CI can distinguish infra from failure.
     if [[ $rc -eq 0 ]]; then PASS=$((PASS+1));

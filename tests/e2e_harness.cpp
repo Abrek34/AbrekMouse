@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <cerrno>
 #include <fcntl.h>
 #include <fstream>
 #include <glob.h>
@@ -135,15 +137,34 @@ static bool read_output_events(struct libevdev* e, int timeout_ms,
                                std::vector<std::vector<out_event>>& frames,
                                std::vector<std::pair<int,int>>& rel_total) {
     const int fd = libevdev_get_fd(e);
-    const long deadline_ms = timeout_ms;
-    long waited_ms = 0;
+    // T53-07: gerçek geçen süreyi clock_gettime ile ölç — her tur "+=20"
+    // uydurmaydı; sürekli akışta sayaç gerçekte ~2× hızlı ilerleyip erken
+    // keserdi (yalancı FAIL) ve deadline sonrası meşgul-döngü olurdu.
+    auto now_ms = []() -> long {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    };
+    const long start_ms = now_ms();
     std::vector<out_event> cur;
     int64_t cur_rx = 0, cur_ry = 0;
     frames.clear();
     rel_total.clear();
+    bool drained_after_deadline = false;
     for (;;) {
+        const long elapsed_ms = now_ms() - start_ms;
+        int wait_ms;
+        if (elapsed_ms >= timeout_ms) {
+            // Deadline geçti: yalnızca bir drenaj pası daha (poll(0));
+            // ikinci turda çık — meşgul-döngü yok.
+            if (drained_after_deadline) break;
+            drained_after_deadline = true;
+            wait_ms = 0;
+        } else {
+            wait_ms = timeout_ms - (int)elapsed_ms;
+        }
         struct pollfd pfd{ fd, POLLIN, 0 };
-        int pr = poll(&pfd, 1, waited_ms >= deadline_ms ? 0 : deadline_ms - waited_ms);
+        int pr = poll(&pfd, 1, wait_ms);
         if (pr == 0) break;                      // no more activity
         if (pr < 0) { if (errno == EINTR) continue; return false; }
         struct input_event ev;
@@ -162,15 +183,23 @@ static bool read_output_events(struct libevdev* e, int timeout_ms,
             }
         }
         if (rc < 0 && rc != -EAGAIN) return false;
-        waited_ms += 20;
     }
     return true;
 }
 
-static void send_events(struct libevdev_uinput* src,
+// T53-08: yazım hatasını yutma — hangi olayda takıldığını bas, false dön.
+static bool send_events(struct libevdev_uinput* src,
                         const std::vector<std::tuple<uint16_t,uint16_t,int32_t>>& evs) {
-    for (auto& [t, c, v] : evs)
-        libevdev_uinput_write_event(src, t, c, v);
+    for (size_t i = 0; i < evs.size(); ++i) {
+        auto& [t, c, v] = evs[i];
+        int rc = libevdev_uinput_write_event(src, t, c, v);
+        if (rc != 0) {
+            fprintf(stderr, "send_events: olay #%zu (type=%u code=%u val=%d) yazım hatası: %s\n",
+                    i, t, c, v, strerror(-rc));
+            return false;
+        }
+    }
+    return true;
 }
 
 // ── config generation ────────────────────────────────────────────────────────
@@ -210,14 +239,29 @@ static std::string config_json(const std::string& device_id, bool raw) {
 
 // ── phase implementations ────────────────────────────────────────────────────
 static int g_daemon_pid = -1;
-static pid_t g_sys_daemon = -1;
 
 static void cleanup() {
-    if (g_daemon_pid > 0) { kill(g_daemon_pid, SIGTERM); waitpid(g_daemon_pid, nullptr, 0); g_daemon_pid = -1; }
-    if (g_sys_daemon > 0) { // resume the system daemon if we paused it
-        kill(g_sys_daemon, SIGCONT);
-        g_sys_daemon = -1;
+    if (g_daemon_pid > 0) {
+        kill(g_daemon_pid, SIGTERM);
+        // T53-09: sınırsız waitpid yerine sınırlı bekle + SIGKILL tırmanışı.
+        int status = 0;
+        bool reaped = false;
+        for (int i = 0; i < 30; ++i) {   // ~3 sn
+            pid_t r = waitpid(g_daemon_pid, &status, WNOHANG);
+            if (r == g_daemon_pid) { reaped = true; break; }
+            usleep(100000);
+        }
+        if (!reaped) {
+            fprintf(stderr, "cleanup: daemon (pid %d) SIGTERM'e 3s yanıt vermedi — SIGKILL\n",
+                    g_daemon_pid);
+            kill(g_daemon_pid, SIGKILL);
+            waitpid(g_daemon_pid, &status, 0);
+        }
+        g_daemon_pid = -1;
     }
+    // NOT: sistem daemon'ı SIGCONT ile sürdürme sorumluluğu run_e2e.sh'ın
+    // EXIT tuzağında; burada g_sys_daemon alanı ölü koddu (hiç atanmıyordu),
+    // kaldırıldı.
 }
 
 static int run_checks(const char* daemon_path, const std::string& prefix,
@@ -242,6 +286,21 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
 
     std::string out_node;
     if (!wait_for_output_device(prefix, 5000, out_node)) {
+        // Canlı bir YABANCI daemon (örn. sistem daemon'ı, root'suz ortamda
+        // durdurulamıyor) PID-dosyası üzerinden temiz-oda daemon'ının
+        // başlamasını engelliyorsa bu, ürün hatası değil çevre koşuludur →
+        // FAIL yerine 77 (skip) döndür.
+        std::string log;
+        { std::ifstream lf(log_path); log.assign(std::istreambuf_iterator<char>(lf),
+                                                 std::istreambuf_iterator<char>()); }
+        if (log.find("Another instance") != std::string::npos ||
+            log.find("PID file exists") != std::string::npos) {
+            fprintf(stderr, "daemon başlayamadı — başka canlı instance var (ortam 77): %s\n",
+                    log_path.c_str());
+            cleanup();
+            libevdev_uinput_destroy(src);
+            return 77;
+        }
         report(false, "daemon output device appeared", "(check daemon.log)");
         cleanup();
         libevdev_uinput_destroy(src);
@@ -261,8 +320,8 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
     if (!raw) {
         // T-A1: single motion frame, one SYN, classic linear gain = 1+accel = ×3.
         // Input (20,10) → exactly (60,30) — speed independent, deterministic.
-        send_events(src, { {EV_REL, REL_X, 20}, {EV_REL, REL_Y, 10},
-                           {EV_SYN, SYN_REPORT, 0} });
+        if (!send_events(src, { {EV_REL, REL_X, 20}, {EV_REL, REL_Y, 10},
+                           {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; }
         if (!read_output_events(out, 400, frames, rel_totals)) { report(false, "T-A1 read", "read error"); }
         bool syn_ok = frames.size() == 1;
         bool amp_ok = false;
@@ -279,8 +338,8 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
 
         // T-A2: button between REL and SYN is buffered into the SAME frame
         // (SM-2) — one SYN, button present, order [REL, BTN, SYN].
-        send_events(src, { {EV_REL, REL_X, 10}, {EV_KEY, BTN_LEFT, 1},
-                           {EV_REL, REL_Y, 5}, {EV_SYN, SYN_REPORT, 0} });
+        if (!send_events(src, { {EV_REL, REL_X, 10}, {EV_KEY, BTN_LEFT, 1},
+                           {EV_REL, REL_Y, 5}, {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; }
         frames.clear(); rel_totals.clear();
         if (!read_output_events(out, 400, frames, rel_totals)) { report(false, "T-A2 read", "read error"); }
         bool t2ok = false;
@@ -299,7 +358,7 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
         if (!t2ok) printf("       frames=%zu\n", frames.size());
 
         // T-A3: button-only frame (no motion) — still one SYN, no ghost motion.
-        send_events(src, { {EV_KEY, BTN_RIGHT, 1}, {EV_SYN, SYN_REPORT, 0} });
+        if (!send_events(src, { {EV_KEY, BTN_RIGHT, 1}, {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; }
         frames.clear(); rel_totals.clear();
         if (!read_output_events(out, 400, frames, rel_totals)) { report(false, "T-A3 read", "read error"); }
         bool t3ok = frames.size() == 1;
@@ -315,12 +374,12 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
         // T-A4: LOW-1 coalesced second frame that arrives WITHOUT a trailing
         // SYN in one write; the deferred frame must flush at the *next* real
         // SYN in a separate frame, never with a synthetic/double SYN.
-        send_events(src, { {EV_REL, REL_X, 6}, {EV_REL, REL_Y, 4},
-                           {EV_SYN, SYN_REPORT, 0} });
+        if (!send_events(src, { {EV_REL, REL_X, 6}, {EV_REL, REL_Y, 4},
+                           {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; }
         usleep(80000); // let the daemon process frame 1
-        send_events(src, { {EV_REL, REL_X, 2} }); // half-frame: no SYN sent yet
+        if (!send_events(src, { {EV_REL, REL_X, 2} })) { cleanup(); libevdev_uinput_destroy(src); return 77; } // half-frame: no SYN sent yet
         usleep(80000); // daemon sees the +2 with no SYN (deferred, LOW-1)
-        send_events(src, { {EV_SYN, SYN_REPORT, 0} }); // real closing SYN
+        if (!send_events(src, { {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; } // real closing SYN
         frames.clear(); rel_totals.clear();
         if (!read_output_events(out, 700, frames, rel_totals)) { report(false, "T-A4 read", "read error"); }
         // Expect exactly 2 output frames: f1 = (6,4) amplified, f2 = (+2) amplified.
@@ -333,8 +392,8 @@ static int run_checks(const char* daemon_path, const std::string& prefix,
         }
     } else {
         // T-B1: raw 1:1 — output stream must be byte-identical to input.
-        send_events(src, { {EV_REL, REL_X, 7}, {EV_REL, REL_Y, 5},
-                           {EV_KEY, BTN_LEFT, 1}, {EV_SYN, SYN_REPORT, 0} });
+        if (!send_events(src, { {EV_REL, REL_X, 7}, {EV_REL, REL_Y, 5},
+                           {EV_KEY, BTN_LEFT, 1}, {EV_SYN, SYN_REPORT, 0} })) { cleanup(); libevdev_uinput_destroy(src); return 77; }
         frames.clear(); rel_totals.clear();
         if (!read_output_events(out, 400, frames, rel_totals)) { report(false, "T-B1 read", "read error"); }
         bool t1ok = frames.size() == 1 && rel_totals[0].first == 7 && rel_totals[0].second == 5;
@@ -377,14 +436,52 @@ int main(int argc, char** argv) {
         return 77;
     }
 
+    // T53-06: bayat workdir'leri erken temizle (pid-reuse'da eski cfg/pid/sock
+    // yeni koşuyu kirletmesin). /tmp/rawe2e-* kalıbındaki tüm dizinler.
+    {
+        glob_t g{};
+        if (glob("/tmp/rawe2e-*", 0, nullptr, &g) == 0) {
+            for (size_t i = 0; i < g.gl_pathc; ++i) {
+                struct stat st;
+                if (stat(g.gl_pathv[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+                    const char* names[] = {"cfg.json", "daemon.log",
+                                           "rawaccel.pid", "rawaccel.sock"};
+                    for (const char* n : names) {
+                        std::string p = std::string(g.gl_pathv[i]) + "/" + n;
+                        unlink(p.c_str());
+                    }
+                    rmdir(g.gl_pathv[i]);
+                }
+            }
+        }
+        globfree(&g);
+    }
+
+    // mktemp ile benzersiz workdir — sabit /tmp/rawe2e-<pid> pid-reuse ile
+    // bayat dosyalarla kirlenebiliyordu.
+    char tmpl[] = "/tmp/rawe2e-XXXXXX";
+    const char* wd = mkdtemp(tmpl);
+    if (!wd) {
+        perror("mkdtemp");
+        return 77;
+    }
+    const std::string workdir = wd;
     const std::string prefix = "RAE2E-" + std::to_string(getpid());
-    const std::string workdir = "/tmp/rawe2e-" + std::to_string(getpid());
-    mkdir(workdir.c_str(), 0700);
 
     int rc = run_checks(daemon_path, prefix, phase == "raw", workdir);
     if (g_ok && rc == 0) printf("%s phase: ALL PASS\n", phase.c_str());
+    else if (rc == 77) printf("%s phase: SKIP (ortam/çevre)\n", phase.c_str());
     else printf("%s phase: FAILURES\n", phase.c_str());
     printf("  checks run: %d\n", g_checks);
-    rmdir(workdir.c_str());
+    // Düzgün süpürme: rmdir yalnız boş dizinde işe yarar; içindeki dosyalar
+    // tek tek unlink edilir (eski kod her fazda /tmp/rawe2e-<pid> bırakıyordu).
+    {
+        const char* names[] = {"cfg.json", "daemon.log", "rawaccel.pid", "rawaccel.sock"};
+        for (const char* n : names) {
+            std::string p = workdir + "/" + n;
+            unlink(p.c_str());
+        }
+        rmdir(workdir.c_str());
+    }
     return (rc != 0) ? rc : (g_ok ? 0 : 1);
 }
