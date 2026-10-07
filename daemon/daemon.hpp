@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <memory>
 #include <cstdint>
+#include <limits>
 
 namespace rawaccel {
 

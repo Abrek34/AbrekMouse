@@ -746,10 +746,28 @@ bool AccelDaemon::open_input_device(mouse_device& dev) {
                         (iid.vendor != 0 || iid.product != 0));
 
     if (has_vid_pid) {
-        // "usb:045e:082a:SERIAL" — unique per physical device even without serial
         char id_buf[512];
-        snprintf(id_buf, sizeof(id_buf), "usb:%04x:%04x:%s",
-                 iid.vendor, iid.product, uniq);
+        if (uniq[0] != '\0') {
+            snprintf(id_buf, sizeof(id_buf), "usb:%04x:%04x:%s",
+                     iid.vendor, iid.product, uniq);
+        } else {
+            // T40-HP01: two same-model mice with an empty EVIOCGUNIQ serial
+            // would both get "usb:VVVV:PPPP:" and the second would be
+            // duplicate-skipped (never grabbed).  Disambiguate with the
+            // per-port phys string, falling back to the canonical by-id path.
+            char phys[256] = {};
+            if (ioctl(dev.fd_in, EVIOCGPHYS(sizeof(phys) - 1), phys) < 0)
+                phys[0] = '\0';
+            phys[sizeof(phys) - 1] = '\0';
+            if (phys[0] != '\0') {
+                snprintf(id_buf, sizeof(id_buf), "usb:%04x:%04x:phys:%s",
+                         iid.vendor, iid.product, phys);
+            } else {
+                const std::string canon = resolve_stable_id(dev.path);
+                snprintf(id_buf, sizeof(id_buf), "usb:%04x:%04x:%s",
+                         iid.vendor, iid.product, canon.c_str());
+            }
+        }
         dev.device_id = std::string(id_buf);
     } else if (uniq[0] != '\0') {
         // No vid/pid but has serial — use serial alone
@@ -2097,6 +2115,22 @@ void AccelDaemon::run_loop() {
             std::lock_guard<std::mutex> lk(devices_mutex_);
             devices_empty = devices_.empty();
         }
+        // D26-N5: a deny window that expires while devices_ is non-empty (and
+        // nothing transient re-armed rescan_needed_) would leave the device
+        // grab-less forever — the periodic rescan only runs when devices_ is
+        // empty or rescan_needed_ is set.  Watch the earliest deny expiry and
+        // kick one self-heal scan past it; the scan prunes expired entries and
+        // retries the node.
+        {
+            double earliest = std::numeric_limits<double>::infinity();
+            for (const auto& kv : path_deny_until_ms_)
+                earliest = std::min(earliest, kv.second);
+            for (const auto& kv : dev_deny_until_ms_)
+                earliest = std::min(earliest, kv.second);
+            if (earliest != std::numeric_limits<double>::infinity() &&
+                now_ms() >= earliest)
+                rescan_needed_.store(true);
+        }
         if (devices_empty || rescan_needed_.load()) {
             const double t = now_ms();
             if (t >= empty_rescan_ms_) {
@@ -2230,12 +2264,21 @@ static inline uint64_t now_ns() {
 /// always-respected no-op default keeps the single-event raw-path callers
 /// unchanged (a lone dropped event is harmless); the batched flush passes the
 /// daemon's log() so a dropped SYN frame is visible.
+/// budget is bounded so a fully-stuck consumer costs at most a few ms of
+/// motor stutter plus a loud log + device teardown (never a deadlocked
+/// loop thread) instead of a silent drop.
 static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbytes,
                                const std::function<void(const std::string&)>& report = {}) {
     constexpr int   kMaxAttempts = 32;
     constexpr int   kMinDelayUs  = 50;
-    constexpr int   kMaxDelayUs  = 4000;
+    // D26-N3: cap each EAGAIN sleep at ~2 ms (was 4 ms exponential, up to
+    // ~120 ms per frame); with the sleep-count cap below the worst-case
+    // block of the single loop thread is ~4 ms, not ~120 ms — other devices
+    // are no longer frozen with a stuck consumer.
+    constexpr int   kMaxDelayUs  = 2000;
+    constexpr int   kMaxEagainSleeps = 2;
     int             delay        = kMinDelayUs;
+    int             eagain_sleeps = 0;
     size_t          done         = 0;
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
         const uint8_t* p   = reinterpret_cast<const uint8_t*>(ev) + done;
@@ -2244,6 +2287,13 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
         if (got < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // D26-N3: only a couple of short sleeps per frame — past
+                // that, report failure (caller drops this frame and logs)
+                // instead of blocking the shared loop thread.
+                if (++eagain_sleeps > kMaxEagainSleeps) {
+                    if (report) report("uinput write: consumer stuck (EAGAIN) — frame dropped, see drop counter");
+                    return false;
+                }
                 struct timespec ts;
                 ts.tv_sec  = delay / 1'000'000;
                 ts.tv_nsec = static_cast<long>(delay % 1'000'000) * 1000;
@@ -2265,6 +2315,11 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
     // on every compositor/kernel stall.  Surface it through the report hook,
     // throttled to one message per ~2 s so a fully-stuck consumer can't flood
     // the log.
+    // D26-N2: attempt budget exhausted with `done < nbytes` — the tail (usually
+    // the closing SYN_REPORT) was dropped.  Report it (throttled to one message
+    // per ~2 s so a fully-stuck consumer can't flood the log) AND return false:
+    // the caller must not be told "all clear", a silent drop masked these on
+    // every compositor/kernel stall.
     if (done < nbytes) {
         static double last_log_ms = -1e9;
         const double   now_l      = now_ms();
@@ -2277,6 +2332,7 @@ static bool uinput_write_retry(int fd, const struct input_event* ev, size_t nbyt
                                "-byte frame after " +
                                std::to_string(kMaxAttempts) + " attempts).");
         }
+        return false;
     }
     return true;
 }
@@ -2800,13 +2856,17 @@ for (size_t i = 0; i < read_count; ++i) {
                 } else if (queued_count < queued_events.size()) {
                     queued_events[queued_count++] = ev;
                 } else {
-                    // Pathological >16-event burst: forwarding the subtype now
-                    // (before its queued slot data) beats dropping it.
-                    if (!flush_queued()) return;
-                    if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
-                        { dev.disconnected = true; return; }
-                    wrote_unsynced_event = true;
+                    // D26-N4: a >16 pre-SYN non-motion burst used to flush
+                    // the queue early and split the frame as
+                    // [B…B][REL,REL,SYN].  Drop the overflow event instead,
+                    // count+log it (throttled), and keep frame order intact.
+                    static double n4a_last_log = -1e9;
+                    const double  n4a_now      = now_ms();
+                    if (out.drop_report &&
+                        (n4a_last_log < 0 || n4a_now - n4a_last_log >= 2000.0)) {
+                        n4a_last_log = n4a_now;
+                        out.drop_report("D26-N4: non-motion queue overflow (>16) — event dropped to preserve frame order");
+                    }
                 }
                 continue;
             }
@@ -2886,15 +2946,16 @@ for (size_t i = 0; i < read_count; ++i) {
                 } else if (queued_count < queued_events.size()) {
                     queued_events[queued_count++] = ev;
                 } else {
-                    // A run of >16 pre-SYN non-motion events is pathological;
-                    // write the backlog now rather than drop buttons (SM-2 only
-                    // forbids flushing MOTION before the SYN — forwarding the
-                    // non-motion group early changes no interval).
-                    if (!flush_queued()) return;
-                    if (!out.flush(uidev)) { dev.disconnected = true; return; }
-                    if (!uinput_write_retry_ev(uidev, ev.type, ev.code, ev.value, out.drop_report))
-                        { dev.disconnected = true; return; }
-                    wrote_unsynced_event = true;
+                    // D26-N4: see the SYN_MT_REPORT branch above — overflow
+                    // drops the event (throttled log) instead of flushing
+                    // early and reordering the frame.
+                    static double n4b_last_log = -1e9;
+                    const double  n4b_now      = now_ms();
+                    if (out.drop_report &&
+                        (n4b_last_log < 0 || n4b_now - n4b_last_log >= 2000.0)) {
+                        n4b_last_log = n4b_now;
+                        out.drop_report("D26-N4: non-motion queue overflow (>16) — event dropped to preserve frame order");
+                    }
                 }
             }
         } else {

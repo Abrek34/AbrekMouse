@@ -2,21 +2,48 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v1.2.6** — native Logitech HID++ hardware controls for DPI,
+> **Current state: v1.2.7** — native Logitech HID++ hardware controls for DPI,
 > report rate, and sensor lift-off distance. Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
 >
-> ⚠️ **Verification status, stated plainly.** The seven gates in
+> **Verification status, stated plainly.** The seven gates in
 > [AGENTS.md](AGENTS.md) are green, and the acceleration was confirmed working
 > on real hardware (gain 1.27–1.58 against a configured limit of 1.8). But no
 > GitHub Actions run has ever completed for this repository — every run stops
 > in ~5 s with an account billing lock — so no commit here is CI-verified, and
 > `test_accel.cpp` is sanitized only by `tests/run_tests_asan.sh`, which is
-> **not** one of the seven. v1.2.6 closed the M101 audit's data-loss and
-> silent-success classes (see its changelog entry), but the same CI and
-> hardware limits still apply: this is not a "verified on an installed system"
-> claim. See the [1.2.6 changelog entry](CHANGELOG.md) before treating this as
-> install-ready.
+> **not** one of the seven. v1.2.7 closed the audit-round fix pack (see its
+> changelog entry), but the same CI and hardware limits still apply: this is
+> not a "verified on an installed system" claim. See the
+> [1.2.7 changelog entry](CHANGELOG.md) before treating this as install-ready.
+
+## Verification status (v1.2.7)
+
+Measured on the v1.2.7 tree (2026-10-07):
+
+- Build: **0 warnings**
+- Unit tests: **34267/34267**
+- Differential oracle vs the vendored OFFICIAL reference: **OK** (no new deviations)
+- SIMD parity: **PASS**
+- CLI under ASan/UBSan: **clean**; daemon/CLI under ASan: **clean**
+- Fuzz: **no crashes** (5.3M execs)
+- E2E: **ALL PASS**
+
+Caveat: the GitHub Actions CI account billing lock is unchanged — none of the
+above ran in CI (see the note above).
+
+**Open KRİTİK/YÜKSEK shortlist (triaged against CHANGELOG/FIX_LOG, v1.2.7):**
+
+- `T40-HP01` (YÜKSEK): two same-model mice with empty `serial_no` share one
+  `device_id`, so the second one is never grabbed (`daemon/daemon.cpp`). Real,
+  still open.
+- Legacy entries from TUR 15/16 with no closure record and no status line
+  (needs re-triage, not counted as confirmed-open): `C-6`, `BS-1`, `BS-2`,
+  `BS-3`, `BS-4`.
+- Everything else previously tagged KRİTİK/YÜKSEK (`GUI-K1`, `HP-1`, `PID-1`,
+  `GUI-Y1/Y2`, `D26-N1`, `C29-N1`, `MATH-2`, `O31-D1`, `O31-L4`,
+  `T35-DMN01`, `T38-HOT02`, `T45-IMP02`, `T51-06`, `SM-1..SM-5`, `BUG-CRIT-*`,
+  `BUG-HIGH-*`) is closed with a recorded fix or a documented design decision.
 
 ## Features
 
@@ -100,7 +127,7 @@ sudo bash setup.sh --reinstall    # clean old install, then reinstall (default)
 backwards compatibility).
 
 > **Arch package coexistence**: on Arch-based distros you can instead install
-> the packaged binary (`packaging/rawaccel-linux-1.1.0-1-x86_64.pkg.tar.zst`,
+> the packaged binary (`packaging/rawaccel-linux-1.2.7-1-x86_64.pkg.tar.zst`,
 > `sudo pacman -U ...`) or publish it via an AUR package. Do **not** mix
 > `setup.sh` and the pacman package: both install the systemd unit to the same
 > path (`/usr/lib/systemd/system/rawaccel.service`) and both install the
