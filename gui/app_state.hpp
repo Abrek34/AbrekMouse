@@ -27,6 +27,10 @@
 #include <pwd.h>
 #include <initializer_list>
 
+// Forward declaration for AppState::hw_pending_apply (defined in
+// gui/hidpp_panel.inl).
+struct HwApplyTask;
+
 #include "../include/rawaccel.hpp"
 #include "../include/config.hpp"
 #include "../include/logitech_hidpp.hpp"
@@ -283,6 +287,12 @@ struct AppState {
     // onboard DPI/rate/LOD widgets showing the previous device's values.  The
     // completion idle callback re-runs the query for this index once free.
     int        hw_pending_query = -1;
+    // T48-01: an Apply clicked while another scan/query/apply worker was
+    // running used to spawn a second worker on the same hidraw node.  The
+    // task is stashed here and started when the in-flight worker's idle
+    // callback clears hw_busy.  Deleted on teardown via the same destroy
+    // path that sets hw_cancel.
+    struct HwApplyTask* hw_pending_apply = nullptr;
     // P169 — battery / capability rows (read-only, updated by the same worker
     // threads that run the scan/query/notification loops).
     GtkWidget* hw_battery_lbl   = nullptr;    // live level/charging/online + family

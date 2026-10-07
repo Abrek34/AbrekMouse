@@ -169,13 +169,19 @@ install(FILES scripts/99-rawaccel.rules
 # overwrote it unconditionally.  Copy the default only when absent.
 set(RAWACCEL_DEFAULT_CONFIG "${CMAKE_SOURCE_DIR}/config/default.json")
 install(CODE "
-    file(MAKE_DIRECTORY \"/etc/rawaccel\")
-    if(NOT EXISTS \"/etc/rawaccel/settings.json\")
-        file(COPY \"${RAWACCEL_DEFAULT_CONFIG}\" DESTINATION \"/etc/rawaccel\"
-             RENAME settings.json)
-        message(STATUS \"RawAccel: installed default config to /etc/rawaccel/settings.json\")
+    # T37-BLD01: honor DESTDIR (packaging) — writing to the host /etc during
+    # \`DESTDIR=\$pkgdir cmake --install\` would pollute the build machine and
+    # decide package contents based on host state.
+    set(_rawa_destdir \"\$ENV{DESTDIR}\")
+    set(_rawa_confdir \"\${_rawa_destdir}/etc/rawaccel\")
+    file(MAKE_DIRECTORY \"\${_rawa_confdir}\")
+    if(NOT EXISTS \"\${_rawa_confdir}/settings.json\")
+        file(COPY \"${RAWACCEL_DEFAULT_CONFIG}\" DESTINATION \"\${_rawa_confdir}\")
+        file(RENAME \"\${_rawa_confdir}/default.json\"
+                      \"\${_rawa_confdir}/settings.json\")
+        message(STATUS \"RawAccel: installed default config to \${_rawa_confdir}/settings.json\")
     else()
-        message(STATUS \"RawAccel: keeping existing /etc/rawaccel/settings.json\")
+        message(STATUS \"RawAccel: keeping existing \${_rawa_confdir}/settings.json\")
     endif()
 ")
 

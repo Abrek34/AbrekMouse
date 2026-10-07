@@ -16,7 +16,9 @@
 #   sudo usermod -aG input $USER   # then log out and back in
 
 # uinput: virtual device creation
-KERNEL=="uinput", MODE="0660", GROUP="input", TAG+="uaccess"
+# T51-17: drop TAG+="uaccess" (any active local user could inject input);
+# the 'input' group is the intended boundary.  Pin SUBSYSTEM=="misc".
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"
 
 # Physical input event nodes — only for Logitech mice (vendor ID 0x046d)
 KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="046d", GROUP="input", MODE="0660", TAG+="uaccess"

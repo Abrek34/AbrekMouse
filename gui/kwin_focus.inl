@@ -179,7 +179,7 @@ static void focus_worker_main(kwin_focus_ctx* ctx) {
                     accepted = true; // PID unreachable — fall back to accepting
                 }
             } else {
-                if (derr) g_error_free(derr);
+                g_clear_error(&derr);
                 accepted = true; // bus refused the lookup — fall back to accepting
             }
         }
@@ -254,7 +254,7 @@ static int kwin_script_load_and_run_sync(GDBusConnection* conn) {
         g_variant_new("(ss)", path.c_str(), "rawaccel_focus_relay"),
         G_VARIANT_TYPE("(i)"),
         G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &err);
-    if (!result) { g_error_free(err); return -1; }
+    if (!result) { g_clear_error(&err); return -1; }
     gint script_id = 0;
     g_variant_get(result, "(i)", &script_id);
     g_variant_unref(result);
@@ -267,17 +267,17 @@ static int kwin_script_load_and_run_sync(GDBusConnection* conn) {
             g_variant_new("(s)", "rawaccel_focus_relay"),
             nullptr, G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &err);
         if (result) g_variant_unref(result);
-        if (err) g_error_free(err);
+        g_clear_error(&err); // free AND reset to nullptr before reuse
         result = g_dbus_connection_call_sync(
             conn, "org.kde.KWin", "/Scripting",
             "org.kde.kwin.Scripting", "loadScript",
             g_variant_new("(ss)", path.c_str(), "rawaccel_focus_relay"),
             G_VARIANT_TYPE("(i)"),
             G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &err);
-        if (!result) return -1;
+        if (!result) { g_clear_error(&err); return -1; }
         g_variant_get(result, "(i)", &script_id);
         g_variant_unref(result);
-        if (script_id < 0) return -1;
+        if (script_id < 0) { g_clear_error(&err); return -1; }
     }
 
     // 4. run() the script: /Scripting/Script<id> → org.kde.kwin.Script.run
@@ -288,7 +288,7 @@ static int kwin_script_load_and_run_sync(GDBusConnection* conn) {
         nullptr, nullptr,
         G_DBUS_CALL_FLAGS_NONE, 3000, nullptr, &err);
     if (result) g_variant_unref(result);
-    if (err) g_error_free(err);  // may fail if KWin has no Workspace yet, ignore
+    g_clear_error(&err);  // may fail if KWin has no Workspace yet, ignore
 
     return script_id;
 }
@@ -302,7 +302,7 @@ static void kwin_script_unload_sync(GDBusConnection* conn) {
         g_variant_new("(s)", "rawaccel_focus_relay"),
         nullptr, G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, &err);
     if (result) g_variant_unref(result);
-    if (err) g_error_free(err);
+    g_clear_error(&err);
 }
 
 // ── GBus callbacks ───────────────────────────────────────────────────────────
@@ -311,12 +311,12 @@ static void on_bus_acquired(GDBusConnection* conn, const gchar*, gpointer user_d
     auto* ctx = static_cast<kwin_focus_ctx*>(user_data);
     GError* err = nullptr;
     GDBusNodeInfo* node = g_dbus_node_info_new_for_xml(FOCUS_NODE_XML, &err);
-    if (!node) { g_error_free(err); return; }
+    if (!node) { g_clear_error(&err); return; }
     GDBusInterfaceInfo* iface = g_dbus_node_info_lookup_interface(node, "org.rawaccel.Focus");
     if (iface) {
         ctx->obj_reg_id = g_dbus_connection_register_object(
             conn, "/Focus", iface, &focus_vtable, ctx, nullptr, &err);
-        if (ctx->obj_reg_id == 0) g_error_free(err);
+        if (ctx->obj_reg_id == 0) g_clear_error(&err);
     }
     g_dbus_node_info_unref(node);
 }
@@ -361,7 +361,7 @@ static bool kwin_focus_install(AppState* S) {
     GError* err = nullptr;
     ctx.session_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &err);
     if (!ctx.session_conn) {
-        g_error_free(err);
+        g_clear_error(&err);
         // R13-KWINOWN: we already own the name — release it so this failed
         // install cannot leave org.rawaccel.Focus owned for the whole session
         // (a second instance's g_bus_own_name would then always fail).

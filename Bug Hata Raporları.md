@@ -2077,14 +2077,14 @@ Analiz tarihi: 2026-09-13
 Kapsam: Tüm ağaç (`daemon/`, `gui/`, `include/`, `src/`, `cli/`, `scripts/`, `packaging/`, `.github/`, docs)
 Yöntem: Satır-satır kaynak taraması + sürüm/parite çapraz kontrolü. Yönerge gereği her bulgu bulunduğu anda bu dosyaya loglanıp analize devam edilmiştir.
 Durum: AÇIK (aşağıdaki maddeler bu turda bulundu, fix bekliyor)
-> Not (2026-10-07): Bu turun maddelerinden 1.2.7 paketiyle kapananlar kendi Durum satırlarında ✅ DÜZELTİLDİ olarak işaretlendi (T35-DMN01, T37-HID01, T38-HOT02, T40-PID01, T43-05, T44-01, T45-IMP02, T46-01, T47-B1, T48-05, T51-06, T53-01, CFG-2, D26-N1, C29-N1). Kalan "AÇIK" satırları v1.2.7 itibarıyla gerçekten açık olan maddelerdir (ör. T34-VERS1 `.SRCINFO` bayatlığı, T35-DMN02..07, T36-*, T37-HID02/03/BLD*, T38-HOT01/03..06, T39-*, T40-HP01/PID02/SIG01/HP02, T41-*..T52-*, T53-02..16 — bireysel Durum satırlarına bkz.).
+> Not (2026-10-07): Bu turun maddelerinden 1.2.7 paketiyle kapananlar kendi Durum satırlarında ✅ DÜZELTİLDİ olarak işaretlendi (T35-DMN01, T37-HID01, T38-HOT02, T40-PID01, T43-05, T44-01, T45-IMP02, T46-01, T47-B1, T48-05, T51-06, T53-01, CFG-2, D26-N1, C29-N1). Kalan "AÇIK" satırları v1.2.7 itibarıyla gerçekten açık olan maddelerdir (ör. T34-VERS1 `.SRCINFO` bayatlığı, T35-DMN03..07, T36-*, T37-HID02/03/BLD*, T38-HOT01/03..06, T39-*, T40-HP01/PID02/SIG01/HP02, T41-*..T52-*, T53-02..16 — bireysel Durum satırlarına bkz.).
 
 **T34-VERS1 · ORTA · `.SRCINFO` bayat — pkgver 1.1.0, kod 1.2.0 + arch eksik**
 - Konum: `packaging/.SRCINFO:3` (`pkgver = 1.1.0`, `arch = x86_64` tek) vs `packaging/PKGBUILD:14-17` (`pkgver=1.2.0`, `arch=('x86_64' 'aarch64')`), `include/rawaccel-base.hpp:9` (`1.2.0`), `CMakeLists.txt:2` (`1.2.0`), `CHANGELOG.md:9` (`[1.2.0]`)
 - Kategori: Paketleme / tutarlılık
 - Açıklama: PKG-1 daha önce "ağaçta teyit (pkgver 1.1.0)" diye kapatılmıştı ama 1.2.0 bump'ında PKGBUILD güncellenmiş, `.SRCINFO` yeniden üretilmemiş. AUR meta verisi eski sürümü ilan eder; aarch64 kullanıcısı yanlış arch ile karşılaşır. `.SRCINFO` içinde `optdepends qt6-tools` satırı da eksik (PKGBUILD:23'te var).
 - Öneri: `cd packaging && makepkg --printsrcinfo > .SRCINFO` ile yeniden üret (PKG-1'in kendi önerisi).
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `packaging/.SRCINFO` `makepkg --printsrcinfo` ile yeniden üretildi: `pkgver = 1.2.7`, `arch = x86_64` + `aarch64`, eksik `optdepends = qt6-tools` eklendi; PKGBUILD/CMakeLists/base.hpp 1.2.7 ile senkron.
 
 **T34-VERS2 · DÜŞÜK · `README.md` bayat sürüm iddiaları (1.1.0 → 1.2.0 drift)**
 - Konum: `README.md:5` (`Current state: v1.1.0`), `README.md:90` (`rawaccel-linux-1.1.0-1-x86_64.pkg.tar.zst`), `README.md:76` (`RawAccel 1.1.0+ relies on...`) vs `include/rawaccel-base.hpp:9` (`1.2.0`)
@@ -2112,7 +2112,7 @@ Yöntem: Paralel daemon agent + satır doğrulama. HP-1/HP-2/HP-3, R10-EIO/REGRB
 - Kategori: Thread safety / kilit süresi
 - Açıklama: `epoll_ctl(DEL)` + `libevdev_uinput_destroy` (ioctl+close) + `ioctl(EVIOCGRAB,0)+close` kilit altında. `teardown_devices` ve `do_hotplug_scan` removal aynı işi kilit dışında (`to_destroy` vektörü) yapar — kod kendi kuralını ihlal eder. Disable'lı reload/app-switch anında `status_json()` ve loop dispatch aynı mutex'te bekler.
 - Öneri: Kilit altında yalnız `epoll_del+map erase`, destroy/ungrab/close'u kilit dışında `to_destroy` ile yap.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: DÜZELTİLDİ (2026-10-07) — `release_device()` artık yalnız `epoll_ctl(DEL)` + map erase (`fd_to_dev_`/`opened_paths_`/`opened_device_ids_`) yapıyor; bloklayan `libevdev_uinput_destroy` + `ioctl(EVIOCGRAB,0)` + `close()` yeni `destroy_device()`'e taşındı ve `apply_new_config()`/`apply_active_app()` içinde kilit bırakıldıktan SONRA `to_destroy` vektörüyle çalıştırılıyor (teardown_devices/do_hotplug_scan ile aynı kalıp). Build 0 uyarı/0 hata, run_tests EXIT=0, oracle EXIT=0.
 
 **T35-DMN03 · DÜŞÜK · Motion frame başına 3. `clock_gettime` (doküman 2 diyor)**
 - Konum: `daemon/daemon.cpp:2253` (`lat_anchor=now_ns`) + `2055` (`t_now=now_ns`) + `2144/2478` (`last_time_ms=now_ms()` üzerine yazma)
@@ -2330,7 +2330,7 @@ Yöntem: Paralel HID++/scripts agent + satır doğrulama. N-SWID2/N-FDERR/N-EAGA
 - Kategori: Paketleme / doğruluk
 - Açıklama: Mutlak host yoluna bakıyor; `DESTDIR="$pkgdir" cmake --install` bunu öne eklemez. Host'ta `/etc/rawaccel/settings.json` varsa paket configsiz çıkar; yoksa pakete girer (tanımsız). Üstelik `package()` sırasında host `/etc`'ye yazmaya çalışır. N-CMOME yalnız üzerine-yazmayı düzeltti, DESTDIR'i değil.
 - Öneri: `$ENV{DESTDIR}` öne ekle veya config kurulumunu `install(FILES...)` + `backup=()`'a bırak.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `install(CODE)` artık hedef config dizinini `$ENV{DESTDIR}` önekine göre çözüyor; `DESTDIR=$pkgdir cmake --install` host `/etc`'ye dokunmadan `$pkgdir/etc/rawaccel/settings.json` kuruyor (idempotent `keeping existing` davranışı korundu). Ayrıca `file(COPY ... RENAME)` bu CMake sürümünde geçersiz olduğundan `file(COPY)` + `file(RENAME)`'e taşındı — paket smoke testi `/tmp/opencode/pkg/etc/rawaccel/settings.json` üretilmesiyle doğrulandı.
 
 **T37-BLD02 · DÜŞÜK · `rawaccel-linux.install` trigger kapsamı SH-4 gerisinde**
 - Konum: `packaging/rawaccel-linux.install:26` (`udevadm trigger` seçicisiz) vs `setup.sh:341` (`--subsystem-match=input --action=change`)
@@ -2386,7 +2386,7 @@ Yöntem: Paralel HID++/scripts agent + satır doğrulama. N-SWID2/N-FDERR/N-EAGA
 # TUR 34-37 ÖZET — ÖNCELİK SIRASI (2026-09-13 taze tur)
 
 **YÜKSEK:** T35-DMN01 (renumber kaybolma) — ✅ DÜZELTİLDİ (2026-10-07; Durum satırına bkz.)
-**ORTA:** T34-VERS1 (.SRCINFO), T35-DMN02 (release kilit), T36-GUI01 (CRUD UAF), T36-GUI03 (input_offset spin), T36-GUI04 (Y-LUT editör yok), T36-CLI01 (disable/match_app/use_raw_input CLI yok), T37-HID01 (write deadline yok), T37-HID02 (pil sırası), T37-HID03 (identify global bütçe yok), T37-BLD01 (CMake DESTDIR)
+**ORTA:** T34-VERS1 (.SRCINFO), T36-GUI01 (CRUD UAF), T36-GUI03 (input_offset spin), T36-GUI04 (Y-LUT editör yok), T36-CLI01 (disable/match_app/use_raw_input CLI yok), T37-HID01 (write deadline yok), T37-HID02 (pil sırası), T37-HID03 (identify global bütçe yok), T37-BLD01 (CMake DESTDIR)
 **DÜŞÜK/INFO:** T34-VERS2, T35-DMN03..07, T36-GUI02/GUI05/GUI06, T36-CLI02..06, T36-CFG01..03, T37-HID04..08, T37-BLD02..07, T37-TST01
 **Not:** TUR 34-37 maddelerinin hiçbiri önceki TURLAR/FIX_LOG'da yok (çapraz kontrol edildi). Satır numaraları 2026-09-13 ağacı.
 
@@ -3311,7 +3311,7 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Kategori: Udev
 - Açıklama: Aktif her kullanıcı tuş enjekte edebilir.
 - Öneri: `uinput` satırından `uaccess`'i kaldır (grup-yeter), `SUBSYSTEM=="misc"` ekle; `event*/hidraw*`'da tut.
-- Durum: AÇIK (2026-09-13 bulundu)
+- Durum: ✅ DÜZELTİLDİ (2026-10-07) — `uinput` satırından `TAG+="uaccess"` kaldırıldı, `SUBSYSTEM=="misc"` eklendi; yetki artık `GROUP="input", MODE="0660"` ile sınırlı. `event*`/`hidraw*` satırlarındaki uaccess bilinçli sınır olarak korunuyor.
 
 **T51-18 · BİLGİ · Quirk `MatchName` koşulsuz + `desktop` `TryExec` yok**
 - Konum: `scripts/rawaccel.quirks:16-18` (`MatchName=*(RawAccel)` tip koşulsuz → non-mouse düğüme `ModelTrackball` bulaşır) + `rawaccel.desktop` (`TryExec` yok → manuel kurulum GUI derlenmemişken ölü menü; `setup.sh:360-362` korumalı, manuel değil `README:129-132`)

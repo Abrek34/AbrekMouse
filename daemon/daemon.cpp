@@ -1134,21 +1134,29 @@ void AccelDaemon::apply_active_app() {
     // atomically via scoped_lock (std::lock semantics: try, back off, retry)
     // removes the cycle; a plain nested lock_guard here is what wedged both
     // threads permanently.  See the lock-order note in daemon.hpp.
-    std::scoped_lock lk(hidpp_devs_mutex_, devices_mutex_);
-    for (auto it = devices_.begin(); it != devices_.end();) {
-        const device_profile* prof = find_profile(it->device_id);
-        if (prof && prof->dev_cfg.disable) {
-            log("Active profile became disabled — releasing: " + it->name, true);
-            release_device(*it);
-            it = devices_.erase(it);
-        } else {
-            if (prof) apply_profile(*it, *prof);
-            ++it;
+    std::vector<mouse_device> to_destroy;
+    {
+        std::scoped_lock lk(hidpp_devs_mutex_, devices_mutex_);
+        for (auto it = devices_.begin(); it != devices_.end();) {
+            const device_profile* prof = find_profile(it->device_id);
+            if (prof && prof->dev_cfg.disable) {
+                log("Active profile became disabled — releasing: " + it->name, true);
+                release_device(*it);
+                // T35-DMN02: destroy/ungrab/close deferred out of the lock.
+                to_destroy.push_back(std::move(*it));
+                it = devices_.erase(it);
+            } else {
+                if (prof) apply_profile(*it, *prof);
+                ++it;
+            }
         }
+        fd_to_dev_.clear();
+        for (size_t i = 0; i < devices_.size(); i++)
+            fd_to_dev_[devices_[i].fd_in] = i;
     }
-    fd_to_dev_.clear();
-    for (size_t i = 0; i < devices_.size(); i++)
-        fd_to_dev_[devices_[i].fd_in] = i;
+    // T35-DMN02: blocking teardown runs without devices_mutex_ held.
+    for (auto& dev : to_destroy)
+        destroy_device(dev);
     // R10-REGRB: the focus switch may have re-enabled a profile for a device
     // that a previous switch live-released (it is no longer in devices_, so
     // the loop above could not apply it).  Kick the self-heal scan — it re-
@@ -1363,6 +1371,15 @@ void AccelDaemon::release_device(mouse_device& dev) {
     opened_paths_.erase(dev.path);
     if (!dev.device_id.empty())
         opened_device_ids_.erase(dev.device_id);
+    // T35-DMN02: destroy/ungrab/close are intentionally NOT done here — see
+    // destroy_device(); the caller defers them until devices_mutex_ is dropped.
+}
+
+void AccelDaemon::destroy_device(mouse_device& dev) {
+    // T35-DMN02: the blocking teardown (uinput destroy ioctls + close,
+    // EVIOCGRAB ungrab, fd close) runs ONLY after devices_mutex_ has been
+    // released — mirrors teardown_devices()/do_hotplug_scan()'s to_destroy
+    // pattern.  Safe to call on a partially-set device (hotplug error paths).
     if (dev.uidev) {
         libevdev_uinput_destroy(dev.uidev);
         dev.uidev = nullptr;
@@ -1383,6 +1400,7 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
     // config_ is written under devices_mutex_ so that status_json() (IPC
     // thread) never reads a half-updated config_.
     bool any_live = false;
+    std::vector<mouse_device> to_destroy;
     {
         // AB-BA fix — same reason as in apply_active_app(): the apply_profile()
         // below reaches find_hidpp_transport() (hidpp_devs_mutex_), which
@@ -1396,11 +1414,13 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
             if (prof && prof->dev_cfg.disable) {
                 // LIVE-DISABLE: a reload/push that turned a device's profile off
                 // must release the grab RIGHT NOW (release_device removes it from
-                // epoll + the open sets and closes fd/uinput) — the old code
+                // epoll + the open sets; destroy_device finishes the teardown
+                // once devices_mutex_ is dropped — T35-DMN02) — the old code
                 // skipped applying but left the device grabbed+accelerated until
                 // replug.
                 log("Live reload disabled a grabbed device — releasing: " + it->name, true);
                 release_device(*it);
+                to_destroy.push_back(std::move(*it));
                 it = devices_.erase(it);
             } else if (prof) {
                 apply_profile(*it, *prof);
@@ -1415,6 +1435,9 @@ void AccelDaemon::apply_new_config(const app_config& new_cfg) {
         for (size_t i = 0; i < devices_.size(); i++)
             fd_to_dev_[devices_[i].fd_in] = i;
     }
+    // T35-DMN02: blocking destroy/ungrab/close runs with devices_mutex_ released.
+    for (auto& dev : to_destroy)
+        destroy_device(dev);
 
     // R5-DUP: the "nothing open" case and the PAS-1-flag case below both want a
     // teardown+setup, and a reload that hit BOTH used to run the pair TWICE —

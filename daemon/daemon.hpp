@@ -216,6 +216,9 @@ private:
     /// release, uinput destroy, fd close) when a live reload / app-switch marks
     /// its matched profile disabled.  Caller must hold devices_mutex_.
     void release_device(mouse_device& dev);
+    /// T35-DMN02: blocking teardown half of release_device(), deferred until
+    /// devices_mutex_ is dropped.  Caller must NOT hold devices_mutex_.
+    void destroy_device(mouse_device& dev);
     /// Shared apply path for both the SIGHUP reload and the IPC config push.
     /// Runs on the loop thread; live-updates open devices without dropping the
     /// grab, and falls back to a full setup when no devices are open yet.

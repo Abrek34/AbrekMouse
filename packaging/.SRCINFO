@@ -1,10 +1,11 @@
 pkgbase = rawaccel-linux
 	pkgdesc = Raw Accel mouse acceleration daemon (Linux port): kernel-level uinput grab + GTK4 GUI + CLI
-	pkgver = 1.1.0
+	pkgver = 1.2.7
 	pkgrel = 1
 	url = https://github.com/rawaccel-linux/rawaccel-linux
 	install = rawaccel-linux.install
 	arch = x86_64
+	arch = aarch64
 	license = custom
 	makedepends = cmake
 	makedepends = pkgconf
@@ -15,6 +16,7 @@ pkgbase = rawaccel-linux
 	depends = polkit
 	depends = systemd
 	optdepends = python: KDE compositor acceleration auto-fix (kde-fix-accel.sh)
+	optdepends = qt6-tools: KWin live reconfigure during the KDE auto-fix (qdbus6)
 	backup = etc/rawaccel/settings.json
 
 pkgname = rawaccel-linux

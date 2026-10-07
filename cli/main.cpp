@@ -1040,6 +1040,9 @@ static std::string stored_value_str(const device_profile& dp, const std::string&
     if (key == "device_id")       return dp.device_id.empty() ? "(all)" : dp.device_id;
     if (key == "gain")            return a.gain ? "true" : "false";
     if (key == "raw")             return dp.prof.raw_passthrough ? "true" : "false";
+    // T36-CLI01: make the two new set-param keys echo their stored values too.
+    if (key == "disable")         return dp.dev_cfg.disable ? "true" : "false";
+    if (key == "match_app")       return dp.match_app.empty() ? "(none)" : dp.match_app;
     if (key == "dpi")             return std::to_string(dp.dev_cfg.dpi);
     if (key == "polling_rate")    return std::to_string(dp.dev_cfg.polling_rate);
     if (key == "cap_mode") {
@@ -1140,8 +1143,19 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         "ud_ratio", "yx_ratio", "distance_mode", "lp_norm",
         "input_smooth_halflife", "scale_smooth_halflife",
         "output_smooth_halflife", "domain_weights", "domain_weight_x",
-        "domain_weight_y", "range_weights", "range_weight_x", "range_weight_y"
+        "domain_weight_y", "range_weights", "range_weight_x", "range_weight_y",
+        "disable", "match_app", "use_raw_input"
     };
+    // T36-CLI01: use_raw_input is a TOP-LEVEL switch, not a per-profile field —
+    // reject it here with an explicit note instead of letting it fall through
+    // to "Unknown key" (it is not unknown, it is just not per-profile) or to a
+    // misleading numeric-parse failure.
+    if (key == "use_raw_input") {
+        std::cerr << "'use_raw_input' is a top-level (global) setting, not a "
+                     "per-profile key — set it in the config file or via the GUI's "
+                     "'Raw Input' toggle; set-param cannot change it.\n";
+        return 1;
+    }
     if (std::find(all_keys.begin(), all_keys.end(), key) == all_keys.end()) {
         std::cerr << "Unknown key: " << key << "\n"
                   << "Valid keys: " << join_keys(all_keys) << "\n";
@@ -1149,7 +1163,8 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
     }
     // Parse numeric value only for numeric params (not for string/bool keys)
     static const std::vector<std::string> non_numeric_keys = {
-        "mode", "gain", "cap_mode", "distance_mode", "raw", "device_id"
+        "mode", "gain", "cap_mode", "distance_mode", "raw", "device_id",
+        "disable", "match_app"
     };
     double v = 0;
     bool need_numeric = true;
@@ -1377,6 +1392,32 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         }
         dp->prof.raw_passthrough = b;
     }
+    // T36-CLI01: `disable` (PAS-2) was hand-JSON only — expose it via
+    // set-param with the same strict-bool contract as gain/raw.
+    else if (key == "disable")          {
+        bool b;
+        if (!parse_strict_bool(val, b)) {
+            std::cerr << "Invalid bool for 'disable': '" << val
+                      << "'.  Valid: true/false/1/0/yes/no/on/off\n";
+            return 1;
+        }
+        dp->dev_cfg.disable = b;
+    }
+    // T36-CLI01: `match_app` was GUI-only — expose it.  Trim + 128-char cap,
+    // mirroring the load-side json_get_string_limited(...,128) so the stored
+    // value is always the one the user asked for.
+    else if (key == "match_app")        {
+        std::string v = val;
+        size_t a = v.find_first_not_of(" \t\r\n");
+        size_t b = v.find_last_not_of(" \t\r\n");
+        v = (a == std::string::npos) ? "" : v.substr(a, b - a + 1);
+        if (v.size() > 128) {
+            std::cerr << "match_app too long: " << v.size()
+                      << " chars (max 128).\n";
+            return 1;
+        }
+        dp->match_app = v;
+    }
     else if (key == "device_id")        {
         // Per-device profile assignment. Empty string clears the assignment
         // (profile then applies to all unmatched mice).  Non-empty values are
@@ -1478,7 +1519,7 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
                      "distance_mode, lp_norm, input_smooth_halflife, "
                      "scale_smooth_halflife, output_smooth_halflife, domain_weights, "
                      "domain_weight_x, domain_weight_y, range_weights, range_weight_x, "
-                     "range_weight_y\n";
+                     "range_weight_y, disable, match_app\n";
         return 1;
     }
 

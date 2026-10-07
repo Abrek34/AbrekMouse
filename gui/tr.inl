@@ -578,6 +578,16 @@ static const char* tr(const char* key) {
              "Uyarı: çift cihaz kimliği — %s. Daemon yalnızca eşleşen ilk profili kullanır."},
             {"\"%s\" & \"%s\" share device %s",
              "\"%s\" ve \"%s\", %s cihazını paylaşıyor"},
+            {"Applying queued settings…", "Kuyruktaki ayarlar uygulanıyor…"},
+            {"Axes linked — Y settings were replaced by X.", "Eksenler bağlandı — Y ayarları X ile değiştirildi."},
+            {"Current: DPI %s · %s · LOD %s", "Güncel: DPI %s · %s · LOD %s"},
+            {"Device busy — Apply queued.", "Cihaz meşgul — Uygulama kuyruğa alındı."},
+            {"Device list changed — apply result discarded.", "Cihaz listesi değişti — uygulama sonucu atıldı."},
+            {"LOD→(unsupported)", "LOD→(desteklenmiyor)"},
+            {"Link X and Y axes?", "X ve Y eksenlerini bağlansın mı?"},
+            {"Link and Overwrite", "Bağla ve Üzerine Yaz"},
+            {"The Y-axis settings currently differ from the X-axis settings.\nLinking the axes will overwrite the Y settings with the X values.\nContinue?", "Y-axis ayarları şu anda X-axis ayarlarından farklı.\nEksenleri bağlamak Y ayarlarını X değerleriyle değiştirir.\nDevam edilsin mi?"},
+            {"rate unknown", "oran bilinmiyor"},
         };
         auto it = D.find(key);
         if (it != D.end()) return it->second;

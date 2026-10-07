@@ -604,7 +604,63 @@ void on_profile_changed(GtkDropDown* dd, GParamSpec*, gpointer user_data) {
 void on_xy_link_toggled(GtkCheckButton* btn, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
     if (S->updating) return; // block spurious triggers from profile_to_widgets programmatic sets
-    S->xy_linked = gtk_check_button_get_active(btn);
+    const bool now_linked = gtk_check_button_get_active(btn);
+    // T46-03: turning the XY link ON collapses the (possibly diverged) Y-axis
+    // settings onto the X values in widgets_to_profile().  Never do that
+    // silently — ask first when a distinct Y curve would be lost.
+    if (now_linked && !S->xy_linked && !S->config.profiles.empty()) {
+        const auto& p = cur_prof(S).prof;
+        if (!(p.accel_x == p.accel_y)) {
+            GtkWidget* dlg = gtk_window_new();
+            gtk_window_set_title(GTK_WINDOW(dlg), tr("Link X and Y axes?"));
+            gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(S->window));
+            gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+            gtk_window_set_default_size(GTK_WINDOW(dlg), 360, -1);
+            GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+            gtk_widget_set_margin_start(vbox, 16); gtk_widget_set_margin_end(vbox, 16);
+            gtk_widget_set_margin_top(vbox, 16);   gtk_widget_set_margin_bottom(vbox, 16);
+            gtk_window_set_child(GTK_WINDOW(dlg), vbox);
+            GtkWidget* lbl = gtk_label_new(tr(
+                "The Y-axis settings currently differ from the X-axis settings.\n"
+                "Linking the axes will overwrite the Y settings with the X values.\nContinue?"));
+            gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+            gtk_box_append(GTK_BOX(vbox), lbl);
+            GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+            gtk_widget_set_halign(hbox, GTK_ALIGN_END);
+            gtk_box_append(GTK_BOX(vbox), hbox);
+            GtkWidget* cancel_btn = gtk_button_new_with_label(tr("Cancel"));
+            GtkWidget* ok_btn     = gtk_button_new_with_label(tr("Link and Overwrite"));
+            gtk_widget_add_css_class(ok_btn, "suggested-action");
+            gtk_box_append(GTK_BOX(hbox), cancel_btn);
+            gtk_box_append(GTK_BOX(hbox), ok_btn);
+            struct xy_link_ctx { AppState* S; GtkCheckButton* btn; };
+            auto* ctx = new xy_link_ctx{ S, btn };
+            g_object_set_data_full(G_OBJECT(dlg), "ctx", ctx,
+                [](gpointer p) { delete static_cast<xy_link_ctx*>(p); });
+            g_signal_connect(cancel_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
+                auto* c = static_cast<xy_link_ctx*>(g_object_get_data(G_OBJECT(d), "ctx"));
+                // Revert the checkbox without re-entering this handler.
+                c->S->updating = true;
+                gtk_check_button_set_active(c->btn, FALSE);
+                c->S->updating = false;
+                gtk_widget_set_sensitive(c->S->y_axis_frame, TRUE);
+                gtk_window_destroy(GTK_WINDOW(d));
+            }), dlg);
+            g_signal_connect(ok_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
+                auto* c = static_cast<xy_link_ctx*>(g_object_get_data(G_OBJECT(d), "ctx"));
+                if (!c->S->window_destroyed) {
+                    c->S->xy_linked = true;
+                    gtk_widget_set_sensitive(c->S->y_axis_frame, FALSE);
+                    widgets_to_profile(c->S); // this copies X→Y now that xy_linked is true
+                    set_status(c->S, tr("Axes linked — Y settings were replaced by X."));
+                }
+                gtk_window_destroy(GTK_WINDOW(d));
+            }), dlg);
+            gtk_window_present(GTK_WINDOW(dlg));
+            return; // real decision happens in the callbacks
+        }
+    }
+    S->xy_linked = now_linked;
     gtk_widget_set_sensitive(S->y_axis_frame, !S->xy_linked);
     widgets_to_profile(S);
 }
@@ -635,6 +691,9 @@ static void save_profile_as_dialog(AppState* S) {
     std::string cur_name = S->config.profiles.empty() ? "" : cur_prof(S).name;
     show_input_dialog(S, tr("Save Profile As"), tr("Profile name"), cur_name.c_str(),
         [S](const std::string& name) {
+            // T36-GUI01: main window may be gone while the save-as / overwrite
+            // modals were alive — writing through S would be UAF.
+            if (S->window_destroyed) return;
             if (name.empty()) return;
             widgets_to_profile(S);
             device_profile dp = cur_prof(S);
@@ -687,6 +746,9 @@ static void save_profile_as_dialog(AppState* S) {
                 g_signal_connect(ov_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
                     auto* dlg_w  = GTK_WIDGET(d);
                     auto* c      = static_cast<overwrite_ctx*>(g_object_get_data(G_OBJECT(dlg_w), "ctx"));
+                    // T36-GUI01: main window destroyed while the overwrite
+                    // modal lived — drop instead of writing to dead widgets.
+                    if (c->S->window_destroyed) { gtk_window_destroy(GTK_WINDOW(d)); return; }
                     c->S->config.profiles[c->existing] = c->dp;
                     c->S->current_profile_idx = c->existing;
                     c->S->config.active_profile = c->dp.name;

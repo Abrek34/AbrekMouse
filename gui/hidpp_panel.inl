@@ -160,6 +160,9 @@ void hw_render_caps(AppState* S, int idx) {
 // ── Forward declarations (defined below the worker threads) ─────────────────
 void hw_update_ui_state(AppState* S);
 void hw_query_current(AppState* S);
+// T48-01: starts a stashed Apply once the worker slot is free (defined
+// below; referenced from idle callbacks above it).
+static bool hw_start_pending_apply(AppState* S);
 
 // ── Worker task payloads ─────────────────────────────────────────────────────
 
@@ -240,12 +243,19 @@ static gpointer hw_scan_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
-        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
+        if (S->hw_cancel) {
+            delete r;
+            if (S->hw_pending_apply) { delete S->hw_pending_apply; S->hw_pending_apply = nullptr; }
+            return G_SOURCE_REMOVE;
+        }
         S->hw_busy = false;
         // GUI-Y3: the combo model was rebuilt below, so any stashed pending
         // selection indexes the OLD vector and is stale — discard it; the
         // hw_query_current() at the end re-queries the re-populated combo.
         S->hw_pending_query = -1;
+        // T48-01: a queued Apply wins over the automatic re-query — it
+        // refreshes the device values itself once the write lands.
+        const bool apply_queued = (S->hw_pending_apply != nullptr);
         S->hidpp_devs = std::move(r->devs);
         // R2-08: invalidate any in-flight query/notification results — they
         // were snapshotted against the previous vector generation.
@@ -274,9 +284,15 @@ static gpointer hw_scan_thread(gpointer data) {
             hw_set_status(S, tr("No Logitech HID++ devices found."));
             hw_render_caps(S, -1); // explain why the controls are disabled
         } else {
-            hw_query_current(S); // trigger a query (no-op if notify already did)
+            // T48-01: a queued Apply refreshes device values itself — skip
+            // the extra query when a queued Apply exists or was just started.
+            if (!apply_queued) hw_query_current(S);
         }
         delete r;
+        if (hw_start_pending_apply(S))
+            return G_SOURCE_REMOVE;
+        if (apply_queued && !S->hidpp_devs.empty())
+            hw_query_current(S);
         return G_SOURCE_REMOVE;
     }, res);
     return nullptr;
@@ -398,7 +414,11 @@ static gpointer hw_query_thread(gpointer data) {
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
-        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
+        if (S->hw_cancel) {
+            delete r;
+            if (S->hw_pending_apply) { delete S->hw_pending_apply; S->hw_pending_apply = nullptr; }
+            return G_SOURCE_REMOVE;
+        }
         S->hw_busy = false;
         const int selected = S->hw_dev_combo
             ? (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo))
@@ -410,6 +430,14 @@ static gpointer hw_query_thread(gpointer data) {
         if (r->devs_version != S->hw_devs_version) {
             hw_update_ui_state(S);
             delete r;
+            // T48-01: still run a queued Apply and re-issue a pending query —
+            // the device list changed but the user's requested action stands.
+            if (!hw_start_pending_apply(S) && S->hw_pending_query >= 0) {
+                int pq = S->hw_pending_query;
+                S->hw_pending_query = -1;
+                if (pq < (int)S->hidpp_devs.size())
+                    hw_query_current(S);
+            }
             return G_SOURCE_REMOVE;
         }
         hw_set_battery(S, r->idx, r->cur.battery, r->cur.bsrc);
@@ -448,7 +476,11 @@ static gpointer hw_query_thread(gpointer data) {
                     }
                     gtk_drop_down_set_selected(dd, (guint)best);
                 } else {
-                    gtk_drop_down_set_selected(dd, 0);
+                    // T48-03: the device did not report its rate — do NOT
+                    // force selection 0; an untouched Apply() would then
+                    // rewrite the lowest rate.  Leave the combo selection
+                    // invalid; Apply() sends no rate write in that case.
+                    gtk_drop_down_set_selected(dd, GTK_INVALID_LIST_POSITION);
                 }
             }
             if (S->hw_lod_combo) {
@@ -459,9 +491,14 @@ static gpointer hw_query_thread(gpointer data) {
                         (guint)(r->cur.lod - 1));
             }
             if (r->cur.ok) {
-                hw_set_status(S, trf("Current: DPI %s · %d Hz · LOD %s",
+                // T48-03: show "unknown" instead of a misleading 0 Hz when
+                // the device did not report a rate.
+                const std::string rate_txt = r->cur.rate_hz > 0
+                    ? std::to_string(r->cur.rate_hz) + " Hz"
+                    : std::string(tr("rate unknown"));
+                hw_set_status(S, trf("Current: DPI %s · %s · LOD %s",
                                      cur_dpi_text(r->cur.dpi).c_str(),
-                                     r->cur.rate_hz,
+                                     rate_txt.c_str(),
                                      lod_text(r->cur.lod, r->supports_lod).c_str()));
             } else {
                 hw_set_status(S, tr("Could not query the device's current settings."));
@@ -472,7 +509,7 @@ static gpointer hw_query_thread(gpointer data) {
     // GUI-Y3: user selected another device while this query was in flight
     // — re-issue the query now that we are free (stale pending cleared by
     // the fresh hw_query_current()).
-    if (S->hw_pending_query >= 0) {
+    if (!hw_start_pending_apply(S) && S->hw_pending_query >= 0) {
         int pq = S->hw_pending_query;
         S->hw_pending_query = -1;
         if (pq < (int)S->hidpp_devs.size())
@@ -596,16 +633,36 @@ static gpointer hw_apply_thread(gpointer data) {
 
     }
 
-    struct Result { AppState* S; Outcome out; };
+    struct Result { AppState* S; Outcome out; int idx; int devs_version; };
     auto* res = new Result();
     res->S = S;
     res->out = out;
+    res->idx = task->idx;              // T48-01: carry through for the stale check
+    res->devs_version = task->devs_version;
     delete task;
     g_idle_add(+[](gpointer p) -> gboolean {
         auto* r = static_cast<Result*>(p);
         AppState* S = r->S;
-        if (S->hw_cancel) { delete r; return G_SOURCE_REMOVE; }
+        if (S->hw_cancel) {
+            delete r;
+            if (S->hw_pending_apply) { delete S->hw_pending_apply; S->hw_pending_apply = nullptr; }
+            return G_SOURCE_REMOVE;
+        }
         S->hw_busy = false;
+
+        // T48-01: the device list was rebuilt while this Apply was in flight —
+        // the write targeted the OLD device at that index; report, don't echo
+        // the values as if they applied to the newly selected device.
+        if (r->devs_version != S->hw_devs_version) {
+            hw_set_status(S, tr("Device list changed — apply result discarded."));
+            hw_update_ui_state(S);
+            delete r;
+            if (!hw_start_pending_apply(S) && S->hw_pending_query >= 0) {
+                S->hw_pending_query = -1;
+                hw_query_current(S);
+            }
+            return G_SOURCE_REMOVE;
+        }
 
         std::string parts;
         if (r->out.dev_invalid) {
@@ -617,28 +674,48 @@ static gpointer hw_apply_thread(gpointer data) {
                         r->out.hidraw_path.c_str());
         } else {
             const char* lod_en[] = {"", "Low", "Medium", "High"};
+            // T48-02: report ONLY what was actually written.  rate_hz==0 is
+            // the "no rate change requested" sentinel and lod_unsupported
+            // means no LOD write was attempted — echoing "Rate→0 Hz" or
+            // "LOD→Low" made the user believe a write happened.
             parts = trf("DPI→%d%s", r->out.dpi,
                         r->out.ok_dpi ? "" : tr("(rejected)"));
-            parts += " · " + trf("Rate→%d Hz%s", r->out.rate_hz,
-                                 r->out.ok_rate ? "" : tr("(rejected)"));
-            // L17-5: distinguish "write rejected" from "device has no LOD
-            // support (nothing was written)" — the old render claimed success
-            // for the latter.
-            parts += " · " + std::string(tr("LOD→"));
+            if (r->out.rate_hz != 0)
+                parts += " · " + trf("Rate→%d Hz%s", r->out.rate_hz,
+                                     r->out.ok_rate ? "" : tr("(rejected)"));
             if (r->out.lod_unsupported) {
-                parts += std::string(tr("(unsupported)"));
+                parts += " · " + std::string(tr("LOD→(unsupported)"));
             } else {
-                parts += std::string(tr(lod_en[std::clamp(r->out.lod, 1, 3)]));
+                parts += " · " + std::string(tr("LOD→"))
+                       + tr(lod_en[std::clamp(r->out.lod, 1, 3)]);
                 if (!r->out.ok_lod) parts += std::string(tr("(rejected)"));
             }
         }
         hw_set_status(S, parts);
         hw_update_ui_state(S);
-        hw_query_current(S); // refresh device-reported values after write
         delete r;
+        // T48-01: a queued Apply wins; otherwise refresh device-reported
+        // values after the write.
+        if (!hw_start_pending_apply(S))
+            hw_query_current(S);
         return G_SOURCE_REMOVE;
     }, res);
     return nullptr;
+}
+
+// T48-01: launch a stashed Apply task once the worker slot is free; the
+// stashed task is superseded (replaced by a newer click) or dropped when
+// the device list changed while it waited.
+static bool hw_start_pending_apply(AppState* S) {
+    if (!S->hw_pending_apply) return false;
+    HwApplyTask* t = S->hw_pending_apply;
+    S->hw_pending_apply = nullptr;
+    if (t->devs_version != S->hw_devs_version) { delete t; return false; }
+    S->hw_busy = true;
+    hw_update_ui_state(S);
+    hw_set_status(S, tr("Applying queued settings…"));
+    hw_thread("rawaccel-hw-apply", hw_apply_thread, t);
+    return true;
 }
 
 // Bounded, read-only notification polling.  This is deliberately independent
@@ -834,8 +911,6 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
         hw_set_status(S, tr("This device does not support DPI changes."));
         return;
     }
-    S->hw_busy = true;
-    hw_update_ui_state(S);
     auto* task = new HwApplyTask();
     task->S = S;
     task->idx = idx;
@@ -860,5 +935,15 @@ void on_hw_apply_clicked(GtkButton*, gpointer user_data) {
         (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_lod_combo)) + 1, 1, 3);
     task->devs_version = S->hw_devs_version;
     task->supports_lod = c.lod;
+    // T48-01: queue the Apply behind the in-flight scan/query/apply worker
+    // instead of running a second worker on the same hidraw node.
+    if (S->hw_busy) {
+        if (S->hw_pending_apply) delete S->hw_pending_apply; // newest wins
+        S->hw_pending_apply = task;
+        hw_set_status(S, tr("Device busy — Apply queued."));
+        return;
+    }
+    S->hw_busy = true;
+    hw_update_ui_state(S);
     hw_thread("rawaccel-hw-apply", hw_apply_thread, task);
 }

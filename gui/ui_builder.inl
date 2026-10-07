@@ -1047,6 +1047,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
             // Signal all HID++ idle callbacks to bail (prevents UAF on widgets)
             S2->hw_cancel = true;
             S2->hw_pending_query = -1;
+            if (S2->hw_pending_apply) { delete S2->hw_pending_apply; S2->hw_pending_apply = nullptr; }
             // O31-G1: the async KDE-fix idle callback must also bail — it has
             // no source id to remove, so flag the window as destroyed and let
             // kde_fix_finish() drop its result instead of touching widgets.

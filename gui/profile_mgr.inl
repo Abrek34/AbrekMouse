@@ -181,6 +181,9 @@ void show_new_profile_dialog(AppState* S) {
     ctx->entry = entry;
     ctx->combo = combo;
     ctx->cb = [S](const std::string& name, const std::string& preset) {
+            // T36-GUI01: main window may be gone while this modal lives —
+            // touching config/widgets through S would be UAF.
+            if (S->window_destroyed) return;
             for (auto& p : S->config.profiles)
                 if (p.name == name) { set_status(S, tr("A profile with that name already exists.")); return; }
             if (S->config.profiles.size() >= MAX_PROFILES) {
@@ -293,8 +296,16 @@ void show_input_dialog(AppState* S,
     g_object_set_data_full(G_OBJECT(dlg), "cb", cb_ptr,
                            [](gpointer p) { delete (std::function<void(const std::string&)>*)p; });
     g_object_set_data(G_OBJECT(dlg), "entry", entry);
+    // T36-GUI01: let do_ok bail when the main window was torn down while the
+    // modal was alive — the cb writes destroyed widgets/config otherwise.
+    g_object_set_data(G_OBJECT(dlg), "app-state", S);
 
     auto do_ok = +[](GtkWidget*, gpointer dlg_ptr) {
+        auto* S2 = static_cast<AppState*>(g_object_get_data(G_OBJECT(dlg_ptr), "app-state"));
+        if (S2 && S2->window_destroyed) {
+            gtk_window_destroy(GTK_WINDOW(dlg_ptr));
+            return;
+        }
         GtkWidget* e = GTK_WIDGET(g_object_get_data(G_OBJECT(dlg_ptr), "entry"));
         auto* cb_p   = (std::function<void(const std::string&)>*)
                         g_object_get_data(G_OBJECT(dlg_ptr), "cb");
@@ -378,6 +389,8 @@ void on_delete_profile(GtkButton*, gpointer user_data) {
     g_signal_connect(del_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
         auto* dlg_w = GTK_WIDGET(d);
         auto* S2 = static_cast<AppState*>(g_object_get_data(G_OBJECT(dlg_w), "app-state"));
+        // T36-GUI01: main window destroyed while this modal lived → no widgets left.
+        if (S2->window_destroyed) { gtk_window_destroy(GTK_WINDOW(d)); return; }
         int idx = S2->current_profile_idx;
         S2->config.profiles.erase(S2->config.profiles.begin() + idx);
         S2->current_profile_idx = std::max(0, idx - 1);
@@ -481,6 +494,8 @@ std::string msg = trf("Reset \"%s\" to default values?\nThis cannot be undone.",
     g_signal_connect(reset_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
         auto* dlg_w = GTK_WIDGET(d);
         auto* S2 = static_cast<AppState*>(g_object_get_data(G_OBJECT(dlg_w), "app-state"));
+        // T36-GUI01: main window destroyed while this modal lived → no widgets left.
+        if (S2->window_destroyed) { gtk_window_destroy(GTK_WINDOW(d)); return; }
         // Keep name and device_id, reset everything else to defaults
         std::string saved_name = cur_prof(S2).name;
         std::string saved_id   = cur_prof(S2).device_id;
