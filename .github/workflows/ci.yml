@@ -50,7 +50,11 @@ jobs:
           test -x build-manual/rawaccel-daemon
           test -x build-manual/rawaccel-cli
           test -x build-manual/rawaccel-gui
+          test -x build-manual/rawaccel-installer
           file build-manual/rawaccel-*
+
+      - name: Installer smoke (GTK4 setup assistant)
+        run: bash tests/run_installer_smoke.sh
 
       - name: Run unit tests
         run: bash tests/run_tests.sh

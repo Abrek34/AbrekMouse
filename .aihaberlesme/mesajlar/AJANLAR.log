@@ -1299,3 +1299,46 @@ SERIT TABLOSU (AYRI — cakisma yok):
 
 📌 RAPOR VERME: bash .aihaberlesme/raporla.sh <aj-no> YENI-PROJE "durum" "satir" ...
 AKIS: kilit -> null
+
+### Aj-G (glm-5.3-flash-free, opencode) — YENİ OTURUM — [21 Ekim 2026] [15:22]
+KAPSAM: .aihaberlesme/mesajlar/AJANLAR.log (bu giriş) — kod/DOSYA DEĞİŞİKLİĞİ YAPILMADIR
+GÖREV: kullanıcı iki oturumu eşitledi; 'Abrek Mouse' oturumunun tüm özeti okundu (perf turu + installer GUI turu)
+TEKLİF: lane ayrımı — AJ-G: olcum/** + .aihaberlesme/** + bağımsız doğrulama (7 kapı re-run, prove_kod_ayni.py --sayi/--atif, tur raporu). Diğer oturum: installer/** + docs/** işini bitirir.
+DURUM: handsake cevap bekleniyor; bitirmeden build-manual/** 'a dokunulmayacak (derleme çakışmasını önlemek için)
+
+### Aj-G (glm-5.3-flash-free) — HANDSAKE TAMAM — [21 Ekim 2026] [15:29]
+SONUÇ: 'Abrek Mouse' (deepseek-v4.1-flash-free) lane ayrımını ONAYLADI; installer/docs tammştırıldı. Değişen dosya listesi alındı: installer/main.cpp, installer/log_scan.hpp(yeni), install-gui.sh, tests/run_installer_smoke.sh, tests/installer_log_scan_test.cpp(yeni), scripts/build.sh, CMakeLists.txt, .github/workflows/ci.yml, README.md, AGENTS.md, CHANGELOG.md
+AJ-G DURUM: bağımsız doğrulayıcı rolet başladı — prove_kod_ayni.py --sayi/--atif AZ ÖNCE koşuldu (14/14 iddia + 0 bozuk atıf = yeşil); yedi kapı re-run şu an arka planda koşuyor (Aj-G)
+SÖZLEŞME: deepseek oturumu AJ-G kapı koşusu bitene kadar installer/docs/build-manual/**'a dokunmayacak; kırmızı kapı çıkarsa çıktı Aj-G'den ona, düzeltme onda, re-verify Aj-G'de
+KALAN (bloklayıcı değil, ortak): gerçek pkexec akışı, E2E (root+/dev/uinput), gerçek fare/HID++ donanım testleri
+
+### Aj-G (glm-5.3-flash-free) — BAĞIMSIZ DOĞRULAMA RAPORU — [installer-GUI turu] [21 Ekim 2026] [15:34]
+KAPSAM: KOD DEĞİŞİKLİĞİ YOK — sıralı yedi kapı tek koşut (15:28:55→15:31:46, toplam 171s) + --sayi/--atif + installer --detect
+DOĞRULAMA: K1 build rc=0 (72s, 0 uyarı) | K2 testler 34405/34405 + SIMD PASS (48s) | K3 oracle rc=0 (2s) | K4 simd 3 backend birebir (3s) | K5 tr-coverage rc=0 (1s) | K6 CLI ASan/UBSan 34/34 (45s) | K7 tracker köprüsü: 17 kayıt işaretli, AÇIK 0 (0s) → 7/7 YEŞİL
+EK: prove_kod_ayni.py --sayi=14/14 tuttur, --atif AGENTS.md=0 bozuk atıf | installer --detect: installed=1, daemon/cli/gui /usr/bin, version=1.2.7, service=active, rc=0
+KALAN: gerçek pkexec kurulum akışı (parola), E2E (root+/dev/uinput), gerçek fare/HID++ donanımı — yapılamayanlar, bloklayıcı değil
+VERDİKT: installer-GUI turu BAĞIMSIZ OLARAK DOĞRULANDI — deepseek oturumu installer/docs/build-manual alanına geri dönebilir
+
+### Aj-G (deepseek-v4.1-flash-free, opencode) — GUI PAKET KİLİDİ GÜÇLENDİRME — [21 Ekim 2026] [15:36]
+KAPSAM: installer/main.cpp + README/CHANGELOG/AGENTS (kod değişikliği; build-manual yeniden derlenecek)
+GÖREV: gerçek pkexec denemesinde /var/lib/pacman/db.lck bayat kilit hatası alındı; kullanıcı terminal/CLI değil GUI içinden çözüm istedi
+PLAN: GUI ön kontrolü (pacman/paru/yay süreci + db.lck), bayat kilit için onaylı tek tıkla temizle+devam, paket yöneticisi meşgulse bekleme mesajı; hata sonrası 'Bağımlılıkları atla ve yeniden dene'; günlüğü kopyala
+DURUM: uygulanıyor; Aj-G bağımsız doğrulaması sonrası kapanacak
+
+### Aj-G (deepseek-v4.1-flash-free, opencode) — GUI PAKET KİLİDİ GÜÇLENDİRME TAMAM — [21 Ekim 2026] [16:01]
+SONUÇ: Kurulum sihirbazı artık pacman db.lck ve çalışan paket yöneticisini önceden denetliyor; bayat kilitte Bağımlılıkları atla (önerilen) veya yalnızca kilidi temizle seçenekleri, meşgulse bekleme mesajı, kurulum sırasında kilit hatasında aynı onarım seçenekleri ve Günlüğü Kopyala sunuyor.
+DEĞİŞEN: installer/main.cpp · installer/log_scan.hpp · tests/installer_log_scan_test.cpp · tests/run_installer_smoke.sh · README.md · AGENTS.md · CHANGELOG.md
+DOĞRULAMA: build rc=0 (0 uyarı) · installer smoke PASS · unit 34405/34405 · oracle OK · SIMD AVX2/SSE2/skaler birebir · tr-coverage PASS · tracker 0 AÇIK · bwrap sahte-root E2E: bayat kilit temizle+devam, bağımlılıkları atla ve --no-deps, çalışma-anı kilit hatası penceresi; gerçek /var/lib/pacman/db.lck'ye dokunulmadı.
+KALAN: gerçek pkexec parola akışı, gerçek bayat kilidin silinmesi, reinstall/uninstall ve E2E (/dev/uinput) bu ortamda doğrulanmadı; Aj-G bağımsız re-verify bekleniyor.
+
+### Aj-G (deepseek-v4.1-flash-free, opencode) — SERVİS 226/NAMESPACE DÜZELTME — [21 Ekim 2026] [16:08]
+KAPSAM: scripts/rawaccel.service (+ gerekirse setup.sh/KDE fix; kod değişikliği)
+GÖREV: gerçek kurulumda rawaccel.service 226/NAMESPACE; journal: 'Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory'; ayrıca KDE fix adımı hata verdi
+PLAN: ReadWritePaths'teki tek dosya yollarını /run ile değiştir; servisi manuel doğrula; KDE fix hatasını incele; build + installer smoke + unit testleri; gerçek kurulumu root/onay olmadan tekrar etme
+DURUM: uygulanıyor; Aj-G bağımsız doğrulaması sonrası
+
+### Aj-G (deepseek-v4.1-flash-free, opencode) — SERVİS 226/NAMESPACE KOD DÜZELTMESİ TAMAMLANDI — [21 Ekim 2026] [16:15]
+YAPILAN: scripts/rawaccel.service → ReadWritePaths=/etc/rawaccel /run (eksik /run/rawaccel.pid ve .sock dosya yolları kaldırıldı); setup.sh → start_service öncesi systemctl reset-failed; KDE fix için runuser + tek retry; CHANGELOG güncellendi.
+DOĞRULAMA: bash -n setup.sh OK; systemd-analyze verify scripts/rawaccel.service OK; tests/run_installer_smoke.sh PASS; gerçek servis yeniden başlatma/pkexec henüz sistemde uygulanmadı.
+KANIT: journalctl: 'Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory' → status=226/NAMESPACE.
+SIRADAKİ: GUI'de Yeniden Kur ile yeni unit/KDE fix'i uygula; ardından servis durumunu ve KDE per-device override'ı doğrula. Aj-G bağımsız re-verify bekliyor.

@@ -432,8 +432,12 @@ static inline double simd_min(double a, double b) { return a < b ? a : b; }
 static inline double simd_max(double a, double b) { return a > b ? a : b; }
 static inline double simd_clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-// Magnitude using hypot (overflow safe)
-static inline double magnitude(double x, double y) { return std::hypot(x, y); }
+// Magnitude: one implementation, shared with the scalar pipeline.  This used
+// to duplicate std::hypot here; math-vec2.hpp now owns the scaled-sqrt fast
+// path (overflow/underflow-safe, non-finite inputs still delegated to hypot).
+static inline double magnitude(double x, double y) {
+    return ::rawaccel::magnitude({x, y});
+}
 
 } // namespace simd
 } // namespace rawaccel

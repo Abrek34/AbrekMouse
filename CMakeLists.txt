@@ -150,6 +150,23 @@ if(BUILD_GUI)
 
     install(TARGETS rawaccel-gui DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+    # Source-tree bootstrap installer.  It wraps setup.sh and is intentionally
+    # NOT installed: after a successful install there is nothing to bootstrap,
+    # and reinstall/uninstall from a system binary would have no source tree.
+    # `install-gui.sh` builds and runs this target from the checkout.
+    add_executable(rawaccel-installer
+        installer/main.cpp
+    )
+    target_include_directories(rawaccel-installer PRIVATE
+        ${GTK4_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(rawaccel-installer
+        ${GTK4_LIBRARIES}
+        Threads::Threads
+        dl
+    )
+
     # Desktop file
     install(FILES scripts/rawaccel.desktop
             DESTINATION /usr/share/applications)

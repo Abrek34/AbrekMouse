@@ -245,7 +245,20 @@ private:
     double base_fn(double x, double ar, const accel_args& args) const {
         // Guard: extreme exponents overflow pow() to Inf (or degenerate 0·Inf).
         // Falling back to 0 keeps the identity output (gain 1.0) instead of NaN.
-        double p = std::pow(x - args.input_offset, args.exponent_classic);
+        //
+        // PERF (hot path): exponent 2 is both the struct default and the most
+        // common classic curve (quadratic).  A runtime std::pow(x, 2.0) costs
+        // ~10 ns on this machine; x*x is the same correctly-rounded result for
+        // every finite x (and for ±0/±Inf/NaN) at ~1 ns.  Keep the generic
+        // branch for all other exponents — including 3, where x*x*x would
+        // introduce a second rounding step and could change the last ULP.
+        const double base = x - args.input_offset;
+        double p;
+        if (args.exponent_classic == 2.0) {
+            p = base * base;
+        } else {
+            p = std::pow(base, args.exponent_classic);
+        }
         if (!std::isfinite(p)) return 0.0;
         double r = ar * p / x;
         return std::isfinite(r) ? r : 0.0;

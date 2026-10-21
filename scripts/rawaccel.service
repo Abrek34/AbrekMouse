@@ -67,8 +67,15 @@ SystemCallArchitectures=native
 # to 0600 / dirs 0700 instead of world-readable.  The IPC socket is chmod'd
 # to 0660 explicitly after creation, so this doesn't break the GUI/CLI access.
 UMask=0077
-# T51-16: /run must stay read-only except the two files the daemon writes.
-ReadWritePaths=/etc/rawaccel /run/rawaccel.pid /run/rawaccel.sock
+# T51-16: /run must stay writable for the PID file and IPC socket.
+# Do NOT list the individual files here: with ProtectSystem=strict systemd
+# resolves ReadWritePaths during mount-namespace setup, before the daemon has
+# created them.  A clean install (or a daemon stop that removes its PID file)
+# then fails with status 226/NAMESPACE:
+#   Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory
+# /run is a tmpfs owned by root; granting the daemon the directory keeps the
+# rest of the filesystem read-only and is robust across first start/restart.
+ReadWritePaths=/etc/rawaccel /run
 # Capability bounding set: only what the daemon actually exercises.
 #   CAP_CHOWN              : chown(IPC socket) to root:input
 #   CAP_DAC_OVERRIDE       : open /dev/uinput + /dev/input/event* as root

@@ -7946,9 +7946,9 @@ static void test_dpi_factor_precompute() {
     }
 }
 
-// R14 — magnitude() uses std::hypot (overflow-safe)
+// R14 — magnitude() is overflow-safe (scaled sqrt, hypot for non-finite)
 static void test_magnitude_hypot() {
-    SECTION("R14 — magnitude uses hypot (overflow-safe)");
+    SECTION("R14 — magnitude overflow-safe (scaled sqrt + hypot fallback)");
 
     // Normal values — must match manual sqrt(x^2 + y^2)
     EXPECT_NEAR(magnitude({3.0, 4.0}), 5.0, 1e-12);
@@ -7979,6 +7979,16 @@ static void test_magnitude_hypot() {
     vec2d delta = {10.0, 10.0};
     double speed = magnitude(delta);
     EXPECT_NEAR(speed, 10.0 * std::sqrt(2.0), 1e-10);
+
+    // The scaled-sqrt fast path keeps finite inputs finite at the very edge,
+    // and delegates non-finite/NaN inputs to hypot (whose IEEE result is the
+    // contract: hypot(Inf,NaN) is +Inf, not NaN).
+    EXPECT(magnitude({std::numeric_limits<double>::max(), 0.0}) ==
+           std::numeric_limits<double>::max());
+    EXPECT(std::isinf(magnitude({std::numeric_limits<double>::infinity(), 3.0})));
+    EXPECT(std::isinf(magnitude({std::numeric_limits<double>::infinity(),
+                                 std::numeric_limits<double>::quiet_NaN()})));
+    EXPECT(std::isnan(magnitude({std::numeric_limits<double>::quiet_NaN(), 3.0})));
 }
 
 // ── R15: Comprehensive hardening tests ───────────────────────────────────────
@@ -8165,6 +8175,34 @@ static void test_ema_long_sequence_stability() {
             last = lm.smooth(5.0, 1.0);
         }
         EXPECT_NEAR(last, 5.0, 0.1);
+        // PERF: at constant speed the trend decays to zero.  It must be
+        // flushed to exactly 0 instead of lingering as the smallest subnormal
+        // (4.94e-324), which made every later multiply/add take a microcode
+        // assist (~100 ns/event on x86) for the rest of the process lifetime.
+        EXPECT(std::fpclassify(lm.windowTrendTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.cutoffTrendTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.windowTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.cutoffTotal) != FP_SUBNORMAL);
+    }
+
+    // PERF: same invariant after the input stops.  A smoother that idles for
+    // long enough must not leave subnormal state behind for the next session.
+    {
+        simple_ema_smoother sm;
+        sm.init(1.0);
+        for (int i = 0; i < 1000; i++) sm.smooth(10.0, 1.0);
+        for (int i = 0; i < 100000; i++) sm.smooth(0.0, 1.0);
+        EXPECT(std::fpclassify(sm.windowTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(sm.cutoffTotal) != FP_SUBNORMAL);
+
+        linear_ema_smoother lm;
+        lm.init(1.0, 1.25);
+        for (int i = 0; i < 1000; i++) lm.smooth(10.0, 1.0);
+        for (int i = 0; i < 100000; i++) lm.smooth(0.0, 1.0);
+        EXPECT(std::fpclassify(lm.windowTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.cutoffTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.windowTrendTotal) != FP_SUBNORMAL);
+        EXPECT(std::fpclassify(lm.cutoffTrendTotal) != FP_SUBNORMAL);
     }
 
     // halflife=0 (no smoothing) — output tracks input

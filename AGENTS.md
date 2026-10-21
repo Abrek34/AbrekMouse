@@ -56,7 +56,11 @@ RAWACCEL_PORTABLE=1 bash scripts/build.sh
 CXX=clang++ bash scripts/build.sh
 ```
 
-Output binaries: `build-manual/rawaccel-daemon`, `build-manual/rawaccel-cli`, `build-manual/rawaccel-gui`
+# GUI installer (source tree; wraps setup.sh through pkexec)
+bash install-gui.sh
+bash install-gui.sh --detect       # durum sorgusu, GUI açmadan
+
+Output binaries: `build-manual/rawaccel-daemon`, `build-manual/rawaccel-cli`, `build-manual/rawaccel-gui`, `build-manual/rawaccel-installer`
 
 Both `scripts/build.sh` and the CMake target apply the same hardening flags
 (`-fstack-protector-strong`, `-fstack-clash-protection`, `-D_FORTIFY_SOURCE=2`,
@@ -187,6 +191,12 @@ bash tests/run_tests_asan.sh
 # that stopped doing real work, 77 = host compiler has no ASan/UBSan (skips
 # loudly, never quietly). Needs no root, no /dev/uinput, no daemon.
 bash tests/run_cli_sanitized.sh
+
+# GTK4 setup assistant: compile rawaccel-installer and verify its headless
+# contract (--detect / --print-command / invalid-source rejection). This does
+# NOT open a window; the visual path is exercised manually. Exit 77 when GTK4
+# development files are unavailable, never a silent pass.
+bash tests/run_installer_smoke.sh
 
 # End-to-end: REAL daemon against synthetic uinput source/sink (needs root +
 # /dev/uinput). SIGSTOPs a running system daemon for the duration and SIGCONTs
@@ -334,8 +344,9 @@ so `|ev.value| ≤ INT32_MAX = 2,147,483,647`. The daemon batches 32 events
 6.87e10`. Clamped `ips_factor ≤ 1e6` and `domain_weights ≤ 1e6` yield:
 `|abs_vel| ≤ 32·INT32_MAX × IPS_FACTOR_MAX × 1e6 ≈ 6.87e22`. The reference's
 `magnitude(v)` uses `sqrt(x*x + y*y)` which overflows to `inf` at
-`|v| ≳ 1.34e154` (`~2^1023`). The port uses `std::hypot` (R14) and log-space
-`lp_distance` (ORTA-BUG-MOTION-03), so it **deliberately diverges** from the
+`|v| ≳ 1.34e154` (`~2^1023`). The port uses a scaled sqrt (R14 semantics:
+`M·sqrt(1+(m/M)²)`, with `std::hypot` fallback for non-finite inputs) and
+log-space `lp_distance` (ORTA-BUG-MOTION-03), so it **deliberately diverges** from the
 reference for `|v| ≫ 6.87e22` — but this region is **unreachable from any valid
 config** (margin ≈ 1.95e131×). The oracle's 1408 rows (max speed `1e5`) sit
 entirely inside the matching envelope. If a future change widens the envelope
@@ -363,8 +374,8 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 152 `test_` functions / 221 `SECTION` groups, 34391 runtime assertions (the
-  runner's own count; the source has 1623 `EXPECT` call sites — `#define` lines
+- 152 `test_` functions / 221 `SECTION` groups, 34405 runtime assertions (the
+  runner's own count; the source has 1637 `EXPECT` call sites — `#define` lines
   excluded, loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
@@ -387,7 +398,7 @@ Test file: `tests/test_accel.cpp`
   speed clamp min/max, dir mul negative direction, synchronous power<1 guard,
   natural legacy (non-gain) mode, output_dpi NaN sanitize,
   lat_stats move semantics, dpi_factor pre-compute consistency,
-  magnitude hypot overflow safety, lookup LUT length clamp to capacity,
+  magnitude scaled-sqrt overflow safety, lookup LUT length clamp to capacity,
   atomic config save (pid-suffix + O_NOFOLLOW/O_EXCL), config type/boolean
   guards + 256-char name/device_id caps, version-stamped config migration
   runs exactly once, lookup zero-width segment denominator guard,
@@ -495,7 +506,10 @@ together — CHANGELOG documents the same three-way sync.
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (152 functions / 221 `SECTION` groups, 34391 runtime assertions) |
+| `installer/main.cpp` | `rawaccel-installer` GTK4 setup assistant: status, pkexec-backed setup.sh run, streamed log, pacman db-lock preflight/repair, clipboard log export. Source-tree bootstrap only; not installed system-wide |
+| `installer/log_scan.hpp` | Failure-marker and pacman-lock scan used by the installer; failure detection keys only on setup.sh's `✗` prefix (never the success word `EKSİKSİZ`) |
+| `install-gui.sh` | Builds/runs `rawaccel-installer` from the checkout; `--detect`/`--print-command` work without a display |
+| `tests/test_accel.cpp` | Unit + integration tests (152 functions / 221 `SECTION` groups, 34405 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -503,6 +517,7 @@ together — CHANGELOG documents the same three-way sync.
 | `tests/e2e_harness.cpp` | E2E harness: synthetic uinput mouse + REAL daemon + virtual sink; accel (T-A1..T-A4) + raw (T-B1) phase checks |
 | `tests/run_e2e.sh` | E2E runner (root): builds harness, SIGSTOP/SIGCONT-sensitive system-daemon isolation, runs both phases, propagates 0/1/77 |
 | `tests/run_tests_asan.sh` | Unit test runner under ASan + UBSan |
+| `tests/run_installer_smoke.sh` | Builds `rawaccel-installer` and checks its headless contract (`--detect`, `--print-command`, invalid-source rejection) plus the `✗`-only log-marker scan; exits 77 without GTK4 |
 | `tests/run_cli_sanitized.sh` | Runs `cli/main.cpp` under ASan + UBSan over 34 real commands (8 presets, profile CRUD, JSON round-trip, config-path rejections); each command asserts its own expected output marker, so an arg rename can't silently turn the gate into 34 no-ops. Exit 0/1/77 |
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
@@ -777,11 +792,13 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **lat_stats finite guard**: non-finite latency samples are dropped and negative samples clamped to 0 before histogram insertion (P55-O1)
 - **Lookup zero-width segment guard**: a duplicated X (denominator 0) falls through to the next point's `by` instead of producing ±Inf; valid strictly-increasing tables are unaffected (P55-O2)
 - **Pre-computed dpi_factor**: `mouse_device::dpi_factor` is computed once in `apply_profile()` instead of dividing on every mouse event — eliminates a floating-point division from the hot path
-- **Overflow-safe magnitude**: `magnitude()` uses `std::hypot(x,y)` instead of `sqrt(x*x+y*y)` — prevents intermediate overflow/underflow for extreme delta values
+- **Overflow-safe, fast magnitude**: `magnitude()` uses the factored form `M·sqrt(1+(m/M)²)` with `M=max(|x|,|y|)` instead of `sqrt(x*x+y*y)` — still prevents intermediate overflow/underflow for extreme deltas, but avoids `std::hypot`'s ~2.5 ns cost on every whole-axis frame. Non-finite/NaN inputs fall back to `std::hypot` so its exact IEEE behaviour is preserved; ordinary finite results differ by at most 2 ULP, far inside the 1e-9 pipeline tolerance. `simd::magnitude` delegates to the same implementation instead of duplicating it.
 - **Unified clock source**: both `now_ms()` and `now_ns()` use `CLOCK_MONOTONIC_RAW` — eliminates drift between timing sources and reduces the per-event `clock_gettime` read count from 3 to 2 (start + end; P100)
 - **P93-BATCH output (PERF, hot path)**: `process_device()` accumulates a whole frame — motion REL, any queued non-motion events, and the closing SYN_REPORT — in a small stack `write_batch` (`daemon/daemon.cpp`) and submits it in a SINGLE `write()` syscall at the real SYN_REPORT. Kernel uinput injects every `input_event` found in the write buffer, so the event stream is byte-identical to the old one-syscall-per-event path while collapsing (typically 3+) writes into 1. Zero-valued axes are skipped; a full buffer forces an early flush (nothing is dropped); overflow beyond 16 events flushes in place preserving order; non-SYN subtypes (SYN_MT_REPORT…) and raw-passthrough REL stay 1:1 per-event (libinput-feel contract, RAC-5). `flush_motion` still reads start/end (2 × `clock_gettime`, vDSO) plus 1 batched write; with batched evdev reads (below) the canonical hot-path cost per motion frame is small constant: 1 `read()` + 1 `write()` + 2×`clock_gettime`.
 - **Batched evdev reads (PERF, hot path)**: `process_device()` reads up to 32 `input_event`s per `read()` into `read_batch` instead of one struct per syscall — a typical 3-event frame (REL_X, REL_Y, SYN) costs 1 read syscall. Short/torn reads are handled as before (misaligned stream → log + drop the tail); EAGAIN/EINTR/error semantics unchanged.
 - **exp2-based EMA (PERF, hot path, P0)**: the per-event `std::pow(base, time)` of the input/scale/output smoothers (2 or 4 calls per smooth, ~60–100 ns each) was the dominant smoothing cost. `init_coeff` now precomputes `log2(base)` once (two extra doubles per smoother) and each `smooth()` evaluates `exp2(log2(base) * time)` — the same result to ~1 ULP with a fraction of the cost. `exp2(-inf * t) == 0` for t>0 reproduces `pow(0, t) == 0` exactly, and `time == 0` gives `exp2(0) == 1` → coefficient 0, matching the old `pow(c, 0) == 1`. The branchless form also keeps the inlined smoother small for GCC's inline budget (a guarded ternary variant made GCC outline `std::visit`'s `__do_visit` as an `.isra.0` call in the non-smoothing apply path). Measured: power-dual+4ema ≈553 → ≈390 ns/event.
+- **Subnormal EMA flush (PERF, hot path, critical)**: the linear smoother multiplies its trend accumulators by `trendDampening` every event. At constant speed (or after the mouse stops) they decay below `DBL_MIN` and become subnormal; from then on every multiply/add pays an x86 microcode assist. Measured on the benchmark's steady 1 ms input: the input-smoothing stage alone went from ≈244 to ≈54 ns/event, and the full `power-dual+4ema` profile from ≈285 to ≈99 ns/event. `flush_subnormal()` now maps any accumulator magnitude below `DBL_MIN` to exact 0 after each update, which is the limiting value anyway (≤2.2e-308). A regression assertion in `test_ema_long_sequence_stability` requires the state to be non-subnormal after 100K constant and 100K stopped samples.
+- **Classic exponent 2 specialization (PERF, hot path)**: `classic::base_fn` called `std::pow(base, exponent_classic)` for the runtime exponent, ~10 ns even when the exponent is exactly 2 (the struct default and a very common curve). `base*base` is the same correctly-rounded result for every finite/±0/±Inf/NaN input at ~1 ns; other exponents keep the generic `std::pow` (notably 3, where `x*x*x` adds a second rounding step). Measured: `classic` 43.5 → 25.3 ns/event, `apply_motion_math(full)` 43.4 → 26.8 ns/event on this host.
 - **Switch dispatch for `accel_union::apply` (PERF, hot path, P0)**: replaced `std::visit` with an explicit `switch (impl.index())` + `std::get<N>` so the tiny per-event dispatch has no template machinery and the loop-invariant active index lets the inliner prune every branch but the active one.
 - **Poll-rate median throttle (PERF, hot path)**: the `real_polling_rate` median (copy + insertion sort + divide) used to be recomputed on EVERY motion frame (~40–80 ns, 1–2× the classic no-smoothing cost). It now recomputes at most once per `POLL_RATE_SAMPLES` frames (`poll_median_tick`); the first 4 samples still emit an estimate in the first ~50 ms so SM-4 / the status JSON converge as before.
 - **Y-axis unlinked field sync**: when X/Y axes are unlinked, fields without dedicated Y widgets (cap_mode, exponent_power, decay_rate, scale, output_offset, motivity, gamma, smooth, sync_speed) are copied from X to prevent stale values

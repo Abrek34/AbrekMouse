@@ -129,6 +129,42 @@ sudo bash setup.sh --reinstall    # clean old install, then reinstall (default)
 `scripts/install.sh` is a thin wrapper that forwards to `setup.sh` (kept for
 backwards compatibility).
 
+### GUI ile kolay kurulum (kaynak dizininden)
+
+Aynı `setup.sh`'yi arka planda çalıştıran küçük bir GTK4 kurulum sihirbazı da
+vardır. Kurulum mantığını kopyalamaz; böylece GUI ile kanonik kurulum
+birbirinden ayrışamaz:
+
+```bash
+bash install-gui.sh
+```
+
+Sihirbaz; kurulu sürümü, daemon/servis durumunu ve kaynak klasörünü gösterir.
+**Hemen Kur / Yeniden Kur / Kaldır** düğmeleri `setup.sh`'yi `pkexec` ile
+yönetici izni isteyerek çalıştırır; ilerleme ve tüm çıktı penceredeki günlüğe
+akıtılır. `--no-deps` seçeneği, bağımlılıklar zaten kuruluysa zaman kazandırır.
+
+Kurulumdan önce sihirbaz paket yöneticisi durumunu denetler:
+
+- **Bayat `/var/lib/pacman/db.lck`:** çalışan bir pacman/paru/yay süreci yoksa
+  pencerede **Bağımlılıkları atla ve devam et** (önerilen; bağımlılıklar zaten
+  kuruluysa en hızlı yol) veya **Kilidi temizle ve devam et** seçeneği sunulur.
+  Temizleme yalnızca kilit dosyasını siler; paket veritabanına dokunmaz.
+- **Paket yöneticisi meşgul:** pacman/paru/yay çalışıyorsa sihirbaz kilide
+  dokunmaz; bitmesini bekleyip yeniden denemenizi söyler.
+- **Kurulum sırasında kilit hatası:** günlükteki hata yakalanır ve
+  **Bağımlılıkları atla ve dene** / **Kilidi temizle ve dene** seçenekleri
+  sunulur. **Günlüğü Kopyala** düğmesi tanı için tüm çıktıyı panoya alır.
+
+- GTK4 geliştirme dosyaları yoksa sihirbaz derlenemez; önce bir kez
+  `sudo bash setup.sh` çalıştırın (bağımlılıkları da kurar), sonra
+  `bash install-gui.sh`'yi tekrar deneyin.
+- `pkexec` yoksa sihirbaz bunu açıkça söyler; yönetici izni alınamadığı için
+  kurulum başlatılamaz.
+- GUI yalnızca kaynak ağacından çalışır (kurulum sonrası sistem binary'si
+  olarak kurulmaz). Durum sorgulamak için:
+  `bash install-gui.sh --detect`.
+
 > **Arch package coexistence**: on Arch-based distros you can instead install
 > the packaged binary (`packaging/rawaccel-linux-1.2.7-1-x86_64.pkg.tar.zst`,
 > `sudo pacman -U ...`) or publish it via an AUR package. Do **not** mix
@@ -616,6 +652,9 @@ rawaccel-linux/
 │   ├── graph.inl              # Cairo curve rendering, LUT editor
 │   ├── profile_mgr.inl        # Profile CRUD dialogs
 │   └── widgets_sync.inl       # Widget ↔ profile sync, GTK callbacks
+├── installer/
+│   ├── main.cpp               # rawaccel-installer — GTK4 setup assistant (wraps setup.sh; db-lock repair)
+│   └── log_scan.hpp           # ✗-only failure marker + pacman db.lck scan (never matches EKSİKSİZ)
 ├── scripts/
 │   ├── build.sh               # Quick build script
 │   ├── install.sh             # Thin wrapper → setup.sh
@@ -629,15 +668,18 @@ rawaccel-linux/
 ├── tests/
 │   ├── test_accel.cpp         # Unit + integration tests
 │   ├── tr_coverage.cpp        # Translation coverage audit (find strings)
+│   ├── installer_log_scan_test.cpp # Installer ✗-marker regression test
 │   ├── run_tests.sh           # Unit test runner
 │   ├── run_tests_asan.sh      # Unit test runner under ASan/UBSan
 │   ├── run_tr_coverage.sh     # Translation coverage runner
+│   ├── run_installer_smoke.sh # GTK4 installer headless contract smoke test
 │   ├── run_fuzz.sh            # libFuzzer runner
 │   ├── fuzz_accel.cpp         # Fuzz harness — acceleration pipeline
 │   ├── fuzz_config.cpp        # Fuzz harness — config JSON parsing
 │   ├── corpus_config/         # Fuzz seed corpus
 │   └── oracle/                # Differential oracle + vendored RawAccel ref
 ├── .github/workflows/ci.yml   # GitHub Actions CI (build + tests + oracle + sanitizers + fuzz)
+├── install-gui.sh             # GUI installer launcher (builds/runs rawaccel-installer)
 ├── setup.sh                   # Canonical one-shot installer
 └── CMakeLists.txt
 ```

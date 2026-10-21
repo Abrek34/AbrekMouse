@@ -21,6 +21,73 @@ The canonical version string lives in `include/rawaccel-base.hpp`
   dönüşümlerden ÖNCE dispatch ediliyor. Böylece iki boru hattı bir daha
   ayrışamaz.
 
+### Fixed — performans / hesaplama
+
+- **EMA trendlerinin subnormal zehirlenmesi (kritik sıcak yol).**
+  `linear_ema_smoother` trend accumulator'ları her olayda
+  `trendDampening` ile çarpılıyor. Sabit hızda veya fare durduktan sonra
+  değerler `DBL_MIN`'in altına inip subnormal oluyor; x86 her sonraki
+  çarpma/toplama için microcode assist ödüyor. Ölçüm: yalnız input
+  smoothing aşaması 244 → 54 ns/olay, tam `power-dual+4ema` profili
+  285 → 99 ns/olay. `flush_subnormal()` her güncellemeden sonra
+  `|değer| < DBL_MIN` ise tam 0 yazıyor (2.2e-308'in altı zaten gerçek
+  hız olarak temsil edilemez). 100K sabit + 100K durmuş örnek sonrası
+  state'in subnormal kalmadığını doğrulayan regresyon assertion'ları
+  eklendi.
+- **`classic` exponent 2 için `std::pow` yerine çarpma.** Struct
+  varsayılanı olan ve yaygın kullanılan `exponent_classic = 2.0` için
+  her olayda ~10 ns'lik libm `pow` çağrısı vardı. `base*base` tüm
+  sonlu/±0/±Inf/NaN girdilerde aynı doğru yuvarlanmış sonucu verir;
+  diğer üsler (özellikle 3, ikinci bir yuvarlama adımı ekler) generic
+  `std::pow` yolunda kaldı. Ölçüm: `classic` 43.5 → 25.3 ns/olay,
+  `apply_motion_math(full)` 43.4 → 26.8 ns/olay.
+- **`magnitude()` sıcak yolunda `std::hypot` yerine ölçekli karekök.**
+  `M·sqrt(1+(m/M)²)` biçimi taşma/underflow güvenliğini korurken
+  `std::hypot`'un ~2.5 ns/çağrı maliyetini ~0.9 ns'ye indiriyor.
+  Sonlu-olmayan/NaN girdiler hâlâ `std::hypot`'a delege edilir; normal
+  sonuçlar arasındaki fark en fazla 2 ULP (boru hattı toleransı 1e-9).
+  `simd::magnitude` artık ayrı bir kopya değil, aynı implementasyonu
+  çağırıyor.
+
+### Fixed — kurulum / servis
+
+- **`rawaccel.service` 226/NAMESPACE ile başlamıyordu.** `ProtectSystem=strict`
+  altında `ReadWritePaths` içinde tek tek `/run/rawaccel.pid` ve
+  `/run/rawaccel.sock` dosyaları listeleniyordu. systemd bu yolları mount
+  namespace kurulumunda, daemon onları oluşturmadan önce çözmeye çalışıyor;
+  temiz kurulumda PID dosyası olmadığı için servis
+  `Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory`
+  ve `status=226/NAMESPACE` ile düşüyordu. `ReadWritePaths=/etc/rawaccel /run`
+  yapıldı; diğer dosya sistemi yolları read-only kalıyor. Kurulum ayrıca
+  önceki restart limitini `systemctl reset-failed` ile temizliyor.
+- **KDE fix adımı tek denemede başarısız olabiliyordu.** Gerçek kurulumda
+  `kde-fix-accel.sh hata verdi` raporlandı; aynı script kullanıcı olarak elle
+  çalıştırıldığında başarılı oldu. Adım artık root oturumunda `runuser` ile
+  çalıştırılıyor (TTY/PAM gerektiren `sudo -u` yalnızca `runuser` yoksa
+  fallback), ve ilk deneme başarısız olursa bir kez yeniden deneniyor.
+  Kök neden bu ortamda yeniden üretilemedi; gerçek KDE oturumunda tekrar
+  doğrulanmalı.
+
+### Added — kurulum
+
+- **GTK4 kolay kurulum sihirbazı (`install-gui.sh`).** Kaynak ağacından
+  `bash install-gui.sh` ile açılan sihirbaz; kurulu sürümü, daemon/servis
+  durumunu ve kaynak klasörünü gösterir. **Hemen Kur / Yeniden Kur / Kaldır**
+  işlemleri kurulum mantığını kopyalamak yerine kanonik `setup.sh`'yi `pkexec`
+  ile çalıştırır; ilerleme ve tüm çıktı pencere içindeki günlüğe akar.
+  Bağımlılıklar zaten kuruluysa `--no-deps` seçeneği kullanılabilir.
+  `rawaccel-installer --detect` ve `--print-command` GUI'siz doğrulama sağlar.
+  Sihirbaz `scripts/build.sh` ve CMake ile derlenir; sistem binary'si olarak
+  kurulmaz (kurulum sonrası bootstrap aracı değildir).
+- **Kurulum sihirbazında paket kilidi onarımı.** Sihirbaz başlamadan önce
+  `/var/lib/pacman/db.lck` ve çalışan pacman/paru/yay süreçlerini denetler.
+  Bayat kilit varsa **Bağımlılıkları atla ve devam et** (önerilen) veya
+  **Kilidi temizle ve devam et** (yalnızca kilit dosyası silinir)
+  seçeneklerini sunar; paket yöneticisi çalışıyorsa kilide dokunmaz.
+  Kurulum sırasında kilit hatası
+  oluşursa aynı seçenekler hata penceresinde gösterilir. Günlük artık
+  **Günlüğü Kopyala** düğmesiyle panoya alınabilir.
+
 ### Added — test
 
 - **X/Y izotropi + DPI bağımsızlığı regresyonu.** 7 hızlanma modu ×

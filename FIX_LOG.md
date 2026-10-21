@@ -630,3 +630,46 @@ Kullanıcı bildirimi: dikey ve yatay hareket DPI'dan bağımsız olarak eşit o
 - **Kapılar:** build 0 uyarı · unit 34391/34391 · oracle 1408/79 OK · SIMD parity AVX2/SSE2/scalar birebir · tr_coverage PASS · CLI ASan/UBSan 34/34 · test_accel ASan/UBSan 34391/34391 · tracker bridge temiz. Bench rc=77 (ortam kirli; ölçüm iddiası yok).
 - **Dosyalar:** `include/rawaccel.hpp`, `tests/test_accel.cpp`, `AGENTS.md`, `olcum/aj2/sayisal_iddialar.txt`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `FIX_LOG.md`.
 - **Ayrıntı:** `Bug Hata Raporları.md` → TUR 55 / T55-01..T55-03.
+
+---
+
+## round-19 (opencode — 21.10.2026) — EMA subnormal slow path, classic pow, hypot
+
+Kullanıcı isteği: hesaplama ve performans hatalarını düzelt. Bu turda üç
+sıcak-yol sorunu ölçülerek bulundu ve düzeltildi; hepsi davranışı koruyor.
+
+| ID | Dosya | Konu | Durum |
+|---|---|---|---|
+| R19-DENORM (PERF, kritik) | `include/rawaccel.hpp` | `linear_ema_smoother` trend accumulator'ları sabit hızda `trendDampening` ile geometrik olarak küçülüp **en küçük subnormal** `4.94e-324` değerine oturuyordu. Ondan sonra her çarpma/toplama x86 microcode assist ödüyordu; yalnız input smoothing aşaması **244 ns/olay**, tam 4-EMA profili **285 ns/olay** oluyordu. `flush_subnormal()` (`abs(v) < DBL_MIN → 0`) her güncellemeden sonra uygulanıyor. | `✅ opencode — input aşaması 244 → 54 ns/olay; power-dual+4ema 285 → 99 ns/olay. 100K sabit + 100K durmuş örnek sonrası state'in subnormal kalmadığını doğrulayan 10 assertion eklendi.` |
+| R19-CLASSIC (PERF) | `include/accel-classic.hpp` | `classic::base_fn` runtime `std::pow(x, exponent_classic)` kullanıyordu; varsayılan/yaygın `2.0` için her olayda ~10 ns. `base*base` aynı doğru yuvarlanmış sonucu verir; diğer üsler generic yolda kaldı. | `✅ opencode — classic 43.5 → 25.3 ns/olay; apply_motion_math(full) 43.4 → 26.8 ns/olay.` |
+| R19-MAG (PERF) | `include/math-vec2.hpp`, `include/simd_math.hpp` | `magnitude()` her whole-axis karede `std::hypot` (~2.5 ns) çağırıyordu; SIMD tarafında ikinci bir kopya vardı. `M·sqrt(1+(m/M)²)` ölçekli biçimi taşma/underflow güvenliğini koruyor, non-finite/NaN girdiler `std::hypot`'a delege ediliyor. | `✅ opencode — ~2.5 → ~0.9 ns/çağrı; rastgele 10M girdide hypot'a karşı en fazla 2 ULP, taşma/underflow vakaları korunuyor. simd::magnitude tek implementasyona delege ediyor.` |
+
+**Ölçüm (bu makine, i9-9900K, GCC 16.2.1, median-of-3; ns/olay):**
+
+| config | önce | sonra |
+|---|---:|---:|
+| noaccel | 13.68 | 12.77 |
+| power-whole | 20.84 | 21.99 |
+| classic | 43.45 | 25.31 |
+| power+rot45+snap15+clamp | 39.05 | 42.51 |
+| power-dual+4ema | 279.98 | 98.49 |
+| apply_motion_math(full) | 43.39 | 26.82 |
+
+`power-whole` ve rotasyon satırlarındaki küçük oynamalar ölçüm gürültüsü
+(noaccel kontrolü aynı koşuda −6.64%); asıl kazanç denormal flush ve
+classic pow yolunda. `tests/perf_baseline.json` bilinçli olarak
+güncellenmedi: baseline farklı bir derleme/ortam turundan geliyor
+(`power-whole` baseline 39.18 iken bu ağaçta düzeltme öncesi bile 20.84),
+bu yüzden onu bu makinenin sayılarıyla daraltmak CI'da yanlış kırmızı
+üretebilir. Mevcut baseline ile bench gate **PASS**.
+
+**Kapılar:** build 0 uyarı · unit **34405/34405** · test_accel ASan/UBSan
+**34405/34405** · oracle **1408 satır / 79 bilinen sapma OK** · SIMD parity
+AVX2/SSE2/scalar birebir · tr_coverage PASS · CLI ASan/UBSan **34/34** ·
+tracker bridge temiz · `prove_kod_ayni.py --sayi` **14/14** · hot-path
+benchmark tüm config'lerde baseline içinde (rc=0).
+
+**Değişen dosyalar:** `include/rawaccel.hpp`, `include/math-vec2.hpp`,
+`include/simd_math.hpp`, `include/accel-classic.hpp`,
+`tests/test_accel.cpp`, `AGENTS.md`, `docs/research/precision.md`,
+`CHANGELOG.md`, `olcum/aj2/sayisal_iddialar.txt`, `FIX_LOG.md`.

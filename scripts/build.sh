@@ -169,7 +169,12 @@ else
     # Direct compilation path (original behavior)
     mkdir -p "$BUILD"
 
-echo "[1/3] Building rawaccel-daemon..."
+    TOTAL_STEPS=3
+    if [ "$HAVE_GTK4" = "1" ]; then
+        TOTAL_STEPS=4
+    fi
+
+echo "[1/$TOTAL_STEPS] Building rawaccel-daemon..."
     # EVDEV_CFLAGS (-I/usr/include/libevdev-1.0) is required for
     # "libevdev/libevdev-uinput.h" -- EVDEV_LIBS alone only covers linking.
     "$CXX" $ALL_CXXFLAGS $EVDEV_CFLAGS -I"$ROOT/include" \
@@ -181,7 +186,7 @@ echo "[1/3] Building rawaccel-daemon..."
         $EVDEV_LIBS -lpthread $ALL_LDFLAGS \
         -o "$BUILD/rawaccel-daemon"
 
-    echo "[2/3] Building rawaccel-cli..."
+    echo "[2/$TOTAL_STEPS] Building rawaccel-cli..."
     "$CXX" $ALL_CXXFLAGS $EVDEV_CFLAGS -I"$ROOT/include" \
         "$ROOT/src/config.cpp" \
         "$ROOT/src/logitech_receiver.cpp" \
@@ -191,17 +196,33 @@ echo "[1/3] Building rawaccel-daemon..."
         -o "$BUILD/rawaccel-cli"
 
     if [ "$HAVE_GTK4" = "1" ]; then
-        echo "[3/3] Building rawaccel-gui..."
+        echo "[3/$TOTAL_STEPS] Building rawaccel-gui..."
+        # Same ETXTBSY hazard as the installer below: a GUI launched directly
+        # from build-manual/ may still be running when setup.sh rebuilds.
+        gui_tmp="$BUILD/rawaccel-gui.tmp.$$"
         "$CXX" $ALL_CXXFLAGS $EVDEV_CFLAGS $GTK4_CFLAGS -I"$ROOT/include" \
             "$ROOT/src/config.cpp" \
             "$ROOT/src/logitech_receiver.cpp" \
             "$ROOT/src/logitech_hidpp.cpp" \
             "$ROOT/gui/main.cpp" \
                 -lpthread $GTK4_LIBS -ldl $ALL_LDFLAGS \
-                -o "$BUILD/rawaccel-gui"
+                -o "$gui_tmp"
+        mv -f "$gui_tmp" "$BUILD/rawaccel-gui"
+
+        echo "[4/$TOTAL_STEPS] Building rawaccel-installer..."
+        # The GUI installer is running while setup.sh rebuilds the tree.  A
+        # direct `g++ -o build-manual/rawaccel-installer` would hit ETXTBSY on
+        # the live executable; compile to a fresh inode and rename over it.
+        installer_tmp="$BUILD/rawaccel-installer.tmp.$$"
+        "$CXX" $ALL_CXXFLAGS $GTK4_CFLAGS -I"$ROOT/include" \
+            "$ROOT/installer/main.cpp" \
+                -lpthread $GTK4_LIBS -ldl $ALL_LDFLAGS \
+                -o "$installer_tmp"
+        mv -f "$installer_tmp" "$BUILD/rawaccel-installer"
     else
-        echo "[3/3] Skipping rawaccel-gui (GTK4 development files not found)."
+        echo "[3/$TOTAL_STEPS] Skipping rawaccel-gui (GTK4 development files not found)."
         rm -f "$BUILD/rawaccel-gui"
+        rm -f "$BUILD/rawaccel-installer"
     fi
 
     echo ""
@@ -211,5 +232,6 @@ echo "[1/3] Building rawaccel-daemon..."
     echo "  $BUILD/rawaccel-cli      -- CLI config tool"
     if [ "$HAVE_GTK4" = "1" ]; then
         echo "  $BUILD/rawaccel-gui      -- GUI"
+        echo "  $BUILD/rawaccel-installer -- kolay kurulum GUI"
     fi
 fi

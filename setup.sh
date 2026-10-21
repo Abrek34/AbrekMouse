@@ -85,6 +85,20 @@ else
     REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 fi
 
+# Run a helper as the desktop user while preserving the session variables that
+# KDE needs.  Prefer runuser over sudo: setup.sh is already root (via pkexec),
+# and sudo may be unavailable/require a TTY in a GUI-launched pkexec session.
+run_as_real_user() {
+    if [[ -z "$REAL_USER" ]]; then return 1; fi
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -m -u "$REAL_USER" -- "$@"
+    else
+        sudo -u "$REAL_USER" \
+            --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+            "$@"
+    fi
+}
+
 # ── Distro tespiti ────────────────────────────────────────────────────────────
 DISTRO_ID=""
 if [[ -f /etc/os-release ]]; then
@@ -400,6 +414,9 @@ do_install() {
 # KDE fix adımı bu sanal cihaz için per-device override yazacak.
 start_service() {
     say "[5/7] Servis başlatılıyor..."
+    # A previous unit can be in start-limit-hit after a failed upgrade; clear
+    # the failed state so a repaired unit is allowed to start immediately.
+    systemctl reset-failed rawaccel.service 2>/dev/null || true
     # H-1: with `set -euo pipefail` an unbounded `systemctl enable --now`
     # would abort the whole install on any service problem (bad config,
     # blocked uinput…) and dead-code the graceful warning below.  Fail
@@ -439,13 +456,20 @@ fix_kde_plasma() {
     # kde-fix-accel.sh global + per-device override yazar; gerçek kullanıcı olarak
     # çalıştırılmalı (kwinrc kullanıcının ev dizininde, sahibinin user olması lazım).
     if [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
-        # H-3: sudo resets the session environment by default — without
-        # XDG_CURRENT_DESKTOP/DESKTOP_SESSION/DBUS_SESSION_BUS_ADDRESS/
-        # XDG_RUNTIME_DIR the KDE detection and the live KWin reload are
-        # silently skipped.  Preserve them so the fix actually runs.
-        sudo -u "$REAL_USER" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
-            bash "$ROOT/scripts/kde-fix-accel.sh" --fix \
-            || warn "kde-fix-accel.sh hata verdi"
+        # H-3: without XDG_CURRENT_DESKTOP/DESKTOP_SESSION/
+        # DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR the KDE detection and live
+        # KWin reload are silently skipped.  run_as_real_user preserves them
+        # and, unlike sudo, works without a TTY under a pkexec GUI launch.
+        if ! run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --fix; then
+            # KWin can be writing kwinrc while the first attempt runs (the
+            # installer starts KDE right after the service); one short retry
+            # avoids a spurious "fix failed" report on an otherwise healthy
+            # session.
+            warn "kde-fix-accel.sh ilk denemede başarısız — yeniden deneniyor..."
+            sleep 1
+            run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --fix \
+                || warn "kde-fix-accel.sh hata verdi"
+        fi
     else
         warn "scripts/kde-fix-accel.sh bulunamadı; KDE fix atlandı."
     fi
@@ -565,8 +589,7 @@ do_uninstall() {
     # global [Libinput]'i adaptive'e döndür (kde-fix-accel.sh --remove).
     if [[ -n "$REAL_USER" ]] && [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
         # H-3: preserve the session env so kwinrc detection + D-Bus reload work.
-        sudo -u "$REAL_USER" --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
-            bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
+        run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
             || warn "kwinrc iz temizliği hata verdi (önemsiz)."
     fi
     ok "Kaldırma tamamlandı. Kullanıcı configi (~/.config/rawaccel + /etc/rawaccel) korundu."

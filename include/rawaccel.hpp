@@ -3,10 +3,27 @@
 #include "simd_math.hpp"
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 namespace rawaccel {
 
 // ── Smoothers ────────────────────────────────────────────────────────────────
+
+/// PERF: flush subnormal EMA state to zero.
+///
+/// The linear smoother multiplies both trend accumulators by `trendDampening`
+/// on every event.  With a constant or stopped input they decay geometrically
+/// and eventually land in the subnormal range, where every subsequent multiply
+/// and add costs a microcode assist (~100 ns on this machine) instead of a
+/// single FP op.  The value is already below DBL_MIN (2.2e-308), far outside
+/// any representable cursor speed or trend, so replacing it with 0 is the
+/// correct numerical limit and removes the permanent slow path.  This is a
+/// real hot-path issue: before the flush, a steady 1 ms input made the
+/// benchmark's smooth path ~240 ns/event; after it, the state is exactly 0 and
+/// the ordinary no-smoothing cost remains.
+static inline double flush_subnormal(double value) {
+    return std::fabs(value) < std::numeric_limits<double>::min() ? 0.0 : value;
+}
 
 /// Simple exponential moving average (EMA) smoother.
 ///
@@ -62,8 +79,8 @@ struct simple_ema_smoother {
         // which matters for GCC's inline budget in the whole modifier pipeline.
         const double twc = 1.0 - std::exp2(windowLog2 * time);
         const double tcc = 1.0 - std::exp2(cutoffLog2 * time);
-        windowTotal += twc * (speed - windowTotal);
-        cutoffTotal += tcc * (speed - cutoffTotal);
+        windowTotal = flush_subnormal(windowTotal + twc * (speed - windowTotal));
+        cutoffTotal = flush_subnormal(cutoffTotal + tcc * (speed - cutoffTotal));
         return std::min(windowTotal, cutoffTotal);
     }
 };
@@ -149,15 +166,15 @@ struct linear_ema_smoother {
 
         // don't let trend carry us below 0 (clamp AFTER the EMA update, like the
         // reference — trend adjustment below then measures the clamped state)
-        windowTotal  = std::max(windowTotal, 0.0);
-        cutoffTotal  = std::max(cutoffTotal, 0.0);
+        windowTotal  = flush_subnormal(std::max(windowTotal, 0.0));
+        cutoffTotal  = flush_subnormal(std::max(cutoffTotal, 0.0));
 
         double nwt = time > 0 ? (windowTotal - oldW) / time : 0;
         double nct = time > 0 ? (cutoffTotal - oldC) / time : 0;
         if (!std::isfinite(nwt) || nwt < -kMaxTrendSlope || nwt > kMaxTrendSlope) nwt = 0;
         if (!std::isfinite(nct) || nct < -kMaxTrendSlope || nct > kMaxTrendSlope) nct = 0;
-        windowTrendTotal += twtc * (nwt - windowTrendTotal);
-        cutoffTrendTotal += tctc * (nct - cutoffTrendTotal);
+        windowTrendTotal = flush_subnormal(windowTrendTotal + twtc * (nwt - windowTrendTotal));
+        cutoffTrendTotal = flush_subnormal(cutoffTrendTotal + tctc * (nct - cutoffTrendTotal));
 
         return std::min(windowTotal, cutoffTotal);
     }

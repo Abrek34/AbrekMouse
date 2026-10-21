@@ -221,7 +221,7 @@ Consequences, all desirable for this code:
 | `std::log` | ~0.5–1 ULP | synchronous :53,57,73,81 |
 | `std::tanh` | ~1–2 ULP | synchronous :88,93 |
 | `std::scalbn` / `std::ilogb` | exact (bit manipulation) | synchronous :147,151-154 |
-| `std::hypot` | 1 ULP, overflow-safe | `math-vec2.hpp:12` (magnitude) |
+| scaled sqrt `M·sqrt(1+(m/M)²)` | ≤2 ULP, overflow-safe; `std::hypot` fallback for non-finite | `math-vec2.hpp` (`magnitude`) |
 
 No `sin/cos` in the hot path except GUI graph/rotation setup
 (`math-vec2.hpp:40-41`) — not latency-critical.
