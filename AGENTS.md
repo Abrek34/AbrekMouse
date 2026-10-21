@@ -363,8 +363,8 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 151 `test_` functions / 217 `SECTION` groups, 34267 runtime assertions (the
-  runner's own count; the source has 1611 `EXPECT` call sites — `#define` lines
+- 152 `test_` functions / 221 `SECTION` groups, 34391 runtime assertions (the
+  runner's own count; the source has 1623 `EXPECT` call sites — `#define` lines
   excluded, loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
@@ -495,7 +495,7 @@ together — CHANGELOG documents the same three-way sync.
 | `gui/widgets_sync.inl` | Widget ↔ profile sync, GTK callbacks |
 | `gui/profile_mgr.inl` | Profile CRUD dialogs |
 | `gui/ui_builder.inl` | Layout helpers, build_ui(), window-close, on_activate() |
-| `tests/test_accel.cpp` | Unit + integration tests (151 functions / 217 `SECTION` groups, 34267 runtime assertions) |
+| `tests/test_accel.cpp` | Unit + integration tests (152 functions / 221 `SECTION` groups, 34391 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
@@ -771,6 +771,7 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **JSON log escaping**: `--log-format json` escapes log `message` strings (`\" \\ \n \r \t \b \f`, control chars → `\uXXXX`) so device names/paths/errno text can never corrupt the log stream (P53)
 - **Subnormal time guard**: `modifier::modify()` clamps `ips_factor` to `IPS_FACTOR_MAX` (1e6) when `dpi_factor/time` overflows to Inf (subnormal time values like 1e-309)
 - **Modify output guard**: defense-in-depth `isfinite()` check at the end of `modifier::modify()` ensures no NaN/Inf escapes to motion_math
+- **X/Y isotropy (correctness invariant)**: whole and separate pipelines share `apply_pre_speed_transforms()`, so rotation / angle snap / speed clamp run exactly once. `modifier::modify()` dispatches `distance_mode::separate` BEFORE computing anything else; the old order applied all three transforms in `modify()` and again in `modify_separate_simd()`, turning a 90° rotation into 180°. `test_xy_isotropy_and_dpi_independence()` pins equal physical X/Y output across 400–3200 DPI (7 modes × whole/separate), DPI-invariant output for the same physical distance, and X/Y symmetry of every built-in preset.
 - **Duplicate device_id warning**: GUI warns on startup and on save if multiple profiles share the same device_id (first-match-wins in daemon)
 - **lat_stats move safety**: move constructor/assignment lock the source mutex before copying data (defense-in-depth against concurrent record() during vector reallocation)
 - **lat_stats finite guard**: non-finite latency samples are dropped and negative samples clamped to 0 before histogram insertion (P55-O1)

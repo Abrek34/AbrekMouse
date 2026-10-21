@@ -6,6 +6,30 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 (`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
 `packaging/PKGBUILD` — bump all three together.
 
+## [Unreleased]
+
+### Fixed — doğruluk
+
+- **Ayrık modda çift dönüşüm (rotation / snap / speed clamp).**
+  `modifier::modify()` bu üç dönüşümü uyguladıktan sonra
+  `modify_separate_simd()`'i çağırıyordu; o da aynı üçünü yeniden
+  uyguluyordu. Snap ve clamp idempotent olduğu için yalnızca rotation
+  gözle görülür biçimde bozuluyordu: 90° dönüş 180°'ye dönüşüyor,
+  `(40,0)` girişi whole modda `(0,40)` çıkarken separate modda `(-40,0)`
+  çıkıyordu. Dönüşümler artık `apply_pre_speed_transforms()` içinde tek
+  yerde ve tam bir kez uygulanıyor; separate mod, `modify()` içinde
+  dönüşümlerden ÖNCE dispatch ediliyor. Böylece iki boru hattı bir daha
+  ayrışamaz.
+
+### Added — test
+
+- **X/Y izotropi + DPI bağımsızlığı regresyonu.** 7 hızlanma modu ×
+  whole/separate × 400/800/1600/3200 DPI için eşit fiziksel X ve Y
+  hareketinin aynı çıktıyı ürettiği; aynı fiziksel mesafenin farklı
+  DPI'larda aynı çıktıyı verdiği; separate modda rotation'ın tam bir kez
+  uygulandığı ve tüm yerleşik presetlerin X/Y'yi aynı yapılandırdığı
+  doğrulanıyor.
+
 ## [1.2.7] — 2026-10-07
 
 Audit-round fix pack: 15 open bug-tracker items closed in one batch.

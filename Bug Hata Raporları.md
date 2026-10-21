@@ -3601,3 +3601,47 @@ Odak: `setup_devices`, `do_hotplug_scan`, `open/create/release/teardown`, `deny_
 - Açıklama: .desktop launcher'da stderr görünmez → kullanıcı hiçbir şey görmez; rc=0 sessiz.
 - Öneri: Görünür modda küçük bilgi dialog'u; headless'ta stderr yeterli; rc != 0.
 - Durum: DÜZELTİLDİ — flock çakışmasında stderr mesajı korunuyor + `gtk_init_check()` başarılıysa kullanıcıya bilgi penceresi (15 sn auto-dismiss) gösteriliyor, rc 1.
+
+---
+
+# TUR 55 — X/Y izotropi / ayrık modda çift dönüşüm (2026-10-21, opencode)
+
+Kullanıcı bildirimi: *"mouse aşağı yukarı sağa ve sola eşit hareket etmeli; çözünürlük ne olursa olsun eşit olmalı."* İki katman ayrı ayrı ölçüldü: donanım DPI yazımı ve yazılım boru hattı.
+
+**T55-01 · YÜKSEK · Ayrık modda rotation / snap / speed clamp iki kez uygulanıyordu**
+- Konum: `include/rawaccel.hpp` — `modifier::modify()` ve `modify_separate_simd()`
+- Kategori: Doğruluk / X-Y simetrisi
+- Açıklama: `modify()` üç ön-dönüşümü uyguladıktan sonra separate modda `modify_separate_simd()` çağırıyordu; o da aynı üçünü yeniden uyguluyordu. Snap ve clamp idempotent olduğu için tek gözlemlenebilir sapma rotation'dı: 90° dönüş 180°'ye dönüşüyor, `(40,0)` whole modda `(0,40)` çıkarken separate modda `(-40,0)` çıkıyordu. Bu, rotation kullanan profillerde X/Y eşitliğini ve whole/separate tutarlılığını bozuyordu.
+- Ölçüm: aynı giriş ve ayarlarla düzeltme öncesi whole `(0,40)` / separate `(-40,0)`; düzeltme sonrası iki yol da `(0,40)`.
+- Düzeltme: rotation + snap + clamp `apply_pre_speed_transforms()` içinde tek yere alındı. `modify()` separate modu dönüşümlerden ÖNCE dispatch ediyor; whole yol da aynı helper'ı kullanıyor. Böylece iki boru hattı bir daha ayrışamaz.
+- Durum: DÜZELTİLDİ — `include/rawaccel.hpp`.
+
+**T55-02 · BİLGİ · Donanım DPI asimetrisi (DPIFIX-1) zaten kapalıydı**
+- Konum: `src/logitech_hidpp.cpp` — `HidppTransport::set_dpi()`
+- Kategori: Donanım / DPI
+- Açıklama: Logitech HID++ extended DPI yolunda tek değerli `set_dpi()` artık aynı DPI'ı X ve Y'ye yazıyor. Eski kod Y eksenindeki değeri koruyordu; PRO X 2'de X=400 / Y=1600 → dikey hareket 4× hızlıydı. Kullanıcının istediği "çözünürlükten bağımsız eşitlik" için iki katman da simetrik olmak zorunda: yazılım (`dpi_factor` her iki eksende aynı) + donanım (aynı DPI yazımı).
+- Sınır: `set_dpi()` istenen değer `dpi_levels` içinde değilse isteği reddediyor; bu durumda donanım önceki DPI'da kalır ve daemon log'a `Failed to set DPI ...` yazar. Asimetri hâlâ görülürse desteklenen bir DPI seçilmeli ve log kontrol edilmeli.
+- Durum: MEVCUT DÜZELTME (DPIFIX-1) doğrulandı; bu turda bu dosyada kod değişmedi.
+
+**T55-03 · Test boşluğu kapatıldı — X/Y izotropi + DPI bağımsızlığı**
+- Konum: `tests/test_accel.cpp` — `test_xy_isotropy_and_dpi_independence()`
+- Kapsam: 7 mod (noaccel / classic / power / natural / jump / synchronous / lookup) × whole/separate × 400/800/1600/3200 DPI; eşit fiziksel X ve Y hareketinin aynı çıktıyı vermesi; aynı fiziksel mesafenin farklı DPI'larda aynı çıktıyı vermesi; separate modda rotation'ın tam bir kez uygulanması; tüm built-in presetlerin X/Y'yi aynı yapılandırması.
+- Sonuç: 64 assertion; toplam suite 34267 → 34391, test fonksiyonu 151 → 152, SECTION 217 → 221.
+- Durum: EKLENDİ.
+
+**Doğrulama (2026-10-21)**
+| Kapı | Sonuç |
+|---|---|
+| `scripts/build.sh` | ✅ 0 uyarı |
+| `tests/run_tests.sh` | ✅ 34391/34391 |
+| Oracle (1408 satır / 79 belgeli sapma) | ✅ OK |
+| SIMD parity (AVX2 / SSE2 / scalar) | ✅ Birebir aynı |
+| `run_tr_coverage.sh` | ✅ PASS |
+| `run_cli_sanitized.sh` (ASan+UBSan) | ✅ 34/34 |
+| `run_tests_asan.sh` (ASan+UBSan) | ✅ 34391/34391 |
+| Tracker bridge | ✅ Temiz |
+| `bench_hotpath.sh` | ⚠️ rc=77 — kontrol sapması %35.76 / %66.83, ortam kirli; ölçüm iddiası yok |
+
+**Performans notu:** Yeni helper `static inline`; derlenmiş daemon/bench ikililerinde `apply_pre_speed_transforms` sembolü yok (tamamen inline). Hot path'e ek syscall, allocation veya bölme eklenmedi.
+
+**Bu turda değişen dosyalar:** `include/rawaccel.hpp`, `tests/test_accel.cpp`, `AGENTS.md`, `olcum/aj2/sayisal_iddialar.txt`, `CHANGELOG.md`, `Bug Hata Raporları.md` (bu kayıt), `FIX_LOG.md`.

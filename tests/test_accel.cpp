@@ -15,6 +15,7 @@
 #include "../include/accel-noaccel.hpp"
 #include "../include/accel-union.hpp"
 #include "../include/config.hpp"
+#include "../include/presets.hpp"
 #include "../include/logitech_receiver.hpp"
 #include "../include/logitech_hidpp.hpp"
 #include "../include/logitech_quirks.hpp"
@@ -68,7 +69,7 @@ static const char* g_section = "";
 // --filter / --list modları kasıtlı olarak az fonksiyon koşar, bu yüzden
 // meta-kontrol yalnız TAM koşuda uygulanır.
 static int  g_test_functions_run = 0;
-static constexpr int EXPECTED_TEST_FUNCTIONS = 151;
+static constexpr int EXPECTED_TEST_FUNCTIONS = 152;
 
 static bool        g_section_active = true;   // current section runs assertions
 static bool        g_list_only      = false;  // --list: print names, skip asserts
@@ -5690,6 +5691,166 @@ static void test_output_dpi_applied() {
     EXPECT_NEAR(in4.y, -6.0, 1e-9);
 }
 
+// ── X/Y isotropy + DPI ("resolution") independence ───────────────────────────
+//
+// Contract reported by the user and by DPIFIX-1: equal physical movement up /
+// down and left / right must produce equal cursor movement, and the
+// acceleration curve must be evaluated in physical units, so the same physical
+// movement gives the same output at any mouse DPI ("resolution").
+//
+// Pinned here in three independent ways:
+//   1. for every algorithm, whole and separate, 400..3200 DPI:
+//      out_x(d, 0) == out_y(0, d);
+//   2. scaling the input counts in proportion to DPI (same physical distance)
+//      produces the same output;
+//   3. every built-in preset configures both axes identically.
+static void test_xy_isotropy_and_dpi_independence() {
+    SECTION("isotropy — X and Y are equal for equal movement at every DPI (whole + separate)");
+
+    const accel_mode modes[] = {
+        accel_mode::noaccel, accel_mode::classic, accel_mode::power,
+        accel_mode::natural, accel_mode::jump, accel_mode::synchronous,
+        accel_mode::lookup
+    };
+    constexpr int mode_count = static_cast<int>(sizeof(modes) / sizeof(modes[0]));
+
+    auto make_profile = [](accel_mode mode, bool whole) {
+        profile p;
+        p.accel_x.mode = mode;
+        p.accel_y.mode = mode;
+        // Lookup needs a table; a flat table makes gain 1 so the axis test is
+        // not measuring interpolation noise.  The other modes ignore it.
+        p.accel_x.length = 4;
+        p.accel_y.length = 4;
+        p.accel_x.data[0] = 0.0f;  p.accel_x.data[1] = 1.0f;
+        p.accel_x.data[2] = 1e4f;  p.accel_x.data[3] = 1.0f;
+        p.accel_y.data[0] = 0.0f;  p.accel_y.data[1] = 1.0f;
+        p.accel_y.data[2] = 1e4f;  p.accel_y.data[3] = 1.0f;
+        // Identical, non-trivial curve parameters on both axes.
+        const bool gain_mode = (mode != accel_mode::lookup);
+        p.accel_x.gain = gain_mode;
+        p.accel_y.gain = gain_mode;
+        p.accel_x.acceleration = 0.005;
+        p.accel_y.acceleration = 0.005;
+        p.accel_x.exponent_classic = 2.0;
+        p.accel_y.exponent_classic = 2.0;
+        p.accel_x.limit = 1.8;
+        p.accel_y.limit = 1.8;
+        p.accel_x.cap = {15.0, 1.8};
+        p.accel_y.cap = {15.0, 1.8};
+        p.accel_x.decay_rate = 0.1;
+        p.accel_y.decay_rate = 0.1;
+        p.accel_x.motivity = 1.5;
+        p.accel_y.motivity = 1.5;
+        p.accel_x.sync_speed = 5.0;
+        p.accel_y.sync_speed = 5.0;
+        p.accel_x.smooth = 0.5;
+        p.accel_y.smooth = 0.5;
+        p.accel_x.scale = 2.2;
+        p.accel_y.scale = 2.2;
+        p.accel_x.exponent_power = 0.8;
+        p.accel_y.exponent_power = 0.8;
+        p.output_dpi = NORMALIZED_DPI;
+        p.speed_processor_args.whole = whole;
+        return p;
+    };
+
+    for (int m = 0; m < mode_count; ++m) {
+        for (bool whole : {true, false}) {
+            const profile p = make_profile(modes[m], whole);
+            modifier_settings settings;
+            settings.prof = p;
+            init_settings(settings);
+            modifier mod;
+
+            for (double dpi : {400.0, 800.0, 1600.0, 3200.0}) {
+                const double dpi_factor = NORMALIZED_DPI / dpi;
+                // Fresh speed processors: stateful smoothers must not carry
+                // state between the X and Y runs.
+                speed_processor sp_x, sp_y;
+                sp_x.init(p.speed_processor_args);
+                sp_y.init(p.speed_processor_args);
+
+                vec2d ix = {40.0, 0.0};
+                vec2d iy = {0.0, 40.0};
+                mod.modify(ix, sp_x, settings, dpi_factor, 8.0);
+                mod.modify(iy, sp_y, settings, dpi_factor, 8.0);
+
+                const double tol = 1e-12 * std::max(1.0, std::fabs(ix.x));
+                EXPECT_NEAR(ix.x, iy.y, tol);
+            }
+        }
+    }
+
+    SECTION("isotropy — the same physical distance gives the same output at 400..3200 DPI");
+
+    // One profile is enough: the property must hold for the pipeline, and the
+    // X/Y loop above already covers every algorithm.
+    for (bool whole : {true, false}) {
+        const profile p = make_profile(accel_mode::classic, whole);
+        modifier_settings settings;
+        settings.prof = p;
+        init_settings(settings);
+        modifier mod;
+
+        auto out_for = [&](double dpi, double counts) {
+            speed_processor sp;
+            sp.init(p.speed_processor_args);
+            vec2d in = {counts, 0.0};
+            mod.modify(in, sp, settings, NORMALIZED_DPI / dpi, 8.0);
+            return in.x;
+        };
+
+        // 40 counts at 400 DPI == 0.1 inch of physical movement.
+        const double reference = out_for(400.0, 40.0);
+        EXPECT(reference > 0.0);
+        for (double dpi : {800.0, 1600.0, 3200.0}) {
+            const double counts = 40.0 * (dpi / 400.0);
+            const double got    = out_for(dpi, counts);
+            EXPECT_NEAR(got, reference, 1e-12 * std::max(1.0, std::fabs(reference)));
+        }
+    }
+
+    SECTION("separate — pre-speed transforms run exactly once (rotation regression)");
+
+    // Regression: modify() applied rotation/snap/clamp and then called
+    // modify_separate_simd(), which applied all three again.  A 90° rotation
+    // became 180°, so (40,0) left as (-40,0) in separate mode while whole mode
+    // produced (0,40).  Both paths must agree and rotate exactly once.
+    for (bool whole : {true, false}) {
+        profile p;
+        p.accel_x.mode = accel_mode::noaccel;
+        p.accel_y.mode = accel_mode::noaccel;
+        p.output_dpi = NORMALIZED_DPI;
+        p.degrees_rotation = 90.0;
+        p.speed_processor_args.whole = whole;
+
+        modifier_settings settings;
+        settings.prof = p;
+        init_settings(settings);
+        speed_processor sp;
+        sp.init(p.speed_processor_args);
+        modifier mod;
+
+        vec2d in = {40.0, 0.0};
+        mod.modify(in, sp, settings, 1.0, 1.0);
+        EXPECT_NEAR(in.x, 0.0, 1e-12);    // double rotation would give -40
+        EXPECT_NEAR(in.y, 40.0, 1e-12);
+    }
+
+    SECTION("presets — every built-in preset configures X and Y identically");
+    for (int i = 0; i < PRESET_COUNT; ++i) {
+        const device_profile dp = make_preset(PRESET_NAMES[i], PRESET_NAMES[i]);
+        EXPECT(!dp.name.empty());
+        EXPECT(dp.prof.accel_x == dp.prof.accel_y);
+        EXPECT_NEAR(dp.prof.domain_weights.x, dp.prof.domain_weights.y, 0.0);
+        EXPECT_NEAR(dp.prof.range_weights.x,  dp.prof.range_weights.y,  0.0);
+        EXPECT_NEAR(dp.prof.yx_output_dpi_ratio, 1.0, 0.0);
+        EXPECT_NEAR(dp.prof.lr_output_dpi_ratio, 1.0, 0.0);
+        EXPECT_NEAR(dp.prof.ud_output_dpi_ratio, 1.0, 0.0);
+    }
+}
+
 // ── R10: EMA smoother correctness ────────────────────────────────────────────
 
 static void test_ema_smoother_halflife() {
@@ -10115,6 +10276,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_lat_stats_move_semantics);
     RUN_TEST(test_dpi_factor_precompute);
     RUN_TEST(test_output_dpi_applied);
+
+    // X/Y isotropy + DPI independence (whole and separate pipelines)
+    RUN_TEST(test_xy_isotropy_and_dpi_independence);
 
     // R14 — magnitude hypot overflow safety
     RUN_TEST(test_magnitude_hypot);

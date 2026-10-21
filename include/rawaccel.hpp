@@ -358,6 +358,70 @@ inline void init_settings(modifier_settings& settings) {
     settings.data.flags         = modifier_flags(settings.prof);
 }
 
+/// Apply the pre-speed transforms shared by the whole-axis and separate-axis
+/// paths: rotation, angle snap, then speed clamp.
+///
+/// This used to be duplicated: `modify()` ran all three and then called
+/// `modify_separate_simd()`, which ran them AGAIN.  Only the separate path was
+/// affected, and the second rotation is observable, not cosmetic — a 90°
+/// rotation turned into 180° (input (40,0) came out as (-40,0) instead of
+/// (0,40)).  Snap and clamp happened to be idempotent, which is why the bug
+/// survived.  One helper means the two paths cannot diverge again.
+///
+/// Returns the reference angle used by the whole-mode directional weight.
+/// Snap deliberately rewrites it to the snapped axis (0 or π/2), matching the
+/// original in-line implementation.
+static inline double apply_pre_speed_transforms(
+    vec2d& in, const modifier_settings& settings, double ips_factor)
+{
+    auto& args  = settings.prof;
+    auto& data  = settings.data;
+    auto& flags = settings.data.flags;
+
+    double reference_angle = 0;
+
+    // 1. Rotation
+    if (flags.apply_rotate)
+        in = rotate(in, data.rot_direction);
+
+    // 2. Angle snap
+    // L-BUG-24: the snap angle reference used exact ==0 on floats — a rotated
+    // or scaled axis lands on micro-offsets, so the horizontal / vertical
+    // branches were missed.  Use an epsilon comparison instead.
+    if (flags.compute_ref_angle &&
+        (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
+        if (std::abs(in.x) < 1e-9) {
+            reference_angle = M_PI / 2;
+        } else if (std::abs(in.y) < 1e-9) {
+            reference_angle = 0.0;  // pure horizontal
+        } else {
+            reference_angle = std::atan(std::fabs(in.y / in.x));
+        }
+        if (flags.apply_snap) {
+            const double snap = args.degrees_snap * M_PI / 180.0;
+            if (reference_angle > M_PI / 2 - snap) {
+                reference_angle = M_PI / 2;
+                in = { 0, std::copysign(magnitude(in), in.y) };
+            } else if (reference_angle < snap) {
+                reference_angle = 0;
+                in = { std::copysign(magnitude(in), in.x), 0 };
+            }
+        }
+    }
+
+    // 3. Speed clamp
+    if (flags.clamp_speed) {
+        const double speed = magnitude(in) * ips_factor;
+        if (speed > 0) {
+            const double ratio = clampsd(speed, args.speed_min, args.speed_max) / speed;
+            in.x *= ratio;
+            in.y *= ratio;
+        }
+    }
+
+    return reference_angle;
+}
+
 // ── SIMD-optimized separate mode acceleration ─────────────────────────────
 /// Process X and Y axes simultaneously using SIMD (2-wide).
 /// Used when speed_flags.dist_mode == distance_mode::separate.
@@ -379,37 +443,10 @@ static void modify_separate_simd(vec2d& in, speed_processor& sp,
     if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
         ips_factor = speed_processor::IPS_FACTOR_MAX;
 
-    // 1. Rotation (scalar - branchy, not worth vectorizing)
-    if (flags.apply_rotate)
-        in = rotate(in, data.rot_direction);
-
-    // 2. Angle snap (scalar - complex branching)
-    double reference_angle = 0;
-    if (flags.compute_ref_angle &&
-        (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
-        if (std::abs(in.x) < 1e-9) reference_angle = M_PI / 2;
-        else if (std::abs(in.y) < 1e-9) reference_angle = 0.0;
-        else reference_angle = std::atan(std::fabs(in.y / in.x));
-        if (flags.apply_snap) {
-            double snap = args.degrees_snap * M_PI / 180.0;
-            if (reference_angle > M_PI / 2 - snap) {
-                reference_angle = M_PI / 2;
-                in = { 0, std::copysign(magnitude(in), in.y) };
-            } else if (reference_angle < snap) {
-                reference_angle = 0;
-                in = { std::copysign(magnitude(in), in.x), 0 };
-            }
-        }
-    }
-
-    // 3. Speed clamp (scalar - magnitude is combined)
-    if (flags.clamp_speed) {
-        double speed = magnitude(in) * ips_factor;
-        if (speed > 0) {
-            double ratio = simd_clamp(speed, args.speed_min, args.speed_max) / speed;
-            in.x *= ratio; in.y *= ratio;
-        }
-    }
+    // 1-3. Rotation / angle snap / speed clamp.  Shared with the whole-axis
+    // path so they run exactly ONCE (this function is also called from
+    // modify(), which used to apply them before dispatching here).
+    (void)apply_pre_speed_transforms(in, settings, ips_factor);
 
     // 4. Domain-weighted speed - THIS IS WHERE SIMD SHINES
     
@@ -520,8 +557,17 @@ public:
             return;
         }
 
-        double reference_angle = 0;
-        double ips_factor      = dpi_factor / time; // counts/ms -> inches/s
+        // Separate mode owns the COMPLETE pipeline, including the shared
+        // rotation/snap/clamp transforms.  Dispatch it before this function
+        // computes anything, so no transform can be applied twice (the old
+        // order applied all three here and again inside
+        // modify_separate_simd(); a 90° rotation became 180°).
+        if (sp.speed_flags.dist_mode == distance_mode::separate) {
+            modify_separate_simd(in, sp, settings, dpi_factor, time);
+            return;
+        }
+
+        double ips_factor = dpi_factor / time; // counts/ms -> inches/s
 
         // Guard: subnormal / extremely small time values can produce Inf ips_factor
         // which cascades into NaN through the accel pipeline.  Clamp to a sane max
@@ -529,86 +575,44 @@ public:
         if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
             ips_factor = speed_processor::IPS_FACTOR_MAX;
 
-        // 1. Rotation
-        if (flags.apply_rotate)
-            in = rotate(in, data.rot_direction);
-
-        // 2. Angle snap
-        // O2: also include the in.y==0 case (pure horizontal movement) in snap.
-        // Previous code skipped snap for pure-X movement due to the "in.y != 0" guard.
-        // L-BUG-24: the snap angle reference used exact ==0 on floats — a
-        // rotated or scaled axis lands on micro-offsets, so the horizontal /
-        // vertical branches were missed.  Use an epsilon comparison instead.
-        if (flags.compute_ref_angle &&
-            (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
-            if (std::abs(in.x) < 1e-9) {
-                reference_angle = M_PI / 2;
-            } else if (std::abs(in.y) < 1e-9) {
-                reference_angle = 0.0;  // pure horizontal
-            } else {
-                reference_angle = std::atan(std::fabs(in.y / in.x));
-            }
-            if (flags.apply_snap) {
-                double snap = args.degrees_snap * M_PI / 180.0;
-                if (reference_angle > M_PI / 2 - snap) {
-                    reference_angle = M_PI / 2;
-                    in = { 0, std::copysign(magnitude(in), in.y) };
-                } else if (reference_angle < snap) {
-                    reference_angle = 0;
-                    in = { std::copysign(magnitude(in), in.x), 0 };
-                }
-            }
-        }
-
-        // 3. Speed clamp
-        if (flags.clamp_speed) {
-            double speed = magnitude(in) * ips_factor;
-            if (speed > 0) {
-                double ratio = clampsd(speed, args.speed_min, args.speed_max) / speed;
-                in.x *= ratio;
-                in.y *= ratio;
-            }
-        }
+        // 1-3. Rotation / angle snap / speed clamp, shared with the separate
+        // path.  The returned angle feeds whole-mode directional weighting.
+        const double reference_angle =
+            apply_pre_speed_transforms(in, settings, ips_factor);
 
         // 4. Domain-weighted speed
-        vec2d abs_vel = { std::fabs(in.x * ips_factor * args.domain_weights.x),
-                          std::fabs(in.y * ips_factor * args.domain_weights.y) };
+        const vec2d abs_vel = { std::fabs(in.x * ips_factor * args.domain_weights.x),
+                                std::fabs(in.y * ips_factor * args.domain_weights.y) };
 
-        if (sp.speed_flags.dist_mode == distance_mode::separate) {
-            // SIMD-optimized separate mode (processes X/Y simultaneously)
-            modify_separate_simd(in, sp, settings, dpi_factor, time);
-            return; // Early return - SIMD version handles everything
-        } else {
-            // Whole (combined) acceleration
-            double speed = sp.calc_speed_whole(abs_vel, time);
+        // Whole (combined) acceleration
+        const double speed = sp.calc_speed_whole(abs_vel, time);
 
-            // Reference directional weight: linear interpolation in angle from
-            // range_weights.x (0°, horizontal) to range_weights.y (90°, vertical):
-            //   weight = rwx + (rwy - rwx) * (2/π) * reference_angle
-            double range_weight = args.range_weights.x;
-            if (flags.apply_directional_weight) {
-                double diff = args.range_weights.y - args.range_weights.x;
-                range_weight += 2.0 / M_PI * reference_angle * diff;
-            }
+        // Reference directional weight: linear interpolation in angle from
+        // range_weights.x (0°, horizontal) to range_weights.y (90°, vertical):
+        //   weight = rwx + (rwy - rwx) * (2/π) * reference_angle
+        double range_weight = args.range_weights.x;
+        if (flags.apply_directional_weight) {
+            const double diff = args.range_weights.y - args.range_weights.x;
+            range_weight += 2.0 / M_PI * reference_angle * diff;
+        }
 
-            double scale = 1.0 + (data.accel_x.apply(speed, args.accel_x) - 1.0) * range_weight;
+        double scale = 1.0 + (data.accel_x.apply(speed, args.accel_x) - 1.0) * range_weight;
 
-            if (sp.speed_flags.should_smooth_scale) {
-                scale = sp.smoother_x.scale_smoother.smooth(scale, time);
-            }
+        if (sp.speed_flags.should_smooth_scale) {
+            scale = sp.smoother_x.scale_smoother.smooth(scale, time);
+        }
 
-            in.x *= scale;
-            in.y *= scale;
+        in.x *= scale;
+        in.y *= scale;
 
-            if (sp.speed_flags.should_smooth_output) {
-                // Reference smooths the magnitude and rescales both components by
-                // the same ratio, preserving the cursor direction.
-                double mag = magnitude(in);
-                if (mag > 0) {
-                    double smoothedMag = sp.smoother_x.output_speed_smoother.smooth(mag, time);
-                    in.x *= (smoothedMag / mag);
-                    in.y *= (smoothedMag / mag);
-                }
+        if (sp.speed_flags.should_smooth_output) {
+            // Reference smooths the magnitude and rescales both components by
+            // the same ratio, preserving the cursor direction.
+            const double mag = magnitude(in);
+            if (mag > 0) {
+                const double smoothedMag = sp.smoother_x.output_speed_smoother.smooth(mag, time);
+                in.x *= (smoothedMag / mag);
+                in.y *= (smoothedMag / mag);
             }
         }
 

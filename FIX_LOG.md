@@ -616,3 +616,17 @@ ad değişti, satır sayısı değişmedi. `1407` eski adın sayımıydı.
 > **elle kopyalamış** ve kayma başlamış. ⭐ **Elle kopyalanan sayı, üretildiği
 > yerde yenilenmez.** Sayı **üreten** yerde yaşamalı (kapı çıktısı) ya da
 > **denetleyen** bir satırla karşılaştırılmalı (`1407` yazılıysa `exit 77`).
+
+---
+
+## round-18 (opencode — 21.10.2026) — X/Y izotropi: ayrık modda çift dönüşüm
+
+Kullanıcı bildirimi: dikey ve yatay hareket DPI'dan bağımsız olarak eşit olmalı.
+
+- **Bulgu (YÜKSEK):** `modifier::modify()` rotation + snap + speed clamp uyguladıktan sonra `modify_separate_simd()` çağırıyordu; o da aynı üçünü tekrar uyguluyordu. Snap/clamp idempotent olduğu için sessizdi; rotation 90° → 180° oluyor, `(40,0)` whole modda `(0,40)` iken separate modda `(-40,0)` çıkıyordu.
+- **Düzeltme:** `include/rawaccel.hpp` — `apply_pre_speed_transforms()` tek uygulama noktası; separate mod `modify()` içinde dönüşümlerden önce dispatch ediliyor. Whole ve separate aynı helper'ı kullanıyor.
+- **Donanım tarafı:** `src/logitech_hidpp.cpp` `set_dpi()` DPIFIX-1 ile aynı DPI'ı X/Y'ye yazıyor; bu turda kod değişmedi, doğrulandı. Desteklenmeyen DPI isteği reddedilirse donanım eski DPI'da kalır (log: `Failed to set DPI ...`).
+- **Test:** `tests/test_accel.cpp` — `test_xy_isotropy_and_dpi_independence()`: 7 mod × whole/separate × 400–3200 DPI, aynı fiziksel mesafe, rotation regresyonu, preset X/Y simetrisi. 34267 → **34391** assertion; 151 → **152** test fonksiyonu; 217 → **221** SECTION.
+- **Kapılar:** build 0 uyarı · unit 34391/34391 · oracle 1408/79 OK · SIMD parity AVX2/SSE2/scalar birebir · tr_coverage PASS · CLI ASan/UBSan 34/34 · test_accel ASan/UBSan 34391/34391 · tracker bridge temiz. Bench rc=77 (ortam kirli; ölçüm iddiası yok).
+- **Dosyalar:** `include/rawaccel.hpp`, `tests/test_accel.cpp`, `AGENTS.md`, `olcum/aj2/sayisal_iddialar.txt`, `CHANGELOG.md`, `Bug Hata Raporları.md`, `FIX_LOG.md`.
+- **Ayrıntı:** `Bug Hata Raporları.md` → TUR 55 / T55-01..T55-03.
