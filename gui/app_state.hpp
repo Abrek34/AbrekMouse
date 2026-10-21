@@ -48,9 +48,24 @@ static const double C_CURVE2[3]= {1.00, 0.55, 0.18};
 static const double C_REF[4]   = {0.45, 0.45, 0.48, 0.6};
 static const double C_DOT[3]   = {1.00, 0.30, 0.30};
 static const double C_TEXT[3]  = {0.80, 0.80, 0.85};
+// Live telemetry overlay: measured point/trail vs the curve's model point.
+static const double C_LIVE[3]  = {0.30, 1.00, 0.55};
+static const double C_MODEL[3] = {1.00, 0.85, 0.25};
 
 // Graph margins (shared between graph.cpp and ui_builder.cpp)
 static constexpr double GRAPH_ML = 58, GRAPH_MR = 16, GRAPH_MT = 16, GRAPH_MB = 44;
+
+// Live operating-point trail length.  The GUI polls the daemon status at
+// 10 Hz, so 120 points cover roughly the last 12 s of *new* motion samples.
+// A repeated sample (same telem_wall_ms) is not appended, so a stationary
+// mouse does not push the real trail out of the ring.
+static constexpr int LIVE_TRAIL_CAP = 120;
+
+struct LiveTelemPoint {
+    double in_ips  = 0.0;
+    double gain    = 0.0;
+    double wall_ms = 0.0;
+};
 
 // ── Mouse device info ─────────────────────────────────────────────────────────
 struct InputDeviceInfo {
@@ -158,6 +173,37 @@ struct AppState {
     // queue_draw(), so between draws this always matches the rendered frame.
     double graph_last_max_gain = 2.0;
 
+    // ── Live telemetry cache (main window) ─────────────────────────────────
+    // daemon_comm.inl polls the daemon `status` JSON at 10 Hz (10 ms socket
+    // timeout so a wedged daemon can never freeze the GTK main thread).  graph.inl
+    // draws the measured operating point + trail, and live_lbl shows the same
+    // sample as a one-line readout below the graph.
+    //
+    // This is deliberately a *latest-sample* cache, not an event-rate stream:
+    // telem_* is the daemon's last flush (see AGENTS.md, "Live Telemetry &
+    // Seqlock").  A real scope needs a ring buffer/data plane; this overlay
+    // answers "where on the curve am I right now?" without touching the hot path.
+    LiveTelemPoint live_trail[LIVE_TRAIL_CAP] = {};
+    int    live_trail_head  = 0;     // next write index
+    int    live_trail_count = 0;     // valid entries (<= LIVE_TRAIL_CAP)
+    double live_last_wall_ms = -1.0; // dedupe: same sample -> no trail push
+    bool   live_telem_fresh = false; // sample is younger than 2 s and valid
+    double live_in_ips      = 0.0;   // raw (pre-rotation/weight) combined speed
+    double live_out_ips     = 0.0;
+    double live_gain        = 0.0;   // measured out/in
+    double live_dx          = 0.0;
+    double live_dy          = 0.0;
+    double live_p50_us      = 0.0;
+    double live_p95_us      = 0.0;
+    double live_p99_us      = 0.0;
+    double live_max_us      = 0.0;
+    double live_lat_samples = 0.0;
+    double live_poll_rate   = 0.0;
+    double live_sample_age_ms = 0.0;
+    std::string live_profile_name;   // clear the trail when the profile changes
+    double live_last_probe_ms = 0.0; // rate-limit probes while the daemon is wedged
+    guint  live_poll_id     = 0;     // 100 ms telemetry poll source
+
     // KDE / libinput double-acceleration warning
     bool   is_kde          = false;   // true if running under KDE Plasma
     bool   is_wayland      = false;   // true if Wayland session
@@ -196,11 +242,13 @@ struct AppState {
     GtkWidget* test_speed_lbl    = nullptr; // live "In (ips)" value
     GtkWidget* test_out_lbl      = nullptr; // live "Out (ips)" value
     GtkWidget* test_gain_lbl     = nullptr; // live "Gain (×)" value
+    GtkWidget* test_delta_lbl    = nullptr; // live "dx/dy counts" value
     GtkWidget* test_status_lbl   = nullptr; // daemon-down / awaiting-motion note
-    GtkWidget* test_lat_lbl      = nullptr; // live "Latency p50/p95 (µs)" value
+    GtkWidget* test_lat_lbl      = nullptr; // live "Latency p50/p95/p99 (µs)" value
+    GtkWidget* test_jitter_lbl   = nullptr; // live "p99−p50" value
     GtkWidget* test_poll_lbl     = nullptr; // live "Poll rate (Hz)" value
     GtkWidget* test_hint_lbl     = nullptr; // lock-tier explanation (persistent)
-    GtkWidget* test_name_lbls[6] = {};      // "In/Out/Gain/Latency/Poll/Device:" name labels (Bug-09, L17-3)
+    GtkWidget* test_name_lbls[8] = {};      // "In/Out/Gain/Delta/Latency/Jitter/Poll/Device:" name labels
     GtkWidget* test_title_lbl    = nullptr; // "Mouse Lock Test" heading (Bug-09)
     int        test_hint_state   = 0;       // hint: 0=Tier-1 locked, 1=Tier-2 confine, 2=Tier-3 n/a
     int        test_status_state = -1;      // status: -1=unset, 0=live, 1=awaiting, 2=daemon down, 3=unfocused
@@ -215,8 +263,10 @@ struct AppState {
     GtkWidget* status_bar        = nullptr;
     GtkWidget* daemon_status     = nullptr;
     bool       daemon_prev_running = false; // R8-RESEND: last poll's daemon state (up-transition trigger)
+    bool       daemon_reachable  = false;   // last update_daemon_status(): ping got a real reply
     double     lp_norm_mem = 2.0;           // R9-LPNRM: last real Lp norm (before the Max=9999 sentinel)
     GtkWidget* graph_area        = nullptr;
+    GtkWidget* live_lbl          = nullptr; // live in/out/gain/p99 line under the graph
     GtkWidget* apply_btn         = nullptr;
     GtkWidget* daemon_start_btn  = nullptr;
     GtkWidget* daemon_stop_btn   = nullptr;
@@ -384,6 +434,13 @@ void  update_daemon_status(AppState* S);
 static void kwin_focus_resend_current(AppState* S);
 /// Best-match device JSON slice of a daemon status response (Bug-02).
 double daemon_device_field(const std::string& resp, AppState* S, const char* key);
+/// CLOCK_MONOTONIC_RAW milliseconds — the clock the daemon stamps telem_wall_ms
+/// with.  Shared by the mouse-test staleness check and the main-window live poll.
+double gui_now_mono_raw_ms();
+/// Drop the live operating-point trail (profile switch / Apply / daemon reset).
+void live_trail_clear(AppState* S);
+/// Re-render the live one-line readout (also called on a language switch).
+void live_telem_update_label(AppState* S);
 
 // profile
 void rebuild_profile_combo(AppState* S);

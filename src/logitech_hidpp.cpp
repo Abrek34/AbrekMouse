@@ -632,6 +632,14 @@ HidppTransport::HidppTransport(const std::string& hidraw_path)
     }
 }
 
+HidppTransport::HidppTransport(std::unique_ptr<hidpp_io_backend> backend,
+                               uint16_t vendor_id, uint16_t product_id)
+    : backend_(std::move(backend)), vendor_id_(vendor_id),
+      product_id_(product_id) {
+    // A null backend is not an error: the transport simply never opens, so
+    // every request fails fast instead of dereferencing a null pointer.
+}
+
 HidppTransport::~HidppTransport() {
     if (fd_ >= 0) close(fd_);
 }
@@ -671,7 +679,11 @@ uint8_t HidppTransport::next_sw_id() {
 }
 
 bool HidppTransport::write_packet(const uint8_t* data, size_t len) {
-    if (fd_ < 0 || !data) return false;
+    if (!data || len == 0) return false;
+    // TEST SEAM (AJ-H): an injected backend replaces the byte-level write.
+    // The hidraw path below is unchanged.
+    if (backend_) return backend_->write_packet(data, len);
+    if (fd_ < 0) return false;
     const uint8_t* p = data;
     size_t left = len;
     // T37-HID01: the EAGAIN → poll(POLLOUT) retry below used to be unbounded,
@@ -715,7 +727,18 @@ bool HidppTransport::write_packet(const uint8_t* data, size_t len) {
 bool HidppTransport::read_packet(uint8_t* buf, size_t max_len, size_t& out_len,
                                   std::chrono::milliseconds timeout) {
     out_len = 0;
-    if (fd_ < 0 || !buf || max_len == 0) return false;
+    if (!buf || max_len == 0) return false;
+    // TEST SEAM (AJ-H): an injected backend replaces the byte-level read.
+    // A dead backend invalidates the transport exactly like the fd path
+    // below does, so callers fast-fail instead of re-waiting the timeout.
+    if (backend_) {
+        if (!backend_->read_packet(buf, max_len, out_len, timeout)) {
+            if (backend_->is_dead()) backend_dead_ = true;
+            return false;
+        }
+        return true;
+    }
+    if (fd_ < 0) return false;
     // N-FDERR: a persistent protocol-level failure (POLLERR/HUP/NVAL, EOF, or a
     // hard read error) means the hidraw fd is dead even though the path may
     // still exist in /dev.  Invalidate it so the daemon's drain loop re-creates
@@ -1192,7 +1215,10 @@ bool HidppTransport::write_register(
 
 std::optional<hidpp_notification> HidppTransport::receive_notification(
     std::chrono::milliseconds timeout) {
-    if (fd_ < 0) return std::nullopt;
+    // is_open() (not `fd_ < 0`) so the injected-backend test seam reaches
+    // this path too — otherwise the notification path would be unreachable
+    // for a backend-driven transport.
+    if (!is_open()) return std::nullopt;
     std::lock_guard lock(request_mutex_);
     const auto read_one = [&](std::chrono::milliseconds wait)
         -> std::optional<hidpp_notification> {
@@ -1216,7 +1242,7 @@ std::optional<hidpp_notification> HidppTransport::receive_notification(
 std::vector<hidpp_notification> HidppTransport::drain_notifications(
     size_t max_count, std::chrono::milliseconds timeout) {
     std::vector<hidpp_notification> notifications;
-    if (max_count == 0 || fd_ < 0) return notifications;
+    if (max_count == 0 || !is_open()) return notifications;
     notifications.reserve(std::min<size_t>(max_count, 32));
     std::lock_guard lock(request_mutex_);
     // BUG-22 (aj4): flush any notifications stashed by send_feature_request()

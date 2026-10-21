@@ -598,6 +598,8 @@ void on_profile_changed(GtkDropDown* dd, GParamSpec*, gpointer user_data) {
     // Reset zoom/pan on profile change — different profiles may have different speed ranges
     S->graph_zoom  = 1.0;
     S->graph_pan_x = 0.0;
+    // The old trail belongs to the old curve; do not connect the two.
+    live_trail_clear(S);
     profile_to_widgets(S);
 }
 
@@ -788,6 +790,9 @@ void on_apply_clicked(GtkButton*, gpointer user_data) {
     // Apply: save current profile changes to config and push to daemon (no dialog)
     widgets_to_profile(S);
     save_config_now(S);
+    // The daemon resets its telemetry counters when the new settings land; the
+    // old measured points no longer belong to the curve now on screen.
+    live_trail_clear(S);
 }
 
 void on_daemon_start(GtkButton*, gpointer user_data) {

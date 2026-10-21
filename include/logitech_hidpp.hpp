@@ -309,15 +309,59 @@ struct hidpp_device {
     bool supports_feature(uint16_t feature_id) const;
 };
 
+/// ── TEST SEAM (AJ-H) ─────────────────────────────────────────────────────────
+/// The HID++ transport normally talks to a hidraw node.  Everything the
+/// protocol layer does ABOVE the byte level — feature-index resolution,
+/// request/response matching, the notification stash, the short-payload
+/// budget — was therefore untestable: `send_feature_request()` and
+/// `resolve_feature_index()` are private, and reaching them needs a real
+/// hidraw device.  AGENTS.md records the gap verbatim: "The full device
+/// round-trip is still untested … no test seam was added to the class for it."
+///
+/// This interface isolates ONLY the byte-level I/O, so a test can inject a
+/// fake HID++ 2.0 device and the unchanged protocol layer above it is
+/// exercised for real (see tests/hidpp_transport_test.cpp).
+///
+/// Production code never implements this interface: the default backend is
+/// the hidraw fd path that lives inside HidppTransport itself.  The seam is
+/// additive — the hidraw path is byte-for-byte the same code as before.
+class hidpp_io_backend {
+public:
+    virtual ~hidpp_io_backend() = default;
+
+    /// Write one HID++ report.  Returns false on a hard failure.
+    virtual bool write_packet(const uint8_t* data, size_t len) = 0;
+
+    /// Read one HID++ report.  Returns false on timeout (transient — the
+    /// caller may retry) or on a dead endpoint; use `is_dead()` to tell the
+    /// two apart, exactly as the fd path distinguishes them.
+    virtual bool read_packet(uint8_t* buf, size_t max_len, size_t& out_len,
+                             std::chrono::milliseconds timeout) = 0;
+
+    /// True when the endpoint is permanently gone.  The transport then
+    /// invalidates itself so callers fast-fail instead of re-waiting the
+    /// timeout on every subsequent request.
+    virtual bool is_dead() const { return false; }
+};
+
 class HidppTransport {
 public:
     explicit HidppTransport(const std::string& hidraw_path);
+
+    /// TEST SEAM (AJ-H): drive the protocol layer over an injected byte-level
+    /// backend instead of a hidraw node.  `backend` must not be null — a null
+    /// backend yields a transport that is never open (is_open() == false),
+    /// which is the safe, non-crashing outcome.
+    explicit HidppTransport(std::unique_ptr<hidpp_io_backend> backend,
+                            uint16_t vendor_id = 0, uint16_t product_id = 0);
     ~HidppTransport();
 
     HidppTransport(const HidppTransport&) = delete;
     HidppTransport& operator=(const HidppTransport&) = delete;
 
-    bool is_open() const { return fd_ >= 0; }
+    bool is_open() const {
+        return fd_ >= 0 || (backend_ != nullptr && !backend_dead_);
+    }
 
     uint16_t vendor_id() const { return vendor_id_; }
     uint16_t product_id() const { return product_id_; }
@@ -469,6 +513,14 @@ public:
 
 private:
     int fd_ = -1;
+    // TEST SEAM (AJ-H): non-null => the transport talks to this backend
+    // instead of a hidraw fd.  Declared right after fd_ so the constructor
+    // initialiser order matches the declaration order (-Wreorder clean).
+    std::unique_ptr<hidpp_io_backend> backend_;
+    // Set when the injected backend reports a permanently dead endpoint, so
+    // is_open() flips to false exactly as the fd path does when it closes a
+    // broken hidraw node.
+    bool backend_dead_ = false;
     // sw_id 0 (0x00) is reserved: the device uses it for every notification,
     // so a command issued with sw_id 0 could be mistaken for a notification
     // (raw-byte matcher) or a mid-request response.  Start at 1 so the first

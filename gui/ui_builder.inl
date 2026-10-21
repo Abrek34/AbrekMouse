@@ -964,6 +964,20 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
     gtk_box_append(GTK_BOX(rvbox), S->graph_area);
 
+    // Live operating-point readout directly under the graph.  Dynamic text is
+    // re-rendered by live_telem_update_label() (daemon_comm.inl) on every poll
+    // and on a language switch, so it is intentionally NOT registered in the
+    // tr widget registry (same pattern as latency_lbl above).
+    S->live_lbl = gtk_label_new(tr("Live (raw): awaiting motion…"));
+    gtk_label_set_xalign(GTK_LABEL(S->live_lbl), 0.0);
+    gtk_label_set_ellipsize(GTK_LABEL(S->live_lbl), PANGO_ELLIPSIZE_END);
+    gtk_label_set_max_width_chars(GTK_LABEL(S->live_lbl), 96);
+    gtk_widget_add_css_class(S->live_lbl, "live-telemetry");
+    gtk_widget_set_margin_start(S->live_lbl, 2);
+    gtk_widget_set_margin_top(S->live_lbl, 2);
+    gtk_widget_set_margin_bottom(S->live_lbl, 2);
+    gtk_box_append(GTK_BOX(rvbox), S->live_lbl);
+
     // ── Status bar ────────────────────────────────────────────────────────────
     GtkWidget* status_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_start(status_hbox, 10);
@@ -1014,6 +1028,13 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     // Poll daemon status every 3s — pass S as user_data
     S->daemon_poll_id = g_timeout_add_seconds(3, poll_daemon_status, S);
 
+    // Main-window live telemetry: 10 Hz into the AppState cache, 10 ms socket
+    // timeout so a wedged daemon cannot freeze the GTK main thread.  The
+    // immediate call populates the graph/label on startup instead of after the
+    // first 100 ms tick.
+    live_telem_poll(S);
+    S->live_poll_id = g_timeout_add(100, live_telem_poll, S);
+
     // Prompt before closing if there are unsaved changes
     g_signal_connect(S->window, "close-request",
                      G_CALLBACK(on_window_close_request), S);
@@ -1026,6 +1047,11 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                 g_source_remove(S2->daemon_poll_id);
                 S2->daemon_poll_id = 0;
             }
+            if (S2->live_poll_id) {
+                g_source_remove(S2->live_poll_id);
+                S2->live_poll_id = 0;
+            }
+            S2->live_telem_fresh = false;
             // clean up the inotify source
             if (S2->inotify_src) {
                 g_source_remove(S2->inotify_src);
@@ -1675,6 +1701,7 @@ void on_activate(GtkApplication* gapp, gpointer user_data) {
     ".sidebar { background-color: #141416; }"
     ".battery-label { color: #e0e0e0; font-weight: bold; min-width: 80px; }"
     ".test-val { font-family: monospace; font-size: large; color: #7fd4ff; min-width: 110px; }"
+    ".live-telemetry { font-family: monospace; color: #6fe39a; }"
     );
     gtk_style_context_add_provider_for_display(
         gdk_display_get_default(),

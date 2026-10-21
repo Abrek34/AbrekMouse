@@ -1,0 +1,41 @@
+=== RawAccel Linux CLI (ASan + UBSan) ===
+Derleniyor...
+Çalıştırılıyor...
+
+  ✓ create-preset gaming                         rc=0
+  ✓ create-preset office                         rc=0
+  ✓ create-preset precision                      rc=0
+  ✓ create-preset disable                        rc=0
+  ✓ create-preset cs2                            rc=0
+  ✓ create-preset valorant                       rc=0
+  ✓ create-preset apex                           rc=0
+  ✓ create-preset fps                            rc=0
+  ✓ list                                         rc=0
+  ✓ show                                         rc=0
+  ✓ set (aktif profil)                           rc=0
+  ✓ set-param rotation                           rc=0
+  ✓ set-param snap                               rc=0
+  ✓ set-param dpi                                rc=0
+  ✓ set-param acceleration                       rc=0
+  ✓ set-param bilinmeyen anahtar                 rc=1
+  ✓ duplicate                                    rc=0
+  ✓ rename                                       rc=0
+  ✓ delete                                       rc=0
+  ✓ export (JSON)                                rc=0
+  ✓ list --json                                  rc=0
+  ✓ validate (var olan config)                   rc=0
+  ✓ validate (yok dosya)                         rc=1
+  ✓ diff (iki preset)                            rc=1
+  ✓ import yok dosya                             rc=1
+  ✓ import reddedilen yol                        rc=1
+  ✓ import (geçerli JSON)                       rc=0
+  ✓ import (bozuk mode JSON)                     rc=1
+  ✓ import (parse hatası)                       rc=1
+  ✓ show olmayan profil                          rc=1
+  ✓ config yolu reddi (/dev/shm)                 rc=1
+  ✓ config dizini yok                            rc=1
+  ✓ config yolu .json degil                      rc=1
+  ✓ config okunamaz/gecersiz                     rc=1
+
+=== Sonuç: 34/34 komut gerçek kodu çalıştırdı ===
+=== Sonuç: PASS — CLI ASan/UBSan altında temiz (34/34 komut) ===

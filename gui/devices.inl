@@ -4,6 +4,32 @@
 #include <iomanip>
 #include <sstream>
 
+// GTK 4.24's GtkDropDown keeps a GtkListView inside a popover.  Replacing or
+// splicing the model while that popover is open leaves item widgets holding a
+// stale model reference; when the popover is later destroyed GTK aborts in
+// gtk_list_item_manager_clear_model() (the 2026-10-21 15:34 core).  The device
+// list is rebuilt from inotify/hot-plug and from profile switches, so it can
+// race an open popover.  Never mutate a dropdown model while its popover is
+// visible: defer the refresh until the popover has closed.
+static bool combo_popover_open(GtkWidget* combo) {
+    if (!combo) return false;
+    for (GtkWidget* child = gtk_widget_get_first_child(combo); child;
+         child = gtk_widget_get_next_sibling(child)) {
+        if (GTK_IS_POPOVER(child) && gtk_widget_get_visible(child))
+            return true;
+    }
+    return false;
+}
+
+static guint device_refresh_retry_id = 0;
+static gboolean device_refresh_retry_cb(gpointer data) {
+    device_refresh_retry_id = 0;
+    auto* S = static_cast<AppState*>(data);
+    if (!S || !S->window || !S->device_id_combo) return G_SOURCE_REMOVE;
+    refresh_mice_combo(S, /*is_auto=*/true, /*quiet=*/true);
+    return G_SOURCE_REMOVE;
+}
+
 /// Resolve a /dev/input/eventN path to its stable /dev/input/by-id/... symlink.
 /// Returns the by-id path if found, otherwise returns the original event_node.
 /// Stable IDs survive reboots; eventN numbers can change on unplug/replug.
@@ -176,6 +202,12 @@ static std::vector<InputDeviceInfo> list_mice() {
 /// "All devices (default)" fallback while the device is unplugged.
 static int device_combo_select(AppState* S, const std::string& device_id) {
     if (!S->device_id_combo) return 0;
+    // Do not splice the live model underneath an open popover.  Preserve the
+    // current selection; the deferred refresh will apply the new list later.
+    if (combo_popover_open(S->device_id_combo)) {
+        guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(S->device_id_combo));
+        return sel == GTK_INVALID_LIST_POSITION ? 0 : (int)sel;
+    }
     for (int i = 0; i < (int)S->mice_list.size(); i++) {
         auto& m = S->mice_list[i];
         if ((!m.stable_id.empty() && m.stable_id == device_id) ||
@@ -217,6 +249,19 @@ void refresh_mice_combo(AppState* S, bool is_auto, bool quiet) {
     // Flicker fix: if auto-triggered and the list is identical, skip the
     // model rebuild entirely — only update the selection if needed.
     bool list_changed = (new_list != S->mice_list);
+
+    // A hot-plug/profile notification may arrive while the user has the mouse
+    // dropdown open.  Defer instead of replacing/splicing the model; otherwise
+    // GTK's list item manager can assert during teardown (see helper above).
+    if (combo_popover_open(S->device_id_combo)) {
+        if (device_refresh_retry_id == 0)
+            device_refresh_retry_id = g_timeout_add(300, device_refresh_retry_cb, S);
+        S->updating = prev_updating;
+        return;
+    }
+
+    // Commit only after the popover guard: the retry must still observe the
+    // old list as changed, otherwise it would skip the model rebuild.
     S->mice_list = std::move(new_list);
 
     if (list_changed || !is_auto) {

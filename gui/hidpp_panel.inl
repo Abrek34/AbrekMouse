@@ -274,7 +274,9 @@ static gpointer hw_scan_thread(gpointer data) {
         // R2-08: invalidate any in-flight query/notification results — they
         // were snapshotted against the previous vector generation.
         ++S->hw_devs_version;
-        if (S->hw_dev_combo) {
+        // Same GTK popover lifetime rule as the device combo: do not replace
+        // the model while the user is looking at the open list.
+        if (S->hw_dev_combo && !combo_popover_open(S->hw_dev_combo)) {
             GtkStringList* sl = gtk_string_list_new(nullptr);
             for (const auto& d : S->hidpp_devs) {
                 const std::string& display_name = d.info.friendly_name.empty()
@@ -473,7 +475,8 @@ static gpointer hw_query_thread(gpointer data) {
                                               (double)r->cur.dpi);
             }
             // Update rate combo with device-specific supported rates
-            if (S->hw_rate_combo && !r->rate_codes_hz.empty()) {
+            if (S->hw_rate_combo && !r->rate_codes_hz.empty() &&
+                !combo_popover_open(S->hw_rate_combo)) {
                 GtkStringList* sl = gtk_string_list_new(nullptr);
                 for (uint32_t hz : r->rate_codes_hz) {
                     gtk_string_list_append(sl, (std::to_string(hz) + " Hz").c_str());

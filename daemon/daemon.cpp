@@ -888,6 +888,17 @@ bool AccelDaemon::setup_devices() {
     }
     log("Found " + std::to_string(mice.size()) + " physical mouse device(s).");
 
+    // PAS-1: with the master intercept switch off, opening each device only to
+    // release it immediately is pointless.  More importantly, the old path
+    // fell through to the "No mice could be grabbed (permission or conflict)"
+    // error even though grabbing was deliberately disabled.  Report the real
+    // reason once and let apply_new_config()/the hot-plug scan pick the
+    // devices up again when the switch is turned back on.
+    if (!raw_input_enabled_.load(std::memory_order_relaxed)) {
+        log("Raw-input disabled in config — no devices will be grabbed (expected).");
+        return true;
+    }
+
     // P131/BUG-02: drop stale deny entries before scanning so a recovered
     // device is picked up and a still-broken one keeps backing off.
     const double setup_now = now_ms();
@@ -1570,6 +1581,13 @@ void AccelDaemon::handle_hotplug() {
 // ── Hot-plug device scan (called from run_loop after kernel settle delay) ─────
 
 void AccelDaemon::do_hotplug_scan() {
+    // PAS-1: no device should be intercepted while raw-input is off.  Returning
+    // here avoids the old ~2 s open/release/log churn for every physical mouse
+    // (the hot-plug path used to check this gate only after logging and opening
+    // the node).  apply_new_config() performs a full rescan when the switch is
+    // enabled again, so no event is lost.
+    if (!raw_input_enabled_.load(std::memory_order_relaxed)) return;
+
     // Check for newly added mice
     auto mice = find_mice();
 

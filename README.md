@@ -22,7 +22,7 @@ A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the
 Measured on the v1.2.7 tree (2026-10-07):
 
 - Build: **0 warnings**
-- Unit tests: **34267/34267**
+- Unit tests: **34405/34405**
 - Differential oracle vs the vendored OFFICIAL reference: **OK** (no new deviations)
 - SIMD parity: **PASS**
 - CLI under ASan/UBSan: **clean**; daemon/CLI under ASan: **clean**
@@ -282,6 +282,29 @@ rawaccel-cli validate            # check config for errors/warnings
 rawaccel-cli reload              # reload daemon config (SIGHUP)
 rawaccel-cli stop                # stop daemon (SIGTERM)
 rawaccel-cli latency             # per-device processing latency stats (IPC first, SIGUSR1 fallback)
+```
+
+#### CLI liveness and `status` exit codes
+
+`status` treats the daemon's **IPC answer as the primary liveness proof**; a PID
+file is secondary. This matters during a daemon restart: a live socket can
+exist after the PID file has been removed or still contains a stale PID.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | The daemon answered the IPC `status` request (running). |
+| `1` | The config file could not be read/validated. |
+| `2` | Stopped: neither a live daemon PID nor a socket file exists. |
+| `3` | Unreachable: a PID/socket artifact exists, but the IPC does not answer. |
+
+For a live IPC answer with no verified PID file, `status` still reports
+`running` (rc=0) and `status --json` sets `"daemon_pid_verified": false`;
+the human-readable output adds an “identity not verified” note on stderr.
+`"unreachable"` is reserved for the case where the IPC itself does not answer,
+not for a daemon that answered but whose PID file is stale.
+
+```bash
+rawaccel-cli status --json | grep -E '"daemon"|"daemon_pid_verified"'
 ```
 
 ### Logitech HID++ hardware controls

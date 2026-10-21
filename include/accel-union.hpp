@@ -54,7 +54,12 @@ struct accel_union {
         case 0:  return std::get<0>(impl)(speed, args);
         case 1:  return std::get<1>(impl)(speed, args);
         case 2:  return std::get<2>(impl)(speed, args);
-        case 3:  return std::get<3>(impl)(speed, args);
+        case 3:
+            // L02-15: the config layer floors decay_rate, but domain_weights
+            // can still shrink the effective speed below the formula's
+            // cancellation-safe band.  Identity is the accurate limit there.
+            if (natural_gain_ill_conditioned(args, speed)) return 1.0;
+            return std::get<3>(impl)(speed, args);
         case 4:  return std::get<4>(impl)(speed, args);
         case 5:  return std::get<5>(impl)(speed, args);
         default: return std::get<6>(impl)(speed, args);

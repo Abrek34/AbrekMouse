@@ -198,6 +198,113 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
         if (!S->xy_linked) draw_curve(dp.prof.accel_y, C_CURVE2);
     }
 
+    // ── Live operating-point overlay ───────────────────────────────────────
+    // Green = measured (telem_in_ips, telem_gain); yellow = the curve's model
+    // gain at the same raw speed.  telem_in_ips is the daemon's RAW physical
+    // magnitude (pre-rotation / pre-weight / pre-smoothing), so this point is
+    // exact for the common euclidean/no-weight/no-smooth profile and can differ
+    // from the curve coordinate when those transforms are active.  The trail is
+    // the last ~12 s of unique samples; a stale sample never draws a marker.
+    if (!dp.prof.raw_passthrough) {
+        const int n = S->live_trail_count;
+        if (n > 0) {
+            const int start = (S->live_trail_head - n + LIVE_TRAIL_CAP) % LIVE_TRAIL_CAP;
+            bool prev_ok = false;
+            double prev_x = 0.0, prev_y = 0.0;
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            for (int i = 0; i < n; i++) {
+                const auto& p = S->live_trail[(start + i) % LIVE_TRAIL_CAP];
+                if (!std::isfinite(p.in_ips) || !std::isfinite(p.gain) ||
+                    p.in_ips < 0.0 || p.in_ips > max_speed ||
+                    p.gain < 0.0 || p.gain > max_gain) {
+                    prev_ok = false;
+                    continue;
+                }
+                const double px = to_cx(p.in_ips);
+                const double py = to_cy(p.gain);
+                if (prev_ok) {
+                    const double t = static_cast<double>(i + 1) / n;
+                    double alpha = 0.06 + 0.34 * t;
+                    if (!S->live_telem_fresh) alpha *= 0.35;
+                    cairo_set_source_rgba(cr, C_LIVE[0], C_LIVE[1], C_LIVE[2], alpha);
+                    cairo_set_line_width(cr, 1.0 + 1.2 * t);
+                    cairo_move_to(cr, prev_x, prev_y);
+                    cairo_line_to(cr, px, py);
+                    cairo_stroke(cr);
+                }
+                prev_x = px; prev_y = py; prev_ok = true;
+            }
+        }
+
+        if (S->live_telem_fresh) {
+            const double in   = S->live_in_ips;
+            const double meas = S->live_gain;
+            // Off-scale markers park just inside the edge; the readout below
+            // still shows the real values, so the clamped position is not a fake
+            // current.  The 6 px inset keeps the whole dot visible inside the
+            // graph clip (a dot centred on the edge would be cut in half).
+            const double px = std::clamp(to_cx(in), GRAPH_ML + 6.0,
+                                        GRAPH_ML + PW - 6.0);
+            const double py = std::clamp(to_cy(meas), GRAPH_MT + 6.0,
+                                        GRAPH_MT + PH - 6.0);
+
+            // Model point from the production dispatch (same call the curve uses).
+            accel_union mau;
+            mau.init(dp.prof.accel_x);
+            const double model = mau.apply(in, dp.prof.accel_x);
+            const bool model_ok = std::isfinite(model) && model >= 0.0;
+            if (model_ok) {
+                const double my = std::clamp(to_cy(model), GRAPH_MT + 6.0,
+                                             GRAPH_MT + PH - 6.0);
+                double dash[] = {4.0, 3.0};
+                cairo_set_dash(cr, dash, 2, 0);
+                cairo_set_source_rgba(cr, C_MODEL[0], C_MODEL[1], C_MODEL[2], 0.8);
+                cairo_set_line_width(cr, 1.0);
+                cairo_move_to(cr, px, py);
+                cairo_line_to(cr, px, my);
+                cairo_stroke(cr);
+                cairo_set_dash(cr, nullptr, 0, 0);
+                cairo_set_source_rgb(cr, C_MODEL[0], C_MODEL[1], C_MODEL[2]);
+                cairo_set_line_width(cr, 1.6);
+                cairo_arc(cr, px, my, 4.0, 0, 2 * M_PI);
+                cairo_stroke(cr);
+            }
+
+            // Glow + measured dot.  White center keeps it visible on the curve.
+            cairo_set_source_rgba(cr, C_LIVE[0], C_LIVE[1], C_LIVE[2], 0.18);
+            cairo_arc(cr, px, py, 9.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+            cairo_set_source_rgb(cr, C_LIVE[0], C_LIVE[1], C_LIVE[2]);
+            cairo_arc(cr, px, py, 5.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+            cairo_set_source_rgb(cr, 1, 1, 1);
+            cairo_arc(cr, px, py, 1.8, 0, 2 * M_PI);
+            cairo_fill(cr);
+
+            // Readout box, bottom-left inside the plot.  The model fallback is
+            // ASCII ("n/a") so a missing model value cannot depend on font
+            // coverage; the translated text itself may still be non-ASCII.
+            char model_buf[32];
+            if (model_ok) snprintf(model_buf, sizeof(model_buf), "%.2f", model);
+            else          snprintf(model_buf, sizeof(model_buf), "n/a");
+            std::string info = trf("raw %.1f ips | gain %.2f | model %s",
+                                   in, meas, model_buf);
+            cairo_select_font_face(cr, "monospace",
+                                   CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 10);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, info.c_str(), &ext);
+            const double bx = GRAPH_ML + 6.0;
+            const double by = GRAPH_MT + PH - 24.0;
+            cairo_set_source_rgba(cr, 0.04, 0.04, 0.06, 0.82);
+            cairo_rectangle(cr, bx - 4.0, by - 2.0, ext.width + 10.0, 17.0);
+            cairo_fill(cr);
+            cairo_set_source_rgb(cr, C_LIVE[0], C_LIVE[1], C_LIVE[2]);
+            cairo_move_to(cr, bx, by + 12.0);
+            cairo_show_text(cr, info.c_str());
+        }
+    }
+
     cairo_reset_clip(cr);
 
     // ── Axis labels ───────────────────────────────────────────────────────────
@@ -227,8 +334,12 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
     cairo_show_text(cr, tr("Speed (ips)"));
 
     cairo_save(cr);
-    cairo_translate(cr, 11, GRAPH_MT + PH / 2 + 20);
+    cairo_translate(cr, 38, GRAPH_MT + PH / 2 + 20);
     cairo_rotate(cr, -M_PI / 2);
+    // cairo_show_text() uses the CURRENT POINT.  The x-axis title above left
+    // the current point in the middle of the graph, so without this reset the
+    // rotated "Gain" label lands there instead of in the left margin.
+    cairo_move_to(cr, 0, 0);
     cairo_show_text(cr, tr("Gain"));
     cairo_restore(cr);
 
@@ -245,9 +356,23 @@ void on_graph_draw(GtkDrawingArea*, cairo_t* cr,
     };
     // Legend — hidden in raw passthrough (no accel curve is drawn, L17-2)
     if (!dp.prof.raw_passthrough) {
+        int legend_row = 0;
         draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10, C_CURVE, tr("X Axis"));
-        if (!S->xy_linked)
-            draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 24, C_CURVE2, tr("Y Axis"));
+        legend_row++;
+        if (!S->xy_linked) {
+            draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10 + legend_row * 14,
+                        C_CURVE2, tr("Y Axis"));
+            legend_row++;
+        }
+        if (S->live_telem_fresh || S->live_trail_count > 0) {
+            draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10 + legend_row * 14,
+                        C_LIVE, tr("Live (raw)"));
+            legend_row++;
+        }
+        if (S->live_telem_fresh) {
+            draw_legend(GRAPH_ML + PW - 100, GRAPH_MT + 10 + legend_row * 14,
+                        C_MODEL, tr("Model"));
+        }
     }
 
     // Zoom hint

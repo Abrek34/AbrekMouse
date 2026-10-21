@@ -29,6 +29,17 @@ int main() {
     if (!log_has_error(split_full))
         ++failures;
 
+    // Classifier regression: setup.sh's service start and the daemon's
+    // journal can contain these diagnostics on a healthy install.  None of
+    // them is setup.sh's err() marker, so the GUI must not turn a successful
+    // install into "finished with errors".
+    if (log_has_error("modprobe: FATAL: Module uinput not found in directory /lib/modules/6.0\n"))
+        ++failures;
+    if (log_has_error("[rawaccel] No mice could be grabbed (permission or conflict, e.g. abrek). Retrying automatically\n"))
+        ++failures;
+    if (log_has_error("  ! uinput modülü yüklenemedi (yeniden başlatma gerekebilir).\n"))
+        ++failures;
+
     const std::string with_prefix = "önemsiz\n  ✗ Servis ÇALIŞMIYOR\n";
     if (!log_has_error(with_prefix, 0))
         ++failures;

@@ -673,3 +673,79 @@ benchmark tüm config'lerde baseline içinde (rc=0).
 `include/simd_math.hpp`, `include/accel-classic.hpp`,
 `tests/test_accel.cpp`, `AGENTS.md`, `docs/research/precision.md`,
 `CHANGELOG.md`, `olcum/aj2/sayisal_iddialar.txt`, `FIX_LOG.md`.
+
+---
+
+## round-20 (opencode — 21.10.2026) — natural decay tabanı + taşınabilir derleme
+
+Kullanıcı isteği: ikinci bağımsız analiz turu; düzeltilmesi gerekenleri
+düzelt. Natural GAIN negatif kazanç düzeltmesi (L02-14) bu turda doğrulandı;
+asıl yeni bulgular derleme hattındaydı.
+
+| ID | Dosya | Konu | Durum |
+|---|---|---|---|
+| R20-NAT (KRİTİK) | `include/config.hpp`, `src/config.cpp`, `cli/main.cpp`, `include/accel-natural.hpp`, `tests/test_accel.cpp` | `natural` GAIN modunda `decay_rate ∈ (0,1e-4)` iç katsayıyı `~0` yapıp iki `O(1/accel)` terimin farkını negatife düşürüyordu (en kötü **-46.68** @ `limit=100`, `decay_rate=1e-9`) → **imleç ekseni ters**. | `✅ NATURAL_DECAY_RATE_MIN = 1e-4` sanitize tabanı + CLI domaini; formül referansla bit-bit aynı. `test_natural_decay_rate_floor()`: üretim erişilebilir kutuda ham 5 negatif → sanitize 0. 34405 → 34417 assertion. |
+| R20-CLANG (YÜKSEK) | `scripts/build.sh` | `PERF_FLAGS` içindeki `-fvect-cost-model=very-cheap` GCC'ye özel; belgelenen `CXX=clang++ bash scripts/build.sh` daha ilk dosyada `unknown argument` ile ölüyordu. | `✅ __clang__` tespiti + GCC'ye özel bayrak; Clang tam derlemesi rc=0. |
+| R20-LTO (YÜKSEK) | `scripts/build.sh` | `RAWACCEL_LTO=1` iki derleyicide de kırıktı: `-fwhole-program-vtables` Clang'e, `-fdevirtualize-at-ltrans` GCC'ye ait; set ikisini birlikte veriyordu. | `✅` LTO bayrakları derleyici ailesine göre ayrıldı; GCC ve Clang LTO tam derlemeleri rc=0. |
+| R20-WARN (DÜŞÜK) | `daemon/main.cpp` | Clang derlemesinde tek proje uyarısı: `log_cb` lambdasında kullanılmayan `verbose` yakalaması (`-Wunused-lambda-capture`). | `✅` Yakalama kaldırıldı; Clang derlemesinde proje kaynaklı uyarı 0 (GLib başlıklarındaki `-Wc2y-extensions` uyarıları dışarıya ait). |
+
+**Kapılar (2026-10-21 23:48–23:52):** build rc=0 / 0 uyarı · unit
+**34417/34417** · oracle **1408 satır / 79 belgeli sapma OK** · SIMD parity
+AVX2/SSE2/scalar birebir · tr_coverage PASS · CLI ASan/UBSan **34/34** ·
+tracker bridge temiz (17 işaretli, AÇIK 0). Ek olarak `run_tests_asan.sh`
+**34417/34417**, `run_fuzz.sh 60` iki harness'ta çökmesiz, `prove_kod_ayni.py
+--sayi` **14/14**.
+
+**Değişen dosyalar:** `include/config.hpp`, `src/config.cpp`, `cli/main.cpp`,
+`include/accel-natural.hpp`, `tests/test_accel.cpp`, `scripts/build.sh`,
+`daemon/main.cpp`, `AGENTS.md`, `CHANGELOG.md`, `FIX_LOG.md`,
+`Bug Hata Raporları.md`, `olcum/aj2/sayisal_iddialar.txt`,
+`docs/research/deviations.md`, `olcum/analiz/**`.
+
+---
+
+## round-21 (opencode — 22.10.2026) — natural GAIN küçük hız / domain_weights kapısı
+
+Kullanıcı isteği: tekrar bağımsız analiz turu; düzeltilmesi gereken bir şey
+kaldı mı? Round-20'nin "üretimde erişilebilir x ≥ 3.125e-4" varsayımı
+`domain_weights`'i kapsamıyordu: ağırlık 0'a kadar yasaldır (CLI domaini
+0..1e6), yani etkin hız bu tabanın çok altına inebilir. Bu turda aynı GAIN
+dalının yalnız negatif değil **pozitif** spike da ürettiği ölçüldü.
+
+| ID | Dosya | Konu | Durum |
+|---|---|---|---|
+| R21-NAT-SPEED (KRİTİK) | `include/accel-natural.hpp`, `include/accel-union.hpp`, `tests/test_accel.cpp` | `natural` GAIN'de iki `O(limit/accel)` terimin farkı, etkin hız küçükken yuvarlama hatasıyla patlıyor. 32000 DPI / 100 ms / 1 count + `domain_weight_x=1e-5` → x=3.125e-9; `limit=100`, `decay=1e-4` için ham kazanç **5.76837158203125**, üretim çıktısı **0.18026161** (beklenen **0.03125**). Başka yasal kombinasyonda negatif dip: `limit=100`, `decay=1e-3`, `domain_weight=3e-5` → ham **0.80131785**, çıktı **0.02504118**. | `✅` `NATURAL_GAIN_MIN_ACCEL_X = 1e-9` + `natural_gain_ill_conditioned()`; `accel_union::apply()` natural dalında `accel*x` bu eşiğin altındaysa **1.0** döndürüyor. Doğrudan `natural::operator()` referansla bit-bit aynı kaldı; oracle 1408/79 değişmedi. 4 assertion (whole + separate) eklendi: **34417 → 34421**, SECTION **224 → 225**. |
+| R21-EVIDENCE (DÜŞÜK) | `olcum/analiz/natural_small_speed_probe.cpp` | Düzeltmenin yeniden üretilebilir kanıtı: kontrol, iki spike ve bir negatif dip; ham `natural` ile `modifier` çıktısını yan yana basıyor. | `✅` GCC ve Clang probe derlemeleri rc=0; dört vaka da `prod_out=0.03125` / `OK`. |
+
+**Ölçüm (bu makine; 1 count, 32000 DPI, 100 ms):**
+
+| durum | x | ham gain | ham çıktı | kapı sonrası |
+|---|---:|---:|---:|---:|
+| kontrol (`domain_weight=1`) | 3.125e-4 | 1 | 0.03125 | 0.03125 |
+| `limit=100`, `decay=1e-4`, `w=1e-5` | 3.125e-9 | 5.76837158203125 | 0.18026161 | **0.03125** |
+| `limit=50`, `decay=1e-4`, `w=1e-5` | 3.125e-9 | 2.1920928955078125 | 0.06850290 | **0.03125** |
+| `limit=100`, `decay=1e-3`, `w=3e-5` | 9.375e-9 | 0.801317850749 | 0.02504118 | **0.03125** |
+
+Eşik gerekçesi: `accel*x < 1e-9` bandında gerçek kazanç 1'den en fazla
+`limit*accel*x/2 ≤ 5e-8` sapar; ham formülün yuvarlama hatası ise
+`~limit*eps/(accel*x)` ile 1e-5 mertebesine çıkabilir. Bu yüzden kimlik
+(1.0), ham formülden daha doğrudur. `x < 1e-9` iç guard'ı yalnız mutlak hızı
+kontrol ediyordu; yeni kapı `accel*x` çarpımını kontrol ederek domain-weight
+ile küçülen hızı da kapsıyor.
+
+**Kapılar (2026-10-22 00:11:23–00:15:20):** build rc=0 / 0 uyarı (91 s) ·
+unit **34421/34421** (77 s) · oracle **1408 satır / 79 belgeli sapma OK**
+(3 s) · SIMD parity AVX2/SSE2/scalar birebir, envanter 26/16/8/10 (4 s) ·
+tr_coverage PASS (1 s) · CLI ASan/UBSan **34/34** (61 s) · tracker bridge
+temiz (17 işaretli, AÇIK 0). Ek: `run_tests_asan.sh` **34421/34421** ·
+`run_fuzz.sh 60` iki harness'ta çökmesiz (accel 3.991.933 run) ·
+`prove_kod_ayni.py --sayi` **14/14** · hot-path benchmark tüm config'lerde
+baseline içinde (rc=0).
+
+**Değişen dosyalar:** `include/accel-natural.hpp`, `include/accel-union.hpp`,
+`tests/test_accel.cpp`, `AGENTS.md`, `CHANGELOG.md`, `FIX_LOG.md`,
+`Bug Hata Raporları.md`, `olcum/aj2/sayisal_iddialar.txt`,
+`olcum/analiz/GATE-SONUC.md`, `olcum/analiz/gates.log`,
+`olcum/analiz/gate-*.log`, `olcum/analiz/natural_small_speed_probe.cpp`,
+`olcum/analiz/BULGU-accel-natural-negatif-kazanc.md`,
+`olcum/analiz/BULGU-duzeltme-natural-decay-tabani.md`.

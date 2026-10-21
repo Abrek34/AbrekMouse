@@ -1,16 +1,20 @@
 # Oracle Deviations — Root-Cause Report
 
 > Author: Aj 8 (P88). Basis: `bash tests/oracle/run_oracle.sh` on the current
-> tree → **1047 rows compared, 45 known deviations, RESULT OK** (rel tol 1e-9).
+> tree → **1408 rows compared, 79 known deviations, RESULT OK** (rel tol 1e-9).
 > Reference data: vendored RawAccelOfficial/rawaccel headers under
 > `tests/oracle/ref/`. Grid: `tests/oracle/oracle_cases.hpp`.
-> Known-deviation list: `tests/oracle/known_deviations.txt` (45 data rows).
+> Known-deviation list: `tests/oracle/known_deviations.txt` (79 data rows).
 >
 > Historical note: this report was written when the oracle compared 915 rows /
-> 31 deviations. The grid has since grown (esport speeds 2000/3000/4000, sync
-> motivity/gamma variant cases, the P155 `io` cap.y=0 legacy case) and the
-> deviation list now has **45 rows** — the reasoning below for the original
-> classes still holds, and the newer rows are detailed in §Current (1047/45).
+> 31 deviations, and the header line above was later re-measured as 1047 rows /
+> 45 deviations. Both were stale by the time the grid grew again (esport
+> speeds 2000/3000/4000, sync motivity/gamma variant cases, the P155 `io`
+> cap.y=0 legacy case, `power_tinyexp_floor`, the natural `limit ≥ 10` cases):
+> the live numbers are **1408 rows / 79 deviations** — re-measured with
+> `bash tests/oracle/run_oracle.sh` on 2026-10-21, not retyped. The reasoning
+> below for the original classes still holds, and the newer rows are detailed
+> in §Current.
 
 ## TL;DR verdict
 
@@ -18,9 +22,10 @@
 |-------|------|---------|
 | **(A)** classic `exponent_classic ≤ 1` "linear path" — all speeds | 23 | **KEEP** — intentional port convention, unreachable in production (sanitize/GUI clamp exp to [1,10]); reference value is an out-of-domain artifact |
 | **(B1)** power / synchronous at speed 0 | 9 | **KEEP** — uniform `x ≤ 0 → 1` guard; speed 0 is non-physical, reference artefacts (0 / 1/motivity) are meaningless. The original 7 rows grew to 9 when the sync motivity/gamma variants (`sync_gain_mot2_gam05`, `sync_legacy_mot05_gam2`) were added (P98/P163) |
-| **(B2)** game_apex_power at speed 0 | 1 | **KEEP** — semantically matchable (ref = 0.9 offset floor) but not worth breaking the uniform guard; nil practical benefit |
-| **(P155)** power `io` cap.y=0 identity guard | 12 | **KEEP** — local guards `cap.y≤0 → identity gain` (fix for the P96 silent-death bug); reference emits NaN/0 on that degenerate input. Not listable as a genuine deviation because `NaN > tol` is never true and `0` vs `1` would flag — these rows are documented here after the P155 fix |
-| **Total (active)** | **45** | KEEP × 45 |
+| **(B2)** game_apex_power at speed 0 | 0 (row removed) | **REMOVED from the list** — PRE-3 raised the apex `output_offset` to 1.0, which made the power identity row at speed 0 line up with the reference; the row is no longer a deviation (the class is kept here for the history) |
+| **(C)** power `tinyexp_floor` (exponent_power=5e-4, inside the BUG-02 floor band) | 23 | **KEEP** — the local port evaluates a shared exponent floored at 1e-3, the reference the raw 5e-4, so 23 of its 24 rows drift; spd=1 is force-checked because both sides reduce to 1^n with scale=1 exactly (R3-NEW-2) |
+| **(P155)** power `io` cap.y=0 identity guard | 24 (12 legacy + 12 gain) | **KEEP** — local guards `cap.y≤0 → identity gain` (fix for the P96 silent-death bug); reference emits NaN/0 on that degenerate input. Not listable as a genuine deviation because `NaN > tol` is never true and `0` vs `1` would flag — these rows are documented here after the P155 fix |
+| **Total (active)** | **79** | KEEP × 79 |
 | **(P102, prospective)** synchronous GAIN N=4 → +69; float→double → +63 (3 × 21) | 0 (not applied) | **D: no change today** — sub-perceptual; see §P102 + precision.md §7 |
 
 No deviation is recommended for reversal. Class A is a **deliberate algorithmic
@@ -95,7 +100,7 @@ dedicated unit tests: "classic linear path (exp<=1) cap".
 
 ---
 
-### Class B1 — `power`/`synchronous` at speed 0 (7 rows)
+### Class B1 — `power`/`synchronous` at speed 0 (9 rows)
 
 | Row | ref gain | local | ref mechanism |
 |-----|----------|-------|---------------|
@@ -104,8 +109,10 @@ dedicated unit tests: "classic linear path (exp<=1) cap".
 | `sync_gain_p2` 0     | 0.667 | 1.0 | `data[0]/x_start` (`ref/accel-synchronous.hpp:128-130`) |
 | `sync_gain_p1` 0     | 0.667 | 1.0 | idem (same params → same LUT) |
 | `sync_gain_p07` 0    | 0.667 | 1.0 | idem |
+| `sync_gain_mot2_gam05` 0 | 0.667 | 1.0 | idem (motivity/gamma variant, P98/P163) |
 | `sync_legacy_p2` 0   | 0.667 | 1.0 | `exp(−log(motivity)) = 1/motivity` from `log(0) → −∞` push (`ref/accel-synchronous.hpp:67-71`) |
 | `sync_legacy_p1` 0   | 0.667 | 1.0 | idem |
+| `sync_legacy_mot05_gam2` 0 | 0.667 | 1.0 | idem (motivity/gamma variant, P98/P163) |
 
 **Root cause:** the reference blindly evaluates its formulas at `x = 0`:
 - GAIN power `base_fn(0) = offset.y = 0` — the "output velocity 0" floor, so
@@ -132,10 +139,15 @@ their ref values coincide.
 
 ---
 
-### Class B2 — `game_apex_power` at speed 0 (1 row)
+### Class B2 — `game_apex_power` at speed 0 (0 rows — the row was removed)
 
 Grid case (`oracle_cases.hpp:169-174`): `power, gain, scale=2.2,
 exponent_power=0.8, input_offset=0.02, output_offset=0.9, cap=(28,2.2), out`.
+
+> **Historical (the row is no longer in `known_deviations.txt`).** PRE-3 raised
+> the apex `output_offset` to 1.0, which made the power identity row at speed 0
+> line up with the reference — so `game_apex_power 0` was REMOVED from the
+> deviation list. The row below is kept for the history only.
 
 | Row | ref gain | local |
 |-----|----------|-------|
@@ -163,9 +175,13 @@ own offset floor. Reference `base_fn(0)` returns `offset.y = output_offset =
   power (2 rows: gain+legacy × p1) + synchronous (7 rows: `sync_gain_p1` /
   `sync_gain_p2` / `sync_gain_p07` / `sync_gain_mot2_gam05` + `sync_legacy_p1` /
   `sync_legacy_p2` / `sync_legacy_mot05_gam2`).
-- 1 row = the apex power preset @0 (`game_apex_power`).
-- 12 rows = the P155 `io` cap.y=0 legacy identity-guard case
-  (`p155_io_cap0_legacy` × 12 speeds, 0.0001 … 100000).
+- 0 rows = the apex power preset @0 (`game_apex_power`) — PRE-3 aligned it with
+  the reference, so the row left the deviation list.
+- 23 rows = `power_tinyexp_floor` (exponent_power=5e-4, inside the BUG-02
+  floor band; the local port floors the shared exponent at 1e-3, the reference
+  uses the raw 5e-4).
+- 24 rows = the P155 `io` cap.y=0 identity-guard case (12 legacy +
+  12 gain × 12 speeds, 0.0001 … 100000).
 - All classes are *deliberate* and each has dedicated regression tests;
   none is a numerical drift or a porting omission. The oracle therefore
   measures what it should: **on every other row the local port matches the
@@ -181,19 +197,24 @@ own offset floor. Reference `base_fn(0)` returns `offset.y = output_offset =
 2. `power_gain_p1`/`power_legacy_p1` @0 (2 rows): FIXABLE trivially by removing
    the `x ≤ 0 → 1` guard, but that reintroduces the 0-gain artefact and opens a
    NaN path for the modifier; keep the guard.
-3. `sync_*` @0 (7 rows): FIXABLE trivially, but you would be faithfully
+3. `sync_*` @0 (9 rows): FIXABLE trivially, but you would be faithfully
    reproducing an extrapolation artefact (`data[0]/x_start`) born of `log(0)`;
    keep the guard.
-4. `game_apex_power` @0 (1 row): the ONLY deviation that is semantically
-   matchable (ref 0.9 is the curve's legit output-offset floor); still not
-   worth it — uniform guard is more valuable than a meaningless-to-output 0.9.
-5. `p155_io_cap0_legacy` (12 rows): NOT FIXABLE — the reference emits NaN/0 on
+4. `game_apex_power` @0 (0 rows — removed): it WAS the only deviation that is
+   semantically matchable (ref 0.9 is the curve's legit output-offset floor);
+   PRE-3 aligned the row with the reference, so it left the list.
+5. `power_tinyexp_floor` (23 rows): NOT FIXABLE without changing the shared
+   exponent floor (1e-3 local vs the raw 5e-4 reference) — the floor exists to
+   keep `gain_inverse` (1/n) out of a division by zero; matching the reference
+   here means reproducing a value the port deliberately floors.
+6. `p155_io_cap0_legacy` + `p155_io_cap0_gain` (24 rows): NOT FIXABLE — the
+   reference emits NaN/0 on
    `cap.y=0` with `io`; local guards it to identity gain (P155/P96-A fix for
    silent mouse death). These rows can never appear as "genuine deviations"
    (`NaN > tol` is never true, `0` vs `1` would), so they are documented here
    and asserted by the dedicated unit section.
 
-**Conclusion for the manager (Aj 1):** all 45 deviations are intentional
+**Conclusion for the manager (Aj 1):** all 79 deviations are intentional
 safety/convention choices; none should be "fixed" toward the reference. If the
 goal is *accuracy*, the actionable surface is not these rows but (a) tighter
 expression of the classic/power base functions to reduce intermediate rounding

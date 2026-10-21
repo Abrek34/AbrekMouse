@@ -4,6 +4,27 @@
 
 namespace rawaccel {
 
+/// GAIN-branch numerical-stability threshold (L02-15).
+///
+/// The GAIN form is a difference of two O(limit/accel) terms.  The config
+/// layer floors natural decay_rate, but it cannot floor the *effective
+/// speed*: domain_weights are legal down to 0, so a hand-edited/CLI profile
+/// can still make x far smaller than the 3.125e-4 production floor that the
+/// decay-rate fix assumed.  When accel*x is below this threshold the
+/// cancellation error exceeds the true gain offset; the exact gain there is
+/// 1 + limit*accel*x/2 + O((accel*x)^2), so identity is the accurate result.
+/// Direct natural::operator() deliberately stays reference-bit-compatible;
+/// the production dispatch (accel_union::apply) uses this predicate.
+inline constexpr double NATURAL_GAIN_MIN_ACCEL_X = 1e-9;
+
+static inline bool natural_gain_ill_conditioned(const accel_args& args, double x) {
+    if (args.mode != accel_mode::natural || !args.gain) return false;
+    if (!(x > args.input_offset)) return false; // operator() already returns 1
+    const double abs_limit = std::fabs(args.limit - 1.0);
+    const double accel = args.decay_rate / (abs_limit < 1e-9 ? 1.0 : abs_limit);
+    return accel > 0.0 && accel * x < NATURAL_GAIN_MIN_ACCEL_X;
+}
+
 /// Natural (vanishing difference) acceleration.
 /// Smoothly approaches a limit asymptote.
 struct natural {
@@ -140,26 +161,63 @@ struct natural {
             // (2026-09-28; 9 limits x 12 decay_rates x 8 speeds = 864 points,
             // gain mode, scored against a 60-digit reference):
             //   reachable means limit in [0, 100] — LIMIT_MAX, enforced at
-            //   src/config.cpp:501 — and decay_rate > 0, which has NO bound
-            //   beyond `if (decay_rate < 0) decay_rate = 0` (config.cpp:452).
+            //   src/config.cpp:593 — and decay_rate > 0.  Since 2026-10-21
+            //   decay_rate has a LOWER bound in natural mode as well:
+            //   NATURAL_DECAY_RATE_MIN = 1e-4 (include/config.hpp:76),
+            //   enforced by sanitize_accel_args() (src/config.cpp:533-535) —
+            //   so the band below is no longer reachable from a config.
             //   139 of 792 scorable points exceed the oracle's 1e-9 relative
             //   tolerance.  Worst: limit=100, decay_rate=1e-9, x=0.01 returns
             //   0.8046875 where the true gain is 1.000000000005 — a 19.5%
             //   speed error, i.e. the cursor moves at 80% while the curve says
             //   "essentially no acceleration".  The whole cluster sits at
             //   decay_rate <= 1e-4, where accel = decay_rate/|L| falls to
-            //   ~1e-11..1e-12 and the two O(1/accel) terms of line ~137 above
-            //   cancel.  It is a 19.5% error, NOT a sign flip and NOT a NaN:
-            //   no reachable input produces a negative gain (measured over the
-            //   same 864 points).
+            //   ~1e-11..1e-12 and the two O(1/accel) terms of line 208 below
+            //   cancel.
+            //
+            // ⚠ CORRECTION (2026-10-21): the sentence that used to stand here
+            //   — "It is a 19.5% error, NOT a sign flip and NOT a NaN: no
+            //   reachable input produces a negative gain (measured over the
+            //   same 864 points)" — was FALSE and is RETRACTED.  The 19.5%
+            //   error cluster and the sign flip are the SAME cancellation,
+            //   only further along: the numerator is a difference of two
+            //   O(limit/accel) terms, so the rounding error there is
+            //   ~limit/accel·2^-52, and once that exceeds the true gain the
+            //   quotient goes NEGATIVE.  The flip needs accel·x ≲ limit·2^-52
+            //   (at limit=100, decay_rate=1e-10: x ≲ 0.02), which the
+            //   2026-09-28 speed set evidently did not cover.
+            //   Re-measured 2026-10-21 (olcum/analiz/fix_verify.cpp,
+            //   olcum/analiz/neg_gain.cpp):
+            //     * wide grid, 2808 points (9 limits × 12 decay_rates ×
+            //       13 speeds × 2 gain modes) → 4 negative gains, worst
+            //       -46.68 (limit=50, decay_rate=1e-6, x=1e-8, gain mode);
+            //     * PRODUCTION-REACHABLE x band only (x ≥ 3.125e-4 = 32000 DPI
+            //       / 100 ms / 1 count), 10560 points → 5 negative gains,
+            //       worst -30.25 (limit=100, decay_rate=1e-10, x=5e-4); at the
+            //       typical desktop point (800 DPI, 100 ms, 1 count → x=1.25e-2)
+            //       the gain is -0.25, i.e. the AXIS IS INVERTED;
+            //     * end-to-end through modifier::modify(): in.x = +1 comes out
+            //       as out.x = -0.25 (800 DPI) and -39.0 (32000 DPI, 80 ms) —
+            //       the final isfinite() guard does not catch it because the
+            //       value is finite, merely negative.
+            //   So the defect is NOT an unreachable edge: it is reachable from
+            //   a hand-edited JSON or a CLI `set-param decay_rate 1e-10`.
             //
             // ⚠ This deviation is INHERITED, not a port defect: the port and
             //   the official reference return the same 0.8046875 there, bit for
             //   bit, and over the reachable box the two differ in 0 of 768
             //   scorable points.  So the fix is NOT in this file — it is a
-            //   lower bound on decay_rate in the config-presets lane, which
-            //   makes the band unreachable without touching the formula and
-            //   without breaking bit-fidelity with the reference.
+            //   lower bound on decay_rate in the config layer, which makes the
+            //   band unreachable without touching the formula and without
+            //   breaking bit-fidelity with the reference.
+            //   ✅ DONE (2026-10-21): that lower bound now exists —
+            //   NATURAL_DECAY_RATE_MIN = 1e-4 (include/config.hpp), applied by
+            //   sanitize_accel_args() to natural profiles (src/config.cpp);
+            //   decay_rate = 0 stays 0 (accel = 0 hits the `accel < 1e-12`
+            //   guard below → flat gain 1.0, no sign error).  The CLI's
+            //   set-param domain mirrors the same floor (cli/main.cpp).
+            //   Re-measured after the fix over the production-reachable box:
+            //   10560 points → 0 negative gains (olcum/analiz/fix_verify.cpp).
             // ⚠ The oracle cannot see any of this: its grid uses decay_rate in
             //   {0.08, 0.1}, i.e. the insensitive region only.  51 of the 58
             //   offending (limit, decay_rate) pairs are at decay_rate <= 1e-4.

@@ -77,6 +77,10 @@ static const char* tr(const char* key) {
              "Ham geçiş — ivme devre dışı (1:1)"},
             {"X Axis",              "X Ekseni"},
             {"Y Axis",              "Y Ekseni"},
+            {"Live (raw)",          "Canlı (ham)"},
+            {"Model",               "Model"},
+            {"raw %.1f ips | gain %.2f | model %s",
+             "ham %.1f inç/sn | kazanç %.2f | model %s"},
             {"%.0f ips  (scroll=zoom)",                  "%.0f inç/sn  (tekerlek=yakınlaştır)"},
             {"%.0f ips  (left click=add, right click=remove)",
                                                                 "%.0f inç/sn  (sol tık=ekle, sağ tık=kaldır)"},
@@ -356,8 +360,20 @@ static const char* tr(const char* key) {
              "Çıkış (ips):"},
             {"Gain (×):",
              "Kazanç (×):"},
-            {"Latency p50/p95 (µs):",
-             "Gecikme p50/p95 (µs):"},
+            {"Delta dx/dy (counts):",
+             "Fark dx/dy (sayaç):"},
+            {"Latency p50/p95/p99 (µs):",
+             "Gecikme p50/p95/p99 (µs):"},
+            {"Jitter p99-p50 (µs):",
+             "Titreşim p99-p50 (µs):"},
+            {"Live (raw): awaiting motion…",
+             "Canlı (ham): hareket bekleniyor…"},
+            {"Live: raw passthrough (no telemetry)",
+             "Canlı: ham geçiş (telemetri yok)"},
+            {"Live: daemon unreachable",
+             "Canlı: daemon erişilemiyor"},
+            {"Live (raw): %.1f ips -> %.1f ips · gain %.2f · p99 %s µs",
+             "Canlı (ham): %.1f inç/sn -> %.1f inç/sn · kazanç %.2f · p99 %s µs"},
             {"Poll rate (Hz):",
              "Yoklama hızı (Hz):"},
             {"Device:",
@@ -775,6 +791,8 @@ static void refresh_language(AppState* S) {
     rebuild_profile_combo(S);   // -> profile_to_widgets, update_mode_sensitivity
     update_daemon_status(S);    // daemon status + battery markup are dynamic
     mouse_test_refresh_language(S); // open test window stays in sync (BUG-09)
+    live_telem_update_label(S);     // dynamic one-line readout under the graph
+    if (S->graph_area) gtk_widget_queue_draw(S->graph_area); // graph legend/readout
 
     // Translate the idle status if it still shows a ready-state in either
     // language.  The old check only matched the English default, so switching

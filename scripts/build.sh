@@ -41,6 +41,18 @@ fi
 
 CXX="${CXX:-g++}"
 
+# Compiler family: a few optimisation flags are GCC-only / Clang-only, and the
+# documented `CXX=clang++ bash scripts/build.sh` path used to fail before it
+# compiled a single file (`-fvect-cost-model=very-cheap`), while
+# `RAWACCEL_LTO=1` failed on BOTH compilers (the old LTO set mixed
+# `-fwhole-program-vtables` (Clang) with `-fdevirtualize-at-ltrans` (GCC)).
+# Detect once here and keep the two flag sets disjoint.
+IS_CLANG=0
+CXX_PREDEFINED="$($CXX -dM -E -x c++ /dev/null 2>/dev/null || true)"
+case "$CXX_PREDEFINED" in
+    *"#define __clang__"*) IS_CLANG=1 ;;
+esac
+
 # RAWACCEL_PORTABLE=1 means: DO NOT USE -march=native.  It exists for
 # reproducible/CI builds (GitHub runners do not guarantee a CPU level, and
 # -march=native bakes whatever the runner happens to have into the binary).
@@ -83,12 +95,24 @@ if [ "$USE_PGO" = "1" ] && [ "$PGO_GEN" = "1" ]; then
     PGO_FLAGS="-fprofile-generate=$BUILD/pgo-data"
     echo "[INFO] PGO profile generation enabled"
 elif [ "$USE_PGO" = "1" ] && [ "$PGO_USE" = "1" ]; then
-    PGO_FLAGS="-fprofile-use=$BUILD/pgo-data -fprofile-correction"
+    PGO_FLAGS="-fprofile-use=$BUILD/pgo-data"
+    # -fprofile-correction is GCC-only; Clang warns and ignores it.
+    if [ "$IS_CLANG" = "0" ]; then
+        PGO_FLAGS="$PGO_FLAGS -fprofile-correction"
+    fi
     echo "[INFO] PGO profile use enabled"
 fi
 
 if [ "$USE_LTO" = "1" ]; then
-    LTO_FLAGS="-flto=auto -fwhole-program-vtables -fdevirtualize-at-ltrans"
+    # GCC and Clang do not share either of the two "extra" LTO flags:
+    #   GCC   : -fdevirtualize-at-ltrans
+    #   Clang : -fwhole-program-vtables
+    # `-flto=auto` is accepted by both (Clang treats `auto` as the default).
+    if [ "$IS_CLANG" = "1" ]; then
+        LTO_FLAGS="-flto=auto -fwhole-program-vtables"
+    else
+        LTO_FLAGS="-flto=auto -fdevirtualize-at-ltrans"
+    fi
     echo "[INFO] LTO (Link Time Optimization) enabled"
 fi
 
@@ -114,8 +138,13 @@ esac
 # Base C++ flags with aggressive optimizations
 BASE_CXXFLAGS="-std=c++20 -O3 $MARCH -Wall -Wextra -Wpedantic -Wno-unused-parameter"
 
-# Additional performance flags
-PERF_FLAGS="-fomit-frame-pointer -funroll-loops -ftree-vectorize -fvect-cost-model=very-cheap"
+# Additional performance flags.  -fvect-cost-model is GCC-only; Clang rejects
+# the whole command line with "unknown argument" (the documented clang build
+# path failed here first).
+PERF_FLAGS="-fomit-frame-pointer -funroll-loops -ftree-vectorize"
+if [ "$IS_CLANG" = "0" ]; then
+    PERF_FLAGS="$PERF_FLAGS -fvect-cost-model=very-cheap"
+fi
 # SIMD math optimizations.
 # These are what the ORACLE/GATE flags are checked against conceptually, so
 # they must follow the same portability switch as MARCH above -- see the note

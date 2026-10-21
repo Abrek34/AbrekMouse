@@ -8,6 +8,32 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 
 ## [Unreleased]
 
+### Added — GUI canlı telemetri
+
+- **Ana pencerede canlı çalışma noktası ve iz.** Grafik, daemon `status`
+  telemetrisini 10 Hz'de yoklayıp `(telem_in_ips, telem_gain)` ölçüm noktasını
+  yeşil, eğrinin aynı hızdaki model kazancını sarı halka olarak çizer. Son
+  ~12 saniyenin benzersiz örnekleri solan bir iz bırakır; tekrar eden
+  `telem_wall_ms` değerleri ve 2 saniyeden eski örnekler işaretlenmez. Grafiğin
+  altındaki satır giriş/çıkış hızını, kazancı ve p99 gecikmeyi gösterir.
+  `telem_in_ips` ham fiziksel büyüklüktür (rotasyon/ağırlık/yumuşatma öncesi),
+  bu yüzden okuma **Live (raw)** olarak etiketlenir; bu dönüşümler açıkken
+  nokta eğri koordinatından sapabilir.
+- **Mouse Lock Test genişletildi.** Ham dx/dy sayaçları, p50/p95/p99 gecikmesi
+  ve p99−p50 jitter'ı eklendi.
+- Salt okunur: hızlanma formülleri, referans yolu ve daemon hot-path'i
+  değişmedi. Ham 1:1 geçişte telemetri üretilmediği için canlı katman
+  çizilmez; daemon erişilemezse poll 2 Hz'e düşer ve GTK ana iş parçacığı
+  kilitlenmez.
+
+### Fixed — GUI
+
+- **Grafikte dikey "Kazanç" eksen başlığı.** `cairo_show_text()` x ekseni
+  başlığının bıraktığı current point'i kullandığı için başlık grafiğin
+  ortasında çiziliyordu; başlık artık sol kenar boşluğunda ve y ekseni
+  etiketleriyle çakışmıyor. Ayrıca ölçek dışına taşan canlı/model
+  işaretçileri kenardan 6 px içeride tutuluyor, böylece nokta kırpılmıyor.
+
 ### Fixed — doğruluk
 
 - **Ayrık modda çift dönüşüm (rotation / snap / speed clamp).**
@@ -20,6 +46,32 @@ The canonical version string lives in `include/rawaccel-base.hpp`
   yerde ve tam bir kez uygulanıyor; separate mod, `modify()` içinde
   dönüşümlerden ÖNCE dispatch ediliyor. Böylece iki boru hattı bir daha
   ayrışamaz.
+- **`natural` GAIN modunda negatif kazanç / eksen tersliği.**
+  `decay_rate ∈ (0, 1e-4)` iken iç katsayı `accel = decay_rate/|limit-1|`
+  çok küçülüyor; GAIN dalındaki iki `O(1/accel)` terimin farkı yuvarlama
+  hatasıyla negatife düşebiliyordu (ölçülen en kötü **-46.68**, `limit=100`,
+  `decay_rate=1e-9`; 32000 DPI / 100 ms'de üretimde erişilebilir). Negatif
+  kazanç imleci ters yönde sürüklüyordu. Formül referansla bit-bit aynı
+  bırakıldı; alt sınır `NATURAL_DECAY_RATE_MIN = 1e-4` olarak
+  `sanitize_accel_args()` katmanına eklendi. `decay_rate = 0` muaf: mevcut
+  `accel < 1e-12` guard'ı düz kazanç 1.0 verir. CLI `set-param` domaini de
+  aynı sınıra hizalandı; `test_natural_decay_rate_floor()` ile 12 assertion
+  eklendi (34405 → 34417).
+- **`natural` GAIN modunda küçük etkin hızda sayısal spike (L02-15).**
+  `decay_rate` tabanı yalnız katsayıyı sınırlıyor; `domain_weights` 0'a kadar
+  inebildiği için etkin hız hâlâ çok küçülebiliyor. 32000 DPI / 100 ms /
+  1 count ve `domain_weight_x = 1e-5` → `x = 3.125e-9`; GAIN dalındaki iki
+  `O(limit/accel)` terimin farkı burada **5.77× pozitif spike** üretiyordu
+  (`limit=100`, `decay_rate=1e-4`): üretim çıktısı **0.18026**, beklenen
+  **0.03125**. Başka yasal kombinasyonlarda negatif dip de ölçüldü
+  (`limit=100`, `decay_rate=1e-3`, `domain_weight_x=3e-5` → **0.8013**).
+  `natural::operator()` referansla bit-bit aynı bırakıldı; üretim
+  dağıtımı `accel_union::apply()` `accel*x < NATURAL_GAIN_MIN_ACCEL_X
+  (1e-9)` olduğunda kimlik (1.0) döndürüyor. Bu bantta gerçek kazanç
+  1'den en fazla ~5e-8 sapıyor; kimlik, ham formülden daha doğru.
+  `test_natural_decay_rate_floor()` içine whole + separate kapsayan
+  4 assertion eklendi (34417 → 34421). Oracle değişmedi: 1408 satır /
+  79 sapma.
 
 ### Fixed — performans / hesaplama
 
@@ -48,6 +100,20 @@ The canonical version string lives in `include/rawaccel-base.hpp`
   sonuçlar arasındaki fark en fazla 2 ULP (boru hattı toleransı 1e-9).
   `simd::magnitude` artık ayrı bir kopya değil, aynı implementasyonu
   çağırıyor.
+
+### Fixed — derleme
+
+- **`CXX=clang++` ve `RAWACCEL_LTO=1` derlemeleri kırıktı.**
+  `PERF_FLAGS` içindeki `-fvect-cost-model=very-cheap` yalnız GCC'de var;
+  Clang, belgelenen özel-derleyici yolunu daha ilk dosyada
+  `unknown argument` ile durduruyordu. LTO seti ise iki derleyicide de
+  çalışmıyordu: `-fwhole-program-vtables` Clang'e, `-fdevirtualize-at-ltrans`
+  GCC'ye ait. `scripts/build.sh` artık `__clang__` ile derleyici ailesini
+  tespit edip iki bayrak setini ayrı tutuyor; `-fprofile-correction` da
+  yalnız GCC'ye ekleniyor. Clang derlemesinde kalan tek proje uyarısı
+  (`daemon/main.cpp` içindeki kullanılmayan `verbose` lambda yakalaması)
+  kaldırıldı. Davranış değişmedi; GCC ve Clang normal + LTO derlemeleri
+  rc=0.
 
 ### Fixed — kurulum / servis
 
@@ -90,6 +156,22 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 
 ### Added — test
 
+- **HID++ protokol katmanı için donanımsız test seam'i (AJ-H).**
+  `include/logitech_hidpp.hpp` içine byte seviyesinde `hidpp_io_backend`
+  arayüzü ve enjekte edilebilir `HidppTransport` constructor'ı eklendi;
+  `src/logitech_hidpp.cpp` write/read yolları backend varsa oraya gidiyor,
+  `is_open()` backend-farkında. Üretim hidraw yolu ve çağrıları değişmedi.
+  Yeni `tests/hidpp_transport_test.cpp` (31 assertion / 8 bölüm) özellik
+  keşfi, istek-yanıt eşleştirme, bildirim zulası (BUG-22), hata çerçevesi,
+  ölü uç nokta fast-fail ve O31-H1 sektör bütçesini sahte cihazla
+  doğruluyor. `test_accel.cpp`'ye bu değişiklikte dokunulmadı (assertion
+  sayısı o sırada 34405'ti; doğal `decay_rate` tabanı sonrası 34417'ye
+  çıkmıştı, L02-15 domain-weight kapısı sonrası güncel sayı 34421).
+- **CLI liveness kapısı + sahte IPC sunucusu (AJ-H).**
+  `tests/fake_ipc_server.cpp` canlı soket + PID dosyası yok senaryosunu
+  deterministik üretiyor; `tests/run_tests.sh` içindeki kapı `status` ve
+  `status --json` için `running` / rc=0 / `daemon_pid_verified` davranışını
+  doğruluyor.
 - **X/Y izotropi + DPI bağımsızlığı regresyonu.** 7 hızlanma modu ×
   whole/separate × 400/800/1600/3200 DPI için eşit fiziksel X ve Y
   hareketinin aynı çıktıyı ürettiği; aynı fiziksel mesafenin farklı
@@ -178,6 +260,16 @@ test/gate altyapısının kendi kendini denetlememesi.
   ve yalnız-sinyal yollarını ayırır; `status --json` donmuş daemon'u
   `"unreachable"` + rc=3 olarak raporlar ve her zaman `devices:[]` içerir;
   `timestamp_ms` eklendi (L13-04).
+- **CLI liveness artık IPC-first (AJ-H).** `status`, `status --json`,
+  `monitor`, `latency` ve `reload` canlılığı yalnız PID dosyasından
+  türetmiyor: önce daemon'ın IPC `status` cevabına bakılıyor. Canlı soket
+  varken PID dosyası yoksa/bayatsa CLI artık yanlışlıkla `"stopped"` (rc=2)
+  demiyor; `"running"` + rc=0 ve `status --json` içinde
+  `daemon_pid_verified:false` dönüyor (kimlik PID ile doğrulanamadı, ama
+  daemon IPC'de ayakta). `"stopped"` yalnız ne canlı PID ne de soket
+  dosyası varken; ölü soket/PID izi varsa `"unreachable"` rc=3.
+  IPC `connect()` artık `O_NONBLOCK` + `poll(2000 ms)` ile sınırlı; dolu
+  kabul kuyruğu veya donmuş daemon CLI'yi süresiz asmıyor.
 - **GUI donmuş daemon'u "running" gösteriyordu (L15-C2).** Artık
   "unreachable" rozeti; Apply/Reload duyarsız (5 s ana-iş-parçacığı
   blokajı yerine).

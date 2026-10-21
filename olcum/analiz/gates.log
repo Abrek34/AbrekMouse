@@ -1,0 +1,10 @@
+=== opencode bağımsız 7 kapı — 2026-10-22 00:11:23 ===
+kaynak: git-yok (ağaç git deposu değil)
+KAPI 1/7 build → rc=0 (91s)  [ham: olcum/analiz/gate-1.log]
+KAPI 2/7 run_tests → rc=0 (77s)  [ham: olcum/analiz/gate-2.log]
+KAPI 3/7 oracle → rc=0 (3s)  [ham: olcum/analiz/gate-3.log]
+KAPI 4/7 simd_parity → rc=0 (4s)  [ham: olcum/analiz/gate-4.log]
+KAPI 5/7 tr_coverage → rc=0 (1s)  [ham: olcum/analiz/gate-5.log]
+KAPI 6/7 cli_sanitized → rc=0 (61s)  [ham: olcum/analiz/gate-6.log]
+KAPI 7/7 tracker_bridge → rc=0 (0s)  [ham: olcum/analiz/gate-7.log]
+=== bitti: 2026-10-22 00:15:20 ===

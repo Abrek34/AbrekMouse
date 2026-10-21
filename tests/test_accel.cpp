@@ -69,7 +69,7 @@ static const char* g_section = "";
 // --filter / --list modları kasıtlı olarak az fonksiyon koşar, bu yüzden
 // meta-kontrol yalnız TAM koşuda uygulanır.
 static int  g_test_functions_run = 0;
-static constexpr int EXPECTED_TEST_FUNCTIONS = 152;
+static constexpr int EXPECTED_TEST_FUNCTIONS = 153;
 
 static bool        g_section_active = true;   // current section runs assertions
 static bool        g_list_only      = false;  // --list: print names, skip asserts
@@ -3036,6 +3036,155 @@ static void test_natural_decay_zero() {
         natural n(args);
         double g = n(10.0, args);
         EXPECT(std::isfinite(g));
+    }
+}
+
+// ── Test: natural decay_rate alt tabanı (L02-14, 2026-10-21) ────────────────
+//
+// natural modunda iç katsayı accel = decay_rate/|limit-1| (accel-natural.hpp:24)
+// ve GAIN dalı iki O(1/accel) terimin FARKINI aldığı için küçük decay_rate'da
+// kazanç NEGATİF olabiliyor: ölçülen en kötü -30.25 (limit=100,
+// decay_rate=1e-10, x=5e-4) → üretim yolunda imleç ekseni TERSİNE dönüyor
+// (modifier::modify(): in.x=+1 → out.x=-0.25 @800 DPI/100 ms).
+//
+// Düzeltme taban tabanda: sanitize_accel_args (src/config.cpp) natural'da
+// decay_rate ∈ (0, NATURAL_DECAY_RATE_MIN) bandını yukarı kırpır; 0 muaf
+// (accel=0 → `accel < 1e-12 → 1.0` guard'ı → düz kazanç 1.0).
+static void test_natural_decay_rate_floor() {
+    SECTION("sanitize — natural decay_rate (0,1e-4) bandı yukarı kırpılır, 0 korunur");
+    {
+        device_profile dp;
+        dp.prof.accel_x.mode = accel_mode::natural;
+        dp.prof.accel_x.decay_rate = 1e-9;
+        dp.prof.accel_y = dp.prof.accel_x;
+        sanitize_device_profile(dp);
+        EXPECT_NEAR(dp.prof.accel_x.decay_rate, NATURAL_DECAY_RATE_MIN, 0.0);
+        EXPECT_NEAR(dp.prof.accel_y.decay_rate, NATURAL_DECAY_RATE_MIN, 0.0);
+    }
+    {
+        // 0 MUAF: accel=0 → guard → düz kazanç 1.0; kırpma olmamalı
+        device_profile dp;
+        dp.prof.accel_x.mode = accel_mode::natural;
+        dp.prof.accel_x.decay_rate = 0.0;
+        dp.prof.accel_y = dp.prof.accel_x;
+        sanitize_device_profile(dp);
+        EXPECT_NEAR(dp.prof.accel_x.decay_rate, 0.0, 0.0);
+    }
+    {
+        // taban ve üstü korunur (preset değeri 0.1 de)
+        device_profile dp;
+        dp.prof.accel_x.mode = accel_mode::natural;
+        dp.prof.accel_x.decay_rate = NATURAL_DECAY_RATE_MIN;
+        sanitize_device_profile(dp);
+        EXPECT_NEAR(dp.prof.accel_x.decay_rate, NATURAL_DECAY_RATE_MIN, 0.0);
+        dp.prof.accel_x.decay_rate = 0.1;
+        sanitize_device_profile(dp);
+        EXPECT_NEAR(dp.prof.accel_x.decay_rate, 0.1, 0.0);
+    }
+    {
+        // natural OLMAYAN modda kırpma uygulanmaz (decay_rate orada okunmaz)
+        device_profile dp;
+        dp.prof.accel_x.mode = accel_mode::classic;
+        dp.prof.accel_x.decay_rate = 1e-9;
+        sanitize_device_profile(dp);
+        EXPECT_NEAR(dp.prof.accel_x.decay_rate, 1e-9, 0.0);
+    }
+
+    SECTION("natural — üretim erişilebilir kutuda negatif kazanç yok");
+    {
+        // üretim erişilebilir x bandı:
+        //   x = |counts| × (NORMALIZED_DPI/dpi)/time_ms ≥ 3.125e-4
+        //       (32000 DPI, 100 ms, 1 count)  ·  800 DPI'da ≥ 1.25e-2
+        const double limits[]  = {0.0, 0.5, 1.0, 1.5, 2.0, 5.0, 10.0, 50.0, 100.0};
+        const double decays[]  = {0.0, 1e-12, 1e-10, 1e-9, 1e-8, 1e-6, 1e-4,
+                                  1e-3, 0.1, 10.0};
+        const double offsets[] = {0.0, 0.001, 0.01};
+        const double xs[]      = {3.125e-4, 1e-3, 1.25e-2, 0.1, 1.0, 10.0, 1e5};
+        int negative = 0, nonfinite = 0, points = 0;
+        for (bool gm : {true, false}) {
+            for (double L : limits) for (double d : decays)
+            for (double off : offsets) for (double x : xs) {
+                if (x <= off) continue;
+                accel_args a = make_args(accel_mode::natural);
+                a.mode = accel_mode::natural;
+                a.gain = gm;
+                a.limit = L;
+                a.decay_rate = d;
+                a.input_offset = off;
+                device_profile dp;
+                dp.prof.accel_x = a;
+                dp.prof.accel_y = a;
+                sanitize_device_profile(dp);
+                natural n(dp.prof.accel_x);
+                double g = n(x, dp.prof.accel_x);
+                ++points;
+                if (!std::isfinite(g)) ++nonfinite;
+                else if (g < 0.0) ++negative;
+            }
+        }
+        EXPECT(points > 0);
+        EXPECT(negative == 0);   // eksen tersliği yok
+        EXPECT(nonfinite == 0);
+    }
+
+    SECTION("natural GAIN — sanitize'siz argümanda terslik belgelenir, sanitize ile kaybolur");
+    {
+        accel_args a = make_args(accel_mode::natural);
+        a.mode = accel_mode::natural;
+        a.gain = true;
+        a.limit = 100.0;
+        a.decay_rate = 1e-10;
+        a.input_offset = 0.0;
+        natural n_raw(a);
+        double g_raw = n_raw(1.25e-2, a);      // 800 DPI, 100 ms, 1 count
+        EXPECT(g_raw < 0.0);                   // ham yolda terslik VAR
+        device_profile dp;
+        dp.prof.accel_x = a;
+        dp.prof.accel_y = a;
+        sanitize_device_profile(dp);
+        natural n_san(dp.prof.accel_x);
+        double g_san = n_san(1.25e-2, dp.prof.accel_x);
+        EXPECT(g_san >= 0.0);                  // sanitize sonrası terslik YOK
+        EXPECT(std::isfinite(g_san));
+    }
+
+    SECTION("natural GAIN — domain_weights ile küçülen hızda kimlik korunur (L02-15)");
+    {
+        // Sanitize decay_rate'i 1e-4'e kaldırsa da domain_weights 0'a kadar
+        // inebilir; x = 1 count × (1000/32000)/100 ms × 1e-5 = 3.125e-9.
+        // Ham GAIN formülü burada 5.77× pozitif spike üretiyordu (ölçüldü);
+        // accel_union'daki kararlılık kapısı kimliği (1.0) döndürmeli.
+        auto nat = [] {
+            accel_args a = make_args(accel_mode::natural);
+            a.mode = accel_mode::natural;
+            a.gain = true;
+            a.limit = 100.0;
+            a.decay_rate = 1e-4;
+            a.input_offset = 0.0;
+            return a;
+        };
+        profile p;
+        p.accel_x = nat();
+        p.accel_y = nat();
+        p.domain_weights = {1e-5, 1.0};
+        p.output_dpi = 0; // çıktı normalizasyonu yok: taban 1 count → 1.0
+
+        modifier_settings ms; ms.prof = p; init_settings(ms);
+        speed_processor sp; sp.init(p.speed_processor_args);
+        modifier mod;
+        vec2d in = {1.0, 0.0};
+        mod.modify(in, sp, ms, 1000.0 / 32000.0, 100.0);
+        EXPECT_NEAR(in.x, 1.0, 1e-12); // 5.77× hız spike'ı yok
+        EXPECT_NEAR(in.y, 0.0, 1e-12);
+
+        // Ayrı mod aynı hızı X ekseninde kullanır; kapı orada da çalışmalı.
+        p.speed_processor_args.whole = false;
+        modifier_settings ms_sep; ms_sep.prof = p; init_settings(ms_sep);
+        speed_processor sp_sep; sp_sep.init(p.speed_processor_args);
+        vec2d in_sep = {1.0, 1.0};
+        mod.modify(in_sep, sp_sep, ms_sep, 1000.0 / 32000.0, 100.0);
+        EXPECT_NEAR(in_sep.x, 1.0, 1e-12);
+        EXPECT_NEAR(in_sep.y, 1.0, 1e-12);
     }
 }
 
@@ -10211,6 +10360,9 @@ int main(int argc, char** argv) {
 
     // New edge-case tests
     RUN_TEST(test_natural_decay_zero);
+    // L02-14 (2026-10-21): natural decay_rate alt tabanı — sanitize bandı
+    // kırpar ve üretim erişilebilir kutuda negatif kazanç oluşmaz.
+    RUN_TEST(test_natural_decay_rate_floor);
     RUN_TEST(test_extreme_inputs);
     RUN_TEST(test_classic_degenerate);
     RUN_TEST(test_power_zero_exponent);

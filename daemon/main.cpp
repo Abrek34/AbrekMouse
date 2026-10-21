@@ -661,7 +661,7 @@ int main(int argc, char* argv[]) {
         }
         return out;
     };
-    auto log_cb = [verbose, json_logs, json_escape](const std::string& msg) {
+    auto log_cb = [json_logs, json_escape](const std::string& msg) {
         if (json_logs) {
             // Simple JSON line: {"timestamp": "...", "level": "info", "message": "..."}
             // Use a basic ISO8601 timestamp

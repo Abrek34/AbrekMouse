@@ -1,0 +1,8 @@
+=== AJ-H stale-PID kanıtı — 2026-10-21 22:06:41 ===
+CLI derleniyor (geçici dizine: /tmp/tmp.SBACEq0euT/rawaccel-cli) ...
+SENARYO A: PID dosyası YOK + canlı soket     → Daemon:  running             rc=0
+SENARYO B: bayat PID (ölü 999999) + canlı soket → Daemon:  running             rc=0
+SENARYO E: ne soket ne PID                     → Daemon:  stopped             rc=2
+ÖNCE (21 Ekim 17:47, düzeltme öncesi): A → stopped rc=2 · B → stopped rc=2 · E → stopped rc=2
+SONRA (yukarıdaki ölçüm): A/B → running rc=0 · E → stopped rc=2 (değişmedi)
+=== bitti ===

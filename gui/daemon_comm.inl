@@ -120,6 +120,16 @@ static std::vector<std::string> daemon_sock_candidates() {
     return v;
 }
 
+/// CLOCK_MONOTONIC_RAW milliseconds — the same clock the daemon uses for
+/// telem_wall_ms (P121/BUG-06).  Defined once here so the mouse-test popup and
+/// the main-window live poll cannot drift onto different clock sources.
+double gui_now_mono_raw_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 +
+           static_cast<double>(ts.tv_nsec) / 1e6;
+}
+
 /// True if any candidate IPC socket file exists on disk.  Cheap (stat-only):
 /// lets tick-driven callers skip the IPC entirely — and its socket timeouts —
 /// when the daemon is down (BUG-05 / BUG-10).
@@ -673,6 +683,189 @@ double daemon_device_field(const std::string& resp, AppState* S, const char* key
     return v;
 }
 
+// ── Live operating-point cache (main window) ─────────────────────────────────
+// One status query every 100 ms feeds the graph overlay and the status line
+// below it.  This is intentionally a *latest-sample* read: the daemon publishes
+// the last flush, not an event stream.  The 10 ms socket timeout is the
+// load-bearing part — the default 150 ms would let a frozen-but-listening
+// daemon block the GTK main thread on every tick.
+
+void live_trail_clear(AppState* S) {
+    S->live_trail_head = 0;
+    S->live_trail_count = 0;
+    S->live_last_wall_ms = -1.0;
+    S->live_telem_fresh = false;
+    if (S->graph_area) gtk_widget_queue_draw(S->graph_area);
+}
+
+/// Append one unique measured sample to the operating-point trail.  Repeated
+/// status reads of the same telem_wall_ms are ignored; a >5 s gap starts a new
+/// trail so a long idle period cannot draw a misleading straight line between
+/// two unrelated movements.
+static void live_trail_push(AppState* S, double in_ips, double gain,
+                            double wall_ms) {
+    if (!std::isfinite(in_ips) || !std::isfinite(gain) ||
+        !std::isfinite(wall_ms) || in_ips < 0.0 || gain < 0.0)
+        return;
+
+    const double last = S->live_last_wall_ms;
+    if (last >= 0.0) {
+        const double gap = wall_ms - last;
+        if (gap <= 0.5) {
+            // Same sample, or a small backwards clock jitter: never append an
+            // out-of-order point.  A large backwards jump is a new epoch.
+            if (gap < -5000.0) live_trail_clear(S);
+            else return;
+        }
+        if (gap > 5000.0) live_trail_clear(S);
+    }
+
+    S->live_trail[S->live_trail_head] = {in_ips, gain, wall_ms};
+    S->live_trail_head = (S->live_trail_head + 1) % LIVE_TRAIL_CAP;
+    if (S->live_trail_count < LIVE_TRAIL_CAP) S->live_trail_count++;
+    S->live_last_wall_ms = wall_ms;
+}
+
+/// Re-render the one-line readout below the graph.  Called from the 10 Hz poll
+/// and from refresh_language() so a language switch does not leave the dynamic
+/// line in the old language until the next sample arrives.
+void live_telem_update_label(AppState* S) {
+    if (!S->live_lbl) return;
+
+    if (cur_prof(S).prof.raw_passthrough) {
+        gtk_label_set_text(GTK_LABEL(S->live_lbl),
+                           tr("Live: raw passthrough (no telemetry)"));
+        return;
+    }
+    if (!S->daemon_reachable) {
+        gtk_label_set_text(GTK_LABEL(S->live_lbl),
+                           tr("Live: daemon unreachable"));
+        return;
+    }
+    if (!S->live_telem_fresh) {
+        gtk_label_set_text(GTK_LABEL(S->live_lbl),
+                           tr("Live (raw): awaiting motion…"));
+        return;
+    }
+
+    char p99[32];
+    if (S->live_p99_us >= 0.0)
+        snprintf(p99, sizeof(p99), "%.0f", S->live_p99_us);
+    else
+        snprintf(p99, sizeof(p99), "—");
+
+    gtk_label_set_text(GTK_LABEL(S->live_lbl),
+        trf("Live (raw): %.1f ips -> %.1f ips · gain %.2f · p99 %s µs",
+            S->live_in_ips, S->live_out_ips, S->live_gain, p99).c_str());
+}
+
+/// Mark the current operating point stale but keep the trail visible (faded)
+/// so the user can still see the last few seconds of measured movement.
+static void live_telem_mark_stale(AppState* S) {
+    const bool was_fresh = S->live_telem_fresh;
+    S->live_telem_fresh = false;
+    live_telem_update_label(S);
+    if (was_fresh && S->graph_area)
+        gtk_widget_queue_draw(S->graph_area);
+}
+
+static gboolean live_telem_poll(gpointer user_data) {
+    auto* S = static_cast<AppState*>(user_data);
+    if (S->window_destroyed) return G_SOURCE_REMOVE;
+    if (!S->graph_area) return G_SOURCE_CONTINUE;
+
+    // A profile switch makes the old trail belong to a different curve.  Clear
+    // it before the first sample of the new profile arrives.
+    const std::string profile_name = cur_prof(S).name;
+    if (profile_name != S->live_profile_name) {
+        S->live_profile_name = profile_name;
+        live_trail_clear(S);
+    }
+
+    if (!daemon_socket_exists()) {
+        S->daemon_reachable = false;
+        live_telem_mark_stale(S);
+        return G_SOURCE_CONTINUE;
+    }
+
+    // A wedged-but-listening daemon would otherwise time out on every 100 ms
+    // tick (10 ms × the socket-candidate failover).  Probe it at most twice a
+    // second; the 3 s update_daemon_status() poll also refreshes this flag.
+    const double probe_now = gui_now_mono_raw_ms();
+    if (!S->daemon_reachable &&
+        probe_now - S->live_last_probe_ms < 500.0) {
+        live_telem_mark_stale(S);
+        return G_SOURCE_CONTINUE;
+    }
+    S->live_last_probe_ms = probe_now;
+
+    // 10 ms, not the 150 ms default: a dead-but-listening daemon must not
+    // eat a double-digit percentage of every 100 ms tick.
+    std::string resp = daemon_ipc_query("status", /*timeout_ms=*/10);
+    if (resp.empty()) {
+        S->daemon_reachable = false;
+        live_telem_mark_stale(S);
+        return G_SOURCE_CONTINUE;
+    }
+    S->daemon_reachable = true;
+
+    const double in    = daemon_device_field(resp, S, "telem_in_ips");
+    const double out   = daemon_device_field(resp, S, "telem_out_ips");
+    const double gain  = daemon_device_field(resp, S, "telem_gain");
+    const double dx    = daemon_device_field(resp, S, "telem_dx");
+    const double dy    = daemon_device_field(resp, S, "telem_dy");
+    const double wall  = daemon_device_field(resp, S, "telem_wall_ms");
+
+    S->live_p50_us      = daemon_device_field(resp, S, "lat_p50_us");
+    S->live_p95_us      = daemon_device_field(resp, S, "lat_p95_us");
+    S->live_p99_us      = daemon_device_field(resp, S, "lat_p99_us");
+    S->live_max_us      = daemon_device_field(resp, S, "lat_max_us");
+    S->live_lat_samples = daemon_device_field(resp, S, "lat_samples");
+    S->live_poll_rate   = daemon_device_field(resp, S, "real_polling_rate");
+
+    const double age = (wall >= 0.0)
+        ? std::max(0.0, gui_now_mono_raw_ms() - wall) : -1.0;
+    const bool fresh = (wall >= 0.0 && age >= 0.0 && age < 2000.0);
+    const bool raw   = cur_prof(S).prof.raw_passthrough;
+    // Raw passthrough has no speed/gain telemetry.  Drop any accel-era trail
+    // so switching back to accel cannot resurrect points from the old mode.
+    if (raw && S->live_trail_count > 0) live_trail_clear(S);
+    const bool valid = !raw && fresh && in >= 0.0 && out >= 0.0 &&
+                       gain >= 0.0 && std::isfinite(in) &&
+                       std::isfinite(out) && std::isfinite(gain);
+
+    S->live_sample_age_ms = age;
+    const bool was_fresh = S->live_telem_fresh;
+
+    if (!valid) {
+        S->live_telem_fresh = false;
+        live_telem_update_label(S);
+        if (was_fresh && S->graph_area)
+            gtk_widget_queue_draw(S->graph_area);
+        return G_SOURCE_CONTINUE;
+    }
+
+    S->live_in_ips  = in;
+    S->live_out_ips = out;
+    S->live_gain    = gain;
+    S->live_dx      = dx;
+    S->live_dy      = dy;
+
+    const double old_last = S->live_last_wall_ms;
+    live_trail_push(S, in, gain, wall);
+    // live_trail_push() may clear the ring on a >5 s gap; set freshness only
+    // after it, otherwise that clear would undo this valid sample.
+    S->live_telem_fresh = true;
+    live_telem_update_label(S);
+
+    // Redraw only when the visible state actually changed: a new unique sample
+    // (old_last moved) or a stale->fresh transition.
+    if (!was_fresh || S->live_last_wall_ms != old_last)
+        gtk_widget_queue_draw(S->graph_area);
+
+    return G_SOURCE_CONTINUE;
+}
+
 void update_daemon_status(AppState* S) {
     // Audit-GUI-1: this is also reachable from one-shot g_timeout_add
     // callbacks (on_daemon_start/stop/reload) that are NOT tracked for
@@ -693,6 +886,10 @@ void update_daemon_status(AppState* S) {
         kwin_focus_resend_current(S);
     }
     S->daemon_prev_running = running;
+    // The live overlay polls at 10 Hz.  Remember whether the last full status
+    // poll actually got a reply, so a wedged-but-listening daemon is probed at
+    // most twice a second instead of timing out on every tick.
+    S->daemon_reachable = running && ipc_ok;
     if (unreachable) {
         gtk_label_set_markup(GTK_LABEL(S->daemon_status),
             tr("<span foreground='#c08040'>● Daemon unreachable</span>"));

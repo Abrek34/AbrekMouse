@@ -22,6 +22,13 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <poll.h>
+#include <fcntl.h>
+
+/// IPC zaman aşımı (ms) — hem bağlantı kurma hem cevap alma BOUNDED olmalı.
+/// AJ-H: connect() AF_UNIX üzerinde kabul kuyruğu doluyken süresiz bloklanır;
+/// bu bütçe her IPC probunu (status/monitor/latency/reload) sınırlar.
+static constexpr int IPC_RCV_TIMEOUT_MS = 2000;
 
 // Version number comes from RAWACCEL_VERSION in rawaccel-base.hpp (single source of truth).
 static constexpr const char* VERSION = rawaccel::RAWACCEL_VERSION;
@@ -289,10 +296,17 @@ static std::vector<std::string> daemon_sock_candidates() {
 /// can ask the root-owned daemon to reload without needing kill() permission.
 static std::string daemon_ipc_send(const std::string& request) {
     for (const auto& sock : daemon_sock_candidates()) {
-        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // AJ-H: connect() SİNIRSIZ BLOKLANAMAZ.  AF_UNIX üzerinde connect(),
+        // dinleyicinin kabul kuyruğu doluysa (donmuş daemon) süresiz bekler —
+        // SO_SNDTIMEO connect()u KISITLAMAZ (Linux'ta yalnız gönderme/
+        // alma için geçerlidir).  Bu yüzden soket O_NONBLOCK açılır,
+        // connect() EINPROGRESS dönerse POLLOUT beklenir ve zaman aşımı
+        // BOUNDED olur (IPC_RCV_TIMEOUT_MS).
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0) continue;
 
-        struct timeval tv { .tv_sec = 2, .tv_usec = 0 }; // 2000 ms (matches daemon server timeout)
+        struct timeval tv { .tv_sec = IPC_RCV_TIMEOUT_MS / 1000,
+                            .tv_usec = (IPC_RCV_TIMEOUT_MS % 1000) * 1000 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -301,7 +315,26 @@ static std::string daemon_ipc_send(const std::string& request) {
         if (sock.size() >= sizeof(addr.sun_path)) { close(fd); continue; }
         std::strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
         if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-            close(fd); continue; // try the next candidate
+            if (errno != EINPROGRESS) { close(fd); continue; }
+            // Kuyruk dolu / daemon yanıt vermiyor → BOUNDED bekle.
+            struct pollfd pfd { fd, POLLOUT, 0 };
+            int pr;
+            do {
+                pr = poll(&pfd, 1, IPC_RCV_TIMEOUT_MS);
+            } while (pr < 0 && errno == EINTR);
+            if (pr <= 0) { close(fd); continue; }   // zaman aşımı → sonraki aday
+            int so_err = 0;
+            socklen_t err_len = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &err_len) != 0 ||
+                so_err != 0) {
+                close(fd); continue;                // bağlantı gerçekleşmedi
+            }
+        }
+        // Bağlantı kuruldu; blocking moda dön (gönderme/alma zaman aşımları
+        // yine SO_SNDTIMEO/SO_RCVTIMEO ile bounded).
+        {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
         }
 
         size_t total_sent = 0;
@@ -343,11 +376,63 @@ static std::string daemon_ipc_query(const std::string& cmd) {
     return daemon_ipc_send(cmd + "\n");
 }
 
+// ── Daemon canlılığı: IPC birincil kanıt, PID dosyası ikincil ───────────────
+//
+// AJ-H (stale-PID düzeltmesi).  ÖNCEKI DAVRANIŞ: liveness YALNIZCA PID
+// dosyasından türetiliyordu ve IPC sorgusu SADECE "running" denildiğinde
+// yapılıyordu.  Sonuç: PID dosyası silinmiş ya da ölü bir PID yazıyorsa
+// (kurulum sırasında daemon yeniden başlarken, SIGKILL sonrası, PID'in
+// yeniden kullanılması) CLI, CANLI bir daemon'a rağmen "Daemon: stopped"
+// (rc=2) diyor ve sokete hiç bakmıyordu.
+//
+// Kanıt (izole ortam, unshare --map-root-user --mount ile /run gizlenerek):
+//   sahte daemon $XDG_RUNTIME_DIR/rawaccel.sock üzerinde "status" cevabı
+//   veriyor, PID dosyası yok → `rawaccel-cli status` → "Daemon: stopped",
+//   rc=2, cihaz listesi boş.  Aynı senaryo bayat PID (ölü 999999) ile de
+//   aynı yanlış cevabı veriyordu.
+//
+// YENİ KURAL: IPC kanalı otoritatif kanıttır — daemon ayakta olduğunu
+// YALNIZCA kendisi kanıtlar.  PID dosyası ikinci elden bir işarettir ve
+// sadece "stopped" (rc=2) ile "unreachable" (rc=3) ayrımını açıklamak için
+// kullanılır.
+enum class daemon_liveness {
+    stopped,      // ne IPC cevabı ne canlı PID → daemon yok
+    unreachable,  // PID dosyası canlı bir daemon gösteriyor, IPC cevap vermiyor
+    running,      // IPC cevap verdi (EN OTORİTER kanıt)
+};
+
+struct daemon_probe {
+    daemon_liveness state = daemon_liveness::stopped;
+    nlohmann::json live;      // ayrıştırılmış status JSON (running ise dolu)
+    std::string ipc_error;    // IPC cevabı bozuksa hata metni
+    bool pid_verified = false;// PID dosyası canlı daemon'u da doğruladı mı?
+};
+
+/// Soket dosyası diskte var mı?  "stopped" demek için HEM canlı PID
+/// olmamalı HEM de soket dosyası HİÇ olmamalı: ölü bir daemon'ın bıraktığı
+/// soket dosyası "durmuş daemon" değil, "erişilemeyen daemon" demektir
+/// (Aj-G kuralı: "stopped" yalnızca pidfile kanıtlayamıyor VE soket yok).
+static bool any_socket_path_exists() {
+    for (const auto& sock : daemon_sock_candidates())
+        if (::access(sock.c_str(), F_OK) == 0) return true;
+    return false;
+}
+
+/// Tek noktadan liveness tespiti: önce IPC, sonra PID dosyası.
+/// Tanımı daemon_running()'dan sonra durur (onu çağırır); burada öncü
+/// bildirim yeterlidir.
+static daemon_probe probe_daemon();
+
 /// How a reload attempt ended.  L13-02: a bool/`signal_result` could not tell
 /// an IPC-CONFIRMED reload ("ok":true — the daemon processed it) apart from a
 /// legacy SIGHUP that was merely DELIVERED.  cmd_reload needs that distinction
 /// to stop printing "Daemon reloaded." for the unverified path.
-enum class reload_result { ipc_ok, signal_sent, not_running, permission_denied, other };
+enum class reload_result { ipc_ok, signal_sent, not_running, permission_denied, other,
+                           // AJ-H: daemon CANLI (IPC "status" cevap veriyor) ama
+                           // "reload" IPC komutunu bilmiyor VE sinyal
+                           // gönderilemedi (PID dosyası yok/sesiz).  Eski
+                           // kod bunu "not running" diye bildiriyordu.
+                           unsupported };
 
 /// Ask the daemon to reload its config.  Tries the IPC socket first (works
 /// for any user in the input group regardless of who the daemon runs as),
@@ -360,7 +445,13 @@ static reload_result daemon_reload_via_any_path() {
     if (resp.find("\"ok\":true") != std::string::npos) return reload_result::ipc_ok;
     switch (send_signal_to_daemon(SIGHUP)) {
     case signal_result::sent:              return reload_result::signal_sent;
-    case signal_result::not_running:       return reload_result::not_running;
+    case signal_result::not_running:
+        // AJ-H: sinyal gönderilemedi çünkü PID dosyası yok/sesiz — ama daemon
+        // canlı olabilir.  IPC "status" cevabı veriyorsa daemon ayaktadır,
+        // sadece "reload" komutunu bilmiyor; "not running" demek yanlış olur.
+        if (probe_daemon().state == daemon_liveness::running)
+            return reload_result::unsupported;
+        return reload_result::not_running;
     case signal_result::permission_denied: return reload_result::permission_denied;
     default:                               return reload_result::other;
     }
@@ -960,11 +1051,23 @@ static int cmd_validate(const std::string& config_path) {
                 // L02-14: natural's internal accel coefficient is
                 // decay_rate/limit; with a tiny decay_rate the GAIN branch's
                 // cancellation can flip the gain negative (measured: negative
-                // gain / inverted axis at limit=100 decay=1e-9).  1e-4 is the
-                // established safety floor (the L02 report's recommended
-                // config.cpp base — same value sanitize already enforces for
-                // exponent_power).
-                if (a.mode == accel_mode::natural && a.decay_rate < 1e-4) {
+                // gain / inverted axis at limit=100 decay=1e-9 — the worst
+                // production-reachable case measured -30.25 at limit=100,
+                // decay_rate=1e-10, x=5e-4; end-to-end modifier::modify()
+                // turns in.x=+1 into out.x=-0.25).
+                //   2026-10-21: the band is closed at the CONFIG layer —
+                //   sanitize clamps natural decay_rate ∈ (0, 1e-4) up to
+                //   NATURAL_DECAY_RATE_MIN = 1e-4 (include/config.hpp,
+                //   src/config.cpp), so the value seen here is the SANITIZED
+                //   one and can only be 0 or ≥ 1e-4.
+                //   decay_rate = 0 is SAFE and explicit (accel = 0 hits the
+                //   `accel < 1e-12 → 1.0` guard in accel-natural.hpp: the
+                //   curve is flat at 1.0), so it must NOT be warned about.
+                //   A file that still carries the old unsafe band is reported
+                //   by the raw-vs-stored cross-check below
+                //   (accel_warn "decay_rate"), which names the clamped value.
+                if (a.mode == accel_mode::natural && a.decay_rate > 0.0 &&
+                    a.decay_rate < NATURAL_DECAY_RATE_MIN) {
                     std::cerr << "WARNING: profile '" << dp.name
                               << "': natural decay_rate (" << a.decay_rate
                               << ", " << axis << " axis) < 1e-4 — gain can go "
@@ -1443,18 +1546,47 @@ static int cmd_set_param(app_config& cfg, const std::string& config_path,
         // cursor / silent 1.5x boost) — sanitize floors those to 0.01, so the
         // CLI domain must start at the same floor to keep P107 byte-correctness.
         if (!range_ok(key.c_str(), 0.01, SCALE_MAX)) return 1;
-    } else if (key == "limit" || key == "decay_rate" || key == "motivity" ||
+    } else if (key == "decay_rate") {
+        // L03-03 (MED): sanitize enforces DECAY_RATE_MAX (include/config.hpp)
+        // but the CLI only checked the lower bound, so `set-param decay_rate
+        // 100` stored 10 with rc=0 — the P107 "bytes-birebir" contract was
+        // empty here.  Reject out-of-range values (rc=1, config untouched)
+        // like every other field; the ceiling constant is shared with
+        // sanitize so the CLI domain can never drift from it.
+        if (!range_ok(key.c_str(), 0, DECAY_RATE_MAX)) return 1;
+        // L02-14 (2026-10-21): natural's internal accel coefficient is
+        // decay_rate/|limit-1| and the GAIN branch's cancellation can flip the
+        // gain NEGATIVE for decay_rate ∈ (0, 1e-4) (measured: gain -30.25 at
+        // limit=100, decay_rate=1e-10 → the axis is inverted).  The config
+        // layer now clamps that band up to NATURAL_DECAY_RATE_MIN = 1e-4
+        // (include/config.hpp, applied by sanitize_accel_args in
+        // src/config.cpp), so accepting such a value here would store bytes
+        // that the loader silently rewrites — exactly the P107 violation.
+        // decay_rate = 0 is explicitly allowed (accel = 0 → the
+        // `accel < 1e-12 → 1.0` guard → flat gain 1.0).
+        // The floor is checked for EVERY mode, not just natural: decay_rate
+        // is read only by the natural algorithm, but the mode can be switched
+        // later (`set-param mode natural`) and the value already stored must
+        // not become a clamp-on-load surprise at that point.
+        if (v > 0.0 && v < NATURAL_DECAY_RATE_MIN) {
+            std::cerr << "Invalid value for 'decay_rate': " << val
+                      << "  (must be 0 or >= " << NATURAL_DECAY_RATE_MIN
+                      << " — in natural mode a smaller value makes the gain go "
+                         "negative and inverts the axis; the loader would clamp "
+                         "it to " << NATURAL_DECAY_RATE_MIN << " anyway)\n";
+            return 1;
+        }
+    } else if (key == "limit" || key == "motivity" ||
                key == "gamma" || key == "smooth") {
-        // L03-03 (MED): sanitize enforces ceilings for these five
-        // (LIMIT_MAX/DECAY_RATE_MAX/MOTIVITY_MAX/GAMMA_MAX/SMOOTH_MAX in
-        // include/config.hpp) but the CLI only checked the lower bound, so
-        // `set-param g smooth 16` stored 1.0 and `limit 5000` stored 100 with
-        // rc=0 — the P107 "bytes-birebir" contract was empty here.  Reject
-        // out-of-range values (rc=1, config untouched) like every other field;
-        // the ceiling constants are shared with sanitize so the CLI domain can
-        // never drift from it.
+        // L03-03 (MED): sanitize enforces ceilings for these four
+        // (LIMIT_MAX/MOTIVITY_MAX/GAMMA_MAX/SMOOTH_MAX in include/config.hpp)
+        // but the CLI only checked the lower bound, so `set-param g smooth 16`
+        // stored 1.0 and `limit 5000` stored 100 with rc=0 — the P107
+        // "bytes-birebir" contract was empty here.  Reject out-of-range values
+        // (rc=1, config untouched) like every other field; the ceiling
+        // constants are shared with sanitize so the CLI domain can never
+        // drift from it.
         const double hi = (key == "limit")      ? LIMIT_MAX
-                        : (key == "decay_rate") ? DECAY_RATE_MAX
                         : (key == "motivity")   ? MOTIVITY_MAX
                         : (key == "gamma")      ? GAMMA_MAX
                                                 : SMOOTH_MAX;
@@ -2292,6 +2424,11 @@ static int cmd_reload() {
     case reload_result::permission_denied: sr = signal_result::permission_denied; break;
     default:                               sr = signal_result::other; break;
     }
+    if (r == reload_result::unsupported) {
+        std::cerr << "Daemon is running but does not support the 'reload' IPC "
+                     "command, and no PID file is available to send SIGHUP.\n";
+        return 1;
+    }
     print_signal_failure(sr, "reload", "HUP");
     return 1;
 }
@@ -2389,6 +2526,45 @@ static bool daemon_running() {
     return false;
 }
 
+// ── Daemon canlılığı: IPC birincil kanıt, PID dosyası ikincil ───────────────
+//
+// Tanım ve gerekçe yukarıda (daemon_ipc_query'ın ardında) verildi; burada
+// yalnızca gövde durur — daemon_running()'a bağlı olduğu için ondan sonra
+// tanımlanmak zorunda.
+static daemon_probe probe_daemon() {
+    daemon_probe p;
+    // 1) IPC = gerçek kanıt: daemon ayakta olduğunu YALNIZCA kendisi söyler.
+    const std::string resp = daemon_ipc_query("status");
+    if (!resp.empty()) {
+        try {
+            p.live = nlohmann::json::parse(resp);
+            p.state = daemon_liveness::running;
+            // Kimlik doğrulaması PID dosyasından gelir (R5-S-1: geri dönüşümü
+            // veya taklit edilmiş PID "daemon" sayılmaz).  IPC cevap verdi
+            // ama PID dosyası yok/sesizse daemon yanıt veriyor demektir,
+            // kimliği doğrulanmamıştır — bu "stopped" DEĞİLDİR (Aj-G kuralı).
+            p.pid_verified = daemon_running();
+            return p;
+        } catch (const std::exception& e) {
+            p.ipc_error = e.what();
+        }
+    }
+    // 2) IPC cevap vermedi → PID dosyası ikinci kanıt.
+    if (daemon_running()) {
+        // PID canlı ama IPC cevap vermiyor → donmuş daemon.
+        p.state = daemon_liveness::unreachable;
+        return p;
+    }
+    // 3) Ne IPC ne canlı PID.  Soket dosyası hâlâ diskteyse daemon ölmüş
+    //    ama iz bırakmış demektir: "stopped" değil, "unreachable".
+    if (any_socket_path_exists()) {
+        p.state = daemon_liveness::unreachable;
+        return p;
+    }
+    p.state = daemon_liveness::stopped;
+    return p;
+}
+
 // ── monitor: live per-device telemetry (reads the IPC status JSON) ───────────
 
 static volatile sig_atomic_t g_monitor_stop = 0;
@@ -2417,7 +2593,9 @@ static std::string monitor_time_stamp() {
 ///         any v > 0 — a 1 ms interval is legitimate, so the doc now matches
 ///         the code instead of the router narrowing the domain).
 static int cmd_monitor(int interval_ms) {
-    if (!daemon_running()) {
+    // AJ-H: liveness IPC'den türetilir — PID dosyası silinmiş/sesiz olsa bile
+    // canlı daemon izlenebilir (eskiden "Daemon is not running" ile çıkıyordu).
+    if (probe_daemon().state == daemon_liveness::stopped) {
         std::cerr << "Daemon is not running.  Start it with: sudo systemctl start rawaccel\n";
         return 1;
     }
@@ -2456,10 +2634,12 @@ static int cmd_monitor(int interval_ms) {
         if (resp.empty()) {
             // Daemon stopped (or IPC socket vanished) mid-poll: report it
             // instead of failing with a confusing JSON-parse error.  Give the
-            // PID file one quick re-check to distinguish "stopped" from a
-            // transient connect snag.
+            // daemon one quick re-check to distinguish "stopped" from a
+            // transient connect snag.  AJ-H: the re-check is IPC-first (the
+            // authoritative channel) — the PID file alone can no longer make
+            // the monitor quit on a live daemon.
             usleep(50000);
-            if (!daemon_running()) {
+            if (probe_daemon().state == daemon_liveness::stopped) {
                 std::cerr << "Daemon stopped — monitor exiting.\n"
                           << "Start it with: sudo systemctl start rawaccel\n";
                 return 1;
@@ -2573,8 +2753,13 @@ static long long status_now_monotonic_raw_ms() {
 
 static int cmd_status_json(const std::string& config_path) {
     nlohmann::json out;
-    bool running = daemon_running();
+    // AJ-H: liveness tek noktadan (probe_daemon) — IPC birincil, PID ikincil.
+    const daemon_probe probe = probe_daemon();
+    const bool running = probe.state == daemon_liveness::running;
     out["daemon"] = running ? "running" : "stopped";
+    // AJ-H: IPC cevap verdi ama PID dosyası canlı daemon'u doğrulamadı —
+    // ayrı alanda bildirilir, "stopped" DEMEZ (Aj-G kuralı).
+    if (running) out["daemon_pid_verified"] = probe.pid_verified;
     out["config"] = config_path;
     // L13-04: no timestamp existed anywhere in status --json, and per-device
     // telem_wall_ms is absent in raw passthrough — consumers had no number to
@@ -2586,13 +2771,11 @@ static int cmd_status_json(const std::string& config_path) {
     // is reported unreachable even when the config is also unreadable.
     bool daemon_unreachable = false;
     nlohmann::json live(nlohmann::json::object());
-    if (running) {
-        try {
-            live = nlohmann::json::parse(daemon_ipc_query("status"));
-        } catch (const std::exception& e) {
-            out["device_error"] = e.what();
-            daemon_unreachable = true;
-        }
+    if (probe.state == daemon_liveness::unreachable) {
+        daemon_unreachable = true;
+        if (!probe.ipc_error.empty()) out["device_error"] = probe.ipc_error;
+    } else if (running) {
+        live = probe.live;
     }
     try {
         auto cfg = load_config(config_path);
@@ -2649,25 +2832,31 @@ static int cmd_status_json(const std::string& config_path) {
 
 static int cmd_status(const std::string& config_path) {
     if (g_json) return cmd_status_json(config_path);
-    bool running = daemon_running();
+    // AJ-H: liveness tek noktadan (probe_daemon) — IPC birincil, PID ikincil.
+    const daemon_probe probe = probe_daemon();
+    const bool running = probe.state == daemon_liveness::running;
     // L13-03: probe the IPC channel up front so the Daemon line tells the truth
     // (running vs unreachable) and the live-device block reuses this one
     // response instead of querying twice.
     bool daemon_unreachable = false;
     nlohmann::json live(nlohmann::json::object());
-    if (running) {
-        try {
-            live = nlohmann::json::parse(daemon_ipc_query("status"));
-        } catch (const std::exception& e) {
-            daemon_unreachable = true;
+    if (probe.state == daemon_liveness::unreachable) {
+        daemon_unreachable = true;
+        if (!probe.ipc_error.empty())
             std::cerr << "\n(daemon unreachable for live device details: "
-                      << e.what() << ")\n";
-        }
+                      << probe.ipc_error << ")\n";
+    } else if (running) {
+        live = probe.live;
     }
     std::cout << "Daemon:  "
-              << (running ? (daemon_unreachable ? "unreachable" : "running")
-                          : "stopped")
+              << (running ? "running"
+                          : (daemon_unreachable ? "unreachable" : "stopped"))
               << "\n";
+    // AJ-H: daemon IPC'den cevap verdi ama PID dosyası onu doğrulamadı —
+    // "stopped" DEĞİLDİR (Aj-G kuralı: soket canlıyken asla "stopped"), ama
+    // kimliğin doğrulanmadığı da söylenmeli (Aj-G: parantezli ufak not).
+    if (running && !probe.pid_verified)
+        std::cout << "         (PID not verified)\n";
     bool config_ok = true;
     try {
         auto cfg = load_config(config_path);
@@ -3437,7 +3626,9 @@ REJECTED (exit 1, config untouched); default = fresh `create` profile value:
   exponent_classic  Classic exponent. Domain 1–10. Default 2.
   exponent_power    Power exponent (synchronous ignores it). Domain 1e-4–5. Default 0.05.
   limit             Upper multiplier asymptote (natural mode). Domain 0–100. Default 1.5.
-  decay_rate        Natural decay rate. Domain 0–10. Default 0.1.
+  decay_rate        Natural decay rate. Domain 0–10, and in natural mode 0 or ≥1e-4
+                    (values in between make the gain go negative and invert the axis;
+                    the loader clamps them to 1e-4). Default 0.1.
   motivity          Synchronous motivity. Domain 0–10. Default 1.5.
   gamma             Synchronous gamma. Domain 0–10. Default 1.
   input_offset      Speed offset before acceleration starts. Domain 0–500, and must
@@ -3718,6 +3909,17 @@ int main(int argc, char* argv[]) {
         if (r == signal_result::sent) {
             std::cout << "SIGUSR1 sent. View stats with: journalctl -u rawaccel -n 30\n";
             return 0;
+        }
+        // AJ-H: "not running" burada YANLIŞ olabilir — sinyal gönderilemedi
+        // çünkü PID dosyası yok/sesiz, ama daemon canlı olabilir (IPC cevap
+        // veriyorsa).  Bu ayrım eskiden yapılamıyordu: CLI "not running"
+        // deyip canlı bir daemon'ı yok sayıyordu.
+        if (r == signal_result::not_running &&
+            probe_daemon().state == daemon_liveness::running) {
+            std::cerr << "Daemon is running but does not support the 'latency' "
+                         "IPC command, and no PID file is available to send "
+                         "SIGUSR1.\n";
+            return 1;
         }
         print_signal_failure(r, "request latency stats from", "USR1");
         return 1;

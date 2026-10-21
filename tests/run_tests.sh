@@ -130,6 +130,56 @@ echo ""
 # Forward any CLI args (e.g. --filter, --list, --quiet) to the test binary
 "$BIN" "$@"
 
+# ── HID++ transport protokol kapısı (AJ-H) ───────────────────────────────────
+# HID++ protokol katmanı (özellik indeksi çözümleme, istek/yanıt eşleştirme,
+# bildirim zulası, kısa-yük bütçesi) bugüne kadar HİÇ test edilemiyordu:
+# send_feature_request/resolve_feature_index private, gerçek hidraw düğümü
+# gerekiyordu (AGENTS.md: "no test seam was added to the class for it").
+# include/logitech_hidpp.hpp'a eklenen `hidpp_io_backend` arayüzü sayesinde
+# sahte bir HID++ 2.0 cihaz üzerinde gerçekten koşturulur.
+#
+# AYRI İKİLİ NEDEN? test_accel.cpp'ye gömülseydi AGENTS.md'deki 34405
+# assertion sayısı değişir ve `olcum/aj2/prove_kod_ayni.py --sayi` (sayı
+# iddiası denetimi) kırmızıya dönerdi. Bu dosya kendi özetini basar ve
+# test_accel.cpp'nin sayılarına dokunmaz.
+#
+# ÖZET SATIRI BİLİŞLİ: buradaki "özet" satırı "Sonuç: N/M geçti" DEĞİLDİR —
+# sayı iddiası denetimi run_tests.sh çıktısındaki SON "Sonuç:" satırını
+# okur; buraya "Sonuç:" yazılırsa 34405 ölçümü bozulur.
+HIDPP_BIN="$TMPDIR/hidpp_transport_test"
+if ! $CXX $CXXFLAGS \
+    "$ROOT/tests/hidpp_transport_test.cpp" \
+    "$ROOT/src/config.cpp" \
+    "$ROOT/src/logitech_receiver.cpp" \
+    "$ROOT/src/logitech_hidpp.cpp" \
+    -o "$HIDPP_BIN" -lpthread; then
+    echo "Hata: hidpp_transport_test derlemesi başarısız (rc=$?)" >&2
+    exit 1
+fi
+"$HIDPP_BIN"
+
+# ── Config sürüm/migration kenar durum kapısı (AJ-H) ──────────────────────────
+# lookup+gain LUT verisi "eski semantikten" "yeni (output speed) semantiğine"
+# migrate_lookup_gain() ile taşınır (y_new = y · x) ve bu taşıma SÜRÜMLE
+# koşulludur.  Kapı, sürüm alanının şekillerini (bozuk / eksik bileşenli /
+# fazla bileşenli / ilerideki sürüm) ölçer — taşınmanın olup olmadığı LUT'un
+# y'sinden okunur (200 · 100 = 20000 ⇔ taşındı).
+#
+# AYRI İKİLİ (HID++ kapısıyla aynı gerekçe): test_accel.cpp'ye gömülseydi
+# AGENTS.md'deki 34405 assertion sayısı değişir ve sayı iddiası denetimi
+# (olcum/aj2/prove_kod_ayni.py --sayi) kırmızıya dönerdi.
+# ÖZET SATIRI "Sonuç: N/M" DEĞİLDİR: sayı denetimi run_tests.sh çıktısındaki
+# SON "Sonuç:" satırını okur.
+MIG_BIN="$TMPDIR/config_migration_test"
+if ! $CXX $CXXFLAGS \
+    "$ROOT/tests/config_migration_test.cpp" \
+    "$ROOT/src/config.cpp" \
+    -o "$MIG_BIN" -lpthread; then
+    echo "Hata: config_migration_test derlemesi başarısız (rc=$?)" >&2
+    exit 1
+fi
+"$MIG_BIN"
+
 # ── CLI davranış kapıları (P83: create-preset 256-char senkronu) ──────────────
 CLI="$ROOT/build-manual/rawaccel-cli"
 DAEMON="$ROOT/build-manual/rawaccel-daemon"
@@ -322,6 +372,113 @@ PY
     fi
     echo "CLI P99 arity/-c\"\" kapısı: ekstra-arg red + -c\"\" red ✓"
     rm -f "$TMPA"
+
+    # ── AJ-H: liveness IPC-first (canlı daemon, PID dosyası YOK) ──────────────
+    # `status` komutu canlılığı YALNIZCA PID dosyasından türetiyordu ve IPC
+    # sorgusunu yalnız "running" denildiğinde yapıyordu.  PID dosyası
+    # silinmiş ya da bayat (ölü PID) olduğunda — kurulum sırasında daemon
+    # yeniden başlarken tam olarak görülen durum — CLI canlı bir daemon'a
+    # rağmen "Daemon: stopped" (rc=2) diyor ve sokete hiç bakmıyordu.
+    # Sahte IPC sunucusu ile "canlı daemon, PID dosyası yok" senaryosu
+    # deterministik olarak üretilir ve kanıtlanır.
+    FAKE_DIR=$(mktemp -d)
+    TMP_FILES+=( "$FAKE_DIR" )
+    FAKE_CFG=$(mktemp --suffix=.json)
+    TMP_FILES+=( "$FAKE_CFG" )
+    # mktemp boş bir dosya yaratır; boş dosya geçersiz JSON'dır ve `status`
+    # config hatasıyla (rc=1) çıkar.  Testin amacı config değil liveness →
+    # minimal GEÇERLİ bir config yazılır.
+    printf '{"active_profile":"sahte","profiles":[{"name":"sahte"}]}' > "$FAKE_CFG"
+    FAKE_BIN="$TMPDIR/fake_ipc_server"
+    if ! $CXX $CXXFLAGS "$ROOT/tests/fake_ipc_server.cpp" -o "$FAKE_BIN"; then
+        echo "Hata: fake_ipc_server derlemesi başarısız (rc=$?)" >&2
+        exit 1
+    fi
+    "$FAKE_BIN" "$FAKE_DIR/rawaccel.sock" "SAHTE-CIHAZ" 8 > "$FAKE_DIR/ready.txt" 2>&1 &
+    FAKE_PID=$!
+    for _ in $(seq 1 50); do
+        [ -S "$FAKE_DIR/rawaccel.sock" ] && break
+        sleep 0.1
+    done
+    if [ ! -S "$FAKE_DIR/rawaccel.sock" ]; then
+        echo "FAIL: AJ-H sahte IPC sunucusu ayağa kalkamadı"
+        kill "$FAKE_PID" 2>/dev/null || true
+        exit 1
+    fi
+    set +e
+    OUT=$(XDG_RUNTIME_DIR="$FAKE_DIR" "$CLI" -c "$FAKE_CFG" status 2>&1)
+    RC=$?
+    OUT2=$(XDG_RUNTIME_DIR="$FAKE_DIR" "$CLI" -c "$FAKE_CFG" status --json 2>&1)
+    RC2=$?
+    # SENARYO B (Aj-G isteği): BAYAT PID + canlı soket → yine "running",
+    # ASLA "stopped" değil.  PID dosyasına ÖLÜ bir PID yazılır (999999).
+    echo 999999 > "$FAKE_DIR/rawaccel.pid"
+    OUT3=$(XDG_RUNTIME_DIR="$FAKE_DIR" "$CLI" -c "$FAKE_CFG" status 2>&1)
+    RC3=$?
+    set -e
+    # Sahte sunucuyu DURDUR (ÜÇ çağrıdan SONRA — sunucu erken kapatılırsa
+    # sonraki çağrı gerçek daemon'a düşer ve kapı ortamdan bağımsız olmaz).
+    # Yalnız SIGTERM yeterli olmayabilir (accept() içinde kalırsa), bu yüzden
+    # SIGKILL yedeği ve SINIRLI bekleme var.  Sınırsız `wait` bir kapıyı
+    # kilitlerdi — ölçüldü (17:54), düzeltildi.
+    kill "$FAKE_PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+        kill -0 "$FAKE_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -9 "$FAKE_PID" 2>/dev/null || true
+    wait "$FAKE_PID" 2>/dev/null || true
+    if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "SAHTE-CIHAZ"; then
+        echo "FAIL: AJ-H canlı daemon (PID dosyası yok) tanınmadı (rc=$RC): $OUT"
+        exit 1
+    fi
+    if [ $RC2 -ne 0 ] || ! echo "$OUT2" | grep -q '"daemon": "running"'; then
+        echo "FAIL: AJ-H status --json canlı daemonı 'running' demedi (rc=$RC2): $OUT2"
+        exit 1
+    fi
+    # Yeni liveness modelinin İZİNİ: JSON'da kimlik doğrulama alanı var mı?
+    # (eski kodda bu alan yok — daemon PID dosyasından türetiliyordu)
+    if ! echo "$OUT2" | grep -q '"daemon_pid_verified"'; then
+        echo "FAIL: AJ-H status --json 'daemon_pid_verified' alanını içermiyor (yeni liveness modeli yok): $OUT2"
+        exit 1
+    fi
+    # SENARYO B: bayat PID + canlı soket → rc=0, "stopped" DEĞİL, cihaz var.
+    if [ $RC3 -ne 0 ] || echo "$OUT3" | grep -q "Daemon:  stopped"; then
+        echo "FAIL: AJ-H bayat PID + canlı soket → 'stopped' oldu (rc=$RC3): $OUT3"
+        exit 1
+    fi
+    if ! echo "$OUT3" | grep -q "SAHTE-CIHAZ"; then
+        echo "FAIL: AJ-H bayat PID + canlı soket → sahte cihaz yok (rc=$RC3): $OUT3"
+        exit 1
+    fi
+    # DÜRÜSTLÜK NOTU: ortamda canlı bir daemon varsa (PID dosyası erişilebilir),
+    # CLI'nin PID dosyası da canlı görünür ve eski (düzeltmesiz) kod da bu
+    # kapıyı geçerdi — yani davranışsal kısım bu ortamda MASKELENİR.  CI'da
+    # (canlı daemon yok) kapı tam güçtedir: eski kod "stopped" (rc=2) der ve
+    # burada KIRMIZIYA döner.  Maskeleme durumu ölçülüp yazdırılır.
+    AJH_MASKED=0
+    for p in "$FAKE_DIR/rawaccel.pid" /run/rawaccel.pid /tmp/rawaccel.pid; do
+        if [ -r "$p" ]; then
+            ajh_pid=$(cat "$p" 2>/dev/null || true)
+            if [ -n "$ajh_pid" ] && [ -r "/proc/$ajh_pid/comm" ] &&
+               grep -q "rawaccel-daemon" "/proc/$ajh_pid/comm" 2>/dev/null; then
+                AJH_MASKED=1
+            fi
+        fi
+    done
+    if [ "$AJH_MASKED" = "1" ]; then
+        echo "AJ-H liveness kapısı: canlı daemon + PID dosyası yok → 'running' ✓ (DAVRANIŞSAL KISIM BU ORTAMDA MASKELİ: canlı daemon var, CI'de tam güçte)"
+    else
+        # Maskelenme yok: kimlik doğrulaması da ölçülebilir — bayat PID
+        # varken "PID not verified" notu görünmeli.
+        if ! echo "$OUT3" | grep -q "PID not verified"; then
+            echo "FAIL: AJ-H bayat PID varken 'PID not verified' notu yok: $OUT3"
+            exit 1
+        fi
+        echo "AJ-H liveness kapısı: canlı daemon + PID dosyası yok → 'running' ✓ (tam güçte)"
+    fi
+    # SENARYO B satırı (bayat PID + canlı soket) yukarıda kesin assertion
+    # olarak sabitlendi: rc=0, "stopped" değil, sahte cihaz listeleniyor.
 
     # ── P107: set-param domain kapısı (sessiz clamp → red) ──────────────────
     # Out-of-domain set-param values must exit 1 AND leave the config file

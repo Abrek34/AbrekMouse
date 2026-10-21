@@ -58,6 +58,22 @@ static constexpr double OUTPUT_OFFSET_MAX  = 100.0;
 static constexpr double LIMIT_MAX         = 100.0;
 static constexpr double ACCEL_MAX         = 20.0;
 static constexpr double DECAY_RATE_MAX    = 10.0;
+// L02-14 (ölçüm 2026-10-21, kanıt: olcum/analiz/BULGU-accel-natural-negatif-kazanc.md):
+// natural modunun iç katsayısı accel = decay_rate / |limit-1|
+// (include/accel-natural.hpp:24).  GAIN dalı iki O(1/accel) terimin FARKINI
+// alır (accel-natural.hpp:208) → accel küçüldükçe yuvarlama hatası büyür ve
+// kazanç NEGATİF olabilir: ölçülen en kötü -46.68 (limit=100, decay_rate=1e-9,
+// x=0.01) → imleç TERS yönde gider.  Bu bant üretimde ERİŞİLEBİLİR: üretim
+// tabanı x = |counts|×(1000/dpi)/time_ms ≥ 3.125e-4 (32000 DPI, 100 ms).
+//   Bu bant referansla bit-bit aynıdır (inherited sapma), dolayısıyla FORMÜL
+//   değiştirilmez — sabit, konfigürasyon katmanında bir ALT SINIR olarak
+//   uygulanır (config.cpp sanitize_accel_args).  0 DEĞERİ MUAF TUTULUR:
+//   accel=0 → accel-natural.hpp:206'nin `accel < 1e-12 → 1.0` guard'ı düz
+//   kazanç 1.0 döndürür (ölçüldü: decay_rate=0 → gain ≡ 1.0, işaret hatası yok).
+//   Ölçülen ihtiyaç: accel ≥ ~2e-10 → decay_rate ≥ ~2e-8; 1e-4 ise CLI'nin
+//   zaten kullandığı ("the established safety floor") ve exponent_power için
+//   sanitize'de uygulanan değer — tek taban, tek kaynak.
+static constexpr double NATURAL_DECAY_RATE_MIN = 1e-4;
 static constexpr double MOTIVITY_MAX      = 10.0;
 static constexpr double GAMMA_MAX         = 10.0;
 static constexpr double SYNC_SPEED_MAX    = 100.0;

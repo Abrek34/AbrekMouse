@@ -3645,3 +3645,92 @@ Kullanıcı bildirimi: *"mouse aşağı yukarı sağa ve sola eşit hareket etme
 **Performans notu:** Yeni helper `static inline`; derlenmiş daemon/bench ikililerinde `apply_pre_speed_transforms` sembolü yok (tamamen inline). Hot path'e ek syscall, allocation veya bölme eklenmedi.
 
 **Bu turda değişen dosyalar:** `include/rawaccel.hpp`, `tests/test_accel.cpp`, `AGENTS.md`, `olcum/aj2/sayisal_iddialar.txt`, `CHANGELOG.md`, `Bug Hata Raporları.md` (bu kayıt), `FIX_LOG.md`.
+
+---
+
+# TUR 56 — natural GAIN decay tabanı + Clang/LTO derleme (2026-10-21, opencode)
+
+İkinci bağımsız analiz turu. Önceki turun kritik bulgusu kodda doğrulandı;
+bu turda ayrıca derleme hattının iki gerçek kırığı bulundu ve düzeltildi.
+
+**T56-01 · KRİTİK · `natural` GAIN modunda negatif kazanç → eksen tersliği**
+- Konum: `include/accel-natural.hpp` (GAIN dalı), `src/config.cpp` (`sanitize_accel_args`)
+- Kategori: Doğruluk / güvenlik
+- Açıklama: `accel = decay_rate/|limit-1|`; `decay_rate ∈ (0,1e-4)` iken iki `O(1/accel)` terimin farkı yuvarlama hatasıyla negatife düşüyordu. Ölçülen en kötü değer **-46.68** (`limit=100`, `decay_rate=1e-9`); 32000 DPI / 100 ms'de üretimde erişilebilir. Negatif kazanç `scale` negatif yapıp imleci ters yönde sürüklüyordu.
+- Düzeltme: Formül referansla bit-bit aynı bırakıldı; `sanitize_accel_args()` natural modda `decay_rate ∈ (0, 1e-4)` değerini `NATURAL_DECAY_RATE_MIN = 1e-4`'e yukarı kırpıyor. `0` muaf (accel guard'ı düz kazanç 1.0 verir). CLI `set-param` domaini ve `--help` metni aynı tabana hizalandı; başlıktaki yanlış “no reachable input produces a negative gain” beyanı ölçümle düzeltildi.
+- Kanıt: `olcum/analiz/fix_verify.cpp` — üretim erişilebilir kutuda 10560 nokta: ham **5** negatif (en kötü -30.25) → sanitize **0**.
+- Test: `test_natural_decay_rate_floor()` — 3 bölüm / 12 assertion; 34405 → **34417**.
+- Durum: DÜZELTİLDİ — `include/config.hpp`, `src/config.cpp`, `cli/main.cpp`, `include/accel-natural.hpp`, `tests/test_accel.cpp`.
+
+**T56-02 · YÜKSEK · `CXX=clang++ bash scripts/build.sh` daha ilk dosyada ölüyordu**
+- Konum: `scripts/build.sh` — `PERF_FLAGS`
+- Kategori: Build / taşınabilirlik
+- Açıklama: `-fvect-cost-model=very-cheap` GCC'ye özel; Clang bilinmeyen argüman hatası veriyordu. `AGENTS.md` özel derleyici yolunu belgeliyordu, yani belgelenen komut çalışmıyordu.
+- Düzeltme: `__clang__` ön-işlemci makrosuyla derleyici ailesi tespit ediliyor; vektör maliyet bayrağı yalnız GCC'ye ekleniyor.
+- Durum: DÜZELTİLDİ — tam Clang derlemesi rc=0.
+
+**T56-03 · YÜKSEK · `RAWACCEL_LTO=1` iki derleyicide de kırıktı**
+- Konum: `scripts/build.sh` — `LTO_FLAGS`
+- Kategori: Build / LTO
+- Açıklama: Eski set `-flto=auto -fwhole-program-vtables -fdevirtualize-at-ltrans` idi. İlk bayrak Clang'e, ikincisi GCC'ye ait; GCC `-fwhole-program-vtables`'ı, Clang `-fdevirtualize-at-ltrans`'ı reddediyordu. Yani LTO seçeneği hiçbir desteklenen derleyiciyle çalışmıyordu.
+- Düzeltme: GCC → `-flto=auto -fdevirtualize-at-ltrans`; Clang → `-flto=auto -fwhole-program-vtables`. `-fprofile-correction` da yalnız GCC'ye ekleniyor (Clang desteklemiyor).
+- Durum: DÜZELTİLDİ — GCC ve Clang tam LTO derlemeleri rc=0.
+
+**T56-04 · DÜŞÜK · Clang'de kullanılmayan lambda yakalaması uyarısı**
+- Konum: `daemon/main.cpp` — `log_cb`
+- Kategori: Derleme uyarısı
+- Açıklama: `verbose` yakalanıyor ama lambda içinde kullanılmıyordu; Clang `-Wunused-lambda-capture` üretiyordu. Verbose davranışı `daemon.set_verbose(verbose)` üzerinden yürüyor.
+- Düzeltme: Yakalama listesinden `verbose` kaldırıldı.
+- Durum: DÜZELTİLDİ — Clang derlemesinde proje kaynaklı uyarı 0 (GLib başlıklarındaki `-Wc2y-extensions` uyarıları dışarıya ait).
+
+**Doğrulama (2026-10-21 23:48–23:52)**
+| Kapı | Sonuç |
+|---|---|
+| `scripts/build.sh` | ✅ rc=0, 0 uyarı |
+| `tests/run_tests.sh` | ✅ 34417/34417 |
+| Oracle (1408 satır / 79 belgeli sapma) | ✅ OK |
+| SIMD parity (AVX2 / SSE2 / scalar) | ✅ Birebir aynı |
+| `run_tr_coverage.sh` | ✅ PASS |
+| `run_cli_sanitized.sh` (ASan+UBSan) | ✅ 34/34 |
+| `run_tracker_bridge.sh` | ✅ Temiz (17 işaretli, AÇIK 0) |
+| Ek: `run_tests_asan.sh` | ✅ 34417/34417 |
+| Ek: `run_fuzz.sh 60` | ✅ Çökme yok (config + accel) |
+| Ek: `prove_kod_ayni.py --sayi` | ✅ 14/14 |
+
+**Bu turda değişen dosyalar:** `include/config.hpp`, `src/config.cpp`, `cli/main.cpp`, `include/accel-natural.hpp`, `tests/test_accel.cpp`, `scripts/build.sh`, `daemon/main.cpp`, `AGENTS.md`, `CHANGELOG.md`, `FIX_LOG.md`, `Bug Hata Raporları.md` (bu kayıt), `olcum/aj2/sayisal_iddialar.txt`, `docs/research/deviations.md`, `olcum/analiz/**`.
+
+---
+
+# TUR 57 — natural GAIN küçük hız spike'ı + domain_weights kapısı (2026-10-22, opencode)
+
+Üçüncü bağımsız analiz turu. TUR 56'nın `decay_rate` tabanı doğrulandı; ancak
+tabanın "üretimde x ≥ 3.125e-4" varsayımı `domain_weights` alanını
+kapsamıyordu. `domain_weights` yasal olarak 0'a kadar inebildiği için etkin hız
+çok daha küçük olabiliyor ve natural GAIN dalı bu bantta negatif **ve pozitif**
+sayısal spike üretiyordu.
+
+**T57-01 · KRİTİK · natural GAIN + küçük etkin hız → 5.77× pozitif spike / eksen hızı bozulması**
+- Konum: `include/accel-natural.hpp` (GAIN dalı), `include/accel-union.hpp` (üretim dağıtımı).
+- Kategori: Doğruluk / güvenlik.
+- Açıklama: GAIN formülü `output = limit*(decay/accel + t) − limit/accel`, `gain = output/x + 1`; iki `O(limit/accel)` terimin farkı küçük `accel*x` değerlerinde yuvarlama hatasına boğuluyor. `sanitize_accel_args()` yalnız `decay_rate`'i tabanlıyor; hızı `domain_weights` belirlediği için hız tabanı garanti edilemiyordu. 32000 DPI / 100 ms / 1 count ve `domain_weight_x=1e-5` → `x=3.125e-9`; `limit=100`, `decay_rate=1e-4` için ham kazanç **5.76837158203125**, üretim çıktısı **0.18026161** (beklenen **0.03125**). Yani 1 count'luk yavaş hareket 5.77× hızlanıyordu. Başka yasal kombinasyonda ters yön de ölçüldü: `limit=100`, `decay=1e-3`, `domain_weight=3e-5` → ham **0.80131785** (çıktı 0.02504118; %20 yavaş).
+- Düzeltme: `NATURAL_GAIN_MIN_ACCEL_X = 1e-9` ve `natural_gain_ill_conditioned(args, x)` eklendi. `accel_union::apply()` doğrudan natural dalında `accel*x < 1e-9` ise **1.0** döndürüyor. Bu bantta gerçek kazanç 1'den en fazla ~5e-8 sapar; ham formülün hatası ise 1e-5 mertebesine çıkabildiği için kimlik daha doğru. Doğrudan `natural::operator()` **değiştirilmedi** (referans bit-bit uyumu ve oracle için); kapı yalnız üretim dağıtımında.
+- Kanıt: `olcum/analiz/natural_small_speed_probe.cpp` — kontrol + iki spike + bir negatif dip; dört vakada da kapı sonrası çıktı `0.03125` / `OK`. GCC ve Clang probe derlemeleri rc=0.
+- Test: `test_natural_decay_rate_floor()` içine whole + separate kapsayan 4 assertion eklendi; **34417 → 34421**, SECTION **224 → 225**.
+- Durum: DÜZELTİLDİ — `include/accel-natural.hpp`, `include/accel-union.hpp`, `tests/test_accel.cpp`.
+
+**Doğrulama (2026-10-22 00:11:23–00:15:20)**
+| Kapı | Sonuç |
+|---|---|
+| `scripts/build.sh` | ✅ rc=0, 0 uyarı, 91 s |
+| `tests/run_tests.sh` | ✅ 34421/34421, 77 s |
+| Oracle (1408 satır / 79 belgeli sapma) | ✅ OK, 3 s |
+| SIMD parity (AVX2 / SSE2 / scalar) | ✅ Birebir aynı, 4 s |
+| `run_tr_coverage.sh` | ✅ PASS, 1 s |
+| `run_cli_sanitized.sh` (ASan+UBSan) | ✅ 34/34, 61 s |
+| `run_tracker_bridge.sh` | ✅ Temiz (17 işaretli, AÇIK 0) |
+| Ek: `run_tests_asan.sh` | ✅ 34421/34421 |
+| Ek: `run_fuzz.sh 60` | ✅ Çökme yok (config + accel; accel 3.991.933 run) |
+| Ek: `prove_kod_ayni.py --sayi` | ✅ 14/14 |
+| Ek: `bench_hotpath.sh` | ✅ Tüm config'ler baseline içinde (rc=0) |
+
+**Bu turda değişen dosyalar:** `include/accel-natural.hpp`, `include/accel-union.hpp`, `tests/test_accel.cpp`, `AGENTS.md`, `CHANGELOG.md`, `FIX_LOG.md`, `Bug Hata Raporları.md` (bu kayıt), `olcum/aj2/sayisal_iddialar.txt`, `olcum/analiz/GATE-SONUC.md`, `olcum/analiz/gates.log`, `olcum/analiz/gate-*.log`, `olcum/analiz/natural_small_speed_probe.cpp`, `olcum/analiz/BULGU-accel-natural-negatif-kazanc.md`, `olcum/analiz/BULGU-duzeltme-natural-decay-tabani.md`.

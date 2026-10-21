@@ -31,8 +31,10 @@ Type=simple
 # /usr/lib/modules-load.d/rawaccel.conf) does the real load; the ExecStartPre
 # below is a belt-and-suspenders fallback and intentionally failure-tolerant
 # ('-' prefix) because ProtectKernelModules=true may block a second modprobe
-# attempt — that is fine, the primary path is modules-load.
-ExecStartPre=-/sbin/modprobe uinput
+# attempt — that is fine, the primary path is modules-load.  Kernels with
+# uinput built in have no loadable module; checking /dev/uinput first keeps
+# "Module uinput not found" out of the journal on those kernels.
+ExecStartPre=-/bin/sh -c 'test -e /dev/uinput || /sbin/modprobe uinput 2>/dev/null'
 ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

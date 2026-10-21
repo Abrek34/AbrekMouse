@@ -197,10 +197,12 @@ static void mouse_test_set_hint(AppState* S, int state) {
 /// window is closed.
 void mouse_test_refresh_language(AppState* S) {
     if (!S->mouse_test_win) return;
-    const char* names[6] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):"),
-                             tr("Latency p50/p95 (µs):"), tr("Poll rate (Hz):"),
-                             tr("Device:") };
-    for (int i = 0; i < 6 && S->test_name_lbls[i]; i++)
+    const char* names[8] = { tr("In (ips):"), tr("Out (ips):"), tr("Gain (×):"),
+                             tr("Delta dx/dy (counts):"),
+                             tr("Latency p50/p95/p99 (µs):"),
+                             tr("Jitter p99-p50 (µs):"),
+                             tr("Poll rate (Hz):"), tr("Device:") };
+    for (int i = 0; i < 8 && S->test_name_lbls[i]; i++)
         gtk_label_set_text(GTK_LABEL(S->test_name_lbls[i]), names[i]);
     if (S->test_title_lbl)
         gtk_label_set_markup(GTK_LABEL(S->test_title_lbl),
@@ -223,11 +225,14 @@ static void mouse_test_stop_poll(AppState* S) {
 /// (daemon down / awaiting motion / raw passthrough) so a stale readout can
 /// never linger next to an updated status line (R2-07 pattern, extended).
 static void mouse_test_blank_values(AppState* S) {
-    if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), "—");
-    if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   "—");
-    if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  "—");
-    if (S->test_lat_lbl)   gtk_label_set_text(GTK_LABEL(S->test_lat_lbl),   "—");
-    if (S->test_poll_lbl)  gtk_label_set_text(GTK_LABEL(S->test_poll_lbl),  "—");
+    if (S->test_speed_lbl)  gtk_label_set_text(GTK_LABEL(S->test_speed_lbl),  "—");
+    if (S->test_out_lbl)    gtk_label_set_text(GTK_LABEL(S->test_out_lbl),    "—");
+    if (S->test_gain_lbl)   gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),   "—");
+    if (S->test_delta_lbl)  gtk_label_set_text(GTK_LABEL(S->test_delta_lbl),  "—");
+    if (S->test_lat_lbl)    gtk_label_set_text(GTK_LABEL(S->test_lat_lbl),    "—");
+    if (S->test_jitter_lbl) gtk_label_set_text(GTK_LABEL(S->test_jitter_lbl), "—");
+    if (S->test_poll_lbl)   gtk_label_set_text(GTK_LABEL(S->test_poll_lbl),   "—");
+    if (S->test_device_lbl) gtk_label_set_text(GTK_LABEL(S->test_device_lbl), "—");
 }
 
 /// 250 ms poll: refresh live speed/gain readouts from the daemon status JSON.
@@ -235,15 +240,6 @@ static void mouse_test_blank_values(AppState* S) {
 /// a dead-but-listening daemon can never wedge the UI (BUG-05).  One status
 /// query per tick does double duty as the up-check — no separate ping round
 /// trip.  A missing/unreachable daemon shows "—" but keeps the timer alive.
-
-/// R12-WALLMS: current time on the same clock the daemon stamps telem_wall_ms
-/// (CLOCK_MONOTONIC_RAW, ms since boot) so sample staleness can be computed.
-static double now_mono_raw_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return static_cast<double>(ts.tv_sec) * 1000.0 +
-           static_cast<double>(ts.tv_nsec) / 1e6;
-}
 
 static gboolean mouse_test_poll(gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
@@ -273,7 +269,7 @@ static gboolean mouse_test_poll(gpointer user_data) {
     // never runs there), so waiting "until motion" would spin forever: detect
     // it from the active profile and show a definitive state instead.
     double wall = daemon_device_field(resp, S, "telem_wall_ms");
-    bool fresh = wall >= 0 && (now_mono_raw_ms() - wall) < 2000.0;
+    bool fresh = wall >= 0 && (gui_now_mono_raw_ms() - wall) < 2000.0;
     if (cur_prof(S).prof.raw_passthrough) {
         // Raw 1:1 passthrough — readouts are guaranteed empty, show loss markers.
         mouse_test_blank_values(S);
@@ -289,9 +285,17 @@ static gboolean mouse_test_poll(gpointer user_data) {
         mouse_test_set_status(S, 1); // awaiting motion
         return G_SOURCE_CONTINUE;
     }
+    // Raw per-flush deltas.  These are counts, not IPS: they expose the actual
+    // sensor packet size behind the speed/gain figures and make a "tiny move"
+    // vs "one huge event" visible.  dx/dy can legitimately be negative.
+    double dx = daemon_device_field(resp, S, "telem_dx");
+    double dy = daemon_device_field(resp, S, "telem_dy");
     if (S->test_speed_lbl) gtk_label_set_text(GTK_LABEL(S->test_speed_lbl), fmt_us(in).c_str());
     if (S->test_out_lbl)   gtk_label_set_text(GTK_LABEL(S->test_out_lbl),   fmt_us(out).c_str());
     if (S->test_gain_lbl)  gtk_label_set_text(GTK_LABEL(S->test_gain_lbl),  fmt_us(gain).c_str());
+    if (S->test_delta_lbl)
+        gtk_label_set_text(GTK_LABEL(S->test_delta_lbl),
+            (fmt_us(dx) + " / " + fmt_us(dy)).c_str());
     // L17-3 (HIGH): name the measured device.  With an "all devices" profile
     // (empty device_id — the default) the slice falls back to the first device
     // that has telemetry, which can be a different mouse than the one the user
@@ -303,16 +307,29 @@ static gboolean mouse_test_poll(gpointer user_data) {
             dev_name.empty() ? "—" : dev_name.c_str());
     }
 
-    // EXT: live per-event processor latency (p50/p95 µs) + real poll rate from
-    // the same status slice.  lat_* only appear once the daemon recorded ≥ 1
-    // sample (histogram), real_polling_rate only once it estimated a median.
+    // EXT: live per-event processor latency (p50/p95/p99 µs) + jitter + real
+    // poll rate from the same status slice.  lat_* only appear once the daemon
+    // recorded ≥ 1 sample (histogram), real_polling_rate only once it estimated
+    // a median.  Jitter is p99−p50: a compact tail-latency spread that a single
+    // p50/p95 pair hides.
     double lat_p50 = daemon_device_field(resp, S, "lat_p50_us");
     double lat_p95 = daemon_device_field(resp, S, "lat_p95_us");
+    double lat_p99 = daemon_device_field(resp, S, "lat_p99_us");
     double lat_n   = daemon_device_field(resp, S, "lat_samples");
     double poll    = daemon_device_field(resp, S, "real_polling_rate");
-    if (S->test_lat_lbl)
-        gtk_label_set_text(GTK_LABEL(S->test_lat_lbl),
-            (lat_n > 0 ? fmt_us(lat_p50) + " / " + fmt_us(lat_p95) : "—").c_str());
+    if (S->test_lat_lbl) {
+        std::string lat_txt = "—";
+        if (lat_n > 0)
+            lat_txt = fmt_us(lat_p50) + " / " + fmt_us(lat_p95) +
+                      (lat_p99 >= 0 ? " / " + fmt_us(lat_p99) : "");
+        gtk_label_set_text(GTK_LABEL(S->test_lat_lbl), lat_txt.c_str());
+    }
+    if (S->test_jitter_lbl) {
+        std::string jitter_txt = "—";
+        if (lat_n > 0 && lat_p50 >= 0 && lat_p99 >= 0)
+            jitter_txt = fmt_us(std::max(0.0, lat_p99 - lat_p50));
+        gtk_label_set_text(GTK_LABEL(S->test_jitter_lbl), jitter_txt.c_str());
+    }
     if (S->test_poll_lbl)
         gtk_label_set_text(GTK_LABEL(S->test_poll_lbl),
             (poll > 0 ? std::to_string((long)poll) : "—").c_str());
@@ -410,13 +427,15 @@ static void mouse_test_teardown(GtkWidget* widget, gpointer user_data) {
     S->test_speed_lbl   = nullptr;
     S->test_out_lbl     = nullptr;
     S->test_gain_lbl    = nullptr;
+    S->test_delta_lbl   = nullptr;
     S->test_lat_lbl     = nullptr;
+    S->test_jitter_lbl  = nullptr;
     S->test_poll_lbl    = nullptr;
     S->test_device_lbl  = nullptr;
     S->test_status_lbl  = nullptr;
     S->test_hint_lbl    = nullptr;
     S->test_title_lbl   = nullptr;
-    for (int i = 0; i < 6; i++) S->test_name_lbls[i] = nullptr;
+    for (int i = 0; i < 8; i++) S->test_name_lbls[i] = nullptr;
     S->test_hint_state   = 0;
     S->test_status_state = -1;
     mouse_test_stop_poll(S);
@@ -508,9 +527,9 @@ void on_mouse_test_clicked(GtkButton*, gpointer user_data) {
     gtk_widget_set_margin_top(grid, 16);
     gtk_box_append(GTK_BOX(vbox), grid);
 
-    // Three telemetry rows.  The name labels are created with tr() directly so
-    // the translation-coverage scanner sees the keys (grid_row-style lambdas
-    // would hide them — the name labels are transient, not registered widgets).
+    // Telemetry rows.  The name labels are created with tr() directly so the
+    // translation-coverage scanner sees the keys (grid_row-style lambdas would
+    // hide them — the name labels are transient, not registered widgets).
     // Their pointers are kept in test_name_lbls so mouse_test_refresh_language()
     // can re-translate them on a language switch while the window is open (BUG-09).
     auto value_lbl = []() {
@@ -540,23 +559,33 @@ void on_mouse_test_clicked(GtkButton*, gpointer user_data) {
     S->test_gain_lbl = value_lbl();
     gtk_grid_attach(GTK_GRID(grid), S->test_gain_lbl, 1, 2, 1, 1);
 
-    // Two extra telemetry rows: per-event processor latency (p50/p95) and the
-    // real poll rate, both from the daemon status slice (lat_*/real_polling_rate).
-    S->test_name_lbls[3] = name_lbl(tr("Latency p50/p95 (µs):"));
+    // Raw per-flush counts behind the speed/gain figures.
+    S->test_name_lbls[3] = name_lbl(tr("Delta dx/dy (counts):"));
     gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[3], 0, 3, 1, 1);
-    S->test_lat_lbl = value_lbl();
-    gtk_grid_attach(GTK_GRID(grid), S->test_lat_lbl, 1, 3, 1, 1);
+    S->test_delta_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_delta_lbl, 1, 3, 1, 1);
 
-    S->test_name_lbls[4] = name_lbl(tr("Poll rate (Hz):"));
+    // Per-event processor latency (p50/p95/p99), tail spread, real poll rate.
+    S->test_name_lbls[4] = name_lbl(tr("Latency p50/p95/p99 (µs):"));
     gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[4], 0, 4, 1, 1);
+    S->test_lat_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_lat_lbl, 1, 4, 1, 1);
+
+    S->test_name_lbls[5] = name_lbl(tr("Jitter p99-p50 (µs):"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[5], 0, 5, 1, 1);
+    S->test_jitter_lbl = value_lbl();
+    gtk_grid_attach(GTK_GRID(grid), S->test_jitter_lbl, 1, 5, 1, 1);
+
+    S->test_name_lbls[6] = name_lbl(tr("Poll rate (Hz):"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[6], 0, 6, 1, 1);
     S->test_poll_lbl = value_lbl();
-    gtk_grid_attach(GTK_GRID(grid), S->test_poll_lbl, 1, 4, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), S->test_poll_lbl, 1, 6, 1, 1);
 
     // L17-3: which physical mouse the numbers above belong to.
-    S->test_name_lbls[5] = name_lbl(tr("Device:"));
-    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[5], 0, 5, 1, 1);
+    S->test_name_lbls[7] = name_lbl(tr("Device:"));
+    gtk_grid_attach(GTK_GRID(grid), S->test_name_lbls[7], 0, 7, 1, 1);
     S->test_device_lbl = value_lbl();
-    gtk_grid_attach(GTK_GRID(grid), S->test_device_lbl, 1, 5, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), S->test_device_lbl, 1, 7, 1, 1);
 
     S->test_status_lbl = gtk_label_new(tr("Awaiting motion…"));
     gtk_label_set_xalign(GTK_LABEL(S->test_status_lbl), 0.5);

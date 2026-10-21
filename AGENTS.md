@@ -56,6 +56,10 @@ RAWACCEL_PORTABLE=1 bash scripts/build.sh
 CXX=clang++ bash scripts/build.sh
 ```
 
+`scripts/build.sh` detects the compiler family (`__clang__`) and selects the
+GCC- or Clang-specific optimisation/LTO flags itself; `CXX=clang++` and
+`RAWACCEL_LTO=1` are both supported without extra flags.
+
 # GUI installer (source tree; wraps setup.sh through pkexec)
 bash install-gui.sh
 bash install-gui.sh --detect       # durum sorgusu, GUI açmadan
@@ -163,7 +167,7 @@ there is no call site. Measured, not inferred.
 | `cli/main.cpp` | gate 6 `run_cli_sanitized.sh` | **yes** |
 | `tests/test_accel.cpp` | `run_tests_asan.sh` (separate) | ⛔ **no** |
 
-So the 34 164 assertions run **without** sanitizers in the canonical pipeline.
+So the 34 417 assertions run **without** sanitizers in the canonical pipeline.
 CI's `sanitizers` job does run them, but that is a **different workflow**, not one
 of the seven local gates — so a green local run is not a sanitized local run. If
 you change `test_accel.cpp` or any header it includes, run
@@ -374,8 +378,8 @@ Test file: `tests/test_accel.cpp`
 - No external dependencies (standard C++20 + project headers)
 - Each `SECTION()` is an independent test group
 - Assertions use `EXPECT` / `EXPECT_NEAR` macros
-- 152 `test_` functions / 221 `SECTION` groups, 34405 runtime assertions (the
-  runner's own count; the source has 1637 `EXPECT` call sites — `#define` lines
+- 153 `test_` functions / 225 `SECTION` groups, 34421 runtime assertions (the
+  runner's own count; the source has 1653 `EXPECT` call sites — `#define` lines
   excluded, loops multiply them)
   covering: algorithms, JSON round-trips,
   file I/O, input validation, multi-profile round-trip, atomic write, IPC JSON,
@@ -491,7 +495,7 @@ together — CHANGELOG documents the same three-way sync.
 | `include/rawaccel.hpp` | Modifier + EMA smoother engine |
 | `include/rawaccel-base.hpp` | Core types, structs, RAWACCEL_VERSION |
 | `include/config.hpp` | Config structs |
-| `include/logitech_hidpp.hpp` | HID++ protocol + `HidppTransport` (hidraw I/O) and, beside it, the `hidpp_hw_sync` / `hidpp_hw_job` / `hidpp_hw_enqueue` / `hidpp_hw_take` / `hidpp_hw_plan_job` write-dedup queue. The queue is **owned by the daemon**, not here: `drain_hidpp_writes()` in `daemon/daemon.cpp` is the only consumer and takes **no** daemon mutex (leaf-lock contract), so the 5.8 s worst-case USB round-trip cannot stall the motion loop |
+| `include/logitech_hidpp.hpp` | HID++ protocol + `HidppTransport` (hidraw I/O) with the `hidpp_io_backend` byte-level test seam, and, beside it, the `hidpp_hw_sync` / `hidpp_hw_job` / `hidpp_hw_enqueue` / `hidpp_hw_take` / `hidpp_hw_plan_job` write-dedup queue. The queue is **owned by the daemon**, not here: `drain_hidpp_writes()` in `daemon/daemon.cpp` is the only consumer and takes **no** daemon mutex (leaf-lock contract), so the 5.8 s worst-case USB round-trip cannot stall the motion loop |
 | `include/presets.hpp` | Built-in game/FPS presets — single source shared by CLI `create-preset` and GUI "New Profile" preset dropdown |
 | `src/config.cpp` | JSON serialization (nlohmann/json) |
 | `daemon/daemon.cpp` | evdev/uinput implementation, hot-plug |
@@ -509,15 +513,17 @@ together — CHANGELOG documents the same three-way sync.
 | `installer/main.cpp` | `rawaccel-installer` GTK4 setup assistant: status, pkexec-backed setup.sh run, streamed log, pacman db-lock preflight/repair, clipboard log export. Source-tree bootstrap only; not installed system-wide |
 | `installer/log_scan.hpp` | Failure-marker and pacman-lock scan used by the installer; failure detection keys only on setup.sh's `✗` prefix (never the success word `EKSİKSİZ`) |
 | `install-gui.sh` | Builds/runs `rawaccel-installer` from the checkout; `--detect`/`--print-command` work without a display |
-| `tests/test_accel.cpp` | Unit + integration tests (152 functions / 221 `SECTION` groups, 34405 runtime assertions) |
+| `tests/test_accel.cpp` | Unit + integration tests (153 functions / 225 `SECTION` groups, 34421 runtime assertions) |
 | `tests/fuzz_config.cpp` | libFuzzer harness — config JSON parsing |
 | `tests/fuzz_accel.cpp` | libFuzzer harness — acceleration pipeline |
 | `tests/run_fuzz.sh` | Fuzz test runner (both harnesses) |
-| `tests/run_tests.sh` | Unit test runner (compile + run) |
+| `tests/run_tests.sh` | Unit test runner (compile + run), including the HID++ protocol gate and the CLI IPC-first liveness gate |
 | `tests/e2e_harness.cpp` | E2E harness: synthetic uinput mouse + REAL daemon + virtual sink; accel (T-A1..T-A4) + raw (T-B1) phase checks |
 | `tests/run_e2e.sh` | E2E runner (root): builds harness, SIGSTOP/SIGCONT-sensitive system-daemon isolation, runs both phases, propagates 0/1/77 |
 | `tests/run_tests_asan.sh` | Unit test runner under ASan + UBSan |
 | `tests/run_installer_smoke.sh` | Builds `rawaccel-installer` and checks its headless contract (`--detect`, `--print-command`, invalid-source rejection) plus the `✗`-only log-marker scan; exits 77 without GTK4 |
+| `tests/hidpp_transport_test.cpp` | HID++ protocol-layer tests over the injected byte backend: feature discovery, request/response matching, notification stash, error frames, dead-endpoint fast-fail, O31-H1 sector budget (31 assertions) |
+| `tests/fake_ipc_server.cpp` | Deterministic fake daemon IPC server for the CLI liveness gate: answers `status` on a live socket while no PID file exists |
 | `tests/run_cli_sanitized.sh` | Runs `cli/main.cpp` under ASan + UBSan over 34 real commands (8 presets, profile CRUD, JSON round-trip, config-path rejections); each command asserts its own expected output marker, so an arg rename can't silently turn the gate into 34 no-ops. Exit 0/1/77 |
 | `tests/oracle/` | Differential oracle: `run_oracle.sh`, grid `oracle_cases.hpp`, local side `local.cpp`, official-ref side `reference.cpp`, `ref/` (vendored MIT), `known_deviations.txt` |
 | `tests/tr_coverage.cpp` | Translation coverage audit (extracts all tr*()/grid_row keys) |
@@ -563,6 +569,16 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Signal safety**: signal handler only sets an atomic flag (`request_stop()`), never joins threads
 - **Sub-pixel accumulation**: `remainder_x/y` carries fractional movement so no micro-moves are lost
 - **Float comparisons**: use epsilon (`1e-9`) instead of `!= 0` / `!= 1`
+- **natural GAIN uses a speed-conditioned stability gate at dispatch (L02-15)**:
+  the config layer floors `decay_rate`, but it cannot floor effective speed —
+  `domain_weights` are legal down to 0, and a tiny positive weight (e.g. `1e-5`
+  at 32000 DPI / 100 ms / 1 count → x=3.125e-9) makes the two `O(limit/accel)`
+  terms cancel. Measured raw gain **5.77** (and a 0.801 dip for another legal
+  case) where the exact gain is 1 + O(1e-8). `accel_union::apply()` therefore
+  returns identity when `accel*x < NATURAL_GAIN_MIN_ACCEL_X = 1e-9`; directly
+  calling `natural::operator()` stays reference-bit-compatible and the oracle
+  remains 1408/79. Regression: `test_natural_decay_rate_floor()`'s L02-15
+  section covers whole and separate dispatch.
 - **classic LEGACY `cap_mode::in` boundary (K1)**: the guard is
   `cap.x > 0 && cap.x >= input_offset` — the `>=` is load-bearing. The official
   reference guards ONLY on `cap.x > 0`; at `cap.x == input_offset` it computes
@@ -631,10 +647,19 @@ compute sample staleness). Design keeps the hot path lock-free:
   as `MAX - 2` because the 0x8100 `write_sector` params are `sector(u16) + data`
   (O31-H1: a literal 16 made an 18-byte vector, so *every* onboard sector write
   was rejected and the path silently never wrote). A `static_assert` and
-  `test_hidpp_short_payload_budget()` both hold the invariant. The full device
-  round-trip is still untested — `send_feature_request`/`resolve_feature_index`
-  are private and `HidppTransport` needs a real hidraw node; no test seam was
-  added to the class for this.
+  `test_hidpp_short_payload_budget()` both hold the invariant. The protocol
+  layer is now testable without hardware: `include/logitech_hidpp.hpp` exposes
+  the byte-level `hidpp_io_backend` seam and an injecting `HidppTransport`
+  constructor; `tests/hidpp_transport_test.cpp` drives feature discovery,
+  request/response matching, the notification stash (BUG-22), error frames,
+  dead-endpoint fast-fail and the O31-H1 sector budget through a fake device.
+  The production hidraw path is unchanged, and `test_accel.cpp` was
+  deliberately left alone so the assertion count stays stable.  (That count
+  did move later, for a different reason: the 2026-10-21 natural
+  `decay_rate` floor added `test_natural_decay_rate_floor()` — 12
+  assertions, 34405 → 34417 — and the numbers above were re-measured, not
+  retyped. The L02-15 domain-weight guard then added 4 assertions
+  (34417 → 34421, 224 → 225 sections); those numbers are current above.)
 - **`apply_profile()` pushes HID++ polling-rate/DPI only when the value changed**
   (O31-D1): `set_polling_rate()` + `set_dpi()` are USB round-trips that run on the
   motion loop thread while it holds `devices_mutex_` AND `hidpp_devs_mutex_`.
@@ -758,7 +783,7 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Atomic config write**: tmp file → `rename()` so the daemon never reads a half-written JSON; `save_config` uses a PID-suffixed temp name opened with `O_NOFOLLOW|O_EXCL` (no symlink clobber, no two-writer race)
 - **Live reload (R5 fix)**: config reload updates settings in-place without releasing the mouse grab — no dropout window
 - **Stable device IDs**: GUI and daemon both resolve `eventN` → `/dev/input/by-id/...` for reboot-stable profile assignment
-- **Input validation**: `sanitize_device_profile()` clamps DPI (1–32 000), polling rate (125–8 000 Hz), rotation (0–360°), snap (0–45°), output DPI (0 = no output-DPI normalization sentinel, else 1–32 000), speed_max ≥ speed_min, accel_args fields (acceleration, scale, decay_rate, exponent_power ≥ 1e-4, offsets ≥ 0, limit ≥ 0, sync_speed ≥ 1e-4, smooth ≥ 0, motivity/gamma ≥ 0, cap ≥ 0), domain/range weights 0..1e6 (P86 ceiling; absurd magnitudes like 1e300 can't push accel-LUT lookups past representable indices), smooth halflifes ≥ 0, LUT `length` 0..max capacity — called on every JSON load
+- **Input validation**: `sanitize_device_profile()` clamps DPI (1–32 000), polling rate (125–8 000 Hz), rotation (0–360°), snap (0–45°), output DPI (0 = no output-DPI normalization sentinel, else 1–32 000), speed_max ≥ speed_min, accel_args fields (acceleration, scale, exponent_power ≥ 1e-4, offsets ≥ 0, limit ≥ 0, sync_speed ≥ 1e-4, smooth ≥ 0, motivity/gamma ≥ 0, cap ≥ 0; `decay_rate` ≥ 0 and — in natural mode — 0 or ≥ 1e-4: the internal coefficient is `decay_rate/|limit-1|` and the GAIN branch's cancellation flips the gain negative below that floor, which inverts the axis; the CLI's `set-param` domain mirrors the same floor. This floor does not bound effective speed: `domain_weights` can still shrink x, so the production `accel_union` dispatch additionally returns 1.0 when `accel*x < 1e-9`, preventing both negative dips and positive spikes at tiny x), domain/range weights 0..1e6 (P86 ceiling; absurd magnitudes like 1e300 can't push accel-LUT lookups past representable indices), smooth halflifes ≥ 0, LUT `length` 0..max capacity — called on every JSON load
 - **Systemd hardening**: `NoNewPrivileges`, `MemoryDenyWriteExecute`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_UNIX`, `ProtectKernelModules/Tunables/ControlGroups`, `LockPersonality`, `RestrictRealtime` (netlink açıkça yok: daemon hot-plug için udev/netlink DEĞİL inotify kullanıyor — `daemon.cpp` `inotify_init1`)
 - **Verbose log**: `daemon -v` shows device open/uinput creation details; `-f text|json` selects the log format (one JSON object per line when `json`)
 - **uinput_write error handling**: all `libevdev_uinput_write_event()` calls are wrapped by `uinput_write()` which checks the return value and marks the device as disconnected on failure
@@ -807,7 +832,8 @@ compute sample staleness). Design keeps the hot path lock-free:
 - **Low-latency motion contract (player focus)**: one loop thread processes every motion event synchronously (evdev read → modifier → uinput write); the epoll 10 ms timeout only serves housekeeping (hot-plug, IPC, signals). No per-event allocation; `mouse_device::dpi_factor` is pre-computed; both timers use `CLOCK_MONOTONIC_RAW`. Measure with the per-device `lat_stats` histogram (µs) via `rawaccel-cli latency` (SIGUSR1 → `snapshot_and_reset`); Min/Avg/p50/p95/p99/Max come from histogram bucket midpoints. p50/avg ≈ 1/3 of a 125 µs frame budget on hardware today; the rare p99/max queue spikes are the P-round analysis target.
 - **CLI `monitor` (live telemetry)**: `rawaccel-cli monitor [interval-ms]` (default 500, domain 1–60000) polls the daemon `status` JSON and renders a per-device table — input/output IPS, gain, latency p50/p95 (µs), `real_polling_rate`, battery, plus a staleness marker from `telem_wall_ms`. Interactive TTY mode redraws in place; piped/redirected output is a timestamped line stream (first line = header, so `monitor | head` just works and SIGPIPE terminates it). Reads no config file (dispatch sits with reload/stop before config load) and exits 0 on Ctrl-C (SIGINT handler sets a flag; the inter-cycle wait is a deadline-loop of EINTR-retried `nanosleep` so stray signals can never truncate the interval).
 - **CLI `diff` (profile comparison)**: `rawaccel-cli diff <a> <b>` compares two profiles — either a profile name in the config or a JSON file (the `export` format, including `export`'s line-stream). Prints only the fields that differ, using the same `accel_args` epsilon (`1e-9` doubles, `1e-5` LUT data) so round-trip precision noise never shows as a fake diff; exit 0 = identical, 1 = at least one difference. Read-only: never touches the config file, the daemon, or LUT contents. CLI gate tests in `tests/run_tests.sh`.
-- **GUI mouse-test latency readout**: the Mouse Lock Test window (`gui/mouse_test.inl`) now shows live per-event processor latency (p50/p95 µs) and the real poll rate alongside in/out/gain, read from the same daemon status slice (`lat_*`, `real_polling_rate`). Blanked on every no-sample path via a shared `mouse_test_blank_values()` helper.
+- **GUI live operating-point overlay**: the main window polls the daemon `status` JSON at 10 Hz into an AppState cache (`gui/daemon_comm.inl`; 10 ms socket timeout, and a 500 ms probe backoff when the daemon is unreachable so a wedged-but-listening daemon cannot freeze the GTK main thread). `gui/graph.inl` draws the measured `(telem_in_ips, telem_gain)` point plus a fading trail of the last ≤120 unique samples, and a yellow hollow model marker from the production `accel_union::apply()` at the same speed. A one-line readout under the graph shows in/out IPS, gain and p99. This is a latest-sample view, not an event-rate scope: repeated `telem_wall_ms` values are not appended, a >5 s gap starts a new trail, and a sample older than 2 s never draws a current marker. Read-only — it does not touch the acceleration formulas, the reference path or the daemon hot path. `telem_in_ips` is the daemon's RAW pre-rotation / pre-weight / pre-smoothing magnitude, so the graph legend and readout say **Live (raw)**; the measured point can differ from the curve coordinate when rotation, domain weights or smoothing are active.
+- **GUI mouse-test latency readout**: the Mouse Lock Test window (`gui/mouse_test.inl`) shows live per-event processor latency (p50/p95/p99 µs), jitter (p99−p50), raw dx/dy counts and the real poll rate alongside in/out/gain, read from the same daemon status slice (`lat_*`, `telem_dx`, `telem_dy`, `real_polling_rate`). Blanked on every no-sample path via a shared `mouse_test_blank_values()` helper.
 
 ## Known Limitations
 

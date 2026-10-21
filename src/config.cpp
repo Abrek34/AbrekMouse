@@ -520,6 +520,19 @@ static void sanitize_accel_args(accel_args& a) {
     // decay_rate: natural mode divides by limit to get internal accel coefficient.
     //   Negative → exp(+large) → diverging gain.  Clamp to >= 0.
     if (a.decay_rate < 0) a.decay_rate = 0;
+    // L02-14 (2026-10-21 ölçümü): natural modda iç katsayı
+    //   accel = decay_rate/|limit-1| (accel-natural.hpp:24) ve GAIN dalı iki
+    //   O(1/accel) terimin farkını aldığı için (accel-natural.hpp:208) küçük
+    //   accel'de yuvarlama hatası kazancı NEGATİF yapabiliyor: ölçülen en kötü
+    //   -46.68 (limit=100, decay_rate=1e-9, x=0.01) → imleç ters yönde.  Bu bant
+    //   üretimde erişilebilir (x ≥ 3.125e-4 @32000 DPI/100 ms) ve referansla
+    //   bit-bit aynı olduğu için (inherited sapma) FORMÜL değiştirilmez —
+    //   engelleme konfigürasyon katmanında, bir alt sınır olarak yapılır.
+    //   0 muaf tutulur: accel=0 → `accel < 1e-12 → 1.0` guard'ı (accel-natural
+    //   .hpp:206) düz kazanç 1.0 verir, işaret hatası oluşmaz.
+    if (a.mode == accel_mode::natural && a.decay_rate > 0.0 &&
+        a.decay_rate < NATURAL_DECAY_RATE_MIN)
+        a.decay_rate = NATURAL_DECAY_RATE_MIN;
     // exponent_power: power mode constructor clamps to 1e-4, but sanitize early.
     //   Zero causes division-by-zero in gain_inverse (1/n).
     if (a.exponent_power < 1e-4) a.exponent_power = 1e-4;
@@ -1332,55 +1345,96 @@ static void migrate_lookup_gain(app_config& cfg) {
 
 /// Simple semantic-version "older than" comparison for "0.0.0"-style strings.
 /// Returns true when lhs < rhs (missing/unknown components count as 0).
+///
+/// AJ-H (backlog-3, 21 Ekim 2026) — İKİ DÜZELTME, ikisi de ölçülmüş sapma:
+///
+/// 1) EKSİK BİLEŞENLİ SÜRÜM YENİDEN TAŞINIYORDU (kalıcı eğri bozulması).
+///    Eski karşılaştırma, ilk üç bileşen eşitse NOKTA SAYISINA bakıyordu
+///    ("0.6.4" < "0.6.4.1" kuralı, FINDING-34-3).  "0.4" tek noktalı olduğu
+///    için "0.4.0"dan ESKİ sayılıyordu → migrate_lookup_gain() yeniden
+///    çalışıyor → lookup+gain LUT'unun y'si x ile ÇARPILIYORDU (y = 200·100
+///    = 20000).  Oysa "0.4" = "0.4.0" demektir ve taşıma 0.4.0'DA yapıldığı
+///    için veri ZATEN taşınmıştır → taşınmamalıydı.  ETKİ: kullanıcının
+///    eğrisi 100 kat şişiyor, yükleme sürümü güncel sürüme damgaladığı için
+///    bir daha taşınmıyor → HASAR KALICI.  Ölçüm: version="0.4" →
+///    lut_y=20000 (taşındı), olması gereken 200 (taşınmamalı).
+///    DÜZELTME: karşılaştırma artık bileşen SAYISINA değil DEĞERlerine
+///    bakar; eksik bileşen SIFIR sayılır ("0.4" == "0.4.0").  Sol tarafın
+///    TÜM bileşenleri karşılaştırılır (sabit derinlik yok → "0.4.0.1.2"
+///    gibi 5+ bileşenli sınıf leke inmeden çalışır).  FINDING-34-3 korunur:
+///    "0.6.4" < "0.6.4.1" (4. bileşende 0 < 1).
+///
+/// 2) INT_MAX'ı AŞAN BİLEŞEN TAŞIMAYI ATLIYORDU (kalıcı bozuk dosya).
+///    BUG-NEW-70'ın varsayımı yanlıştı: "99999999999" 64-bit'te
+///    unsigned long'a SIĞIYOR (strtoul errno=0, ERANGE değil) → sadece
+///    min(n, INT_MAX) ile INT_MAX'a kırpılıyor → "ilerideki sürüm" gibi
+///    görünüyor → migrate_lookup_gain() HİÇ çalışmıyor → pre-0.4 veri
+///    hiç taşınmıyor, bozuk sürüm kaydedilirken de KORUNUYOR (kalıcı bozuk
+///    dosya).  Ölçülen: strtoul("99999999999") = 99999999999, errno=0
+///    (ERANGE yalnız ULONG_MAX'ı aşınca); version="99999999999" → lut_y=200
+///    (taşınmadı).  DÜZELTME: INT_MAX'ı AŞAN bileşen BOZUK sayılır →
+///    "her şeyden eski" → taşıma çalışır (YÜKSEK-BUG-MOTION-02 kuralı).
+///    Tam INT_MAX ('2147483647.0') GELECEK sürümdür, bozuk DEĞİLDİR →
+///    taşıma atlanır (N2 kuralı).
+///
+/// Bozuk sürüm davranışı (negatif bileşen, sayısal olmayan, boş bileşen)
+/// DEĞİŞMEDİ: hepsi "her şeyden eski" → taşıma çalışır (BUG-LOW-2,
+/// YÜKSEK-BUG-MOTION-02).
 static bool version_lt(const std::string& lhs, const std::string& rhs) {
-    auto parse = [](const std::string& v, std::array<int,3>& out) {
-        size_t start = 0, pos = 0;
-        int part = 0;
-        while (part < 3 && pos != std::string::npos) {
-            pos = v.find('.', start);
-            const std::string tok = (pos == std::string::npos) ? v.substr(start) : v.substr(start, pos - start);
-            if (tok.empty()) return false;
-            // BUG-LOW-2: strtoul("-1") does NOT set errno and returns
-            // ULONG_MAX (two's-complement wrap), which then clamps to INT_MAX
-            // — a negative version component became a huge positive one, so a
-            // corrupt stored version like "0.6.-1" compared "newer than"
-            // everything and migration was silently skipped.  A leading '-'
-            // is never valid: flag it and let the history treat the version
-            // as corrupt (lhs → older than everything, rhs → never less).
+    // Bir bileşen sözdizimi: yalnız rakam.  Negatif bileşen ("0.6.-1"),
+    // boş bileşen ("0.4..1"), sayısal olmayan bileşen ("0.4.abc") ve
+    // INT_MAX'ı aşan bileşen BOZUK sayılır.
+    auto parse = [](const std::string& v, std::vector<long long>& out) -> bool {
+        out.clear();
+        size_t start = 0;
+        for (;;) {
+            const size_t pos = v.find('.', start);
+            const std::string tok = (pos == std::string::npos)
+                                       ? v.substr(start)
+                                       : v.substr(start, pos - start);
+            if (tok.empty()) return false;                 // boş bileşen → bozuk
+            // BUG-LOW-2: strtoul("-1") errno'yu set ETMEZ ve ULONG_MAX
+            // döner (iki'se tümleyen sarmalama) → negatif bileşen devasa bir
+            // POZİTİF sayıya dönüşür.  Negatif bileşen hiçbir zaman geçerli
+            // değildir: bozuk işaretle, "her şeyden eski" kabul et.
             if (tok[0] == '-') return false;
+            for (char c : tok)
+                if (c < '0' || c > '9') return false;      // sayısal olmayan → bozuk
             char* end = nullptr;
             errno = 0;
-            const unsigned long n = std::strtoul(tok.c_str(), &end, 10);
-            // BUG-NEW-70: strtoul overflow (ERANGE) sets errno and returns
-            // ULONG_MAX WITHOUT touching end — a value like "99999999999"
-            // falls through as ULONG_MAX and `static_cast<int>` is UB.
-            // Clamp to the int range instead of relying on the cast.
-            if (errno == ERANGE || end == tok.c_str())
+            const unsigned long long n = std::strtoull(tok.c_str(), &end, 10);
+            // ERANGE artık yalnız ULONG_MAX'ı aşan değerlerde oluşur; 64-bit'te
+            // "99999999999" buraya TAKILMAZ (aşımı aşağıdaki kontrol yakalar).
+            if (errno == ERANGE || end == tok.c_str() || (end && *end != '\0'))
                 return false;
-            if (end && *end != '\0') return false;
-            out[part++] = static_cast<int>(std::min<unsigned long>(n, INT_MAX));
-            if (pos != std::string::npos) start = pos + 1;
+            // AJ-H-2: INT_MAX'ı aşan bileşen "gelecek sürüm" gibi
+            // yorumlanıyordu → taşıma atlanıyordu.  Bozuk sayıp
+            // "her şeyden eski" kabul et.  Tam INT_MAX geçerli bir sürümdür.
+            if (n > static_cast<unsigned long long>(INT_MAX)) return false;
+            out.push_back(static_cast<long long>(n));
+            if (pos == std::string::npos) break;
+            start = pos + 1;
         }
-        return part > 0;
+        return !out.empty();
     };
-    std::array<int,3> a = {0,0,0}, b = {0,0,0};
-    // YÜKSEK-BUG-MOTION-02: a corrupt/unparseable STORED version (e.g. "abc")
-    // must be treated as "older than any real version" so migration still runs.
-    // Previously parse() failure → false here silently skipped ALL migrations,
-    // leaving pre-0.4 lookup+gain data permanently unmigrated.
-    if (!parse(lhs, a)) return true; // corrupt lhs → older than everything
-    if (!parse(rhs, b)) return false; // corrupt rhs never compares less
-    if (a[0] != b[0]) return a[0] < b[0];
-    if (a[1] != b[1]) return a[1] < b[1];
-    if (a[2] != b[2]) return a[2] < b[2];
-    // FINDING-34-3: first 3 components equal — a version with more
-    // components is greater (e.g. "0.6.4" < "0.6.4.1").
-    auto count_dots = [](const std::string& s) {
-        int n = 0;
-        for (char c : s) n += (c == '.');
-        return n;
-    };
-    return count_dots(lhs) < count_dots(rhs);
+    std::vector<long long> a, b;
+    // YÜKSEK-BUG-MOTION-02: bozuk/çözümlenemeyen SAKLANAN sürüm "her gerçek
+    // sürümden eski" sayılmalı → taşıma yine de çalışsın.  Önceden
+    // parse() başarısızlığı → false dönüyordu ve TÜM taşımalar sessizce
+    // atlanıyordu (pre-0.4 lookup+gain verisi kalıcı olarak taşınmamış
+    // kalıyordu).
+    if (!parse(lhs, a)) return true;  // bozuk lhs → her şeyden eski
+    if (!parse(rhs, b)) return false; // bozuk rhs asla küçük sayılmaz
+    // Bileşen bileşen, SAYISAL karşılaştırma; eksik bileşen SIFIR sayılır
+    // ("0.4" == "0.4.0" → AJ-H-1).  Karşılaştırma sol tarafın TÜM
+    // bileşenlerini kapsar (sabit derinlik yok).
+    const size_t depth = std::max(a.size(), b.size());
+    for (size_t i = 0; i < depth; ++i) {
+        const long long av = (i < a.size()) ? a[i] : 0;
+        const long long bv = (i < b.size()) ? b[i] : 0;
+        if (av != bv) return av < bv;
+    }
+    return false; // eşit → küçük değil
 }
 
 bool migrate_config(app_config& cfg) {
