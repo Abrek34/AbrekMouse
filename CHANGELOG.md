@@ -8,6 +8,19 @@ The canonical version string lives in `include/rawaccel-base.hpp`
 
 ## [Unreleased]
 
+### Fixed — GUI & KWin Wayland & Logitech HID++ (Round-23)
+
+- **KWin Wayland aktif pencere takılma/donma onarımı.** KWin betiğindeki `callDBus("org.rawaccel.Focus", ...)`
+  çağrısı callback almadığında KWin motoru tarafından senkron çalıştırılıp tüm compositor'ı donduruyordu.
+  `function() {}` asenkron callback parametresi eklendi ve GUI method handler'ı DBus cevabını anında (<0.1 ms)
+  dönecek şekilde düzenlendi.
+- **Logitech M185 (046d:c542) ve Nano Alıcı HID++ kilitlenme onarımı.** HID++ desteklemeyen alıcılara
+  500 ms timeout ile yapılan 8 adaylık sorgu döngüsü engellendi (`is_known_non_hidpp_receiver()` fast path).
+  Daemon'daki 2 saniyelik sonsuz yeniden tarama döngüsü `non_hidpp_paths_` ile hafızaya alındı; USB paket spam'i
+  ve alıcının USB'den düşmesi (`Device error (No such device)`) tamamen önlendi.
+- **GUI zamanlayıcı IPC timeout optimizasyonu.** `mouse_test_poll`, `daemon_running()` ve `update_daemon_status`
+  içindeki 150 ms'lik soket timeout'ları 10 ms'ye düşürüldü; GUI ana iş parçacığı kilitlenmelerden arındırıldı.
+
 ### Added — GUI canlı telemetri
 
 - **Ana pencerede canlı çalışma noktası ve iz.** Grafik, daemon `status`
@@ -72,6 +85,31 @@ The canonical version string lives in `include/rawaccel-base.hpp`
   `test_natural_decay_rate_floor()` içine whole + separate kapsayan
   4 assertion eklendi (34417 → 34421). Oracle değişmedi: 1408 satır /
   79 sapma.
+- **Logitech HID++ 2.0 Onboard Profiles Feature 0x8100 sektör yazımı (Fn 7).**
+  `write_onboard_profile_sector` fonksiyonu hatalı olarak `0x48` (Fn 4)
+  kullanıyordu; Solaar ve Logitech HID++ 2.0 Feature 0x8100 standardına göre
+  sektör yazma fonksiyonu Function 7 (`0x70` / writeSectorBlock)'dir.
+  `0x70` standardına düzeltildi ve test mock'u güncellendi.
+- **Canlı donanım DPI takibi ve HERO sensör asimetrisi onarımı.**
+  Daemon arka planında `apply_hidpp_dpi()` ve periyodik DPI sorgusu eklendi.
+  Kullanıcı faredeki fiziksel DPI tuşuna bastığında hız hesabı (`dev.dpi_factor`)
+  dinamik olarak senkronize edilir. HERO sensörlü farelerde donanım seviyesinde
+  X/Y asimetrisi (`dpi_current != dpi_current_y`) tespit edildiğinde `set_dpi`
+  ile anında simetrik 1:1 eşitliğe zorlanır.
+- **Onboard profil modunu geri yükleme.**
+  `disable_onboard_profiles_for_write` ile kapatılan dahili profil modu, daemon
+  veya GUI kapandığında (`stop()` ve `~HidppTransport()`) `restore_onboard_profiles()`
+  ile otomatik olarak yeniden etkinleştirilir (Logitech G HUB standardı).
+- **hidraw dosya kilidi (`flock`).**
+  GUI ve daemon'ın aynı anda `/dev/hidraw` aygıtına erişip paket yanıtlarını
+  karıştırmasını önlemek için `send_feature_request` içine `flock(fd_, LOCK_EX)`
+  koruması eklendi.
+- **Udev kuralı güvenliği (klavye keylogger izolasyonu).**
+  `scripts/99-rawaccel.rules` içindeki Logitech kuralına `ENV{ID_INPUT_MOUSE}=="1"`
+  eklenerek Logitech klavyelerin yetkisiz masaüstü süreçlerine açılması engellendi.
+- **Systemd servis önceliği.**
+  `scripts/rawaccel.service` içine `Nice=-10` eklenerek yüksek sistem yükünde
+  fare gecikmesi ve mikrotitreşimleri (jitter) önlendi.
 
 ### Fixed — performans / hesaplama
 

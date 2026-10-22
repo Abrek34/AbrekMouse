@@ -120,6 +120,9 @@ IPAddressDeny=any
 # and the udev rule (99-rawaccel.rules) keeps /dev/uinput accessible.
 SupplementaryGroups=input
 
+# Performance: elevate scheduling priority to prevent input jitter under heavy system load
+Nice=-10
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rawaccel

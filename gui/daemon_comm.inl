@@ -530,8 +530,12 @@ bool daemon_running(bool* ipc_ok) {
     if (ipc_ok) *ipc_ok = false;
     // Fast path: try IPC ping first (socket exists only while daemon is running).
     // Skip the ping entirely when no socket file is present (BUG-10 — no query).
+    // R23-FIX: use 10 ms timeout — the default 150 ms (×2 socket candidates)
+    // blocked the GTK main thread for up to 300 ms on every 3 s poll tick,
+    // causing periodic freezes.  A healthy daemon replies in < 1 ms over a
+    // local Unix socket; 10 ms is ample.
     if (daemon_socket_exists()) {
-        std::string pong = daemon_ipc_query("ping");
+        std::string pong = daemon_ipc_query("ping", /*timeout_ms=*/10);
         if (!pong.empty() && pong.find("pong") != std::string::npos) {
             if (ipc_ok) *ipc_ok = true;
             return true;
@@ -916,7 +920,11 @@ void update_daemon_status(AppState* S) {
     // slice, not the first device in the array (BUG-02).
     if (S->battery_detected_lbl) {
         if (running) {
-            std::string resp = daemon_ipc_query("status");
+            // R23-FIX: use 10 ms timeout — this runs on the GTK main thread
+            // every 3 s; the old 150 ms default (×2 candidates) blocked the
+            // UI for up to 300 ms per poll.  Battery data is cosmetic and can
+            // tolerate a missed tick.
+            std::string resp = daemon_ipc_query("status", /*timeout_ms=*/10);
             int battery = (int)daemon_device_field(resp, S, "detected_battery");
             if (battery >= 0 && battery <= 100) {
                 gtk_widget_set_visible(GTK_WIDGET(S->battery_detected_lbl), TRUE);

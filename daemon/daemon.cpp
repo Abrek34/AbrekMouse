@@ -589,6 +589,17 @@ void AccelDaemon::stop() {
     if (save_thread_.joinable()) save_thread_.join();
     teardown_devices();
 
+    // Restore onboard profiles on all active Logitech transports so the mouse
+    // does not stay stuck in host mode after daemon exits (Logitech G HUB behavior)
+    {
+        std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+        for (auto& pair : hidpp_transports_) {
+            if (pair.second && pair.second->is_open()) {
+                pair.second->restore_onboard_profiles();
+            }
+        }
+    }
+
     if (inotify_fd_ >= 0) { close(inotify_fd_); inotify_fd_ = -1; inotify_wd_ = -1; }
     if (epoll_fd_   >= 0) { close(epoll_fd_);   epoll_fd_   = -1; }
 
@@ -1955,6 +1966,32 @@ void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
     }
 }
 
+void AccelDaemon::apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi) {
+    if (dpi == 0) return;
+
+    std::string needle;
+    if (!dev.info.serial.empty()) {
+        needle = dev.info.serial;
+    } else {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04x:%04x", dev.vendor_id, dev.product_id);
+        needle = buf;
+    }
+
+    std::lock_guard<std::mutex> lk(devices_mutex_);
+    for (auto& m : devices_) {
+        if (m.device_id.find(needle) != std::string::npos) {
+            if (m.dpi != static_cast<int>(dpi) || m.detected_dpi != static_cast<int>(dpi)) {
+                log("Hardware DPI update on " + m.name + ": " +
+                    std::to_string(m.dpi) + " -> " + std::to_string(dpi) + " DPI", true);
+                m.dpi = static_cast<int>(dpi);
+                m.detected_dpi = static_cast<int>(dpi);
+                m.dpi_factor = NORMALIZED_DPI / static_cast<double>(m.dpi);
+            }
+        }
+    }
+}
+
 /// Between drain iterations, keep tabs on queued HID++ notifications without
 /// ever blocking the event loop: each drain opens the hidraw node, consumes a
 /// bounded number of notifications (0 ms poll), classifies them against the
@@ -1983,7 +2020,12 @@ void AccelDaemon::poll_hidpp_notifications() {
                     ++it;
                 }
             }
+            for (auto it = non_hidpp_paths_.begin(); it != non_hidpp_paths_.end();) {
+                if (!seen.count(*it)) it = non_hidpp_paths_.erase(it);
+                else ++it;
+            }
             for (const auto& path : paths) {
+                if (non_hidpp_paths_.count(path)) continue;
                 const bool known = std::any_of(
                     hidpp_devs_.begin(), hidpp_devs_.end(),
                     [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
@@ -1992,6 +2034,7 @@ void AccelDaemon::poll_hidpp_notifications() {
                 // on this hidraw node (receiver 0xFF, direct 0x00, paired 0x01-0x06).
                 // identify_logitech_device (singular) only tries 0xFF/0x00 and would
                 // miss mice behind a Unifying receiver.
+                bool any_valid = false;
                 for (auto& dev : identify_logitech_devices(path)) {
                     // protocol_version 0 = Logitech hidraw node with no HID++
                     // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
@@ -2001,6 +2044,10 @@ void AccelDaemon::poll_hidpp_notifications() {
                     log("HID++ device detected: " + path + " (idx=0x" +
                         std::to_string(static_cast<int>(dev.device_index)) + ")", true);
                     hidpp_devs_.push_back(std::move(dev));
+                    any_valid = true;
+                }
+                if (!any_valid) {
+                    non_hidpp_paths_.insert(path);
                 }
             }
         }
@@ -2031,6 +2078,26 @@ void AccelDaemon::poll_hidpp_notifications() {
                 if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
                     dev.battery_level = b->level;
                     apply_hidpp_battery(dev, *b);
+                }
+            }
+
+            // Check hardware DPI periodically (every 5 s per device) to detect physical
+            // DPI button toggles or asymmetric hardware DPI (HERO sensor X != Y drift).
+            if (now_ms() - static_cast<double>(dev.last_dpi_check_ms) >= 5000.0) {
+                dev.last_dpi_check_ms = static_cast<uint64_t>(now_ms());
+                if (auto info = transport_ptr->get_dpi_info(dev.device_index)) {
+                    if (info->dpi_current > 0) {
+                        // Detect and repair asymmetric hardware DPI
+                        if (info->extended && info->dpi_current_y > 0 &&
+                            info->dpi_current != info->dpi_current_y) {
+                            log("Asymmetric hardware DPI detected on " + dev.hidraw_path +
+                                " (X=" + std::to_string(info->dpi_current) +
+                                ", Y=" + std::to_string(info->dpi_current_y) +
+                                ") — forcing symmetric DPI", true);
+                            transport_ptr->set_dpi(info->dpi_current, dev.device_index);
+                        }
+                        apply_hidpp_dpi(dev, info->dpi_current);
+                    }
                 }
             }
         }

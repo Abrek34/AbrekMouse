@@ -749,3 +749,23 @@ baseline içinde (rc=0).
 `olcum/analiz/gate-*.log`, `olcum/analiz/natural_small_speed_probe.cpp`,
 `olcum/analiz/BULGU-accel-natural-negatif-kazanc.md`,
 `olcum/analiz/BULGU-duzeltme-natural-decay-tabani.md`.
+
+---
+
+## round-22 (antigravity — 22.10.2026) — Logitech HID++ 2.0 Feature 0x8100 Fn 7 yazımı, canlı DPI senkronu & asimetri onarımı, flock, systemd & udev güvenliği
+
+Kullanıcı isteği: performans ve çalışma doğruluğu, fare aşağı-yukarı ve sağa-sola eşit hareket etmeli, çözünürlükten bağımsız eşit hareket.
+
+| ID | Dosya | Konu | Durum |
+|---|---|---|---|
+| R22-HIDPP-WRITE (KRİTİK) | `src/logitech_hidpp.cpp`, `tests/hidpp_transport_test.cpp` | `write_onboard_profile_sector` fonksiyon ID olarak `0x48` (Fn 4) gönderiyordu. Solaar ve Logitech HID++ 2.0 Feature 0x8100 standardında sektör yazma fonksiyonu **Function 7 (`0x70` / writeSectorBlock)**'dir. Sahte test mock'u `0x48`'e izin verdiği için bug gizlenmişti. | `✅` `0x70` (Fn 7) standardına çekildi; fake backend canned reply `{4, 0x07}` güncellendi; 32/32 HID++ testi PASS. |
+| R22-HIDPP-RESTORE (YÜKSEK) | `include/logitech_hidpp.hpp`, `src/logitech_hidpp.cpp`, `daemon/daemon.cpp` | `disable_onboard_profiles_for_write` farenin dahili hafıza modunu kapatır. AbrekMouse kapanırken modu geri açmıyordu; fare host modunda asılı kalıyordu (Logitech G HUB kapanırken onboard modu geri yükler). | `✅` `restore_onboard_profiles()` hook'u eklendi; `~HidppTransport` ve `AccelDaemon::stop()` anında farenin dahili profili otomatik olarak geri yüklenir. |
+| R22-HIDPP-LOCK (YÜKSEK) | `src/logitech_hidpp.cpp` | GUI ve daemon bağımsız `HidppTransport` örnekleriyle aynı `/dev/hidraw` düğümünü açıyordu. Aynı anda istek atıldığında paket yanıtları birbirine karışıyordu (cross-process race condition). | `✅` `send_feature_request` içine `flock(fd_, LOCK_EX)` dosya kilidi koruması eklendi; süreçler arası yarış engellendi. |
+| R22-DPI-SYNC (YÜKSEK) | `daemon/daemon.hpp`, `daemon/daemon.cpp` | Kullanıcı farenin fiziksel DPI düğmesine bastığında veya fare donanım modu değiştiğinde daemon bunu algılamıyordu (hız hesabı `NORMALIZED_DPI / dev.dpi` bozuluyordu). Ayrıca HERO sensörlerinde donanım X/Y asimetrisi (`dpi_current != dpi_current_y`) oluşabiliyordu. | `✅` `apply_hidpp_dpi()` ve `poll_hidpp_notifications()` 5s periyodik DPI sorgusu eklendi; donanım DPI drifti dinamik senkronize edilir, X/Y donanım asimetrisi tespit edilirse `set_dpi` ile anında 1:1 simetrik eşitliğe zorlanır. |
+| R22-CONST-SMART (ORTA) | `include/logitech_hidpp.hpp` | `smart_shift = 0x4C00` sabiti hatalıydı (Solaar standardı `0x2110`/`0x2111`). `wireless_status = 0x0080` sinyal gücüydü. | `✅` `smart_shift = 0x2110`, `smart_shift_enhanced = 0x2111`, `wireless_signal_strength = 0x0080` tanımlandı. |
+| R22-SEC-UDEV (GÜVENLİK) | `scripts/99-rawaccel.rules` | Logitech kuralı `ATTRS{idVendor}=="046d"` için `TAG+="uaccess"` veriyordu fakat `ENV{ID_INPUT_MOUSE}=="1"` filtresi yoktu; Logitech klavyelerin `event*` düğümleri yetkisiz masaüstü uygulamalarına açılıyordu (keylogger riski). | `✅` `ENV{ID_INPUT_MOUSE}=="1"` filtresi eklendi; yalnız fareler uaccess kapsamına alındı. |
+| R22-PERF-SERVICE (PERF) | `scripts/rawaccel.service` | Servis dosyasında zamanlama önceliği yoktu; yüksek CPU yükü altında input jitter riski vardı. | `✅` `Nice=-10` eklendi. |
+| R22-TR-COVERAGE (DÜŞÜK) | `gui/ui_builder.inl`, `gui/tr.inl` | Çözünürlük bağımsızlığı ve 1:1 eksen simetrisi için `Y/X Ratio` açıklaması güncellendi; `tr.inl` sözlüğü eşleşti. | `✅` `run_tr_coverage.sh` PASS (0 eksik). |
+
+**Kapılar (2026-10-22):** build rc=0 / 0 uyarı · unit **34422/34422** · HID++ **32/32** · config migration **32/32** · oracle **1408 satır / 79 belgeli sapma OK** · SIMD parity AVX2/SSE2/scalar birebir · tr_coverage PASS · CLI ASan/UBSan **34/34** · hot-path benchmark olay başına ~36 ns.
+

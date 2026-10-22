@@ -21,7 +21,7 @@
 KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input"
 
 # Physical input event nodes — only for Logitech mice (vendor ID 0x046d)
-KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="046d", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ENV{ID_INPUT_MOUSE}=="1", ATTRS{idVendor}=="046d", GROUP="input", MODE="0660", TAG+="uaccess"
 
 # Logitech HID++ interface — GUI/CLI onboard device control (DPI, report
 # rate, lift-off distance) without root.  uaccess additionally grants the

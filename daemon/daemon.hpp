@@ -322,6 +322,7 @@ private:
     // Paths of currently-identified Logitech hidraw devices with their
     // cached feature maps (post-replug cache is cleared + re-identified).
     std::vector<hidpp_device> hidpp_devs_;
+    std::set<std::string> non_hidpp_paths_;
     // shared_ptr, not unique_ptr (O31-D1): a queued HID++ write job holds its
     // own reference, so an unplug that erases this map entry cannot dangle an
     // in-flight write on a kernel hidraw fd.  The rescan at daemon.cpp:1693
@@ -335,6 +336,7 @@ private:
     // matching evdev mouse (matched by vid:pid).  Ambiguous matches (several
     // mice behind one receiver) merge nothing — only log.  Hidpp-worker thread.
     void apply_hidpp_battery(const hidpp_device& dev, const hidpp_battery_info& b);
+    void apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi);
 
     /// Find the HID++ transport and device index matching the given evdev mouse.
     /// Matches by serial number (Unifying receiver) or vendor:product (direct).

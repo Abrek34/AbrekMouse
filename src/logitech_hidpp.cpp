@@ -1,8 +1,10 @@
 #include "logitech_hidpp.hpp"
+#include "logitech_receiver.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <linux/hidraw.h>
 #include <cstring>
 #include <cerrno>
@@ -641,6 +643,11 @@ HidppTransport::HidppTransport(std::unique_ptr<hidpp_io_backend> backend,
 }
 
 HidppTransport::~HidppTransport() {
+    if (is_open()) {
+        try {
+            restore_onboard_profiles();
+        } catch (...) {}
+    }
     if (fd_ >= 0) close(fd_);
 }
 
@@ -784,6 +791,15 @@ std::optional<std::vector<uint8_t>> HidppTransport::send_feature_request(
     const uint8_t wire_function = normalize_function_id(function_id);
 
     std::lock_guard lock(request_mutex_);
+    struct file_lock_guard {
+        int fd;
+        explicit file_lock_guard(int f) : fd(f) {
+            if (fd >= 0) ::flock(fd, LOCK_EX);
+        }
+        ~file_lock_guard() {
+            if (fd >= 0) ::flock(fd, LOCK_UN);
+        }
+    } flock_guard(fd_);
     const uint8_t request_device = target_device_index != 0xFF
         ? target_device_index : device_index_.load(std::memory_order_relaxed);
     // Solaar (device.py `request()`) sends HID++ 2.0 feature calls ALWAYS as
@@ -1973,8 +1989,30 @@ bool HidppTransport::disable_onboard_profiles_for_write(uint8_t target_device_in
     // NT-slug PRO X 2 tool).  The write then applies to the host mode and is
     // no longer blocked by the active profile.
     const uint8_t param = 0x02;
-    return send_feature_request(*index, 0x10, &param, 1,
-                                std::chrono::milliseconds(700), target).has_value();
+    bool ok = send_feature_request(*index, 0x10, &param, 1,
+                                   std::chrono::milliseconds(700), target).has_value();
+    if (ok) {
+        onboard_profiles_disabled_by_us_.store(true, std::memory_order_relaxed);
+    }
+    return ok;
+}
+
+bool HidppTransport::restore_onboard_profiles(uint8_t target_device_index) {
+    if (!onboard_profiles_disabled_by_us_.load(std::memory_order_relaxed))
+        return true;
+    const uint8_t target = target_device_index != 0xFF
+        ? target_device_index : device_index_.load(std::memory_order_relaxed);
+    const auto index = resolve_feature_index(
+        hidpp_feature_index::onboard_profiles, target);
+    if (!index) return true;
+    // fn 0x10 param 0x01 = set onboard profiles ON (Solaar / G HUB shutdown restore)
+    const uint8_t param = 0x01;
+    bool ok = send_feature_request(*index, 0x10, &param, 1,
+                                  std::chrono::milliseconds(500), target).has_value();
+    if (ok) {
+        onboard_profiles_disabled_by_us_.store(false, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
@@ -2292,8 +2330,8 @@ bool HidppTransport::write_onboard_profile_sector(
     uint16_t sector, const std::vector<uint8_t>& data,
     uint8_t target_device_index) {
     // 0x8100 OnboardProfiles — write a single flash sector.
-    // fn=0x48 write_sector: params = sector (u16 BE) + flash data. The data
-    // chunk is derived from HIDPP_SHORT_PAYLOAD_MAX rather than written out, so
+    // fn=0x70 write_sector: params = sector (u16 BE) + flash data (Solaar / HID++ 2.0 Feature 0x8100 spec).
+    // The data chunk is derived from HIDPP_SHORT_PAYLOAD_MAX rather than written out, so
     // it cannot drift past the budget again (O31-H1: chunk 16 made the vector
     // 18 bytes, `param_len > 16` rejected every call, and the path silently
     // never wrote anything). See HIDPP_ONBOARD_SECTOR_DATA_CHUNK.
@@ -2309,7 +2347,7 @@ bool HidppTransport::write_onboard_profile_sector(
         params[1] = static_cast<uint8_t>(sector);
         const size_t n = std::min(chunk, data.size() - off);
         std::copy(data.begin() + off, data.begin() + off + n, params.begin() + 2);
-        if (!send_feature_request(*index, 0x48, params.data(),
+        if (!send_feature_request(*index, 0x70, params.data(),
                                   static_cast<uint8_t>(params.size()),
                                   std::chrono::milliseconds(500),
                                   target_device_index))
@@ -2400,6 +2438,23 @@ std::vector<hidpp_device> identify_logitech_devices(const std::string& hidraw_pa
     HidppTransport transport(hidraw_path);
     if (!transport.is_open()) return out;
 
+    // Fast-path for known non-HID++ receivers (e.g. 046d:c542 Nano receiver).
+    // Avoid probing 8 candidates and 2 legacy registers with 500ms timeouts on
+    // hardware known not to implement HID++, which was stalling the thread
+    // and spamming the USB receiver with invalid packets.
+    if (is_known_non_hidpp_receiver(transport.product_id())) {
+        hidpp_device device;
+        device.hidraw_path = hidraw_path;
+        device.vendor_id = transport.vendor_id();
+        device.product_id = transport.product_id();
+        device.info.protocol_version = 0;
+        device.info.target = 0x00;
+        device.info.name = hidraw_export_name(hidraw_path);
+        device.connected = false;
+        out.push_back(std::move(device));
+        return out;
+    }
+
     // Receiver node candidates first (0xFF), then the direct 0x00 endpoint,
     // then every paired wireless device a single-interface receiver answers
     // for on indexes 1..6 (Solaar uses the same sweep).  Probing only
@@ -2475,6 +2530,18 @@ std::vector<hidpp_device> identify_logitech_devices(const std::string& hidraw_pa
 std::optional<hidpp_device> identify_logitech_device(const std::string& hidraw_path) {
     HidppTransport transport(hidraw_path);
     if (!transport.is_open()) return std::nullopt;
+
+    if (is_known_non_hidpp_receiver(transport.product_id())) {
+        hidpp_device device;
+        device.hidraw_path = hidraw_path;
+        device.vendor_id = transport.vendor_id();
+        device.product_id = transport.product_id();
+        device.info.protocol_version = 0;
+        device.info.target = 0x00;
+        device.info.name = hidraw_export_name(hidraw_path);
+        device.connected = false;
+        return device;
+    }
 
     // Fast single-endpoint probe used by the daemon (which re-checks nodes on
     // every add and must stay cheap).  Receivers normally use 0xFF, while

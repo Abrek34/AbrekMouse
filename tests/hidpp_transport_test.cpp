@@ -363,9 +363,9 @@ static void test_hidpp_onboard_sector_payload_budget() {
     // GERÇEKTEN tele çıkmalı ve parametre vektörü bütçenin tam sınırında
     // (16) olmalı.  Chunk kayarsa (14 → 16) bu test KIRMIZIYA döner.
     auto dev = make_device();
-    // fn 0x48 ("set_long_parameter" yazım biçimi) taşımada 4-bit seçiciye
-    // normalleşir (0x48 → 0x04) — sahte cihaz da NORMALİZE id ile eşleşir.
-    dev->canned[{4, hidpp_normalize_function_id(0x48)}] = {};  // write_sector → başarılı
+    // Feature 0x8100 OnboardProfiles: fn 0x70 (write_sector) taşımada 4-bit seçiciye
+    // normalleşir (0x70 → 0x07) — sahte cihaz da NORMALİZE id ile eşleşir.
+    dev->canned[{4, hidpp_normalize_function_id(0x70)}] = {};  // write_sector → başarılı
     auto* devp = dev.get();
     HidppTransport transport(std::move(dev));
 
@@ -373,8 +373,9 @@ static void test_hidpp_onboard_sector_payload_budget() {
     const bool written = transport.write_onboard_profile_sector(0x0003, payload);
     EXPECT(written);
 
-    // 16 bayt / 14 baytlık chunk → 2 sektör yazma isteği.
-    const uint8_t fn_write_sector = hidpp_normalize_function_id(0x48);
+    // 16 bayt / 14 baytlık chunk → 2 sektör yazma isteği (Feature 0x8100 Fn 7 = 0x70).
+    const uint8_t fn_write_sector = hidpp_normalize_function_id(0x70);
+    EXPECT(fn_write_sector == 0x07);
     const size_t writes = devp->requests_for(4, fn_write_sector);
     EXPECT(writes == 2);
     // Her istek parametre vektörünü tam bütçeyle göndermeli (2 + 14 = 16).

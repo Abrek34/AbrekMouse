@@ -251,7 +251,10 @@ static gboolean mouse_test_poll(gpointer user_data) {
         mouse_test_set_status(S, 2); // daemon not running
         return G_SOURCE_CONTINUE;
     }
-    std::string resp = daemon_ipc_query("status");
+    // R23-FIX: use 10 ms timeout (same as live_telem_poll) — the default
+    // 150 ms blocked the GTK main thread on every 250 ms tick, causing
+    // visible freezes whenever the mouse test window was open.
+    std::string resp = daemon_ipc_query("status", /*timeout_ms=*/10);
     if (resp.empty()) {
         // No complete response within the timeout — treat as daemon down.
         mouse_test_blank_values(S);

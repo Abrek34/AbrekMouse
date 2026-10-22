@@ -37,7 +37,8 @@ enum class hidpp_feature_index : uint16_t {
     device_friendly_name = 0x0007,
     keep_alive          = 0x0008,
     battery_status      = 0x1000,
-    wireless_status     = 0x0080,
+    wireless_signal_strength = 0x0080,
+    wireless_status     = wireless_signal_strength, // alias for backwards compatibility
     // Legacy names below are kept only for the feature-name table.  They are
     // not used as HID++ 2.0 aliases by the transport.
     device_activity     = 0x000A,
@@ -51,7 +52,8 @@ enum class hidpp_feature_index : uint16_t {
     extended_adjustable_dpi = 0x2202, // X/Y DPI + capability-gated LOD
     report_rate         = 0x8060,     // 1..8 ms report periods
     extended_adjustable_report_rate = 0x8061, // 8 ms..125 us
-    smart_shift         = 0x4C00,
+    smart_shift         = 0x2110,     // Solaar SMART_SHIFT
+    smart_shift_enhanced = 0x2111,    // Solaar SMART_SHIFT_ENHANCED
     onboard_profiles    = 0x8100,
     // HID++ 2.0 battery features used by modern Logitech devices.
     // Unified Battery is a separate feature from BATTERY_STATUS.  The
@@ -301,6 +303,7 @@ struct hidpp_device {
     // into the matching evdev mouse's detected_battery.  Worker-thread only.
     int      battery_level = -1;
     uint64_t last_battery_ms = 0; // CLOCK_MONOTONIC_RAW ms of last active query
+    uint64_t last_dpi_check_ms = 0; // CLOCK_MONOTONIC_RAW ms of last active DPI query
 
     std::optional<uint8_t> feature_index(uint16_t feature_id) const;
     std::optional<uint16_t> feature_id(uint8_t dynamic_index) const;
@@ -489,10 +492,14 @@ public:
     get_reprog_controls(uint8_t target_device_index = 0xFF);
 
     /// Write an onboard-profile flash sector.  `data` must be sector_bytes long.
-    /// 0x8100 fn=0x50 set_long_parameter benchmark, fn=0x48 write_sector.
+    /// 0x8100 fn=0x50 set_long_parameter benchmark, fn=0x70 write_sector.
     bool write_onboard_profile_sector(uint16_t sector,
                                       const std::vector<uint8_t>& data,
                                       uint8_t target_device_index = 0xFF);
+
+    /// Restore onboard profiles mode (Feature 0x8100 fn 0x10 param 0x01 = Onboard Mode ON)
+    /// if it was previously disabled by us via disable_onboard_profiles_for_write.
+    bool restore_onboard_profiles(uint8_t target_device_index = 0xFF);
 
     // Root feature: get feature set
     std::vector<std::pair<uint16_t, uint8_t>> get_feature_set(
@@ -530,6 +537,7 @@ private:
     uint16_t vendor_id_ = 0;
     uint16_t product_id_ = 0;
     std::atomic<uint8_t> device_index_{0xFF};
+    std::atomic<bool> onboard_profiles_disabled_by_us_{false};
     mutable std::mutex request_mutex_;
     mutable std::mutex feature_mutex_;
     std::unordered_map<uint32_t, uint8_t> feature_indices_;

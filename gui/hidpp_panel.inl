@@ -830,6 +830,10 @@ static gboolean hw_notification_tick(gpointer user_data) {
         GTK_DROP_DOWN(S->hw_dev_combo));
     if (idx < 0 || idx >= (int)S->hidpp_devs.size())
         return G_SOURCE_CONTINUE;
+    // Protocol 0 devices (e.g. 046d:c542 Nano receiver) implement no HID++:
+    // skip notification polling to avoid spamming the non-responsive receiver.
+    if (S->hidpp_devs[idx].info.protocol_version == 0)
+        return G_SOURCE_CONTINUE;
     S->hw_notify_busy = true;
     auto* task = new HwNotificationTask();
     task->S = S;
@@ -884,6 +888,16 @@ void hw_query_current(AppState* S) {
     if (!S->hw_dev_combo) return;
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
     if (idx < 0 || idx >= (int)S->hidpp_devs.size()) { S->hw_pending_query = -1; return; }
+    // Protocol 0 devices (e.g. 046d:c542 Nano receiver) implement no HID++:
+    // skip querying feature registers that will inevitably time out and block.
+    if (S->hidpp_devs[idx].info.protocol_version == 0) {
+        S->hw_pending_query = -1;
+        S->hw_busy = false;
+        hw_update_ui_state(S);
+        hw_render_caps(S, idx);
+        hw_set_status(S, tr("No Logitech HID++ devices found."));
+        return;
+    }
     // GUI-Y3: a busy scan/query/apply would previously drop this selection
     // silently, leaving stale onboard values on screen.  Stash it and let the
     // in-flight task's completion idle callback re-issue the query.

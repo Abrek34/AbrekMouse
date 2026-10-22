@@ -86,6 +86,13 @@ const char* logitech_receiver_kind_name(logitech_receiver_kind kind) {
     }
 }
 
+bool is_known_non_hidpp_receiver(unsigned int product_id) {
+    if (const receiver_spec* spec = receiver_for(product_id)) {
+        return !spec->hidpp;
+    }
+    return false;
+}
+
 std::vector<logitech_receiver_info>
 discover_logitech_receivers(const std::string& sysfs_root) {
     std::vector<logitech_receiver_info> result;

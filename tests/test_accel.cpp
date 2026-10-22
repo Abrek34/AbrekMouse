@@ -925,6 +925,7 @@ static void test_hidpp_short_payload_budget() {
     EXPECT(hidpp_normalize_function_id(0x48) == 0x04);
     EXPECT(hidpp_normalize_function_id(0x04) == 0x04);  // narrow form kept
     EXPECT(hidpp_normalize_function_id(0x50) == 0x05);
+    EXPECT(hidpp_normalize_function_id(0x70) == 0x07);
     EXPECT(bytes[3] == ((0x04 << 4) | 0x00));
     for (size_t i = 0; i < HIDPP_SHORT_PAYLOAD_MAX; ++i)
         EXPECT(bytes[4 + i] == static_cast<uint8_t>(0xA0 + i));

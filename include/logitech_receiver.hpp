@@ -30,6 +30,9 @@ struct logitech_receiver_info {
 
 const char* logitech_receiver_kind_name(logitech_receiver_kind kind);
 
+/// True if the product ID is known to NOT support HID++ (e.g. 0xc542 Nano receiver).
+bool is_known_non_hidpp_receiver(unsigned int product_id);
+
 /// Enumerate Logitech USB receivers from sysfs. `sysfs_root` is injectable so
 /// the parser can be tested without physical hardware.
 std::vector<logitech_receiver_info>

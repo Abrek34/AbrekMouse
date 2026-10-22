@@ -464,7 +464,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
     trtip(S->ud_ratio_spin,
         "Up/down output DPI ratio (1.0 = off). Values >1 amplify downward movement.");
     trtip(S->yx_ratio_spin,
-        "Y-axis output DPI ratio, relative to X (1.0 = off). Scales all Y motion.");
+        "Y-axis output DPI ratio, relative to X (1.0 = equal/symmetric). Set to 1.0 for equal horizontal and vertical movement across any resolution.");
 
     // ── Speed Limit ───────────────────────────────────────────────────────────
     append_section("<b>Speed Limit</b>");
@@ -697,7 +697,7 @@ void build_ui(AppState* S, GtkApplication* gapp) {
 
         // P-APP: per-application profile binding.  Empty = apply always;
         // non-empty = only while the focused app's WM_CLASS matches.  Works
-        // automatically on KDE Wayland (KWin focus relay) and X11; on other
+        // automatically on KDE Wayland (via KWin focus relay); on other
         // desktops the daemon uses the last value pushed via IPC.
         S->match_app_entry = gtk_entry_new();
         gtk_entry_set_placeholder_text(GTK_ENTRY(S->match_app_entry),

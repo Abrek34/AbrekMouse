@@ -23,7 +23,7 @@ function rawaccel_focus_report() {
     if (cls === rawaccel_last) return;
     rawaccel_last = cls;
     callDBus("org.rawaccel.Focus", "/Focus", "org.rawaccel.Focus",
-             "setActiveApp", cls);
+             "setActiveApp", cls, function() {});
 }
 workspace.windowActivated.connect(rawaccel_focus_report);
 rawaccel_focus_report();
@@ -53,7 +53,6 @@ static const char* FOCUS_NODE_XML =
 // so the GTK main thread never blocks on Alt-Tab.
 struct FocusJob {
     GDBusConnection*       conn = nullptr;
-    GDBusMethodInvocation* inv  = nullptr;  // g_object_ref'd by the poster
     std::string            sender;
     std::string            wm_class;
 };
@@ -116,12 +115,18 @@ static void focus_method_call(GDBusConnection* conn, const gchar*,
         // T48-05: hand the report (sender verification + IPC + last_app
         // update) to the focus worker — this is a GDBus main-context
         // callback, so doing the 2000 ms GetConnectionUnixProcessID and the
-        // 150 ms set_active_app here froze the UI on every Alt-Tab.  The
-        // D-Bus reply is sent by the worker (GDBus is thread-safe); we hold
-        // our own ref on the invocation until then.
+        // 150 ms set_active_app here froze the UI on every Alt-Tab.
+        // R23-FIX: reply to KWin IMMEDIATELY.  callDBus() in KWin's scripting
+        // engine is fully synchronous — it blocks the entire compositor event
+        // loop until a D-Bus method reply is received.  The old code deferred
+        // the reply to the focus worker (after GetConnectionUnixProcessID +
+        // daemon IPC, ~2+ seconds), freezing the entire desktop on every
+        // window switch while the GUI was open.  Now the reply goes out in
+        // < 0.1 ms; the worker still performs sender verification and daemon
+        // IPC asynchronously without holding KWin hostage.
+        g_dbus_method_invocation_return_value(inv, nullptr);
         FocusJob job;
         job.conn     = conn;
-        job.inv      = static_cast<GDBusMethodInvocation*>(g_object_ref(inv));
         job.sender   = sender ? sender : "";
         job.wm_class = wm_class ? wm_class : "";
         {
@@ -135,7 +140,9 @@ static void focus_method_call(GDBusConnection* conn, const gchar*,
                                                "Unknown method");
 }
 
-// T48-05: worker loop draining FocusJobs.  All blocking work lives here.
+// T48-05 / R23-FIX: worker loop draining FocusJobs.  All blocking work lives
+// here.  The D-Bus reply is sent immediately in focus_method_call() (R23-FIX)
+// so KWin's synchronous callDBus() never stalls the compositor.
 static void focus_worker_main(kwin_focus_ctx* ctx) {
     for (;;) {
         FocusJob job;
@@ -220,8 +227,8 @@ static void focus_worker_main(kwin_focus_ctx* ctx) {
                 }
             }
         }
-        g_dbus_method_invocation_return_value(job.inv, nullptr);
-        g_object_unref(job.inv);
+        // R23-FIX: reply was already sent in focus_method_call() — no inv to
+        // return or unref here.
     }
 }
 
@@ -336,6 +343,8 @@ static void on_name_lost(GDBusConnection*, const gchar*, gpointer user_data) {
 /// focus CHANGE (its script caches the last-reported class), so after a daemon
 /// down/up cycle app-scoped profiles would stay dormant until the user switches
 /// windows — re-send the last known WM_CLASS.
+/// R23-FIX: dispatch via the focus worker queue instead of calling
+/// daemon_ipc_set_active_app on the GTK main thread (150 ms blocking IPC).
 static void kwin_focus_resend_current(AppState* S) {
     auto* ctx = static_cast<kwin_focus_ctx*>(S->kwin_focus_ctx);
     if (!ctx || !ctx->installed) return;
@@ -345,7 +354,15 @@ static void kwin_focus_resend_current(AppState* S) {
         last = ctx->last_app;
     }
     if (last.empty()) return;
-    daemon_ipc_set_active_app(last);
+    FocusJob job;
+    job.conn     = ctx->session_conn;
+    job.sender   = "";   // resend — no sender verification needed
+    job.wm_class = last;
+    {
+        std::lock_guard<std::mutex> lk(ctx->focus_mu);
+        ctx->focus_jobs.push(std::move(job));
+    }
+    ctx->focus_cv.notify_one();
 }
 
 /// Install the KWin focus relay.  Best-effort: returns true if relay is active.

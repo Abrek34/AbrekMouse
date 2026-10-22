@@ -945,11 +945,14 @@ static std::string fmt_us(double v) {
 /// bound. Non-blocking: the IPC query itself carries a 150 ms socket timeout.
 void on_perf_clicked(GtkButton*, gpointer user_data) {
     auto* S = static_cast<AppState*>(user_data);
+    // R23-FIX: use 10 ms timeout — this runs on the main thread from a
+    // button click; the old 150 ms default could freeze the UI visibly.
     if (!daemon_running()) {
         set_status(S, tr("Daemon is not running."));
         return;
     }
-    std::string resp = daemon_ipc_query("status");
+    // R23-FIX: use 10 ms timeout — button-click path on main thread.
+    std::string resp = daemon_ipc_query("status", /*timeout_ms=*/10);
     double samples = daemon_device_field(resp, S, "lat_samples");
     if (samples <= 0) {
         gtk_label_set_text(GTK_LABEL(S->latency_lbl),

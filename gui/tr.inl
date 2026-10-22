@@ -244,8 +244,8 @@ static const char* tr(const char* key) {
              "Sol/sağ çıkış DPI oranı (1.0 = kapalı). >1 değerler sağa hareketi güçlendirir."},
             {"Up/down output DPI ratio (1.0 = off). Values >1 amplify downward movement.",
              "Yukarı/aşağı çıkış DPI oranı (1.0 = kapalı). >1 değerler aşağı hareketi güçlendirir."},
-            {"Y-axis output DPI ratio, relative to X (1.0 = off). Scales all Y motion.",
-             "Y ekseni çıkış DPI oranı, X'e göre (1.0 = kapalı). Tüm Y hareketini ölçekler."},
+            {"Y-axis output DPI ratio, relative to X (1.0 = equal/symmetric). Set to 1.0 for equal horizontal and vertical movement across any resolution.",
+             "Y ekseni çıkış DPI oranı, X'e göre (1.0 = eşit/simetrik). Tüm çözünürlüklerde yatay ve dikey eşit hareket için 1.0 yapın."},
             {"Master switch for mouse interception (default: on).\n"
              "When off, the daemon grabs no mouse and every profile is inert —\n"
              "the desktop owns the devices (OS-level raw passthrough).",
