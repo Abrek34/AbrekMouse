@@ -1,0 +1,981 @@
+# Changelog
+
+All notable changes to **rawaccel-linux** are documented here.
+
+The canonical version string lives in `include/rawaccel-base.hpp`
+(`RAWACCEL_VERSION`) and must stay in sync with `CMakeLists.txt` and
+`packaging/PKGBUILD` — bump all three together.
+
+## [Unreleased]
+
+### Fixed — GUI & KWin Wayland & Logitech HID++ (Round-23)
+
+- **KWin Wayland aktif pencere takılma/donma onarımı.** KWin betiğindeki `callDBus("org.rawaccel.Focus", ...)`
+  çağrısı callback almadığında KWin motoru tarafından senkron çalıştırılıp tüm compositor'ı donduruyordu.
+  `function() {}` asenkron callback parametresi eklendi ve GUI method handler'ı DBus cevabını anında (<0.1 ms)
+  dönecek şekilde düzenlendi.
+- **Logitech M185 (046d:c542) ve Nano Alıcı HID++ kilitlenme onarımı.** HID++ desteklemeyen alıcılara
+  500 ms timeout ile yapılan 8 adaylık sorgu döngüsü engellendi (`is_known_non_hidpp_receiver()` fast path).
+  Daemon'daki 2 saniyelik sonsuz yeniden tarama döngüsü `non_hidpp_paths_` ile hafızaya alındı; USB paket spam'i
+  ve alıcının USB'den düşmesi (`Device error (No such device)`) tamamen önlendi.
+- **GUI zamanlayıcı IPC timeout optimizasyonu.** `mouse_test_poll`, `daemon_running()` ve `update_daemon_status`
+  içindeki 150 ms'lik soket timeout'ları 10 ms'ye düşürüldü; GUI ana iş parçacığı kilitlenmelerden arındırıldı.
+
+### Added — GUI canlı telemetri
+
+- **Ana pencerede canlı çalışma noktası ve iz.** Grafik, daemon `status`
+  telemetrisini 10 Hz'de yoklayıp `(telem_in_ips, telem_gain)` ölçüm noktasını
+  yeşil, eğrinin aynı hızdaki model kazancını sarı halka olarak çizer. Son
+  ~12 saniyenin benzersiz örnekleri solan bir iz bırakır; tekrar eden
+  `telem_wall_ms` değerleri ve 2 saniyeden eski örnekler işaretlenmez. Grafiğin
+  altındaki satır giriş/çıkış hızını, kazancı ve p99 gecikmeyi gösterir.
+  `telem_in_ips` ham fiziksel büyüklüktür (rotasyon/ağırlık/yumuşatma öncesi),
+  bu yüzden okuma **Live (raw)** olarak etiketlenir; bu dönüşümler açıkken
+  nokta eğri koordinatından sapabilir.
+- **Mouse Lock Test genişletildi.** Ham dx/dy sayaçları, p50/p95/p99 gecikmesi
+  ve p99−p50 jitter'ı eklendi.
+- Salt okunur: hızlanma formülleri, referans yolu ve daemon hot-path'i
+  değişmedi. Ham 1:1 geçişte telemetri üretilmediği için canlı katman
+  çizilmez; daemon erişilemezse poll 2 Hz'e düşer ve GTK ana iş parçacığı
+  kilitlenmez.
+
+### Fixed — GUI
+
+- **Grafikte dikey "Kazanç" eksen başlığı.** `cairo_show_text()` x ekseni
+  başlığının bıraktığı current point'i kullandığı için başlık grafiğin
+  ortasında çiziliyordu; başlık artık sol kenar boşluğunda ve y ekseni
+  etiketleriyle çakışmıyor. Ayrıca ölçek dışına taşan canlı/model
+  işaretçileri kenardan 6 px içeride tutuluyor, böylece nokta kırpılmıyor.
+
+### Fixed — doğruluk
+
+- **Ayrık modda çift dönüşüm (rotation / snap / speed clamp).**
+  `modifier::modify()` bu üç dönüşümü uyguladıktan sonra
+  `modify_separate_simd()`'i çağırıyordu; o da aynı üçünü yeniden
+  uyguluyordu. Snap ve clamp idempotent olduğu için yalnızca rotation
+  gözle görülür biçimde bozuluyordu: 90° dönüş 180°'ye dönüşüyor,
+  `(40,0)` girişi whole modda `(0,40)` çıkarken separate modda `(-40,0)`
+  çıkıyordu. Dönüşümler artık `apply_pre_speed_transforms()` içinde tek
+  yerde ve tam bir kez uygulanıyor; separate mod, `modify()` içinde
+  dönüşümlerden ÖNCE dispatch ediliyor. Böylece iki boru hattı bir daha
+  ayrışamaz.
+- **`natural` GAIN modunda negatif kazanç / eksen tersliği.**
+  `decay_rate ∈ (0, 1e-4)` iken iç katsayı `accel = decay_rate/|limit-1|`
+  çok küçülüyor; GAIN dalındaki iki `O(1/accel)` terimin farkı yuvarlama
+  hatasıyla negatife düşebiliyordu (ölçülen en kötü **-46.68**, `limit=100`,
+  `decay_rate=1e-9`; 32000 DPI / 100 ms'de üretimde erişilebilir). Negatif
+  kazanç imleci ters yönde sürüklüyordu. Formül referansla bit-bit aynı
+  bırakıldı; alt sınır `NATURAL_DECAY_RATE_MIN = 1e-4` olarak
+  `sanitize_accel_args()` katmanına eklendi. `decay_rate = 0` muaf: mevcut
+  `accel < 1e-12` guard'ı düz kazanç 1.0 verir. CLI `set-param` domaini de
+  aynı sınıra hizalandı; `test_natural_decay_rate_floor()` ile 12 assertion
+  eklendi (34405 → 34417).
+- **`natural` GAIN modunda küçük etkin hızda sayısal spike (L02-15).**
+  `decay_rate` tabanı yalnız katsayıyı sınırlıyor; `domain_weights` 0'a kadar
+  inebildiği için etkin hız hâlâ çok küçülebiliyor. 32000 DPI / 100 ms /
+  1 count ve `domain_weight_x = 1e-5` → `x = 3.125e-9`; GAIN dalındaki iki
+  `O(limit/accel)` terimin farkı burada **5.77× pozitif spike** üretiyordu
+  (`limit=100`, `decay_rate=1e-4`): üretim çıktısı **0.18026**, beklenen
+  **0.03125**. Başka yasal kombinasyonlarda negatif dip de ölçüldü
+  (`limit=100`, `decay_rate=1e-3`, `domain_weight_x=3e-5` → **0.8013**).
+  `natural::operator()` referansla bit-bit aynı bırakıldı; üretim
+  dağıtımı `accel_union::apply()` `accel*x < NATURAL_GAIN_MIN_ACCEL_X
+  (1e-9)` olduğunda kimlik (1.0) döndürüyor. Bu bantta gerçek kazanç
+  1'den en fazla ~5e-8 sapıyor; kimlik, ham formülden daha doğru.
+  `test_natural_decay_rate_floor()` içine whole + separate kapsayan
+  4 assertion eklendi (34417 → 34421). Oracle değişmedi: 1408 satır /
+  79 sapma.
+- **Logitech HID++ 2.0 Onboard Profiles Feature 0x8100 sektör yazımı (Fn 7).**
+  `write_onboard_profile_sector` fonksiyonu hatalı olarak `0x48` (Fn 4)
+  kullanıyordu; Solaar ve Logitech HID++ 2.0 Feature 0x8100 standardına göre
+  sektör yazma fonksiyonu Function 7 (`0x70` / writeSectorBlock)'dir.
+  `0x70` standardına düzeltildi ve test mock'u güncellendi.
+- **Canlı donanım DPI takibi ve HERO sensör asimetrisi onarımı.**
+  Daemon arka planında `apply_hidpp_dpi()` ve periyodik DPI sorgusu eklendi.
+  Kullanıcı faredeki fiziksel DPI tuşuna bastığında hız hesabı (`dev.dpi_factor`)
+  dinamik olarak senkronize edilir. HERO sensörlü farelerde donanım seviyesinde
+  X/Y asimetrisi (`dpi_current != dpi_current_y`) tespit edildiğinde `set_dpi`
+  ile anında simetrik 1:1 eşitliğe zorlanır.
+- **Onboard profil modunu geri yükleme.**
+  `disable_onboard_profiles_for_write` ile kapatılan dahili profil modu, daemon
+  veya GUI kapandığında (`stop()` ve `~HidppTransport()`) `restore_onboard_profiles()`
+  ile otomatik olarak yeniden etkinleştirilir (Logitech G HUB standardı).
+- **hidraw dosya kilidi (`flock`).**
+  GUI ve daemon'ın aynı anda `/dev/hidraw` aygıtına erişip paket yanıtlarını
+  karıştırmasını önlemek için `send_feature_request` içine `flock(fd_, LOCK_EX)`
+  koruması eklendi.
+- **Udev kuralı güvenliği (klavye keylogger izolasyonu).**
+  `scripts/99-rawaccel.rules` içindeki Logitech kuralına `ENV{ID_INPUT_MOUSE}=="1"`
+  eklenerek Logitech klavyelerin yetkisiz masaüstü süreçlerine açılması engellendi.
+- **Systemd servis önceliği.**
+  `scripts/rawaccel.service` içine `Nice=-10` eklenerek yüksek sistem yükünde
+  fare gecikmesi ve mikrotitreşimleri (jitter) önlendi.
+
+### Fixed — performans / hesaplama
+
+- **EMA trendlerinin subnormal zehirlenmesi (kritik sıcak yol).**
+  `linear_ema_smoother` trend accumulator'ları her olayda
+  `trendDampening` ile çarpılıyor. Sabit hızda veya fare durduktan sonra
+  değerler `DBL_MIN`'in altına inip subnormal oluyor; x86 her sonraki
+  çarpma/toplama için microcode assist ödüyor. Ölçüm: yalnız input
+  smoothing aşaması 244 → 54 ns/olay, tam `power-dual+4ema` profili
+  285 → 99 ns/olay. `flush_subnormal()` her güncellemeden sonra
+  `|değer| < DBL_MIN` ise tam 0 yazıyor (2.2e-308'in altı zaten gerçek
+  hız olarak temsil edilemez). 100K sabit + 100K durmuş örnek sonrası
+  state'in subnormal kalmadığını doğrulayan regresyon assertion'ları
+  eklendi.
+- **`classic` exponent 2 için `std::pow` yerine çarpma.** Struct
+  varsayılanı olan ve yaygın kullanılan `exponent_classic = 2.0` için
+  her olayda ~10 ns'lik libm `pow` çağrısı vardı. `base*base` tüm
+  sonlu/±0/±Inf/NaN girdilerde aynı doğru yuvarlanmış sonucu verir;
+  diğer üsler (özellikle 3, ikinci bir yuvarlama adımı ekler) generic
+  `std::pow` yolunda kaldı. Ölçüm: `classic` 43.5 → 25.3 ns/olay,
+  `apply_motion_math(full)` 43.4 → 26.8 ns/olay.
+- **`magnitude()` sıcak yolunda `std::hypot` yerine ölçekli karekök.**
+  `M·sqrt(1+(m/M)²)` biçimi taşma/underflow güvenliğini korurken
+  `std::hypot`'un ~2.5 ns/çağrı maliyetini ~0.9 ns'ye indiriyor.
+  Sonlu-olmayan/NaN girdiler hâlâ `std::hypot`'a delege edilir; normal
+  sonuçlar arasındaki fark en fazla 2 ULP (boru hattı toleransı 1e-9).
+  `simd::magnitude` artık ayrı bir kopya değil, aynı implementasyonu
+  çağırıyor.
+
+### Fixed — derleme
+
+- **`CXX=clang++` ve `RAWACCEL_LTO=1` derlemeleri kırıktı.**
+  `PERF_FLAGS` içindeki `-fvect-cost-model=very-cheap` yalnız GCC'de var;
+  Clang, belgelenen özel-derleyici yolunu daha ilk dosyada
+  `unknown argument` ile durduruyordu. LTO seti ise iki derleyicide de
+  çalışmıyordu: `-fwhole-program-vtables` Clang'e, `-fdevirtualize-at-ltrans`
+  GCC'ye ait. `scripts/build.sh` artık `__clang__` ile derleyici ailesini
+  tespit edip iki bayrak setini ayrı tutuyor; `-fprofile-correction` da
+  yalnız GCC'ye ekleniyor. Clang derlemesinde kalan tek proje uyarısı
+  (`daemon/main.cpp` içindeki kullanılmayan `verbose` lambda yakalaması)
+  kaldırıldı. Davranış değişmedi; GCC ve Clang normal + LTO derlemeleri
+  rc=0.
+
+### Fixed — kurulum / servis
+
+- **`rawaccel.service` 226/NAMESPACE ile başlamıyordu.** `ProtectSystem=strict`
+  altında `ReadWritePaths` içinde tek tek `/run/rawaccel.pid` ve
+  `/run/rawaccel.sock` dosyaları listeleniyordu. systemd bu yolları mount
+  namespace kurulumunda, daemon onları oluşturmadan önce çözmeye çalışıyor;
+  temiz kurulumda PID dosyası olmadığı için servis
+  `Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory`
+  ve `status=226/NAMESPACE` ile düşüyordu. `ReadWritePaths=/etc/rawaccel /run`
+  yapıldı; diğer dosya sistemi yolları read-only kalıyor. Kurulum ayrıca
+  önceki restart limitini `systemctl reset-failed` ile temizliyor.
+- **KDE fix adımı tek denemede başarısız olabiliyordu.** Gerçek kurulumda
+  `kde-fix-accel.sh hata verdi` raporlandı; aynı script kullanıcı olarak elle
+  çalıştırıldığında başarılı oldu. Adım artık root oturumunda `runuser` ile
+  çalıştırılıyor (TTY/PAM gerektiren `sudo -u` yalnızca `runuser` yoksa
+  fallback), ve ilk deneme başarısız olursa bir kez yeniden deneniyor.
+  Kök neden bu ortamda yeniden üretilemedi; gerçek KDE oturumunda tekrar
+  doğrulanmalı.
+
+### Added — kurulum
+
+- **GTK4 kolay kurulum sihirbazı (`install-gui.sh`).** Kaynak ağacından
+  `bash install-gui.sh` ile açılan sihirbaz; kurulu sürümü, daemon/servis
+  durumunu ve kaynak klasörünü gösterir. **Hemen Kur / Yeniden Kur / Kaldır**
+  işlemleri kurulum mantığını kopyalamak yerine kanonik `setup.sh`'yi `pkexec`
+  ile çalıştırır; ilerleme ve tüm çıktı pencere içindeki günlüğe akar.
+  Bağımlılıklar zaten kuruluysa `--no-deps` seçeneği kullanılabilir.
+  `rawaccel-installer --detect` ve `--print-command` GUI'siz doğrulama sağlar.
+  Sihirbaz `scripts/build.sh` ve CMake ile derlenir; sistem binary'si olarak
+  kurulmaz (kurulum sonrası bootstrap aracı değildir).
+- **Kurulum sihirbazında paket kilidi onarımı.** Sihirbaz başlamadan önce
+  `/var/lib/pacman/db.lck` ve çalışan pacman/paru/yay süreçlerini denetler.
+  Bayat kilit varsa **Bağımlılıkları atla ve devam et** (önerilen) veya
+  **Kilidi temizle ve devam et** (yalnızca kilit dosyası silinir)
+  seçeneklerini sunar; paket yöneticisi çalışıyorsa kilide dokunmaz.
+  Kurulum sırasında kilit hatası
+  oluşursa aynı seçenekler hata penceresinde gösterilir. Günlük artık
+  **Günlüğü Kopyala** düğmesiyle panoya alınabilir.
+
+### Added — test
+
+- **HID++ protokol katmanı için donanımsız test seam'i (AJ-H).**
+  `include/logitech_hidpp.hpp` içine byte seviyesinde `hidpp_io_backend`
+  arayüzü ve enjekte edilebilir `HidppTransport` constructor'ı eklendi;
+  `src/logitech_hidpp.cpp` write/read yolları backend varsa oraya gidiyor,
+  `is_open()` backend-farkında. Üretim hidraw yolu ve çağrıları değişmedi.
+  Yeni `tests/hidpp_transport_test.cpp` (31 assertion / 8 bölüm) özellik
+  keşfi, istek-yanıt eşleştirme, bildirim zulası (BUG-22), hata çerçevesi,
+  ölü uç nokta fast-fail ve O31-H1 sektör bütçesini sahte cihazla
+  doğruluyor. `test_accel.cpp`'ye bu değişiklikte dokunulmadı (assertion
+  sayısı o sırada 34405'ti; doğal `decay_rate` tabanı sonrası 34417'ye
+  çıkmıştı, L02-15 domain-weight kapısı sonrası güncel sayı 34421).
+- **CLI liveness kapısı + sahte IPC sunucusu (AJ-H).**
+  `tests/fake_ipc_server.cpp` canlı soket + PID dosyası yok senaryosunu
+  deterministik üretiyor; `tests/run_tests.sh` içindeki kapı `status` ve
+  `status --json` için `running` / rc=0 / `daemon_pid_verified` davranışını
+  doğruluyor.
+- **X/Y izotropi + DPI bağımsızlığı regresyonu.** 7 hızlanma modu ×
+  whole/separate × 400/800/1600/3200 DPI için eşit fiziksel X ve Y
+  hareketinin aynı çıktıyı ürettiği; aynı fiziksel mesafenin farklı
+  DPI'larda aynı çıktıyı verdiği; separate modda rotation'ın tam bir kez
+  uygulandığı ve tüm yerleşik presetlerin X/Y'yi aynı yapılandırdığı
+  doğrulanıyor.
+
+## [1.2.7] — 2026-10-07
+
+Audit-round fix pack: 15 open bug-tracker items closed in one batch.
+Highlights:
+
+### Fixed — veri kaybı / doğruluk
+
+- **T45-IMP02 (import'ta çift-migrasyon).** Wrapper `version` artık
+  mevcut config'i ezmiyor; import edilen batch ayrı bir context'te tam
+  bir kez `migrate_config()`'den geçiyor → pre-0.4 `lookup+gain` profilleri
+  doğru normalize, mevcut profiller dokunulmuyor.
+- **T51-06 + T46-01 (kwinrc'de yabancı anahtar silme).** `kde-fix-accel.sh`
+  python yolları (`--fix`/`--remove`) ve GUI `kde_upsert_section` artık
+  bölüm gövdesindeki kullanıcı anahtarlarını ve yorumları koruyor.
+- **T43-05 (>256 profil sessiz silinme).** Güvenilir dosya yolunda
+  `MAX_PROFILES` aşımı yüklemede hata veriyor; IPC yolunda düşen profil
+  sayısı stderr'e yazılıyor.
+- **T38-HOT02 (SYN_DROPPED park ezilmesi).** Batch-sonu defer artık
+  parked frame'i ezmiyor → buton kaybı yok.
+
+### Fixed — daemon / CLI
+
+- **C29-N1** app-bound profiller catch-all olamaz; **T35-DMN01** replug
+  sırasında cihaz tek scan'de kaybolmaz; **D26-N1** ikinci instance'ın
+  teardown'u ilk daemon'un socket'ini silmez (kodda zaten kapalıydı,
+  rapor işlendi); **T40-PID01** parse-edilemez PID dosyası boot'u
+  kilitlemez; **MATH-2/T44-01** `scale=0` ölü imleç/gizli boost kapandı.
+- **T47-B1** ölü-ama-dinleyen XDG soketi sebebiyle IPC failover kırık;
+  **CFG-2** `validate` uyarıları artık ham değerlerle tetiklenir;
+  **T37-HID01** `write_packet`'e 500 ms deadline; **T53-01**
+  `run_tests.sh` temiz checkout'ta `build-manual/` oluşturur;
+  **T48-05** focus yolunda ana-thread bloklayıcı I/O worker thread'e
+  taşındı.
+
+All gates green: build 0 warnings, 34267/34267 unit tests, oracle
+byte-identical to reference, SIMD parity pass, CLI under ASan/UBSan clean,
+tracker bridge clean.
+
+## [1.2.6] — 2026-10-03
+
+M101 denetim turunun (20 lane, `.aihaberlesme/mesajlar/denetim-L*.md`)
+"yedi kapı yeşil ama ölçtüklerinin yarısını ölçmüyor" bulgularına karşı
+düzeltme turu. Kullanıcı verisi kaybına yol açan üç sınıf kapatıldı:
+GUI'nin LUT'u silmesi, config yazımının sessiz tersine dönmesi, ve
+test/gate altyapısının kendi kendini denetlememesi.
+
+### Fixed — kullanıcı verisi kaybı
+
+- **GUI grafiği kullanıcının LUT eğrisini siliyordu (L03-01, CRIT).**
+  `accel_args::data[]` `mutable` idi ve `synchronous::fill_lut()` iç LUT
+  integralini doğrudan oraya yazıyordu; `gui/graph.inl`'in `compute_curve`
+  fonksiyonu profil `accel_args`'ının referansını geçtiği için yalnızca bir
+  grafik çizimi kullanıcının kayıtlı eğrisini eziyor ve sonraki kayıt bunu
+  diske yazıyordu (ölçülen sapma: lookup gain 3.33 → 5.01, 500 ips'te 15×).
+  `mutable` kaldırıldı; synchronous kendi `lut[]` üyesini kullanıyor.
+- **`use_raw_input`/`disable` sayısal 0/1 değerlerinin TERSİNİ yüklüyordu
+  (L05-01, CRIT).** `{"use_raw_input": 0}` → `true`, `{"disable": 1}` →
+  `false`; sessiz, kalıcı ve kullanıcının istediğinin tam tersi. `gain`/
+  `raw_passthrough` ile aynı O31-C3 toleransı uygulandı.
+- **`lut_data` tek başına (lut_length'siz) sessizce yok ediliyordu (L05-03).**
+  `lut_length` yoksa eleman sayısından türetiliyor; tek load→save turu
+  eğriyi kalıcı siliyordu.
+- **Kısmi `cap` dizisi sessizce atılıyordu (L05-02).** `{"cap":[500]}` artık
+  x=500'ü korur; `cap.y` struct default'u doküman/oracle/config ile
+  hizalandı (`{15, 1.5}`, eskiden `{15, 0}` = "cap yok" sentineli, 100k
+  ips'te 501× gain).
+- **`diff` iki farklı tam-config export'unu "no differences" diyordu
+  (L13-05);** wrapper artık reddediliyor. `domain_weights`/`range_weights`
+  %.10g string yerine gerçek double ε ile karşılaştırılıyor (L13-06).
+
+### Fixed — sessiz "başarılı" yalanları
+
+- **`push_config` bir geri alma (revert) push'unu sessizce düşürüyordu
+  (L08-01, CRIT).** Bekleyen farklı bir push varken uygulanmış config'e
+  dönüş "zaten o" diye atlanıyor, ardından bekleyen push uygulanıyordu.
+  No-op guard'lar artık `has_pending` durumunda atlanıyor.
+- **`stop` / `reload` / `status` doğrulanmamış başarı bildiriyordu
+  (L13-01/02/03).** `stop` ~2 s boyunca çıkışı yoklar; `reload` IPC-onaylı
+  ve yalnız-sinyal yollarını ayırır; `status --json` donmuş daemon'u
+  `"unreachable"` + rc=3 olarak raporlar ve her zaman `devices:[]` içerir;
+  `timestamp_ms` eklendi (L13-04).
+- **CLI liveness artık IPC-first (AJ-H).** `status`, `status --json`,
+  `monitor`, `latency` ve `reload` canlılığı yalnız PID dosyasından
+  türetmiyor: önce daemon'ın IPC `status` cevabına bakılıyor. Canlı soket
+  varken PID dosyası yoksa/bayatsa CLI artık yanlışlıkla `"stopped"` (rc=2)
+  demiyor; `"running"` + rc=0 ve `status --json` içinde
+  `daemon_pid_verified:false` dönüyor (kimlik PID ile doğrulanamadı, ama
+  daemon IPC'de ayakta). `"stopped"` yalnız ne canlı PID ne de soket
+  dosyası varken; ölü soket/PID izi varsa `"unreachable"` rc=3.
+  IPC `connect()` artık `O_NONBLOCK` + `poll(2000 ms)` ile sınırlı; dolu
+  kabul kuyruğu veya donmuş daemon CLI'yi süresiz asmıyor.
+- **GUI donmuş daemon'u "running" gösteriyordu (L15-C2).** Artık
+  "unreachable" rozeti; Apply/Reload duyarsız (5 s ana-iş-parçacığı
+  blokajı yerine).
+- **KWin uyarı barı ölü koddu (L15-C1, CRIT).** `line[10] == ']'` koşulu
+  hiçbir gerçek kwinrc satırında doğru olamıyordu (10 baytlık başlık +
+  NUL); çift-hızlandırma uyarısı asla görünmüyordu.
+- **HID++ paneli desteklenmeyen LOD'u "uygulandı" diye gösteriyordu
+  (L17-5).** Artık "(unsupported)".
+- **Fare testi penceresi ölçülen cihazın kimliğini göstermiyordu (L17-3).**
+  "Tüm cihazlar" profilinde telemetri ilk cihazdan okunabildiği için
+  yanlış fare olabilirdi; "Device:" satırı eklendi.
+- **Grafik raw passthrough modunda da ivme eğrisi çiziyordu (L17-2).**
+  Artık 1:1 düz çizgi + mod notu.
+
+### Fixed — motor doğruluğu
+
+- **Sel (natural) NaN/Inf girdide korumasızdı (L02-10); jump LEGACY
+  (L02-12); power LEGACY (L01-B05)** — finiteness guard'ları eklendi.
+- **Lookup tek noktalı LUT + GAIN ölü imleç üretiyordu (L02-01).** `x0<=0`
+  durumunda `0.0` yerine kimlik dönüyor.
+- **Classic GAIN `1 < exponent_classic < 1.015625` bandında monotoniklik
+  kırığı (L01-B01/B02).** Pozitif `constant` kuyruğu sıfıra çökertiliyor;
+  oracle bu bandı hiç görmüyordu.
+- **Smoother NaN girdiyle KALICI zehirleniyordu (L09-05).** Tek bir bozuk
+  kare tüm EMA durumunu NaN yapıyor, profil değişimi bile kurtarmıyordu
+  (yalnız fiş çekmek). `isfinite(speed)` guard'ı eklendi.
+- **`real_polling_rate` <100 Hz'de sessizce eski kalıyordu (L09-02);**
+  ölçüm bandı 5 Hz'e genişletildi.
+
+### Fixed — kapı altyapısı (sessiz yeşil)
+
+- **Test kayıt defteri denetimi (L20-CRIT-1):** 151 `RUN_TEST()` çağrısı
+  sayılıyor; bir tanesi silinirse `META-FAIL` + rc=1. Eskiden 151 testin
+  tamamı silinse `0/0 geçti` + rc=0 idi.
+- **`bench_hotpath.cpp` sabit mutlak baseline yolu (L20-CRIT-2)** — CI'da
+  perf kapısı kırıktı; `BENCH_BASELINE` env + exe-göreli arama.
+- **`tr_coverage` sayı tabanı (L18 B-17/B-19):** 287→17 düşse bile PASS
+  veriyordu ve eksik dosya sessizce atlanıyordu; taban 250 + dosya var-yok
+  denetimi.
+- **SIMD parity kapısı kör noktaları (L04-01/02/03):** smoother dalları,
+  `yx_output_dpi_ratio` ve `v2d_max` artık değer-pinli assert'lerle
+  sınanıyor (mutasyon testiyle doğrulandı: lane swap, DPI ratio ve
+  max→min mutasyonlarının hepsi artık kırmızı).
+- **`lat_stats::percentile()` taşma örneklerinde `max_us` dönüyordu
+  (L10-08);** p50 > avg absurdity'si interpole ediliyor.
+- **`json_str` 0x80 üstü ham bayt geçiriyordu (L10-06);** geçersiz UTF-8
+  artık `\u00XX` kaçışlanıyor (tek tuhaf cihaz adı tüm `status` çıktısını
+  boşaltıyordu).
+- **`chmod` dönüş değeri atılıyordu (L10-02);** loglanıyor.
+
+### Kapılar
+
+Yedi kapı bu düzeltmelerle yeşil: build 0 uyarı · 34267/34267 assertion ·
+oracle 1408 satır / 79 sapma · SIMD parity (yeni kapsamla) · tr coverage ·
+CLI ASan/UBSan 34/34 · tracker bridge. Ayrıca iki bağımsız mutasyon
+doğrulaması: test çağrısı silme → META-FAIL; SIMD lane swap / DPI ratio /
+max-min → kırmızı.
+
+⚠️ Unchanged honesty: CI hâlâ hiç çalışmadı (hesap kilitli, adım=0);
+kurulum/root/donanım yolu bu ortamda koşulamadı.
+
+## [1.2.5] — 2026-10-01
+
+Sürüm notundaki abartı düzeltildi: 1.2.4 "kurulu bir sistemde doğrulandı,
+bilinen bir kusur yok" diyordu. İkisi de doğrulanamıyordu (aşağıda). Bu
+sürüm yedi kapının yeşil olduğunu **yalnızca doğru ifade eder**, ve kullanıma
+hazırlık iddiasını taşımaz.
+
+### Fixed: the GUI stale-config guard was dead code on Linux (STALE-1)
+
+`gui/main.cpp` loads the config once at startup and `save_config_now()` writes
+`S->config` back in full, so any edit made since — by `rawaccel-cli`, a second
+GUI, or the daemon persisting an IPC `set_config` to `/etc` — was silently
+discarded with nothing in any log. The fix records the file mtime at load and
+refuses the save when the file moved underneath.
+
+**The first version of that guard did nothing.** It used `-1` as the
+"unreadable" sentinel and tested `stamp >= 0` to mean "the read succeeded".
+`fs::file_time_type` is not signed-positive, and on libstdc++/Linux it is not:
+measured `fs::last_write_time()` on a live file returns
+`-4646858292110006316`, i.e. **every real mtime is negative**. So
+`config_mtime_loaded >= 0` never held, the guard was never entered, and the
+silent clobber it was written to prevent still happened. Found by
+`olcum/aj1/stale1_proof.cpp`, which printed two *different* stamps and then
+still reported "mtime aynı". Validity is now decided by comparing against a
+sentinel no real mtime can equal (`CONFIG_STAMP_UNREADABLE`), never by a sign
+test. Proof: without the guard the CLI's `mode=power` is overwritten back to
+`mode=classic`; with it, the save is refused and `mode=power` survives.
+
+The guard is **detect-and-warn, not auto-reload**: reloading would discard the
+user's own unsaved widget edits, which is a strictly worse data-loss path.
+`config_mtime_saved` was removed — it had no reader.
+
+### Fixed: `run_tests_asan.sh` was conditionally green
+
+Two sources, both measured: the binary lived at a **shared** path
+(`build-manual/test_accel_asan`), so a second copy overwrote a running one
+(`ETXTBSY` → rc 126), and `TMPDIR` was never exported, so both copies used the
+same fixed `/tmp/test_p99_c_dir` and one copy's `remove_all` threw under the
+other (`SIGABRT` → rc 134). Each run now gets its own `TMPDIR` and its own
+binary. The cleanup gained a delete-before-verify guard, because during
+mutation testing the trap was reached with an empty variable and expanded to
+`rm -rf /tmp` — the proof harness destroyed its own evidence, and the failure
+was initially misattributed to a server restart. That guard exists in both
+`run_tests.sh` and `run_tests_asan.sh`.
+
+### Fixed: a skipped perf gate in CI looked identical to a passing one
+
+All four SKIP paths in `.github/workflows/ci.yml` were `echo` + `exit 0`.
+`exit 0` is the right decision — an unusable host is not a regression, and
+failing the pipeline for it would teach everyone to ignore the job — but on
+its own it renders as a **green tick**: the appearance of "verified" for a gate
+that measured nothing. That is the class this repo forbids elsewhere
+(`run_cli_sanitized.sh:20` and `run_simd_parity.sh` both "skip loudly, never
+quietly"). Every SKIP path now also emits a `::warning::` annotation, which
+GitHub shows as a yellow warning on the job summary, while a genuinely measured
+pass stays a plain green tick — so "green = actually measured" is readable from
+the UI.
+
+Proven, not asserted: `olcum/aj1/perf_gate_gorunurluk.sh` extracts the **real**
+`run: |` block from `ci.yml` (it is not hand-copied) and drives all four paths
+with stub bench scripts. On the fixed tree all four match expectation. Mutated
+back to the pre-fix file, the 77 and 126 paths come out `annotation=(none)` —
+**silently green** — and the tool exits 1. Raw numbers:
+`olcum/aj1/perf_gate_kanit.txt`.
+
+### Fixed: perf gate measured against a load average that never applied
+
+`scripts/bench_hotpath.sh` guarded on `loadavg`, which on this host sat at
+144–158 permanently, so the guard never fired. It now runs a real control
+config (`noaccel`, named in `tests/perf_baseline.json`) and compares it to
+`_meta.threshold_percent`, exiting 77 when the host is too busy to measure.
+A positive control is what exposed the original number: with the control
+active, `noaccel` measures **−0.40 %**; without it the harness reported a
+**+84 %** false regression on that same config.
+
+The two `_meta` fields that record the control (`control_config`,
+`control_max_percent`) were **written but never read** — dead data. They are now
+consumed, validated, and rejected if unknown, and `control_max_percent` is
+required to be *below* `threshold_percent` (a control that fires only after the
+gate it guards is not a control). Verified by three mutations: an unknown
+control config and an over-threshold value both fail; a control too small to
+trip fails with exit 77, which proves the baseline is really being read.
+
+### Fixed: `use_raw_input` was documented backwards nowhere, i.e. not at all
+
+The name is inverted with respect to behaviour: `true` lets the daemon
+intercept and accelerate the device, `false` makes it skip the device entirely
+via `ioctl(EVIOCGRAB, 0)`. Nothing said so. Now documented in
+`rawaccel-cli --help` and in the README's Global switches table. Distinct from
+the per-profile `raw` / `raw_passthrough` (default `false`), which bypass only
+one profile.
+
+### Measured: the acceleration curve is provably monotonic (not a defect)
+
+Live telemetry on the physical G502 after the user moved the mouse reported
+gain 1.265–1.581 against a `limit` of 1.8, but the sampled points were **not
+monotonic**, which looked like a bug. It is not:
+
+- The isolated `classic::operator()` curve over 0.001–40 ips at 40 000 points:
+  39 999 increasing steps, **0** decreasing steps. The curve is smooth.
+- All `speed_processor` half-lives in the live profile are `0.0`, so the EMA
+  and trend blocks are inert — the smoothing hypothesis is excluded by
+  configuration, not by argument.
+- The reported `telem_gain` is `Σout/Σin` over a telemetry window, while the
+  curve is applied per event at instantaneous speed. Real mouse input is
+  bursty, so the windowed ratio is an x-weighted average of per-event gains and
+  is not required to be monotonic. `olcum/aj1/dalgalanma_kaynak.cpp` reproduces
+  the observed 1.27–1.58 band from lognormal event speeds (μ 12–45 ips,
+  CV 0.8–2.5) with no defect assumed.
+
+A side result worth keeping: across that whole sweep the p98 gain never
+exceeded the configured `limit` (max 1.7966), so the cap holds under input
+variance far beyond normal use.
+
+### Reverted: denormal deadband (PERF6) — no gain, measured cost
+
+`kill_denormal()` on the trend accumulators measured **+4.08 ns/event
+(+1.37 %)** over 5+5 interleaved runs: a regression, not a speedup. The
+deadband only flushed the *stored* trend value; the subnormals that matter are
+produced in the intermediate `x *= trendDampening` accumulation, so the
+intervention missed them while adding four `fabs`+compare per call. Reverted.
+
+The subnormals are real and worth recording where they come from, because the
+first explanation was wrong. `0.75^N` does **not** underflow to zero — measured:
+still `4.0e-203` at N = 1620, and not zero at N = 5000. A microscopic count
+per candidate path (`olcum/aj1/subnormal_nerede.cpp`, 200 000 iterations) puts
+them in the accumulation (`76 850` subnormal results) and the `windowTotal`
+sum (`5 650`), first reached after **2 462** calls — about 2.46 s of no mouse
+movement — and **not** in the `1 - exp2(log2(0.75)·t)` coefficient, which never
+goes subnormal because it tends to 1.0. Turning on FTZ/DAZ drops the hot-path
+cost from ~151 ns to ~15 ns per call (−90 %, 3 runs each), so a global FTZ/DAZ
+remains the real lever; its measured numerical effect is 0.0032 % of 100 ips and
+only after that 2.46 s of stillness.
+
+### Still not verified — do not read the green gates as "ready to ship"
+
+- **No CI run has ever executed a single step.** Not one workflow run in this
+  repository's history has run anything. Measured across all 8 runs
+  (2026-09-29 → 2026-10-01), **every job reports `steps=0`** and every run dies
+  in 3–6 s; `actions/jobs/*/logs` returns HTTP 404 `BlobNotFound` for a job that
+  had produced any output at all. Earlier runs carried the explicit message
+  "The job was not started because your account is locked due to a billing
+  issue." A 3-second run cannot be a build plus 34 164 assertions plus the
+  oracle plus ASan plus fuzz; a compile error or a red gate would still have
+  produced compiler or test output in the log, and there is no log. So this is
+  an **account** blocker, not a code one — and it is not fixable from here.
+  Raw data: `olcum/aj1/ci_durum_kanit.txt`.
+  **"Seven gates green" is a local, measured result; no commit has been verified
+  on GitHub. The two do not substitute for each other.**
+- **The installed binaries are stale.** `/usr/bin/rawaccel-gui` predates the
+  stale-config fix (verified by string search: the new warning text is absent
+  from the installed binary and present in the fresh build). Reinstalling
+  requires root, which this environment does not have.
+- **The seven gates are not a sanitized run of `test_accel.cpp`.** Per
+  `AGENTS.md`, that translation unit is sanitized only by the separate
+  `run_tests_asan.sh`, which is not one of the seven. The `sanitizers` CI job
+  is a different workflow that has never executed.
+- **Clean install is unexercised**: `setup.sh` needs root.
+
+## [1.2.4] — 2026-09-30
+
+Kullanıma hazır sürüm: yedi kapının tamamı yeşil, kurulu sistemde de.
+
+### Fixed: gate 2 turned red whenever the product was installed
+
+`tests/run_tests.sh` gave each run its own `XDG_RUNTIME_DIR`, but that only
+changes the PID file the daemon *writes* — `daemon/main.cpp:458-459` checks
+liveness against the **union** of three candidates
+(`$XDG_RUNTIME_DIR` || `/run` || `/tmp`), deliberately, so a daemon started
+without `XDG_RUNTIME_DIR` is still caught. With a root-owned live
+`/run/rawaccel.pid`, the test's own daemon refused to start with
+"Another instance may already be running" and the gate failed for the wrong
+reason. The fix isolates the test environment (`unshare -Urm` with an empty
+tmpfs over `/run`, falling back to `bwrap`; if neither is available the gate
+FAILS loudly rather than skipping silently). Scope is `/run` only — masking
+`/tmp` breaks the legitimate-config-path case.
+
+### Fixed: gate 6 depended on whether the product was installed
+
+`tests/run_cli_sanitized.sh` tested "config directory does not exist" against
+the hardcoded system path `/etc/rawaccel/settings.json`. Once installed, that
+directory exists, so the case's precondition was unsatisfiable and the gate
+read red on a correct build — and green on an uninstalled one. Now uses a
+deliberately absent directory under the test's own `$WORK`.
+
+### Reverted: exp2 coefficient cache (PERF1)
+
+Measured, not assumed. 5+5 interleaved runs: `power-dual+4ema` −1.04 %,
+`classic` **+0.59 % regression**; an independent 3-run measurement gave
+−1.05 ns (−0.35 %), i.e. inside noise. Cause: `linear_ema_smoother` carries
+5 cache fields × 2 axes = 20 live doubles → x86 register spill. The oracle is
+bit-identical after the revert (1408 rows / 79 documented deviations).
+
+### Measured: denormal stall in the trend accumulator
+
+`windowTrendTotal` / `cutoffTrendTotal` decay geometrically (`× 0.75`) and
+never reach exactly zero, sticking at the smallest subnormal. Same binary,
+only the CPU's FTZ/DAZ bits toggled: **145.11 → 13.23 ns/call (−91 %)**.
+Measurement tools live in `olcum/aj4/` and `olcum/aj5/` and do not touch
+production code.
+
+### Gates
+
+All seven green with the daemon installed and running:
+build (0 warnings) · 34164/34164 · oracle 1408 rows / 79 deviations ·
+SIMD parity · tr coverage · CLI ASan/UBSan 31/31 · tracker bridge.
+
+## [1.2.3] — 2026-09-13
+
+### Fixed: asymmetric hardware DPI (X ≠ Y) after profile apply
+
+**Bug (DPIFIX-1):** `set_dpi()` wrote the requested DPI to the **X** axis and
+PRESERVED whatever Y was currently set to whenever the device supports a
+separate Y DPI (`supports_y`). Every profile apply — daemon start and the GUI
+hardware panel — passes a single DPI value, so on dual-axis devices a stale
+Y left the cursor anisotropic. On the PRO X 2 this produced **X=400 /
+Y=1600**: vertically moving the physical mouse the same distance moved the
+cursor four times farther than horizontally, in every mode including Raw
+Passthrough ("Ham Geçiş") because the hardware already reported different
+counts per centimetre per axis.
+
+- `src/logitech_hidpp.cpp` — `set_dpi()` now writes the same DPI to both axes
+  (symmetric single-value set, matching Solaar's `dpi_extended` semantics).
+  There is no X-only caller in the app; the previous "keep Y" behaviour had no
+  UI purpose and only generated the asymmetry.
+
+**Reported:** Abrek34 — "mouse ham geçiş tıklı ama sağa/sola ile aşağı/yukarı
+hareketler eşit değil". Diagnosed live on the PRO X 2 (`GetDpi` read)
+before/after the fix; hardware verified back to symmetric X=Y=400.
+
+## [1.2.2] — 2026-09-13
+
+### Fixed
+- **LOD off-by-one (PRO X 2 / Hidpp 0x2202).** HID++ 0x2202 ve 0x8100 profil
+  DPI satırı, kalkış mesafesini **1=Low, 2=Medium, 3=High** olarak kodluyor
+  (OpenLogi `Lod` ve donanımda doğrulanmış G HUB/Onboard Memory Manager
+  dökümleri: "Medium→Low" `02→01`, "Low→High" `01→03`). Değer **0 bir seviye
+  değil** — "destek yok / satır boş" sentinel'idir ve firmware yazımı
+  reddeder. Eski Solaar-mirası `{0=Low,1=Medium,2=High}` eşlemesi:
+  - `hidpp-set-lod low` byte `0` gönderiyordu → cihaz "not supported"
+    döndürüyordu, düşük LOD asla ayarlanamıyordu;
+  - okuma da bir basamak kayık gösteriyordu (gerçek "High"(3) hiç
+    gösterilemiyor, orta değerde yanlış etiket basılıyordu).
+  - `hidpp_lift_off_distance` enum'ı `{low=1, medium=2, high=3}`'e çekildi;
+    `set_dpi` LOD baytını 1..3'e clamp'liyor, `get/set_lift_off_distance`
+    yalnız 1..3'ü geçerli sayıyor (0/0xFF çöpü "desteklenmiyor" olarak
+    gösteriliyor); CLI dump ve GUI paneli (combo seçimi, durum satırı,
+    apply) senkron düzeltildi.
+  - Doğrulama (PRO X 2, `40A9`, Unifying `046d:c54d`): low/medium/high
+    yazımı + okuması artık çalışıyor; yalnız byte 0 reddediliyor.
+- `set_dpi` artık geçersiz LOD baytı varken tüm DPI yazımını düşürmüyor:
+  bayt 1..3'e clamp'lenerek cihazın DPI değişimini de kabul etmesi
+  sağlanıyor (PRO X 2'ye LOD=0'lı bir yazım bütün yazımı reddettiriyordu).
+
+## [1.2.1] — 2026-09-13
+
+### Added
+- **HID++ ayarları etkinleştirildi.** Onboard-profile modunda çalışan gaming
+  farelerde (PRO X 2 / G Pro X vb.) DPI / polling-rate / LOD yazmaları HID++
+  tarafından reddediliyordu; yazmadan önce onboard modu kapatılıyor
+  (`disable_onboard_profiles_for_write`).
+- `setup.sh` artık `hidraw` alt sistemini de tetikliyor; HID++ hidraw
+  düğümlerine udev kuralları paket kurulumunda anında uygulanıyor.
+
+### Fixed
+- **MATH-1:** negatif ivmelenme + aktif cap (`cap.y > 0`) dejenere eğri
+  üretiyordu (cap.x negatife dönüyor, gain eğrisi geriye gidiyordu). Bu
+  kombinasyon artık identity eğrisine düşürülüyor.
+- Test corpus (`tests/corpus_accel`, `tests/corpus_config`) haznelere eklendi.
+
+## [1.2.0] — 2026-09-13
+
+### Fixed
+- **HID++ ayarları (donanım paneli düzeltildi).** Wired G502 HERO SE gibi
+  HID++ 2.0 cihazlarda DPI / polling-rate / LOD ayarları cihaza yazılamıyordu:
+  - `ROOT.GetFeature`, `FEATURE_SET.GetCount` ve `resolve_feature_index`
+    artık `send_short` yerine `send_feature_request` kullanıyor. Bu cihazlar
+    kısa `0x10` isteklerine **uzun `0x11`** raporuyla cevap veriyor;
+    `send_short` yalnızca kısa yanıtı çözebildiği için özellik keşfi boş
+    dönüyor, yazma yolları (`set_dpi` / `set_polling_rate`) reddediliyordu.
+    Artık özellik keşfi (feature yağı), DPI listesi, mevcut DPI, polling rate
+    ve HID++ panel kontrolleri tam çalışıyor.
+  - `0x2201` (non-extended) `AdjustableDpi` **SetDPI fonksiyon kodu `0x03`'e
+    düzeltildi** (OpenLogi `set_sensor_dpi`, `[sensor_index, dpi_hi, dpi_lo]`).
+    Önceki `0x01` aslında DPI *listesini* (GetSensorDpiList) okuyan fonksiyondu;
+    değer gönderse de hızı değiştirmiyordu. Doğrulama (G502 HERO SE,
+    `046d:c08b`): 2400 → 400 → 2400 DPI ve 1000 → 500 → 125 → 1000 Hz yazımları
+    yazıldıktan hemen sonra okunarak teyit edildi.
+  - `gui/hidpp_panel.inl` `hw_query_thread` içindeki `g_idle_add` lambda'sının
+    eksik `});` kapanışı onarıldı (derleme hatası).
+  - **Centurion batarya `/0x0104` desteği:** PRO X 2 LIGHTSPEED, G515 LS TKL
+    gibi cihazların [soc, soc_duplicate, charging_status] dizilimli 3-bayt pil
+    yükü artık `UNIFIED_BATTERY`'den önce deneniyor.
+- GUI HID++ uygulama sonucu artık yazıldıktan sonra cihazdan yeniden okunarak
+  durum satırına yansıtılıyor; "kabul edildi ama uygulanmadı" görüntüsü kalmadı.
+  Eski açık GUI process'i bellekteki eski binary'yi kullandığı için "(reddedildi)"
+  gösterebilir — kapatıp yeniden açın.
+
+## [1.1.0] — 2026-09-11
+
+### Added
+- End-to-end daemon test (`tests/e2e_harness.cpp` + `tests/run_e2e.sh`): drives the
+  REAL daemon against a synthetic uinput mouse and a virtual sink. Accel phase
+  checks frame/SYN structure, SM-2 button buffering, LOW-1 coalesced deferral, and
+  ×3 classic-linear gain (T-A1..T-A4); raw phase verifies byte-identical 1:1
+  passthrough (T-B1). Needs root + `/dev/uinput`; not run in CI.
+
+### Changed
+- P93-BATCH (hot path): `process_device()` accumulates each frame — motion REL,
+  queued non-motion events, and the closing SYN_REPORT — in a stack `write_batch`
+  and submits it in a SINGLE `write()` syscall at the real SYN_REPORT. With the
+  companion 32-event batched evdev reads, the canonical per-motion-frame cost is
+  1 `read()` + 1 `write()` + 2×`clock_gettime` (was ~3-8 syscalls).
+- CFG-1: `output_dpi = 0` now means "no output-DPI normalization" (1:1 counts)
+  instead of being clamped to 1 (which silently produced a near-dead cursor).
+  `sanitize_device_profile()` and the CLI `set-param` domain/`check` warning now
+  treat 0 as a valid sentinel.
+
+### Fixed
+- E2E harness debug: flushed whole-batches produce exactly one SYN per frame (no
+  duplicated trailing SYN).
+
+## [0.6.6] — 2026-09-11
+
+### Added
+- Per-application profiles (`match_app`): a profile can be bound to the focused
+  application's WM_CLASS so it applies only while that app is active. The
+  daemon live-switches profiles without dropping the mouse grab (case-insensitive
+  substring matching; empty = always). Config, JSON round-trip, sanitize (128-char
+  cap), and legacy compatibility are covered by tests (33786 assertions).
+- KDE Wayland active-window focus relay: an embedded KWin script watches
+  `workspace.windowActivated` and forwards `resourceClass` to the GUI-owned
+  GDBus service `org.rawaccel.Focus`, which pushes it to the daemon via the new
+  `set_active_app` IPC. Works on X11/KDE too; degrades gracefully on other
+  desktops (GUI "App:" field is then a manual per-profile hint only).
+- GUI "App:" match field on each profile's Device Assignment row.
+- HID++ transport layer (Easy-Switch/LED/reprog groundwork): `get_change_host_info`,
+  `set_change_host`, `get_led_brightness`, `set_led_brightness` (0x8040/0x1982/0x1981),
+  `get_reprog_controls`, and `write_onboard_profile_sector`. Queued for the next
+  GUI hardware panel.
+
+### Fixed
+- Graph pan-zoom: wheel-zooming mid-drag no longer shifts the pan baseline
+  (`drag_zoom_start` is frozen at drag start).
+- Profile name gate now strips surrounding whitespace so a name of only spaces
+  can no longer create a blank/ambiguous profile row.
+
+## [0.6.4] — 2026-09-08
+
+### Added
+- Added native C++ Logitech HID++ controls for supported devices:
+  hardware DPI, discrete report/polling rate, and extended sensor lift-off distance.
+- Added CLI commands `hidpp-set-dpi`, `hidpp-set-rate`, and `hidpp-set-lod`.
+- Added protocol rate conversion and HID++ feature-ID regression tests.
+- Unsupported devices reject hardware changes without modifying RawAccel profiles.
+
+## [0.6.3] — 2026-09-08
+
+### Fixed
+- Made live telemetry fields atomic and kept snapshots consistent across daemon and IPC threads.
+- Fixed IPC shutdown descriptor reuse, strict `set_config` framing, and startup config-path races.
+- Prevented stale PID cleanup from allowing a second daemon to start alongside a live instance.
+- Rejected non-finite event intervals before they can poison stateful speed smoothers.
+- Added regression coverage for telemetry/lifecycle boundaries and invalid timing recovery.
+
+## [0.6.2] — 2026-09-08
+
+### Fixed
+- Corrected HID++ 2.0 feature-set discovery through the dynamic FEATURE_SET index.
+- Added HID++ report validation, error-response rejection, target-aware feature
+  caching, and safer hidraw polling/read handling.
+- Improved direct Logitech device probing without assuming every endpoint is a receiver.
+- Added deterministic HID++ packet regression coverage for malformed and null input.
+
+## [0.6.1] — 2026-09-08
+
+### Bug Fixes & Security Hardening
+- **Atomic config backup**: `save_config()` now snapshots the old file to
+  `.bak` with a private hard link before replacing it.  The live config path
+  is no longer briefly absent during a save, so concurrent daemon/GUI/CLI
+  reads cannot spuriously fail with a missing-file error.
+- **accel-classic (`gain_inverse`) division-by-zero protection**: guarded against `accel == 0` and `power <= 1.0` when calculating inverted gain thresholds, preventing `Inf`/`NaN` poisoning in GAIN mode.
+- **accel-power (`scale_from_output_point`) overflow protection**: added negative difference check and `std::isfinite` fallback guarding against non-finite scale multipliers under small exponents.
+- **CLI IPC partial send loop**: wrapped `send()` in a retry loop with `EINTR` handling to ensure large JSON configurations are completely transmitted without socket truncation.
+- **GUI zombie process fix**: replaced manual `fork()` and 5-second `waitpid` timeout in `on_kde_open_settings` with `g_spawn_command_line_async`, delegating process lifecycle and cleanup entirely to GLib.
+- **GUI profile duplicate parity**: cleared `device_id` when duplicating profiles in GUI (`profile_mgr.inl`) matching CLI behavior, preventing duplicate device binding collision warnings.
+- **setup.sh symlink hardening**: added symlink checks before synchronizing user configuration to `/etc/rawaccel/` and used secure file installation (`install -Dm644 -o root -g root`).
+- **Packaging (Arch PKGBUILD & CMakeLists.txt)**: included installation of `scripts/rawaccel.quirks` to `/usr/share/libinput/50-rawaccel.quirks` to prevent compositors/libinput from applying double pointer acceleration over the virtual uinput device.
+
+## [0.6.0] — 2026-09-07
+
+> **Version decision:** 0.6.0 **MINOR** bump (maintainer-approved, R50). The
+> release covers the R50 performance round (daemon `status_json` lock-narrowing
+> + hot-path benchmark/perf-gate tooling + docs) and the R51–R52 fix rounds
+> (accuracy, CLI, GUI and oracle-hardening) under the same version — all
+> additive / non-breaking, hence MINOR rather than MAJOR. The canonical bump
+> text lives in `include/rawaccel-base.hpp`, `CMakeLists.txt`,
+> `packaging/PKGBUILD` (P146), pkgrel carried to 3 for the final artifact.
+
+### Documentation / UX
+- **New [docs/performance_tuning.md](docs/performance_tuning.md)** — user-facing
+  performance guide: the 3-syscall hot-path model (2× `clock_gettime` +
+  1 batched REL write), measurement data (math 20–425 ns/event vs syscall cost,
+  worst config ~0.34% CPU at 8 kHz), polling-rate frame-budget table
+  (125–8000 Hz), DPI granularity facts (curve is DPI-agnostic), the
+  smoothing-halflife responsiveness table (halflife is the only real "feel
+  latency" lever: 10 ms ≈ one frame, 100 ms ≈ 190 ms of wrong gain at the knee),
+  native-vs-portable/PGO build notes, latency measurement workflow, and a
+  latency FAQ (sources: AGENTS.md canonical syscall contract, precision.md §8.3,
+  real_hardware_test.md §4).
+- README: added a pointer from the **Performance** section to the new guide.
+- **GUI latency panel live validation** (R50 §P140): the status-bar
+  **Performans** button readout (Avg/p50/p95/p99/Max, P90) checked against a
+  live daemon — the `status` JSON `lat_*` fields on the active profile's device
+  slice were cross-verified against three `rawaccel-cli latency` dumps; code
+  path `on_perf_clicked()` → `daemon_device_field()` → `latency_lbl` confirmed
+  wired (no code change needed); the performance guide now ships a real
+  `rawaccel-cli latency` dump as a live example.
+- **R50 measurement results folded into the guide** (R50 §P142): the P136
+  `status_json` lock-narrowing (471 ns → 57.7 ns under the lock, **8.2×**
+  shorter, percentile math moved out) is now documented in §4.1; the P138 PGO
+  evaluation (11.01 vs 11.05 ns/apply ≈ **0.4%, noise — not adopted**) and the
+  oracle cross-check (local 35 cyc/apply vs official ref 40 cyc/apply ⇒ local
+  ~11% faster) landed in §2 and §5.
+
+### Performance / Internal
+- **status_json lock-narrowing** (P136, Aj 6): the IPC reader now takes a fast
+  `lat.copy()` snapshot (57.7 ns) under `devices_mutex_` and computes percentiles
+  after releasing the lock instead of doing all math (471 ns) while holding it —
+  8.2× shorter lock hold, hot path untouched (seqlock) and byte-identical stats.
+- **Hot-path benchmark + CI perf gate** (P135/Aj 5, P137/Aj 2): new
+  `scripts/bench_hotpath.sh` (+ `tests/bench_hotpath.cpp`) measures
+  cycles/instructions/syscalls per event over the noaccel/power/classic
+  baseline, ready for a +5% regression gate; `perf-gate` CI job added
+  (runs `bench_hotpath.sh --compare tests/perf_baseline.json` once the
+  baseline lands; auto-skips until then).
+- **Fuzz hot-path seed** (P137, Aj 2): `fuzz_accel` now seeds from
+  `tests/corpus_accel/` in addition to the config corpus.
+- **PGO evaluated — not adopted** (P138, Aj 4): `-fprofile-generate`/`-fprofile-use`
+  under production flags showed ~0.4% (noise) with build-time and toolchain
+  fragility costs; `tests/oracle/oracle_perf.cpp` + `run_oracle_perf.sh` added
+  as a reusable ns/cyc micro-benchmark (local ~11% faster than vendored official ref).
+
+### Bug-fix / accuracy round (R51–R52)
+
+- **Accuracy fix — power `io` cap.y ≤ 0** (P155): a zero/negative cap.y previously
+  produced a *silent dead mouse* (scale 0 → gain 0). It now evaluates to identity
+  scale with the cap disabled. Matches the official reference's degenerate-input
+  semantics (ref itself yields NaN in GAIN / 0 in LEGACY for that input — the
+  local guard avoids the dead curve and is a documented deviation).
+- **Accuracy fix — power GAIN cap order** (P155): `operator()` now follows the
+  reference ordering — the `speed < cap.x` cap branch is decided **before** the
+  output-offset plateau, so an `output_offset > cap.y` tail no longer bypasses
+  the cap (previously high speeds froze at the output offset, `output_offset=1e6`
+  → flat 1e6 instead of the cap tail). Canonical cap setups are bit-identical
+  (A/B verified); only the previously-broken region changed.
+- **Sanitize fix — EMA half-life ceiling** (P155): smooth half-life values are
+  clamped to `≤ 1e9` in `sanitize_*` (prevents EMA freeze on absurd inputs).
+- **CLI fix — no more lying "Daemon reloaded."** (P156): `daemon_apply_config`
+  now returns failure on a daemon `"ok": false` response and only falls back to
+  SIGHUP for empty/unknown replies; previously a rejected live push was reported
+  as success. Bonus: `delete` prints the "active profile changed" message only
+  when it really changed; `copy_file` backup path fsyncs the destination; and
+  `output_dpi` accepts fractional DPI (`range_ok` instead of an int cast).
+- **GUI fix — event-driven child process reaping**: both daemon-start/apply
+  child watchers now use `g_child_watch_add` to hook GLib's internal SIGCHLD mechanism,
+  eliminating periodic 500ms CPU polling wakeups and preventing `EINTR`-induced zombie leaks.
+- **GUI fix — `xy_linked` user choice preserved** (P157): an unlinked X/Y pair
+  whose current values happen to be equal is no longer silently re-linked; the
+  guard now only forces unlinking when the values truly differ.
+- **Concurrency fix — daemon telemetry seqlock**: two-phase odd/even update protocol
+  implemented for `dev.telem_samples`, preventing torn telemetry reads in `status_json`.
+- **JSON robustness — locale-independent float formatting**: `append_fixed` now
+  enforces RFC 8259 '.' decimal separators regardless of LC_NUMERIC and guards `NaN`/`Inf`.
+- **Accuracy fix — power `io` cap.x ≤ 0**: non-positive `cap.x` in `io` mode now
+  evaluates to identity base curve rather than freezing mouse gain to a flat constant.
+- **CLI robustness — IPC socket timeout**: extended from 200 ms to 2000 ms to match
+  daemon server timeout and avoid false timeouts during disk `fsync` operations.
+- **Oracle expansion + regression lock** (P158): +7 power `io`/offset-tail cases
+  (cap.y=0 identity, tiny cap.x, `output_offset>cap.y` tail — gain & legacy). The
+  differential oracle now compares **1047 rows** against the official reference
+  with **45 documented deviations**; `tests/test_accel.cpp` got a P155 SECTION
+  pinning the fixed gain values (1e6 / 644495.723284 / 33.7247 / 1.50322).
+- **Perf regression gate (P159)**: the R52 fix set measured against the R50
+  baseline — power-dual+4EMA **+0.35%…+0.8%**, classic +0.2% (noise), all well
+  under the +5% CI gate; live hot-path p50 ≈ 2.25 µs preserved.
+- **R53 second-opinion round**: all 7 audit lanes re-verified the R52 fixes
+  (0 functional CRIT); doc/CI gaps found there (CHANGELOG/AGENTS/perf-guide
+  sync, single-run CI perf-gate noise → median-of-3) landed with this commit.
+
+## [0.5.0] — 2026-09-05
+
+### Player round (oyuncu turu, R29–R37)
+- **`rawaccel-cli create-preset`**: research-based game presets `cs2`, `valorant`,
+  `apex`, `fps` (plus existing `gaming`/`office`/`precision`/`disable`) map onto
+  the acceleration engine with per-game parameter choices; a `.tar`/file import
+  arity fix (`import` with a single file) closes a CRIT round-trip gap (P65).
+- **Default profile is acceleration-free, not raw passthrough** (`noaccel` mode —
+  no acceleration by default, user decision, R34); acceleration is opt-in per
+  profile. `raw_passthrough` stays `false` and output is normalized to 1000 DPI,
+  so the fresh default is **not** a literal 1:1 bypass — exact raw 1:1 is the
+  `disable` preset (`raw_passthrough=true`; R46/P101 correction).
+- **Apex preset tuning** (`output_offset 0.2 → 0.9`): fixes the sub-1:1 "muddy"
+  feel on the power curve while keeping the fast 180° flick ramp (R37, user
+  approved).
+- **Player guide** in README: game-specific preset tutorial / tuning workflow
+  for CS2, Valorant, Apex, generic FPS.
+- **Oracle esport grid** (`tests/oracle/`): the speed sweep now covers the
+  tournament band `2000 / 3000 / 4000` ips between the previously sampled
+  `1000/5000`; the four game presets are mirrored as dedicated cases. The
+  differential oracle now compares **915 gain rows** (31 documented intentional
+  deviations) vs the official reference.
+- **Virtmouse live harness** (`scripts/virtmouse-game.c`, R35/P64): injects
+  synthetic game-speed mouse motion (uinput virtual mouse) for live end-to-end
+  latency / hot-path verification.
+
+### Live telemetry (IPC `status`)
+- Per-device motion telemetry published in the `status` JSON from the daemon:
+  `telem_in_ips`, `telem_out_ips`, `telem_gain`, `telem_dx`, `telem_dy`.
+- Lock-free lane: `flush_motion()` (loop thread) does relaxed stores + a
+  release-bump of the seqlock counter; `status_json()` (IPC thread) does the
+  double-load verify with bounded retry. No measurable hot-path cost
+  (independent latency gap +1.1% / −1.6% = noise, see P32/P38).
+- Raw-passthrough still fills the counter and deltas; gain is 0 when
+  `in == 0`. `rawaccel-cli status` / GUI connection state surface it as-is.
+
+### Stability / correctness fixes (Bug-Hunt package)
+- **CLI (`cli/main.cpp`)**
+  - All 8 config-mutating commands route through `safe_save()`: a save or
+    I/O failure now reports a clean error and exits 1 instead of
+    `std::terminate` → SIGABRT (exit 134).
+  - Missing command arguments produce a targeted
+    `Command 'X' is missing N argument(s)` message instead of a misleading
+    "Unknown command" plus full help.
+  - A trailing bare `-c` reports `Option '-c' requires a path argument`.
+  - An existing-but-corrupt config is never overwritten: load refuses with
+    `Refusing to overwrite — run validate`; a default is created only when the
+    file genuinely does not exist.
+- **Config (`src/config.cpp`)**
+  - (P43-BF1, critical) The schema `version` is now read back from the JSON
+    instead of defaulting empty on every load. Previously `migrate_config()`
+    re-ran on each load, so a stored `lookup` + `gain` config grew on every
+    save (200 → 20000 → 2000000 in a round-trip probe). Migration now runs
+    exactly once and is a no-op for current files.
+  - LUT `length` is clamped to `LUT_RAW_DATA_CAPACITY` (no out-of-bounds
+    access from a programmatic by-pass).
+  - `save_config()` temp files use a PID-suffixed name opened with
+    `O_NOFOLLOW | O_EXCL` — no symlink clobber, no two-writer race.
+  - Scalar/string fields (`mode`, `gain`, `cap_mode`, `active_profile`,
+    `use_raw_input`, `device_id`, `name`) are type-guarded; `device_id` and
+    `name` are capped at 256 characters; malformed types degrade to defaults.
+  - `lut_data` min computation is `size_t`-safe (no narrowing cast UB).
+- **Daemon (`daemon/main.cpp`)**
+  - JSON log output escapes every `message` field (`\" \\ \n \r \t \b \f`,
+    control chars → `\uXXXX`), so device names/paths/errno text can never
+    corrupt the log stream.
+  - `--config=PATH` / `--log-format=FMT` (`=` forms) accepted next to
+    `-c PATH` / `--config PATH`; a missing value is a hard parse error
+    (exit 1); explicit `--config=` paths receive the same validation as `-c`.
+- **Hot-path & latency safety**
+  - `lat_stats::record()` (`daemon/lat_stats.hpp`) drops non-finite samples
+    and clamps negative ones to 0 — histogram invariants stay valid.
+  - Lookup zero-width segment (`include/accel-lookup.hpp`): a duplicated X
+    (denominator 0) falls through to the next point's `by` instead of
+    producing ±Inf; valid strictly-increasing tables are unaffected.
+  - Removed a dead guard (`hi < capacity-1`); no behavior change.
+- **GUI (`gui/widgets_sync.inl`)**
+  - `pkexec_systemctl_async()` returns `pid > 0`, so the systemd start/stop
+    branch is actually taken — closes the double-start window where both
+    `pkexec systemctl` and a direct `pkexec rawaccel-daemon` were launched.
+
+### Documentation / UX
+- README: new "Player profile (oyuncu profili)" section (gaming preset
+  table), low-latency & safe-defaults documentation, performance expansion,
+  `rawaccel-cli latency` statistics, telemetry-via-`status`.
+- AGENTS.md: "Live Telemetry & Seqlock" and "Low-latency motion contract"
+  design decisions, translation-coverage rules, hardening parity between
+  `scripts/build.sh` and CMake.
+
+### Tooling / QA / packaging
+- Differential oracle (`tests/oracle/run_oracle.sh`) vs the vendored official
+  RawAccel reference: 915 gain rows — 884 matched at REL 1e-9 + 31 documented
+  intentional deviations (expanded with the R35 esport grid); wired into CI
+  (`ci.yml`) so accel-math drift fails the build.
+- Translation coverage suite (`tests/run_tr_coverage.sh`): every translatable
+  UI string must have a Turkish entry (0 MISSING = PASS).
+- SYN_DROPPED event-sequence machine tests (8 scenarios) added — 132 test
+  groups / 21627 runtime assertions green under ASan+UBSan too.
+- Fuzz smoke (60 s) in CI; deep run 11.7M+ executions crash-free.
+- PKGBUILD (Arch/CachyOS) with hardened, PIE, `BIND_NOW` binaries; canonical
+  `setup.sh` one-shot installer enforcing the dependency policy on the
+  pacman/apt/dnf branches.
+
+## [0.4.0] — 2026-09-05
+
+- **Turkish GUI** with a live language switch (Otomatik / English / Türkçe);
+  preference persisted in `~/.config/rawaccel/gui_lang`.
+- **IPC config push sync**: the GUI sends `set_config` to the root daemon,
+  which writes `/etc/rawaccel/settings.json` and applies the change live
+  (previously SIGHUP reloaded a stale copy).
+- **KDE Plasma double-acceleration protection**: `scripts/kde-fix-accel.sh`
+  sets per-device Flat + 0 acceleration in `kwinrc`/`kcminputrc`.
+- Reference alignment of all acceleration modes (classic GAIN / jump /
+  synchronous / lookup) and the differential oracle harness.
+- Hardened build flags in both `scripts/build.sh` and CMake, with
+  `RAWACCEL_PORTABLE=1` support.
+- Canonical one-shot installer: `sudo bash setup.sh` (deps + build + system
+  files + service + KDE fix), `--uninstall`, `--reinstall`; `scripts/install.sh`
+  kept as a thin wrapper.
+- First Arch/CachyOS package (`packaging/PKGBUILD`).

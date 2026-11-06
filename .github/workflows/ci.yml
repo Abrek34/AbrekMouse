@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build (portable) + Unit tests + Warning gate
+    runs-on: ubuntu-24.04
+    env:
+      RAWACCEL_PORTABLE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libevdev-dev libgtk-4-dev python3 cmake
+
+      - name: Build (warning-as-failure gate)
+        run: |
+          set -o pipefail
+          set -e
+          # Capture full output, then fail if any compiler diagnostic appears.
+          bash scripts/build.sh 2>&1 | tee build.log
+          # R4-L-10: the old `grep -E "warning:|error:"` matched ANY line
+          # containing those strings — innocent output (e.g. a filename with
+          # "error" in it, scripts echoing the words) false-failed the gate.
+          # Match only compiler/linker diagnostic shapes: FILE:LINE[:COL]:
+          # (warning|fatal error|error):, plus ld:/collect2: errors — with a
+          # non-alnum prefix so "/usr/bin/ld:" matches but a token like
+          # "collect2_test.c:" does not (R10-LDREG).
+          if grep -E ":[0-9]+(:[0-9]+)?: (warning|fatal error|error):|(^|[^[:alnum:]_])(ld|collect2): (fatal error|error|warning):" build.log; then
+            echo "::error::Build produced compiler warnings or errors (see above)."
+            exit 1
+          fi
+
+      - name: Verify binaries
+        run: |
+          test -x build-manual/rawaccel-daemon
+          test -x build-manual/rawaccel-cli
+          test -x build-manual/rawaccel-gui
+          test -x build-manual/rawaccel-installer
+          file build-manual/rawaccel-*
+
+      - name: Installer smoke (GTK4 setup assistant)
+        run: bash tests/run_installer_smoke.sh
+
+      - name: Run unit tests
+        run: bash tests/run_tests.sh
+
+      - name: Run translation coverage (R10-CITRC)
+        # Every translatable GUI string must have a Turkish entry; exits 1 on
+        # a MISSING key, so a new untranslated string now fails CI.
+        run: bash tests/run_tr_coverage.sh
+
+      - name: Run oracle (reference cross-check)
+        # Differential check vs the vendored official RawAccel reference.
+        # Fails (exit 1) if any row outside tests/oracle/known_deviations.txt drifts.
+        run: bash tests/oracle/run_oracle.sh
+
+      - name: Run SIMD backend parity (AVX2 / SSE2 / scalar)
+        # Every other gate here compiles WITHOUT -march, so they only ever
+        # exercised the SSE2 backend — which is how the AVX2 lane bug (Y read
+        # from the zero padding lane, killing vertical movement) reached
+        # production. This step forces each backend explicitly and diffs the
+        # three against each other. Runs even though RAWACCEL_PORTABLE=1,
+        # because it does not rely on the build's -march.
+        run: bash tests/run_simd_parity.sh
+
+      # T52-11: the CMake packaging path was never gated by CI — a broken
+      # CMakeLists or missing install rule drifted silently past every job.
+      # Minimal, fast gate: configure + build through CMake itself. Uses the
+      # same portable flag as build.sh (no -march=native on the runner).
+      - name: Verify CMake build (T52-11)
+        run: |
+          set -e
+          cmake -B build-ci -DRAWACCEL_PORTABLE=ON -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build-ci -j"$(nproc)"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+  sanitizers:
+    name: Tests under ASan + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev python3
+
+      - name: Build & run tests with -fsanitize=address,undefined
+        env:
+          # Fail loud on any sanitizer report
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+        run: |
+          set -e
+          set -o pipefail
+          mkdir -p build-manual
+          g++ -std=c++20 -O1 -g -Wall -Wextra -Wno-unused-parameter \
+              -fsanitize=address,undefined -fno-omit-frame-pointer \
+              -I include -I src \
+              tests/test_accel.cpp src/config.cpp src/logitech_receiver.cpp src/logitech_hidpp.cpp \
+              -o build-manual/test_accel_asan
+          build-manual/test_accel_asan
+
+  sanitize-cli:
+    name: CLI under ASan + UBSan
+    runs-on: ubuntu-24.04
+    # cli/main.cpp (3285 lines: arg parsing, config-path validation, JSON
+    # round-trip, print_profile, diff/export) is executed by NO other sanitizer
+    # job — `sanitizers` only runs tests/test_accel.cpp, and run_tests.sh runs
+    # the real CLI without sanitizers. This job closes that hole.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev python3
+
+      - name: Run tests/run_cli_sanitized.sh
+        env:
+          ASAN_OPTIONS: "halt_on_error=1:abort_on_error=1:strict_string_checks=1:detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+        run: bash tests/run_cli_sanitized.sh
+
+  fuzz-smoke:
+    name: Fuzz smoke (60s per harness)
+    runs-on: ubuntu-24.04
+    # Only run on push / manual dispatch — keeps PRs fast.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev clang
+
+      - name: Run fuzz harnesses (60s each)
+        run: bash tests/run_fuzz.sh 60
+
+      - name: Upload crashes on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            tests/corpus_config
+            tests/corpus_accel
+          if-no-files-found: ignore
+
+  perf-gate:
+    name: Hot-path performance gate (P137)
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libevdev-dev python3
+
+      - name: Run hot-path perf gate
+        # A SKIPPED perf gate must never be indistinguishable from a PASSED one.
+        # `exit 0` is still correct — an unusable host is not a regression, and
+        # failing the pipeline for it would train everyone to ignore this job —
+        # but on its own it renders as a green tick, which is the exact thing
+        # this repo forbids elsewhere: run_cli_sanitized.sh:20 and
+        # run_simd_parity.sh both "skip loudly, never quietly". A green tick on
+        # a gate that never measured anything is a false claim of verification,
+        # so every skip path below also emits a `::warning::` annotation, which
+        # GitHub renders as a yellow warning on the job summary. The perf gate
+        # has now skipped silently on every push to this repository (the host
+        # check never passed), and nothing in the UI said so.
+        run: |
+          set -e
+          if [ ! -x scripts/bench_hotpath.sh ]; then
+            echo "::warning::Perf gate SKIPPED — scripts/bench_hotpath.sh yok. Hiçbir regresyon ölçülmedi."
+            exit 0
+          fi
+          if [ ! -f tests/perf_baseline.json ]; then
+            echo "::warning::Perf gate SKIPPED — tests/perf_baseline.json yok. Hiçbir regresyon ölçülmedi."
+            exit 0
+          fi
+          # P109 (Aj5): bayat Python kopyası silindi. bench_hotpath.sh kendi
+          # gate'ini yapıyor (median-of-3, threshold, CPU model/governor kontrolü).
+          # exit 77 = ortam geçersiz (CPU model/governor uyuşmazlığı) → SKIP
+          # exit 126 = ETXTBSY (binary başka bir işlem tarafından kullanımda) → SKIP
+          # exit 1 = performans regresyonu → FAIL
+          set +e
+          bash scripts/bench_hotpath.sh
+          BENCH_RC=$?
+          set -e
+          if [ $BENCH_RC -eq 77 ]; then
+            echo "::warning::Perf gate SKIPPED (exit 77) — ortam geçersiz. Regresyon ölçülmedi; bu yeşil bir performans sonucu DEĞİLDİR."
+            exit 0
+          fi
+          if [ $BENCH_RC -eq 126 ]; then
+            echo "::warning::Perf gate SKIPPED (exit 126) — benchmark binary kullanımda (ETXTBSY). Regresyon ölçülmedi."
+            exit 0
+          fi
+          if [ $BENCH_RC -ne 0 ]; then
+            echo "::error::Perf gate FAIL (exit $BENCH_RC)"
+            exit $BENCH_RC
+          fi

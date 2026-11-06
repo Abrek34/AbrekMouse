@@ -1,0 +1,37 @@
+# Paketleme artıkları
+packaging/src/
+packaging/pkg/
+*.pkg.tar.zst
+packaging/*.srcinfo
+# Dağıtım kopyası (yayına hazır) git tarafindan izlenmez — git archive ile yeniden uretilir
+yayına hazır/
+
+# Derleme çıktıları (setup.sh/build.sh uretir)
+build-manual/
+build/
+
+# E2E harness binary (tests/run_e2e.sh uretir) — R10-E2EBIN
+tests/e2e_harness
+
+# ── Fuzzer koşu girdileri (libFuzzer üretimi) ────────────────────────────────
+# tests/corpus_config/ ve tests/corpus_accel/ altındaki 40 onaltılık karakterli
+# dosya adları libFuzzer'ın "yeni birim" çıktısıdır: fuzher çalıştıkça birikir.
+# Elle yazılmış GERÇEK seed'ler (minimal.json, full_profile.json,
+# all_modes.json, extreme_values.json) .json uzantılıdır ve korunur.
+#
+# Bu diziler commit edilirse depo kalıcı olarak ~69 MB / 17.4k dosya şişer ve
+# her fuzzer koşusu yeni dosya daha ekler. AGENTS.md'deki "seed corpus" amacı
+# 4 gerçek seed ile zaten sağlanıyor.
+tests/corpus_config/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+tests/corpus_accel/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+
+# Python bytecode: olcum/ altındaki araçlar (prove_kod_ayni.py, decay_band.py,
+# ...) her koşuda __pycache__ bırakır ve `git status` her seferinde commit
+# edilmemesi gereken gürültü gösterir. 2026-09-29'da ölçüldü:
+# olcum/config-presets/__pycache__/ çalışma ağacında untracked olarak duruyordu.
+__pycache__/
+*.py[cod]
+
+# AJ5 ölçüm gölge kopyası: include/ + daemon/ kopyası, depoya girmez
+olcum/aj5/shadow/
+logs/

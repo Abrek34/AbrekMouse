@@ -1,0 +1,12 @@
+=== AJ-H mutasyon kanıtı — 2026-10-21 22:25:53 ===
+repo'ya dokunulmaz; mutasyon geçici kopyaya uygulanır
+
+M1: iç kısa-yük koruması gevşetildi      rc=0 · FAIL satırı=0 · HID++ test özeti: 31/31 başarılı, 0 başarısız
+  → YEŞİL ⚠ (bu mutasyon KAPIDAN KAÇTI — eşdeğer mutant olabilir)
+M2: bildirim zulası devre dışı            rc=1 · FAIL satırı=1 · HID++ test özeti: 28/29 başarılı, 1 başarısız
+  → KIRMIZI ✓ (kapı hatayı yakaladı)
+M3: yanıt eşleştirme bozuldu               rc=1 · FAIL satırı=7 · HID++ test özeti: 19/26 başarılı, 7 başarısız
+  → KIRMIZI ✓ (kapı hatayı yakaladı)
+M0: kontrol (mutasyonsuz)                     rc=0 · FAIL satırı=0 · HID++ test özeti: 31/31 başarılı, 0 başarısız
+  → YEŞİL ⚠ (bu mutasyon KAPIDAN KAÇTI — eşdeğer mutant olabilir)
+Repo dosyaları DOKUNULMADI (mutasyon geçici kopyada uygulandı).

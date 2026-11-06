@@ -1,0 +1,154 @@
+#pragma once
+#include "math-vec2.hpp"
+#include <cfloat>
+#include <cstddef>
+
+namespace rawaccel {
+
+/// Single source of truth for the version number — read by GUI and daemon.
+inline constexpr const char* RAWACCEL_VERSION = "1.2.8";
+
+using milliseconds = double;
+
+inline constexpr int    POLL_RATE_MIN        = 125;
+inline constexpr int    POLL_RATE_MAX        = 8000;
+inline constexpr milliseconds DEFAULT_TIME_MIN = 1000.0 / POLL_RATE_MAX / 2;
+inline constexpr milliseconds DEFAULT_TIME_MAX = 100;
+inline constexpr milliseconds WRITE_DELAY     = 1000;
+// SM-7: smoothing EMA halflife upper bound in ms (10 s).  Beyond ~10 s the
+// per-8ms EMA step (e^-0.0008 ≈ 0.9992) makes the estimate effectively static
+// and pins smoothed speed at its initial 0 — a dead-mouse symptom.  Shared by
+// sanitize (src/config.cpp), the CLI set-param domain (cli/main.cpp) and the
+// P107 contract test so the CLI-accepted domain always survives sanitize
+// unchanged.
+inline constexpr double SMOOTH_HALFLIFE_MAX = 10000;
+inline constexpr size_t MAX_NAME_LEN         = 256;
+inline constexpr size_t LUT_RAW_DATA_CAPACITY = 514;
+inline constexpr size_t LUT_POINTS_CAPACITY  = LUT_RAW_DATA_CAPACITY / 2;
+inline constexpr size_t MAX_PROFILES         = 256; // SEC-9: bound config size (IPC memory DoS guard)
+/// Ceiling for the *file* loader.  SEC-9 guards a hostile IPC client, so the
+/// tight MAX_PROFILES cap belongs on `app_config_from_json` (its only caller is
+/// the daemon's config-push RPC) and NOT on `load_config`: the config file is
+/// root-owned, i.e. exactly as trusted as the binary reading it, and it has
+/// already been read into memory in full by the `json::parse(f)` above it, so a
+/// higher cap adds no new exposure.  Applying MAX_PROFILES to the file path
+/// instead meant a config with more than 256 profiles (hand-edited, or written
+/// by a different tool) was silently TRUNCATED in memory and the truncation was
+/// then made permanent by the next load->modify->save round trip — a real
+/// destroy-my-data bug, in a codebase that already fixed the identical forward
+/// loss for the `version` field (CFG-5).  Every write path (CLI create /
+/// duplicate / import / create-preset, GUI) still refuses to go past
+/// MAX_PROFILES with an explicit error, so 65536 is unreachable in normal use
+/// and only bounds a pathological root-owned file.
+inline constexpr size_t MAX_PROFILES_FILE    = 65536;
+inline constexpr double MAX_NORM             = 16;
+inline constexpr double NORMALIZED_DPI       = 1000;
+
+enum class accel_mode {
+    classic,
+    jump,
+    natural,
+    synchronous,
+    power,
+    lookup,
+    noaccel
+};
+
+enum class cap_mode {
+    io,
+    in,
+    out
+};
+
+struct accel_args {
+    accel_mode mode           = accel_mode::noaccel;
+    bool       gain           = true;
+    double input_offset       = 0;
+    double output_offset      = 0;
+    double acceleration       = 0.005;
+    double decay_rate         = 0.1;
+    double gamma              = 1;
+    double motivity           = 1.5;
+    double exponent_classic   = 2;
+    double scale              = 1;
+    double exponent_power     = 0.05;
+    double limit              = 1.5;
+    double sync_speed         = 5;
+    double smooth             = 0.5;
+    // L03-02 (HIGH): docs/research/parameter_index.md:85, config/default.json:35
+    // and tests/oracle/ref/rawaccel-base.hpp:61 all say cap.y default = 1.5.
+    // The old `{ 15, 0 }` meant the in-code default was the "no cap" sentinel
+    // (cap.y > 0 ? ... : DBL_MAX), so a profile built without JSON `cap` grew
+    // unbounded (measured 501x gain at 100k ips) while the oracle/JSON default
+    // is the asymptotic 1.5x.  Align the struct with the documented default.
+    vec2d  cap                = { 15, 1.5 };
+    cap_mode cap_mode_val     = cap_mode::out;
+    int    length             = 0;
+    // A1 (state bleed): NOT mutable.  This array is user config state (lookup
+    // curve / LUT) and must only change through a non-const reference.  It used
+    // to be `mutable` so the synchronous GAIN LUT generator could write it
+    // through `const accel_args&`; the GUI's compute_curve(args) passes the
+    // profile's own accel_args, so merely drawing a graph overwrote the user's
+    // stored LUT and the next save_config persisted the corruption.  The
+    // synchronous accelerator now keeps its integral LUT in its own member
+    // array (accel-synchronous.hpp), and nothing writes args.data through a
+    // const reference.
+    float data[LUT_RAW_DATA_CAPACITY] = {};
+
+    // Use field-by-field comparison — memcmp is unreliable with padding members.
+    // All double fields use epsilon comparison to survive JSON round-trips where
+    // double→string→double may introduce sub-ULP differences (fixes xy_linked false-unlink).
+    // LUT float data uses a slightly larger epsilon for the same reason.
+    static constexpr double DBL_EPSILON_CMP = 1e-9;
+    static constexpr float  LUT_EPSILON     = 1e-5f;
+
+    static bool deq(double a, double b) {
+        return std::fabs(a - b) <= DBL_EPSILON_CMP;
+    }
+
+    bool operator==(const accel_args& o) const {
+        if (mode != o.mode || gain != o.gain || cap_mode_val != o.cap_mode_val) return false;
+        if (!deq(input_offset,     o.input_offset)   || !deq(output_offset, o.output_offset)) return false;
+        if (!deq(acceleration,     o.acceleration)   || !deq(decay_rate,    o.decay_rate))    return false;
+        if (!deq(gamma,            o.gamma)           || !deq(motivity,      o.motivity))      return false;
+        if (!deq(exponent_classic, o.exponent_classic)|| !deq(scale,        o.scale))         return false;
+        if (!deq(exponent_power,   o.exponent_power)  || !deq(limit,        o.limit))         return false;
+        if (!deq(sync_speed,       o.sync_speed)      || !deq(smooth,       o.smooth))        return false;
+        if (!deq(cap.x,            o.cap.x)           || !deq(cap.y,        o.cap.y))         return false;
+        if (length != o.length) return false;
+        for (int i = 0; i < length && i < (int)LUT_RAW_DATA_CAPACITY; ++i)
+            if (std::fabs(data[i] - o.data[i]) > LUT_EPSILON) return false;
+        return true;
+    }
+    bool operator!=(const accel_args& o) const { return !(*this == o); }
+};
+
+struct speed_args {
+    bool   whole                        = true;
+    double lp_norm                      = 2;
+    double input_speed_smooth_halflife  = 0;
+    double scale_smooth_halflife        = 0;
+    double output_speed_smooth_halflife = 0;
+};
+
+struct profile {
+    // +1 so a full MAX_NAME_LEN (256) name round-trips with its NUL
+    // terminator (config.cpp loads up to MAX_NAME_LEN chars — CFG-6).
+    char   name[MAX_NAME_LEN + 1] = "default";
+    bool   raw_passthrough          = false; // true → bypass entire pipeline, 1:1 raw input
+    vec2d  domain_weights           = { 1, 1 };
+    vec2d  range_weights            = { 1, 1 };
+    accel_args accel_x;
+    accel_args accel_y;
+    speed_args speed_processor_args;
+    double output_dpi               = NORMALIZED_DPI;
+    double yx_output_dpi_ratio      = 1;
+    double lr_output_dpi_ratio      = 1;
+    double ud_output_dpi_ratio      = 1;
+    double degrees_rotation         = 0;
+    double degrees_snap             = 0;
+    double speed_min                = 0;
+    double speed_max                = 0;
+};
+
+} // namespace rawaccel

@@ -1,0 +1,28 @@
+# AJ4 gauge-scan ölçümü — 2026-09-28 19:16:37
+HEAD: b01342b1
+LC_ALL=C  (betik locale'den bağımsız)
+
+=== POZITIF KONTROL (§4) ===
+PC-1 kapsam        : GEÇTİ  (ham accel widget'ları = ayrıştırılanlar)
+PC-2 üst sınırlar : GEÇTİ  (13 klamp tek tek geri alındı → tarama her birini işaretlemeli, üretimde hiçbiri açık kalmamalı)
+PC-4 CLI sütunu    : GEÇTİ  (4 anahtar elle ölçülmüş değerle eşleşmeli)
+PC sonucu: 3/3 geçti  → ÖLÇÜM GEÇERLİ
+
+=== TARAMA: GUI gauge ↔ sanitize üst sınır ↔ CLI domain ===
+alan                gauge         sanitize              cli             durum
+acceleration        0.0..20.0     ACCEL_MAX=20          YOK             eşleşiyor
+cap.x               0.0..500.0    CAP_X_MAX=500         range 0..CAP_X_MAXeşleşiyor
+cap.y               0.0..100.0    CAP_Y_MAX=100         range 0..CAP_Y_MAXeşleşiyor
+decay_rate          0.0..10.0     DECAY_RATE_MAX=10     min 0           eşleşiyor
+exponent_classic    1.0..10.0     10.0=10               range 1..10     eşleşiyor
+exponent_power      0.0001..5.0   EXP_POWER_MAX=5       range 1e-4..EXP_POWER_MAXeşleşiyor
+gamma               0.01..10.0    GAMMA_MAX=10          min 0           eşleşiyor
+input_offset        0.0..100.0    CAP_X_MAX=500         range 0..CAP_X_MAXİHLAL: gauge 100.0 < sanitize 500.0
+limit               0.0..100.0    LIMIT_MAX=100         min 0           eşleşiyor
+motivity            0.01..10.0    MOTIVITY_MAX=10       min 0           eşleşiyor
+output_offset       0.0..100.0    OUTPUT_OFFSET_MAX=100 range 0..OUTPUT_OFFSET_MAXeşleşiyor
+scale               0.01..100.0   SCALE_MAX=100         range 0.01..SCALE_MAXeşleşiyor
+smooth              0.0..1.0      SMOOTH_MAX=1          min 0           eşleşiyor
+sync_speed          0.0001..100.0 SYNC_SPEED_MAX=100    min 1e-4        eşleşiyor
+
+ihlal: 1 / ölçülen alan: 14

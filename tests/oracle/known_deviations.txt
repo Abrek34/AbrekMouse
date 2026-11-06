@@ -1,0 +1,125 @@
+# T13 — Known, intentional deviations of the local port from the official
+# RawAccel reference. Rows here are expected to differ; run_oracle.sh treats
+# only rows NOT in this list as drift. Format: <case-name>\t<spd>
+#
+# Deviation classes (five; all documented port conventions with their own tests).
+# The file currently holds 79 rows and they account for exactly:
+#   23 classic_gain_exp_le1 | 9 power/sync at spd 0 | 23 power_tinyexp_floor
+#   | 12 p155_io_cap0_legacy | 12 p155_io_cap0_gain
+# If a new row is added here, document its class in this header — an
+# unexplained row reads as cruft, and the natural "cleanup" (delete it) turns
+# into a hard gate failure ("UNKNOWN mismatched rows") instead of a fix.
+#  1. classic *exp<=1* → the local port's "linear path" returns the constant
+#     gain 1+acceleration. The official reference keeps x^(exp-1), which
+#     explodes (e.g. gain ≈ 448 at speed 0.001 for exp=0.5) on the physical
+#     expectation that exp<1 is an unusual config. AGENTS.md test:
+#     "classic linear path (exp<=1) cap".
+#     Reachability (T15/T16): the GUI spinner is bounded to [1,10]
+#     (gui/ui_builder.inl `make_spin(1,10,...)`), and `sanitize_accel_args`
+#     now clamps exponent_classic to [1,10] (src/config.cpp), so a real
+#     daemon/GUI/CLI config can never carry exp<1 — these rows are only
+#     reachable through the raw algorithm API, where the port keeps its
+#     safe documented behavior.
+#  2. power / synchronous at speed 0 → the port guards `x <= 0 → 1.0`
+#     (identity); the reference blindly runs the formula, yielding artifacts
+#     (power → 0, synchronous → ≈0.667). Speed 0 is non-physical for a mouse
+#     (output = input × gain = 0 anyway). AGENTS.md test: "synchronous power<1".
+#  3. power exponent_power ∈ [1e-4, 1e-3) → the port floors the shared exponent
+#     at 1e-3 (BUG-02 root-cause: scale derivation and curve evaluation must use
+#     the SAME n), the reference evaluates the raw ep. Every speed in the band is
+#     a documented deviation; `power_tinyexp_floor` pins it (raw*_pX cases use
+#     exponents ≥ 0.3 so they never exercise the band).
+#  4. `p155_io_cap0_legacy` (12 rows) → `io` gain with the degenerate
+#     `cap.y = 0`. The local port returns the ordinary gain curve; the
+#     reference returns **0** for the whole speed range (measured:
+#     ref=0 vs local 0.125893 at spd=0.001, 1 at spd=1, 7.94328 at spd=1000),
+#     i.e. the reference kills all output on this input while the port does
+#     not. P155.
+#     The sibling family `p155_io_cap0_gain` is the SAME cap.y=0 input and the
+#     SAME local result, but the reference emits **NaN** there instead of 0 —
+#     measured, not assumed. Those 12 rows are NOW listed because the oracle
+#     explicitly checks for finiteness mismatch (ref NaN vs local finite).
+#     Do not generalise this into "cap.y=0 rows are never listed" — half of them
+#     are, and those are the rows below. (AGENTS.md said exactly that and was
+#     wrong; corrected.)
+classic_gain_exp_le1	0.001
+classic_gain_exp_le1	0.005
+classic_gain_exp_le1	0.01
+classic_gain_exp_le1	0.1
+classic_gain_exp_le1	0.5
+classic_gain_exp_le1	1
+classic_gain_exp_le1	3
+classic_gain_exp_le1	5
+classic_gain_exp_le1	7.5
+classic_gain_exp_le1	10
+classic_gain_exp_le1	15
+classic_gain_exp_le1	30
+classic_gain_exp_le1	50
+classic_gain_exp_le1	100
+classic_gain_exp_le1	250
+classic_gain_exp_le1	500
+classic_gain_exp_le1	1000
+classic_gain_exp_le1	2000
+classic_gain_exp_le1	3000
+classic_gain_exp_le1	4000
+classic_gain_exp_le1	5000
+classic_gain_exp_le1	10000
+classic_gain_exp_le1	100000
+power_gain_p1	0
+power_legacy_p1	0
+power_tinyexp_floor	0
+power_tinyexp_floor	0.001
+power_tinyexp_floor	0.005
+power_tinyexp_floor	0.01
+power_tinyexp_floor	0.1
+power_tinyexp_floor	0.5
+# spd=1 is NOT a deviation: both sides reduce to 1^n with scale=1 (cap out)
+# and agree exactly; keep it unlisted so it is force-checked every run.
+power_tinyexp_floor	3
+power_tinyexp_floor	5
+power_tinyexp_floor	7.5
+power_tinyexp_floor	10
+power_tinyexp_floor	15
+power_tinyexp_floor	30
+power_tinyexp_floor	50
+power_tinyexp_floor	100
+power_tinyexp_floor	250
+power_tinyexp_floor	500
+power_tinyexp_floor	1000
+power_tinyexp_floor	2000
+power_tinyexp_floor	3000
+power_tinyexp_floor	4000
+power_tinyexp_floor	5000
+power_tinyexp_floor	10000
+power_tinyexp_floor	100000
+sync_gain_p2	0
+sync_gain_p1	0
+sync_gain_p07	0
+sync_legacy_p2	0
+sync_legacy_p1	0
+sync_legacy_mot05_gam2	0
+sync_gain_mot2_gam05	0
+p155_io_cap0_legacy	0.0001
+p155_io_cap0_legacy	0.001
+p155_io_cap0_legacy	0.01
+p155_io_cap0_legacy	0.1
+p155_io_cap0_legacy	1
+p155_io_cap0_legacy	3
+p155_io_cap0_legacy	5
+p155_io_cap0_legacy	10
+p155_io_cap0_legacy	100
+p155_io_cap0_legacy	1000
+p155_io_cap0_legacy	10000
+p155_io_cap0_legacy	100000
+p155_io_cap0_gain	0.0001
+p155_io_cap0_gain	0.001
+p155_io_cap0_gain	0.01
+p155_io_cap0_gain	0.1
+p155_io_cap0_gain	1
+p155_io_cap0_gain	3
+p155_io_cap0_gain	5
+p155_io_cap0_gain	10
+p155_io_cap0_gain	100
+p155_io_cap0_gain	1000
+p155_io_cap0_gain	10000
+p155_io_cap0_gain	100000

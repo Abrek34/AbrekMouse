@@ -1,0 +1,28 @@
+{
+  "noaccel": 13.6782,
+  "power-whole": 39.1757,
+  "classic": 43.8619,
+  "power+rot45+snap15+clamp": 58.5337,
+  "power-dual+4ema": 307.3409,
+  "apply_motion_math(full)": 43.9391,
+  "_meta": {
+    "unit": "ns/event",
+    "iterations_per_config": {
+      "noaccel": 7365344,
+      "power-whole": 2556212,
+      "classic": 2287226,
+      "power+rot45+snap15+clamp": 1712576,
+      "power-dual+4ema": 331542,
+      "apply_motion_math(full)": 2286676
+    },
+    "runs_used": 3,
+    "method": "median",
+    "min_seconds_per_run": 0.1,
+    "positive_control": false,
+    "cpu_model": "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+    "cpu_governor": "unreadable",
+    "threshold_percent": 20.0,
+    "control_config": "noaccel",
+    "control_max_percent": 12.0
+  }
+}

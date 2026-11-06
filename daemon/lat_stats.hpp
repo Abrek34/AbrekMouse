@@ -1,0 +1,221 @@
+#pragma once
+// lat_stats.hpp — Latency histogram for per-device processing-time tracking.
+//
+// This header has NO libevdev dependency so it can be included in unit tests
+// without linking against the evdev/uinput libraries.
+//
+// Thread safety: flush_motion() (loop thread) calls record(); dump_latency_stats()
+// (main thread) calls snapshot_and_reset(). mtx serialises all field access.
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <mutex>
+
+namespace rawaccel {
+
+struct lat_stats {
+    // 1000 buckets × 0.5 µs = 0–500 µs range.  Samples above the range go to 'over'.
+    static constexpr int    BUCKETS    = 1000;
+    static constexpr double BUCKET_US  = 0.5;         // µs per bucket
+    static constexpr double RANGE_US   = BUCKETS * BUCKET_US; // 500 µs
+
+    mutable std::mutex mtx;     // guards all fields below
+
+    uint64_t count   = 0;
+    double   sum_us  = 0;
+    double   min_us  = 1e9;
+    double   max_us  = 0;
+    uint64_t hist[BUCKETS] = {};
+    uint64_t over    = 0;       // samples > RANGE_US
+
+    // std::mutex is neither copyable nor movable; provide explicit move constructor
+    // so mouse_device (which contains lat_stats) can be moved into a vector.
+    // The mutex is NOT transferred — the new object gets a fresh (unlocked) mutex.
+    lat_stats() = default;
+    lat_stats(lat_stats&& o) noexcept {
+        // R13: lock source before reading — another thread may be calling record().
+        // In practice moves only happen under devices_mutex_, but defend in depth.
+        std::lock_guard<std::mutex> lk(o.mtx);
+        count = o.count; sum_us = o.sum_us;
+        min_us = o.min_us; max_us = o.max_us; over = o.over;
+        std::copy(o.hist, o.hist + BUCKETS, hist);
+        o.count = 0; o.sum_us = 0; o.min_us = 1e9; o.max_us = 0;
+        std::fill(o.hist, o.hist + BUCKETS, 0ULL);
+        o.over = 0;
+    }
+    lat_stats& operator=(lat_stats&& o) noexcept {
+        if (this != &o) {
+            // R13: lock both — prevent concurrent record() during move.
+            // Always lock in address order to avoid deadlock.
+            std::mutex* first  = &mtx < &o.mtx ? &mtx : &o.mtx;
+            std::mutex* second = &mtx < &o.mtx ? &o.mtx : &mtx;
+            std::lock_guard<std::mutex> lk1(*first);
+            std::lock_guard<std::mutex> lk2(*second);
+            count = o.count; sum_us = o.sum_us;
+            min_us = o.min_us; max_us = o.max_us; over = o.over;
+            std::copy(o.hist, o.hist + BUCKETS, hist);
+            o.count = 0; o.sum_us = 0; o.min_us = 1e9; o.max_us = 0;
+            std::fill(o.hist, o.hist + BUCKETS, 0ULL);
+            o.over = 0;
+        }
+        return *this;
+    }
+    lat_stats(const lat_stats&)            = delete;
+    lat_stats& operator=(const lat_stats&) = delete;
+
+    // ── Write path (loop thread, called from flush_motion) ──────────────────
+
+    void record(double lat_us) {
+        // O1 (P55): NaN latency would poison sum_us/avg_us permanently and a
+        // negative sample would skew min/avg.  Both are unreachable from the
+        // daemon (CLOCK_MONOTONIC_RAW deltas are always finite, non-negative)
+        // but the guards are cheap and keep the histogram invariant-valid.
+        if (!std::isfinite(lat_us)) return;
+        if (lat_us < 0) lat_us = 0;
+        std::lock_guard<std::mutex> lk(mtx);
+        count++;
+        sum_us += lat_us;
+        if (lat_us < min_us) min_us = lat_us;
+        if (lat_us > max_us) max_us = lat_us;
+        if (lat_us < RANGE_US) {
+            int b = static_cast<int>(lat_us / BUCKET_US);
+            if (b < 0) b = 0;
+            hist[b]++;
+        } else {
+            over++;
+        }
+    }
+
+    // ── Read path (caller must hold mtx, or use snapshot_and_reset) ─────────
+
+    double avg_us() const {
+        return count > 0 ? sum_us / count : 0.0;
+    }
+
+    /// Compute a percentile (0–100) from the histogram.  O(BUCKETS).
+    /// Caller must hold mtx.
+    double percentile(double pct) const {
+        if (count == 0) return 0.0;
+        // BUG-NEW-72: pct outside [0,100] previously made
+        // static_cast<uint64_t>(ceil(count·pct/100)) UB (negative)
+        // or returned max_us (pct > 100).  Clamp to the valid domain.
+        // BUG-HIGH-1: NaN is not caught by <=/>= and would flow into the
+        // out-of-range uint64_t cast — guard it explicitly (Inf still lands
+        // in the pct >= 100 branch as max_us).
+        if (std::isnan(pct)) return 0.0;
+        if (pct <= 0.0) return 0.0;
+        if (pct >= 100.0) return max_us;
+        uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
+        uint64_t cum = 0;
+        for (int i = 0; i < BUCKETS; i++) {
+            cum += hist[i];
+            if (cum >= target)
+                // Midpoint of the bucket that contains the k-th sample.
+                // Using the upper edge would overstate percentiles for small
+                // counts (e.g. p50 of a single sample = 0.5µs, not ~0.25µs).
+                return (static_cast<double>(i) + 0.5) * BUCKET_US;
+        }
+        // L10-08 (MED): the target lies in the overflow samples (> RANGE_US).
+        // Returning max_us for EVERY such percentile made p25 = p50 = p75 =
+        // 5000 µs on a mixed distribution — p50 could exceed the reported avg,
+        // which is impossible for a real distribution (measured: p50 5000 vs
+        // exact 2755, avg 2772).  Interpolate linearly across the overflow
+        // region instead: the k-th overflow sample sits proportionally between
+        // RANGE_US and max_us.  Bounded, monotone, and much closer to the
+        // exact value; only the overflow tail is estimated (the histogram
+        // itself stays exact for samples <= RANGE_US).
+        if (over > 0) {
+            const uint64_t in_range = count - over; // samples inside the histogram
+            const double pos = (target > in_range) ? static_cast<double>(target - in_range) : 0.0;
+            double frac = pos / static_cast<double>(over);
+            if (frac > 1.0) frac = 1.0;
+            return RANGE_US + frac * (max_us - RANGE_US);
+        }
+        return max_us;
+    }
+
+    // ── Snapshot (read + reset atomically, caller must NOT hold mtx) ────────
+
+    struct snapshot {
+        uint64_t count;
+        double   sum_us, min_us, max_us;
+        uint64_t hist[BUCKETS];
+        uint64_t over;
+
+        double avg_us() const { return count > 0 ? sum_us / count : 0.0; }
+
+        double percentile(double pct) const {
+            if (count == 0) return 0.0;
+            // BUG-NEW-72: same guard as the live percentile() above.
+            // BUG-HIGH-1: NaN flows past <=/>= into the cast — guard it.
+            if (std::isnan(pct)) return 0.0;
+            if (pct <= 0.0) return 0.0;
+            if (pct >= 100.0) return max_us;
+            uint64_t target = static_cast<uint64_t>(std::ceil(count * pct / 100.0));
+            uint64_t cum = 0;
+            for (int i = 0; i < BUCKETS; i++) {
+                cum += hist[i];
+                if (cum >= target)
+                    return (static_cast<double>(i) + 0.5) * BUCKET_US;
+            }
+            // L10-08: same overflow interpolation as lat_stats::percentile()
+            // (see the comment there) — p50 must never exceed the reported avg
+            // on a mixed distribution.
+            if (over > 0) {
+                const uint64_t in_range = count - over;
+                const double pos = (target > in_range) ? static_cast<double>(target - in_range) : 0.0;
+                double frac = pos / static_cast<double>(over);
+                if (frac > 1.0) frac = 1.0;
+                return RANGE_US + frac * (max_us - RANGE_US);
+            }
+            return max_us;
+        }
+    };
+
+    /// Zero the counters without producing a snapshot.  Used on the transition
+    /// into raw 1:1 passthrough (R12-LATRAW): flush_motion() — the only
+    /// lat.record() caller — never runs in raw mode, so without a reset the
+    /// status JSON keeps publishing stale accel-era lat_* fields long after raw
+    /// mode took over.  Caller must NOT hold mtx (we take it).
+    void reset() {
+        std::lock_guard<std::mutex> lk(mtx);
+        count = 0; sum_us = 0; min_us = 1e9; max_us = 0;
+        std::fill(hist, hist + BUCKETS, 0ULL);
+        over = 0;
+    }
+
+    /// Non-resetting copy for lock-narrowing readers (P136: status_json).
+    /// Copies counters+histogram under mtx; avg/percentile math runs on the
+    /// returned copy with NO locks held. Caller must NOT hold mtx (we take it).
+    snapshot copy() const {
+        std::lock_guard<std::mutex> lk(mtx);
+        snapshot s;
+        s.count  = count;
+        s.sum_us = sum_us;
+        s.min_us = min_us;
+        s.max_us = max_us;
+        std::copy(hist, hist + BUCKETS, s.hist);
+        s.over   = over;
+        return s;
+    }
+
+    /// Atomically copies current stats into a snapshot and resets all counters.
+    snapshot snapshot_and_reset() {
+        std::lock_guard<std::mutex> lk(mtx);
+        snapshot s;
+        s.count  = count;
+        s.sum_us = sum_us;
+        s.min_us = min_us;
+        s.max_us = max_us;
+        std::copy(hist, hist + BUCKETS, s.hist);
+        s.over   = over;
+        // Reset
+        count = 0; sum_us = 0; min_us = 1e9; max_us = 0;
+        std::fill(hist, hist + BUCKETS, 0ULL);
+        over = 0;
+        return s;
+    }
+};
+
+} // namespace rawaccel

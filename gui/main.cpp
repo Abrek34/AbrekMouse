@@ -1,0 +1,317 @@
+//  rawaccel-gui — GTK4 frontend for rawaccel-linux
+//  Version: RAWACCEL_VERSION (rawaccel-base.hpp)
+//
+//  File layout (each .inl compiled as part of this single translation unit):
+//    app_state.hpp    — AppState struct, shared includes, forward declarations
+//    devices.inl      — Mouse device discovery + stable by-id paths, inotify hot-plug
+//    daemon_comm.inl  — Daemon PID lookup, status display, signal sending
+//    graph.inl        — Cairo curve rendering, LUT editor
+//    widgets_sync.inl — Widget ↔ profile sync, GTK signal callbacks
+//    profile_mgr.inl  — Profile CRUD dialogs (new/rename/delete/duplicate/reset/save)
+//    ui_builder.inl   — Layout helpers, build_ui(), window-close dialog, on_activate()
+//    main.cpp         — AppState instantiation, config load, main()
+//
+//  Architecture note: AppState is NOT accessed via a global pointer. Instead:
+//    - All helper functions receive AppState* as a parameter.
+//    - GTK callbacks receive AppState* through the gpointer user_data mechanism.
+//    - on_activate() is the only entry point that receives the live AppState*.
+
+#include "app_state.hpp"
+#include "tr.inl"
+#include <fcntl.h>    // open() for the single-instance lock file (BUG-01)
+#include <sys/file.h> // flock() — cross-user/session instance guard (BUG-01)
+#include <ctime>      // time() for the corrupt-config backup suffix (M-8)
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Returns reference to current profile. Caller must ensure profiles is non-empty.
+device_profile& cur_prof(AppState* S) {
+    auto& profs = S->config.profiles;
+    if (profs.empty()) {
+        device_profile dp; dp.name = "default";
+        profs.push_back(dp);
+        S->current_profile_idx = 0;
+    }
+    int idx = std::clamp(S->current_profile_idx, 0, (int)profs.size() - 1);
+    S->current_profile_idx = idx;
+    return profs[idx];
+}
+
+void set_status(AppState* S, const std::string& msg) {
+    gtk_label_set_text(GTK_LABEL(S->status_bar), msg.c_str());
+}
+
+// STALE-1 (AJ1, 30 Sep 2026; sentinel fixed 1 Oct 2026): mtime of the config
+// file, or CONFIG_STAMP_UNREADABLE if unreadable.
+// fs::last_write_time is in `file_time_type` ticks, not seconds; only the
+// RELATIVE comparison below matters, so the absolute epoch is irrelevant.
+// STAR: error is signalled by returning the sentinel, NOT by a negative value
+// and NOT by a sign test.  On libstdc++/Linux every real mtime is ALREADY
+// negative (measured -4646858292110006316), so `stamp >= 0` would mean
+// "unreadable" for every readable file.  See the sentinel note in app_state.hpp.
+static std::int64_t config_file_stamp(const std::string& path) {
+    std::error_code ec;
+    auto t = fs::last_write_time(path, ec);
+    if (ec) return CONFIG_STAMP_UNREADABLE;
+    return static_cast<std::int64_t>(t.time_since_epoch().count());
+}
+
+void save_config_now(AppState* S) {
+    try {
+        // STALE-1: refuse to silently clobber a config that changed underneath
+        // us.  `S->config` was loaded once at startup, so writing it back in
+        // full discards any edit made since — by the CLI, another GUI, or the
+        // daemon persisting an IPC set_config.  We do NOT auto-reload: that
+        // would throw away the user's own unsaved widget edits, which is a
+        // worse data-loss path than making them decide.  CONFIG_STAMP_UNREADABLE
+        // means "never stamped" (first save of a session, or the file was
+        // unreadable), in which case there is nothing to compare against and we
+        // proceed.  Validity is decided by COMPARING TO THE SENTINEL, never by a
+        // sign test -- on libstdc++/Linux every real mtime is already negative,
+        // so `>= 0` was false for every readable file and this whole guard was
+        // dead code (measured 1 Oct 2026).  See the sentinel note in app_state.hpp.
+        if (S->config_mtime_loaded != CONFIG_STAMP_UNREADABLE) {
+            std::int64_t now_stamp = config_file_stamp(S->config_path);
+            if (now_stamp != CONFIG_STAMP_UNREADABLE && now_stamp != S->config_mtime_loaded) {
+                set_status(S, trf(
+                    "Not saved: %s changed on disk since this window was opened "
+                    "(edited by the CLI or another tool). Reopen the GUI to load "
+                    "it, otherwise your save would discard those changes.",
+                    S->config_path.c_str()));
+                return;   // nothing written, nothing pushed
+            }
+        }
+        save_config(S->config, S->config_path);
+        S->config_mtime_loaded = config_file_stamp(S->config_path);
+        S->unsaved = false;
+        // Push the full config to the daemon over IPC ("set_config" RPC):
+        // the daemon persists it to its OWN config path — for a root systemd
+        // daemon that is /etc/rawaccel/settings.json — and live-applies it.
+        // A plain SIGHUP only makes the daemon re-read its own (stale) config.
+        // Fall back to SIGHUP for old daemons that predate the IPC RPC.
+        // ASYNC: the blocking RPC (up to a 5 s timeout while a root daemon
+        // fsyncs) must not freeze the GTK main thread — it runs on a helper
+        // thread and the degraded status feedback arrives via g_idle_add.
+        std::string json = app_config_to_json(S->config);
+        std::string dup_warn = check_duplicate_device_ids(S->config);
+        daemon_ipc_push_config_async(json, S, dup_warn);
+        if (!dup_warn.empty())
+            set_status(S, dup_warn + tr(" | Saving…"));
+        else
+            set_status(S, tr("Saving…"));
+    } catch (std::exception& e) {
+        set_status(S, trf("Save error: %s", e.what()));
+    }
+}
+
+std::string check_duplicate_device_ids(const app_config& cfg) {
+    // O(n^2) but profiles are few; avoids extra includes.
+    std::string warn;
+    for (size_t i = 0; i < cfg.profiles.size(); ++i) {
+        const auto& a = cfg.profiles[i];
+        if (a.device_id.empty()) continue;
+        for (size_t j = i + 1; j < cfg.profiles.size(); ++j) {
+            const auto& b = cfg.profiles[j];
+            if (a.device_id == b.device_id) {
+                if (!warn.empty()) warn += "; ";
+                warn += trf("\"%s\" & \"%s\" share device %s",
+                            a.name.c_str(), b.name.c_str(), a.device_id.c_str());
+            }
+        }
+    }
+    if (!warn.empty()) {
+        warn = trf("Warning: duplicate device IDs — %s. Only the first matching profile is used by the daemon.",
+                   warn.c_str());
+    }
+    return warn;
+}
+
+// ── Translation units (included in dependency order) ─────────────────────────
+#include "devices.inl"
+#include "daemon_comm.inl"
+#include "graph.inl"
+#include "widgets_sync.inl"
+#include "mouse_test.inl"
+#include "profile_mgr.inl"
+#include "hidpp_panel.inl"
+#include "kwin_focus.inl"
+#include "ui_builder.inl"
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    // Suppress harmless GTK4 GtkGizmo size warnings (known GTK4 cosmetic bug
+    // where sliders briefly report negative min-size during layout).
+    // GTK4 uses structured logging, so g_log_set_handler() is bypassed —
+    // we must install a writer func instead.
+    g_log_set_writer_func(
+        [](GLogLevelFlags level, const GLogField* fields, gsize n_fields, gpointer) -> GLogWriterOutput {
+            for (gsize i = 0; i < n_fields; ++i) {
+                if (g_strcmp0(fields[i].key, "MESSAGE") == 0 && fields[i].value) {
+                    const char* msg = static_cast<const char*>(fields[i].value);
+                    if (std::strstr(msg, "GtkGizmo")) return G_LOG_WRITER_HANDLED;
+                }
+            }
+            return g_log_writer_default(level, fields, n_fields, nullptr);
+        }, nullptr, nullptr);
+
+    AppState state;
+
+    // Find config — prefer real user's config even if launched with sudo.
+    // Use getpwnam_r (reentrant, thread-safe) instead of getpwnam.
+    const char* sudo_user = getenv("SUDO_USER");
+    if (sudo_user && sudo_user[0] != '\0') {
+        struct passwd  pwd_buf;
+        struct passwd* result = nullptr;
+        std::vector<char> pw_buf(16384);
+        int ret = getpwnam_r(sudo_user, &pwd_buf, pw_buf.data(), pw_buf.size(), &result);
+        if (ret == 0 && result && result->pw_dir && result->pw_dir[0] != '\0') {
+            state.config_path = std::string(result->pw_dir) + "/.config/rawaccel/settings.json";
+        } else {
+            state.config_path = std::string("/home/") + sudo_user + "/.config/rawaccel/settings.json";
+        }
+    } else {
+        state.config_path = find_config_path();
+    }
+    if (state.config_path.empty()) {
+        g_warning("find_config_path() returned empty — falling back to /etc/rawaccel/settings.json");
+        state.config_path = "/etc/rawaccel/settings.json";
+    }
+    state.lang_path = (fs::path(state.config_path).parent_path() / "gui_lang").string();
+
+    if (fs::exists(state.config_path)) {
+        try {
+            state.config = load_config(state.config_path);
+        } catch (const std::exception& e) {
+            // M-8/R2-04: never silently overwrite a corrupt config with defaults.
+            // Stash the offending file aside (best-effort) so its contents are
+            // recoverable, then load a default profile and surface the warning.
+            std::string backup = state.config_path + ".corrupt-" +
+                                 std::to_string(time(nullptr));
+            std::error_code ec;
+            fs::copy_file(state.config_path, backup,
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec)
+                state.config_load_warn = trf("Config load error (%s) — defaults loaded; could not back up %s.",
+                                             e.what(), state.config_path.c_str());
+            else
+                state.config_load_warn = trf("Config load error (%s) — corrupt file backed up to %s; defaults loaded.",
+                                             e.what(), backup.c_str());
+            device_profile dp;
+            dp.name = "default";
+            dp.dev_cfg.dpi = 800;
+            dp.dev_cfg.polling_rate = 1000;
+            state.config.profiles.push_back(dp);
+        }
+    }
+    // STALE-1: stamp the config file's mtime NOW, so save_config_now() can tell
+    // "nobody touched it" from "someone changed it while this window was open".
+    // Stamped after the load (and after any corrupt-file backup, which is a
+    // copy and does not touch the original).
+    state.config_mtime_loaded = config_file_stamp(state.config_path);
+    // R5-D: a missing config is a normal first-run, not a corrupt one — don't
+    // flash the ".corrupt-" backup alarm for a file that never existed (the
+    // old catch-all copied a nonexistent file, failed, and called the failed
+    // copy a "corrupt config" worth warning about).  The empty-profiles guard
+    // below seeds the default profile either way.
+    if (state.config.profiles.empty()) {
+        device_profile dp; dp.name = "default";
+        state.config.profiles.push_back(dp);
+    }
+
+    // Open the GUI on the persisted active profile instead of always the first
+    // one, so the header-bar selection, the loaded widget values, and the
+    // daemon's active profile all agree at startup (P97-D1).
+    state.current_profile_idx = 0;
+    if (!state.config.active_profile.empty()) {
+        for (int i = 0; i < (int)state.config.profiles.size(); ++i) {
+            if (state.config.profiles[i].name == state.config.active_profile) {
+                state.current_profile_idx = i;
+                break;
+            }
+        }
+    }
+
+    // ── Single-instance guard (BUG-01) ─────────────────────────────────────
+    // GApplication's single-instance guarantee is per application ID per session
+    // bus — a second launch from a different user (sudo) or a bus-less DBus
+    // env would otherwise spawn a real second window + second inotify watch +
+    // double telemetry timers over the same config.  An advisory exclusive
+    // flock() on a file inside the shared config directory closes that hole
+    // across users and sessions.  Best effort: a failure to create/open/lock
+    // never blocks the GUI (no shared working copy is corrupted either way).
+    const fs::path cfg_dir = fs::path(state.config_path).parent_path();
+    {
+        std::error_code ec;
+        fs::create_directories(cfg_dir, ec);
+        (void)ec;
+    }
+    std::string lock_path = (cfg_dir / "rawaccel-gui.lock").string();
+    int lock_fd = open(lock_path.c_str(), O_CREAT | O_RDONLY | O_CLOEXEC, 0600);
+    if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        // Held by a live instance.  Deliberately NOT routed through tr(): the
+        // translation-coverage scanner requires every tr() key to have a dict
+        // entry, and this message is transient console/diagnostic only.
+        fprintf(stderr,
+                "RawAccel GUI is already running (config lock: %s). Exiting.\n",
+                lock_path.c_str());
+        close(lock_fd);
+        // LIFECYCLE/UX: a second launch used to exit SILENTLY — the stderr
+        // line above goes nowhere under a desktop (.desktop) launcher, so
+        // the user saw nothing at all.  Surface it: show a small modal
+        // dialog when a display is available; fall back to stderr only when
+        // headless (gtk_init_check fails).  A non-zero exit status lets
+        // shell callers notice too.
+        std::string msg = "RawAccel GUI is already running (config lock: " + lock_path + ").";
+        if (gtk_init_check()) {
+            GtkWindow* win = GTK_WINDOW(gtk_window_new());
+            gtk_window_set_title(win, "RawAccel");
+            gtk_window_set_default_size(win, 420, 80);
+            gtk_window_set_resizable(win, FALSE);
+            GtkWidget* lbl = gtk_label_new(msg.c_str());
+            gtk_label_set_wrap(GTK_LABEL(lbl), TRUE);
+            gtk_widget_set_margin_start(lbl, 12);
+            gtk_widget_set_margin_end(lbl, 12);
+            gtk_widget_set_margin_top(lbl, 12);
+            gtk_widget_set_margin_bottom(lbl, 12);
+            gtk_window_set_child(win, lbl);
+            // Run a private main loop so the user can actually read it;
+            // close/click anywhere to dismiss.
+            GMainLoop* loop = g_main_loop_new(nullptr, FALSE);
+            g_signal_connect(win, "close-request", G_CALLBACK(+[](GtkWindow*, gpointer data) -> gboolean {
+                g_main_loop_quit(static_cast<GMainLoop*>(data));
+                return FALSE;
+            }), loop);
+            gtk_window_present(win);
+            // Safety net: auto-dismiss after ~15 s so a forgotten dialog
+            // cannot wedge a scripted double-launch forever.
+            guint timeout_id = g_timeout_add(15000, +[](gpointer data) -> gboolean {
+                g_main_loop_quit(static_cast<GMainLoop*>(data));
+                return G_SOURCE_REMOVE;
+            }, loop);
+            g_main_loop_run(loop);
+            if (timeout_id) g_source_remove(timeout_id);
+            g_main_loop_unref(loop);
+            gtk_window_destroy(win);
+        }
+        return 1;
+    }
+
+    GtkApplication* app = gtk_application_new(
+        "io.github.rawaccel", G_APPLICATION_DEFAULT_FLAGS);
+    // Pass &state as user_data — on_activate receives it via gpointer.
+    g_signal_connect(app, "activate", G_CALLBACK(on_activate), &state);
+    int ret = g_application_run(G_APPLICATION(app), argc, argv);
+    // LIFECYCLE: the window-destroy handler already stopped the HID++ workers
+    // and the focus teardown; join both here as well so NO detached/late
+    // thread can outlive the AppState it references (idempotent — both are
+    // no-ops when the destroy handler already ran).
+    hidpp_workers_join(&state);
+    kwin_focus_join_cleanup(&state);
+    if (lock_fd >= 0) {
+        flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+    }
+    g_object_unref(app);
+    return ret;
+}

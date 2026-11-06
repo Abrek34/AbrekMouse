@@ -1,0 +1,4057 @@
+#include "../include/config.hpp"
+#include "../include/presets.hpp"
+#include "../include/rawaccel.hpp"
+#include "../include/logitech_receiver.hpp"
+#include "../include/logitech_hidpp.hpp"
+#include "../include/nlohmann/json.hpp"
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <iomanip>
+#include <cmath>
+#include <cctype>
+#include <csignal>
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <ctime>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <fcntl.h>
+
+/// IPC zaman aşımı (ms) — hem bağlantı kurma hem cevap alma BOUNDED olmalı.
+/// AJ-H: connect() AF_UNIX üzerinde kabul kuyruğu doluyken süresiz bloklanır;
+/// bu bütçe her IPC probunu (status/monitor/latency/reload) sınırlar.
+static constexpr int IPC_RCV_TIMEOUT_MS = 2000;
+
+// Version number comes from RAWACCEL_VERSION in rawaccel-base.hpp (single source of truth).
+static constexpr const char* VERSION = rawaccel::RAWACCEL_VERSION;
+
+using namespace rawaccel;
+
+/// Validate a user-supplied config path (SEC-2).
+/// Resolve `path` as far as the filesystem allows: the deepest existing
+/// ancestor is canonicalised and the not-yet-created tail is re-appended, so a
+/// prefix check on the result can never be fooled by ".." or by a symlink hop
+/// — without requiring the target itself to exist.
+/// `target_exists` (optional) reports whether the FULL path already resolves.
+static bool resolve_config_target(const std::string& path,
+                                  std::string* out,
+                                  bool* target_exists = nullptr) {
+    if (path.empty()) return false;
+    if (target_exists) *target_exists = false;
+
+    char buf[PATH_MAX] = {};
+    // T44-03: the not-yet-existing tail is re-appended verbatim, so a ".."
+    // lurking beneath a missing directory survives into the "canonical" path
+    // and is later resolved by stat()/the kernel — bypassing the prefix ban in
+    // check_config_path_policy() (e.g. /tmp/nonexist/../proc/foo.json).
+    // Try to canonicalise the parent directory too; if even that fails and a
+    // ".." component remains, reject the path instead of trusting it.
+    char buf2[PATH_MAX] = {};
+    auto normalise_parent = [&]() -> bool {
+        std::string parent = *out;
+        const size_t slash = parent.find_last_of('/');
+        parent = (slash == std::string::npos) ? std::string(".")
+                : (slash == 0) ? std::string("/") : parent.substr(0, slash);
+        if (realpath(parent.c_str(), buf2) != nullptr) {
+            const std::string filename = out->substr(out->find_last_of('/') + 1);
+            *out = std::string(buf2);
+            if (out->back() != '/') *out += '/';
+            *out += filename;
+            return true;
+        }
+        std::string cur;
+        for (size_t i = 0; i <= out->size(); ++i) {
+            if (i == out->size() || (*out)[i] == '/') {
+                if (cur == "..") return false;
+                cur.clear();
+            } else {
+                cur += (*out)[i];
+            }
+        }
+        return true;
+    };
+    if (realpath(path.c_str(), buf) != nullptr) {
+        *out = buf;
+        if (target_exists) *target_exists = true;
+        return true;
+    }
+
+    // Walk up until something resolves, remembering the tail we peeled off.
+    std::string head = path, tail;
+    for (;;) {
+        const size_t slash = head.find_last_of('/');
+        if (slash == std::string::npos) {
+            // Relative path with no directory part: resolve the CWD and re-join.
+            if (realpath(".", buf) != nullptr) {
+                *out = std::string(buf) + "/" + tail;
+                if (!normalise_parent()) return false;
+                return true;
+            }
+            break;
+        }
+        const std::string last = head.substr(slash + 1);
+        head = (slash == 0) ? "/" : head.substr(0, slash);
+        if (!last.empty() && last != ".")
+            tail = tail.empty() ? last : (last + "/" + tail);
+        if (realpath(head.c_str(), buf) != nullptr) {
+            *out = buf;
+            if (!tail.empty()) {
+                if (out->back() != '/') *out += '/';
+                *out += tail;
+            }
+            if (!normalise_parent()) return false;
+            return true;
+        }
+    }
+    *out = path;   // nothing on the way resolved — hand back what we were given
+    if (!normalise_parent()) return false;
+    return true;
+}
+
+/// The ONE place the config-path policy lives, so it cannot drift per call
+/// branch again (see R5-S-9 below).  Takes an already-RESOLVED path.
+static bool check_config_path_policy(const std::string& canonical) {
+    if (canonical.size() < 5 ||
+        canonical.compare(canonical.size() - 5, 5, ".json") != 0) {
+        std::cerr << "Config path '" << canonical
+                  << "' does not have a .json extension.\n";
+        return false;
+    }
+    for (const char* bad : { "/proc/", "/sys/", "/dev/" }) {
+        if (canonical.rfind(bad, 0) == 0) {
+            std::cerr << "Config path '" << canonical
+                      << "' is in a disallowed directory.\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Returns true if the path is acceptable; prints an error and returns false otherwise.
+/// Checks:
+///   1. Path must not be empty.
+///   2. The RESOLVED path must have a ".json" extension.
+///   3. The RESOLVED path must not be under /proc/, /sys/ or /dev/.
+///   4. If the file exists, it must be a regular file (not /dev/*, /proc/*, special nodes).
+///   5. If the file exists, it must be ≤ 4 MB (sanity guard against reading huge files).
+///   6. With `require_existing_parent`, the parent directory must exist too.
+///
+/// R5-S-9 (COMPLETED here) — byte-identical to the copy in daemon/main.cpp:
+/// the ban was applied to the canonical path on the "file exists" branch and to
+/// the RAW STRING on the other one, and `stat()` resolved the ".." components
+/// the raw string still contained, so `/tmp/x/../../../dev/shm/a.json` passed
+/// while the same target spelled directly was rejected.  The policy now runs on
+/// the resolved path on EVERY branch, via check_config_path_policy().
+static bool validate_config_path(const std::string& path,
+                                 bool require_existing_parent = true) {
+    if (path.empty()) {
+        std::cerr << "Config path is empty.\n";
+        return false;
+    }
+
+    std::string canonical;
+    bool exists = false;
+    if (!resolve_config_target(path, &canonical, &exists)) {
+        std::cerr << "Config path '" << path << "' cannot be resolved.\n";
+        return false;
+    }
+
+    if (!check_config_path_policy(canonical)) return false;
+
+    if (exists) {
+        struct stat st {};
+        if (stat(canonical.c_str(), &st) == 0) {
+            if (!S_ISREG(st.st_mode)) {
+                std::cerr << "Config path '" << canonical
+                          << "' is not a regular file.\n";
+                return false;
+            }
+            constexpr off_t MAX_CONFIG_BYTES = 4L * 1024L * 1024L; // 4 MB
+            if (st.st_size > MAX_CONFIG_BYTES) {
+                std::cerr << "Config file is too large ("
+                          << st.st_size << " bytes, max " << MAX_CONFIG_BYTES << ").\n";
+                return false;
+            }
+        }
+    }
+
+    if (require_existing_parent && !exists) {
+        // The file doesn't exist yet, so the parent directory must exist
+        std::string parent = ".";
+        const size_t slash = canonical.find_last_of('/');
+        if (slash != std::string::npos)
+            parent = (slash == 0) ? "/" : canonical.substr(0, slash);
+        struct stat pst {};
+        if (stat(parent.c_str(), &pst) != 0 || !S_ISDIR(pst.st_mode)) {
+            std::cerr << "Config directory '" << parent
+                      << "' does not exist.\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+// ── Daemon communication ──────────────────────────────────────────────────────
+
+/// True when the process at /proc/<pid> is genuinely the rawaccel daemon
+/// (R5-S-1). /proc/<pid>/comm can be spoofed with prctl(PR_SET_NAME); the
+/// kernel-maintained /proc/<pid>/exe link cannot.  The exe check is best-effort
+/// (falls back to comm alone when /proc is restricted — EACCES against a root
+/// daemon) so a permission restriction never breaks daemon detection.
+static bool pid_is_rawaccel_daemon(pid_t pid) {
+    if (pid <= 0) return false;
+    char proc_root[64];
+    std::snprintf(proc_root, sizeof(proc_root), "/proc/%d", (int)pid);
+
+    // 1) Kernel-maintained binary link — strongest identity check.
+    {
+        char link[96];
+        std::snprintf(link, sizeof(link), "%s/exe", proc_root);
+        char exe[4096];
+        ssize_t n = readlink(link, exe, sizeof(exe) - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            const char* base = std::strrchr(exe, '/');
+            base = base ? base + 1 : exe;
+            if (std::strcmp(base, "rawaccel-daemon") != 0) return false;
+        } else if (errno == ENOENT || errno == ESRCH) {
+            return false; // process gone
+        }
+        // else EACCES/EPERM (restricted /proc): fall through to the comm check.
+    }
+
+    // 2) /proc/<pid>/comm must also name the daemon.
+    char comm_path[96];
+    std::snprintf(comm_path, sizeof(comm_path), "%s/comm", proc_root);
+    FILE* cf = std::fopen(comm_path, "r");
+    if (!cf) return false;
+    char comm[64] = {};
+    (void)!std::fgets(comm, sizeof(comm), cf);
+    std::fclose(cf);
+    size_t len = std::strlen(comm);
+    if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+    return std::strcmp(comm, "rawaccel-daemon") == 0;
+}
+
+/// Result codes from a daemon-signal attempt — lets the caller distinguish
+/// "daemon not running" from "running but I lack permission" (the daemon
+/// runs as root via systemd, and `kill()` from an unprivileged user returns
+/// EPERM).  This was previously squashed into a single bool, producing the
+/// misleading "is it running?" message even when the daemon was up.
+enum class signal_result { sent, not_running, permission_denied, other };
+
+/// @param out_pid  optional: receives the PID that was targeted (L13-01 —
+///                 cmd_stop needs it to verify the daemon actually exited).
+static signal_result send_signal_to_daemon(int sig, pid_t* out_pid = nullptr) {
+    // N6: daemon prefers $XDG_RUNTIME_DIR/rawaccel.pid — check it first.
+    std::vector<std::string> paths;
+    const char* xdg = std::getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0] != '\0') paths.push_back(std::string(xdg) + "/rawaccel.pid");
+    paths.push_back("/run/rawaccel.pid");
+    paths.push_back("/tmp/rawaccel.pid");
+
+    for (auto& path : paths) {
+        std::ifstream f(path);
+        if (!f.is_open()) continue;
+        pid_t pid = 0;
+        f >> pid;
+        // R5-S-1: only signal a PID that is actually the rawaccel daemon —
+        // prevents signalling a recycled / spoofed process.
+        if (!pid_is_rawaccel_daemon(pid)) continue;
+        if (out_pid) *out_pid = pid;
+        if (kill(pid, sig) == 0) return signal_result::sent;
+        if (errno == EPERM)      return signal_result::permission_denied;
+        return signal_result::other;
+    }
+    return signal_result::not_running;
+}
+
+// ── Daemon IPC (Unix socket) ──────────────────────────────────────────────────
+
+/// Candidate IPC socket paths, in the order the daemon tries them.
+/// The daemon writes the *first* one it can bind: $XDG_RUNTIME_DIR (only set
+/// for user services), then /run (system service — what systemd uses).
+/// CLI is invoked from a user shell, where XDG_RUNTIME_DIR *is* set, so a
+/// naive `daemon_sock_path()` would point at /run/user/1000/rawaccel.sock
+/// while the system daemon listens on /run/rawaccel.sock.  Walk the whole
+/// list so both deployments work.
+static std::vector<std::string> daemon_sock_candidates() {
+    std::vector<std::string> v;
+    const char* xdg = std::getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0] != '\0') v.push_back(std::string(xdg) + "/rawaccel.sock");
+    v.push_back("/run/rawaccel.sock");
+    return v;
+}
+
+/// Send a raw request over the daemon socket and return the response.
+/// Empty string on failure.  Used so unprivileged users (in the input group)
+/// can ask the root-owned daemon to reload without needing kill() permission.
+static std::string daemon_ipc_send(const std::string& request) {
+    for (const auto& sock : daemon_sock_candidates()) {
+        // AJ-H: connect() SİNIRSIZ BLOKLANAMAZ.  AF_UNIX üzerinde connect(),
+        // dinleyicinin kabul kuyruğu doluysa (donmuş daemon) süresiz bekler —
+        // SO_SNDTIMEO connect()u KISITLAMAZ (Linux'ta yalnız gönderme/
+        // alma için geçerlidir).  Bu yüzden soket O_NONBLOCK açılır,
+        // connect() EINPROGRESS dönerse POLLOUT beklenir ve zaman aşımı
+        // BOUNDED olur (IPC_RCV_TIMEOUT_MS).
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (fd < 0) continue;
+
+        struct timeval tv { .tv_sec = IPC_RCV_TIMEOUT_MS / 1000,
+                            .tv_usec = (IPC_RCV_TIMEOUT_MS % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        if (sock.size() >= sizeof(addr.sun_path)) { close(fd); continue; }
+        std::strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            if (errno != EINPROGRESS) { close(fd); continue; }
+            // Kuyruk dolu / daemon yanıt vermiyor → BOUNDED bekle.
+            struct pollfd pfd { fd, POLLOUT, 0 };
+            int pr;
+            do {
+                pr = poll(&pfd, 1, IPC_RCV_TIMEOUT_MS);
+            } while (pr < 0 && errno == EINTR);
+            if (pr <= 0) { close(fd); continue; }   // zaman aşımı → sonraki aday
+            int so_err = 0;
+            socklen_t err_len = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &err_len) != 0 ||
+                so_err != 0) {
+                close(fd); continue;                // bağlantı gerçekleşmedi
+            }
+        }
+        // Bağlantı kuruldu; blocking moda dön (gönderme/alma zaman aşımları
+        // yine SO_SNDTIMEO/SO_RCVTIMEO ile bounded).
+        {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
+        size_t total_sent = 0;
+        bool send_ok = true;
+        while (total_sent < request.size()) {
+            ssize_t n = send(fd, request.c_str() + total_sent, request.size() - total_sent, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                send_ok = false;
+                break;
+            }
+            if (n == 0) { send_ok = false; break; }
+            total_sent += static_cast<size_t>(n);
+        }
+        if (!send_ok) {
+            close(fd);
+            continue; // try the next candidate
+        }
+
+        std::string resp;
+        char buf[4096];
+        while (true) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break; // EOF (daemon closed) or 2 s RCVTIMEO
+            resp.append(buf, (size_t)n);
+            // C-4: no silent 64 KB truncation — the daemon closes the socket
+            // after the full response, so keep reading.  Runaway guard only
+            // (a stuck/broken daemon should not balloon memory forever).
+            if (resp.size() > 16 * 1024 * 1024) { resp.clear(); break; }
+        }
+        close(fd);
+        return resp;
+    }
+    return {};
+}
+
+/// Send a one-line command and return the response (eventless variant).
+static std::string daemon_ipc_query(const std::string& cmd) {
+    return daemon_ipc_send(cmd + "\n");
+}
+
+// ── Daemon canlılığı: IPC birincil kanıt, PID dosyası ikincil ───────────────
+//
+// AJ-H (stale-PID düzeltmesi).  ÖNCEKI DAVRANIŞ: liveness YALNIZCA PID
+// dosyasından türetiliyordu ve IPC sorgusu SADECE "running" denildiğinde
+// yapılıyordu.  Sonuç: PID dosyası silinmiş ya da ölü bir PID yazıyorsa
+// (kurulum sırasında daemon yeniden başlarken, SIGKILL sonrası, PID'in
+// yeniden kullanılması) CLI, CANLI bir daemon'a rağmen "Daemon: stopped"
+// (rc=2) diyor ve sokete hiç bakmıyordu.
+//
+// Kanıt (izole ortam, unshare --map-root-user --mount ile /run gizlenerek):
+//   sahte daemon $XDG_RUNTIME_DIR/rawaccel.sock üzerinde "status" cevabı
+//   veriyor, PID dosyası yok → `rawaccel-cli status` → "Daemon: stopped",
+//   rc=2, cihaz listesi boş.  Aynı senaryo bayat PID (ölü 999999) ile de
+//   aynı yanlış cevabı veriyordu.
+//
+// YENİ KURAL: IPC kanalı otoritatif kanıttır — daemon ayakta olduğunu
+// YALNIZCA kendisi kanıtlar.  PID dosyası ikinci elden bir işarettir ve
+// sadece "stopped" (rc=2) ile "unreachable" (rc=3) ayrımını açıklamak için
+// kullanılır.
+enum class daemon_liveness {
+    stopped,      // ne IPC cevabı ne canlı PID → daemon yok
+    unreachable,  // PID dosyası canlı bir daemon gösteriyor, IPC cevap vermiyor
+    running,      // IPC cevap verdi (EN OTORİTER kanıt)
+};
+
+struct daemon_probe {
+    daemon_liveness state = daemon_liveness::stopped;
+    nlohmann::json live;      // ayrıştırılmış status JSON (running ise dolu)
+    std::string ipc_error;    // IPC cevabı bozuksa hata metni
+    bool pid_verified = false;// PID dosyası canlı daemon'u da doğruladı mı?
+};
+
+/// Soket dosyası diskte var mı?  "stopped" demek için HEM canlı PID
+/// olmamalı HEM de soket dosyası HİÇ olmamalı: ölü bir daemon'ın bıraktığı
+/// soket dosyası "durmuş daemon" değil, "erişilemeyen daemon" demektir
+/// (Aj-G kuralı: "stopped" yalnızca pidfile kanıtlayamıyor VE soket yok).
+static bool any_socket_path_exists() {
+    for (const auto& sock : daemon_sock_candidates())
+        if (::access(sock.c_str(), F_OK) == 0) return true;
+    return false;
+}
+
+/// Tek noktadan liveness tespiti: önce IPC, sonra PID dosyası.
+/// Tanımı daemon_running()'dan sonra durur (onu çağırır); burada öncü
+/// bildirim yeterlidir.
+static daemon_probe probe_daemon();
+
+/// How a reload attempt ended.  L13-02: a bool/`signal_result` could not tell
+/// an IPC-CONFIRMED reload ("ok":true — the daemon processed it) apart from a
+/// legacy SIGHUP that was merely DELIVERED.  cmd_reload needs that distinction
+/// to stop printing "Daemon reloaded." for the unverified path.
+enum class reload_result { ipc_ok, signal_sent, not_running, permission_denied, other,
+                           // AJ-H: daemon CANLI (IPC "status" cevap veriyor) ama
+                           // "reload" IPC komutunu bilmiyor VE sinyal
+                           // gönderilemedi (PID dosyası yok/sesiz).  Eski
+                           // kod bunu "not running" diye bildiriyordu.
+                           unsupported };
+
+/// Ask the daemon to reload its config.  Tries the IPC socket first (works
+/// for any user in the input group regardless of who the daemon runs as),
+/// then falls back to SIGHUP for older daemons that don't speak IPC.
+/// P130-R49: returns the full outcome so callers know *why* the reload failed
+/// (not_running vs permission_denied) AND whether success was confirmed by the
+/// daemon (ipc_ok) or is only an unverified signal delivery (signal_sent).
+static reload_result daemon_reload_via_any_path() {
+    std::string resp = daemon_ipc_query("reload");
+    if (resp.find("\"ok\":true") != std::string::npos) return reload_result::ipc_ok;
+    switch (send_signal_to_daemon(SIGHUP)) {
+    case signal_result::sent:              return reload_result::signal_sent;
+    case signal_result::not_running:
+        // AJ-H: sinyal gönderilemedi çünkü PID dosyası yok/sesiz — ama daemon
+        // canlı olabilir.  IPC "status" cevabı veriyorsa daemon ayaktadır,
+        // sadece "reload" komutunu bilmiyor; "not running" demek yanlış olur.
+        if (probe_daemon().state == daemon_liveness::running)
+            return reload_result::unsupported;
+        return reload_result::not_running;
+    case signal_result::permission_denied: return reload_result::permission_denied;
+    default:                               return reload_result::other;
+    }
+}
+
+/// Push the caller's full config to the running daemon (IPC "set_config" RPC).
+/// The daemon persists it to its own config path (a root systemd daemon writes
+/// /etc/rawaccel/settings.json even though this CLI's working copy lives in the
+/// user's home) and live-applies it.  Falls back to a SIGHUP reload for daemons
+/// that predate the RPC.
+/// @return  true if the daemon acknowledged the pushed config OR (fallback) a
+///          reload signal was accepted.
+static bool daemon_apply_config(const app_config& cfg) {
+    std::string json = app_config_to_json(cfg);
+    std::string req = "set_config " + std::to_string(json.size()) + "\n" + json;
+    std::string resp = daemon_ipc_send(req);
+    // P156/HIGH: the daemon rejected the push (schema/validation failure or
+    // persistence error) — it answered, understood our message, and said NO.
+    // We must NOT fall through to a reload: reload re-reads the daemon's own
+    // (unchanged) file, so the caller's config would silently never apply, yet
+    // the fallback's reload would report "ok:true" and the CLI would print
+    // "Daemon reloaded." with rc=0 — a lie.
+    if (resp.find("\"ok\":false") != std::string::npos) return false;
+    if (resp.find("\"ok\":true" ) != std::string::npos) return true;
+    // ROUND4-FIX: a RESPONSIVE modern daemon that answers "unknown command"
+    // (or a malformed/error reply) must NOT downgrade to the SIGHUP fallback —
+    // it understood the request and refused it, and the fallback would reload
+    // the STALE daemon-side file, then report success for a config that never
+    // applied.  Only a truly silent/legacy daemon (no set_config support) goes
+    // down the legacy SIGHUP path.  Any non-empty response containing "error"
+    // means the daemon is alive and answered with an explicit rejection.
+    if (resp.find("\"error\"") != std::string::npos) return false;
+    // Legacy fallback path: an IPC-confirmed reload OR a delivered SIGHUP both
+    // count as "accepted" here (callers only care whether the push was applied).
+    auto rr = daemon_reload_via_any_path();
+    return rr == reload_result::ipc_ok || rr == reload_result::signal_sent;
+}
+
+// ── Global CLI flags ──────────────────────────────────────────────────────────
+
+/// When true, mutating commands save the config locally but do NOT push it to
+/// the running daemon — the user can review/apply later with `rawaccel-cli
+/// reload`.  P82-CRIT-1: opt-in guard so a one-shot `-c /tmp/t.json create x`
+/// (whose working copy lives outside the daemon's own config path) does not
+/// silently clobber the live daemon config unless the user explicitly wants it.
+static bool g_no_daemon = false;
+
+/// When true, `list` renders the config as JSON (machine-readable) instead of
+/// the human-readable profile dump.  Parsed as a global option so it works in
+/// either position: `rawaccel-cli list --json` or `rawaccel-cli --json list`.
+static bool g_json = false;
+
+/// Apply a config change to the running daemon, honoring the global --no-daemon
+/// flag.  When the flag is set the change is written to the local config file
+/// only; the user can later push it with `rawaccel-cli reload` (or rerun
+/// without --no-daemon).  P82-CRIT-1.
+/// @return  0 on success (config saved + daemon push ok or skipped via -n).
+/// @return  1 if the daemon push failed — the config WAS saved locally, but the
+///          running daemon may not have picked it up (P115-A5-05: this used to
+///          be silent with rc=0).
+static int daemon_apply_if_enabled(const app_config& cfg) {
+    if (g_no_daemon) {
+        std::cout << "Config updated locally (not applied to daemon — "
+                     "use 'rawaccel-cli reload' or remove --no-daemon)\n";
+        return 0;
+    }
+    if (daemon_apply_config(cfg)) {
+        // O31-L3: this path PUSHES the freshly-saved config (IPC set_config),
+        // it does not reload the daemon's own file — "Daemon reloaded." was a
+        // lie for the modern code path (only the legacy fallback reloads).
+        std::cout << "Config applied to the daemon.\n";
+        return 0;
+    }
+    // L12-11: the old advice ("Re-run without the change, or apply with:
+    // rawaccel-cli reload") was wrong twice: "re-run without the change"
+    // is contradictory (it reads as "undo it"), and `reload` only makes the
+    // daemon re-read ITS OWN config file — it does not push this CLI's saved
+    // working copy when the daemon runs with a different -c path (the common
+    // root systemd case).  Give commands the user can actually run instead.
+    // Note: this branch is only reached WITHOUT --no-daemon (that flag returns
+    // earlier), so "re-run this command" cannot collide with the flag.
+    std::cerr << "Warning: config saved locally but the daemon did not apply it.\n"
+              << "  Check the daemon: rawaccel-cli status\n"
+              << "  If it is not running, start it: sudo systemctl start rawaccel\n"
+              << "  If it is running but refused the config: journalctl -u rawaccel -n 20\n"
+              << "  Once the daemon is reachable, re-run this command to push the saved config.\n";
+    return 1;
+}
+
+/// Print a uniform "couldn't reach daemon" diagnostic.  Suggests the right
+/// remediation based on whether kill() failed with EPERM (sudo / systemctl)
+/// or because the PID file simply isn't there.
+static void print_signal_failure(signal_result r, const char* action, const char* kill_signal) {
+    switch (r) {
+    case signal_result::permission_denied:
+        std::cerr << "Permission denied while trying to " << action << " the daemon.\n"
+                  << "The daemon is running as root; signal it with:\n";
+        if (std::strcmp(action, "reload") == 0 || std::strcmp(action, "stop") == 0)
+            std::cerr << "  sudo systemctl " << action << " rawaccel    (preferred)\n";
+        std::cerr << "  sudo kill -" << kill_signal << " $(cat /run/rawaccel.pid)\n";
+        break;
+    case signal_result::not_running:
+        std::cerr << "Daemon is not running.  Start it with: sudo systemctl start rawaccel\n";
+        break;
+    default:
+        std::cerr << "Could not " << action << " the daemon (errno=" << errno << ").\n";
+        break;
+    }
+}
+
+static int finite_double_to_int(double v) {
+    // L12-07: both range comparisons below are false for NaN, so the final
+    // static_cast<int>(NaN) was UB (UBSan: "nan is outside the range of
+    // representable values of type 'int'").  Today the only two callers
+    // (dpi / polling_rate) guard with isfinite+int_ok first, but the helper
+    // must be safe on its own — defense in depth.
+    if (std::isnan(v)) return 0;
+    if (v < static_cast<double>(INT_MIN)) return INT_MIN;
+    // BUG-CRIT-2: (double)INT_MAX == 2147483648.0 — `>` lets 2147483648.0 fall
+    // through to the cast below, which is UB.  `>=` clamps it to INT_MAX.
+    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
+    return static_cast<int>(v);
+}
+
+/// save_config() throws std::runtime_error on any I/O failure (temp write,
+/// fsync, rename, fs::create_directories).  An uncaught exception reaches
+/// main() and hits std::terminate() — the CLI dies with SIGABRT (exit 134,
+/// core dump) instead of a clean diagnostic.  Wrap every mutation call site.
+/// @return  false if the save failed (message already printed to stderr).
+static bool safe_save(const app_config& cfg, const std::string& path) {
+    try {
+        save_config(cfg, path);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to save config: " << e.what() << "\n";
+        return false;
+    }
+}
+
+// ── Profile display ────────────────────────────────────────────────────────────
+
+/// Space-joined key list for error messages (P107).
+static std::string join_keys(const std::vector<std::string>& keys) {
+    std::string s;
+    for (size_t i = 0; i < keys.size(); i++)
+        s += (i ? " " : "") + keys[i];
+    return s;
+}
+
+static void print_accel_args(const accel_args& a, const std::string& prefix = "  ") {
+    auto mode_str = [](accel_mode m) -> std::string {
+        switch (m) {
+        case accel_mode::classic:     return "classic";
+        case accel_mode::power:       return "power";
+        case accel_mode::natural:     return "natural";
+        case accel_mode::jump:        return "jump";
+        case accel_mode::synchronous: return "synchronous";
+        case accel_mode::lookup:      return "lookup";
+        default:                      return "noaccel";
+        }
+    };
+
+    std::cout << prefix << "mode:             " << mode_str(a.mode) << "\n";
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << prefix << "gain:             " << (a.gain ? "true" : "false") << "\n";
+    std::cout << prefix << "acceleration:     " << a.acceleration     << "\n";
+    std::cout << prefix << "input_offset:     " << a.input_offset     << "\n";
+    std::cout << prefix << "output_offset:    " << a.output_offset    << "\n";
+    std::cout << prefix << "scale:            " << a.scale            << "\n";
+    std::cout << prefix << "exponent_classic: " << a.exponent_classic << "\n";
+    std::cout << prefix << "exponent_power:   " << a.exponent_power   << "\n";
+    std::cout << prefix << "limit:            " << a.limit            << "\n";
+    std::cout << prefix << "motivity:         " << a.motivity         << "\n";
+    std::cout << prefix << "gamma:            " << a.gamma            << "\n";
+    std::cout << prefix << "decay_rate:       " << a.decay_rate       << "\n";
+    std::cout << prefix << "sync_speed:       " << a.sync_speed       << "\n";
+    std::cout << prefix << "smooth:           " << a.smooth           << "\n";
+    std::cout << prefix << "cap:              [" << a.cap.x << ", " << a.cap.y << "]\n";
+    auto cap_mode_str = [](cap_mode c) -> std::string {
+        switch (c) {
+        case cap_mode::in:  return "in";
+        case cap_mode::io:  return "io";
+        default:            return "out";
+        }
+    };
+    std::cout << prefix << "cap_mode:         " << cap_mode_str(a.cap_mode_val) << "\n";
+}
+
+static void print_profile(const device_profile& dp) {
+    auto& p = dp.prof;
+    std::cout << "Profile: " << dp.name << "\n";
+    // P115-A5-09: a disabled profile (per-device disable flag) used to be
+    // invisible in every listing — status claimed the profile was active while
+    // its acceleration was actually bypassed.
+    if (dp.dev_cfg.disable)
+        std::cout << "  disabled:     true  (C29-N6: honored at setup/hot-plug — the "
+                     "daemon skips the device; toggling a live device applies on "
+                     "the next rescan; full 1:1 bypass = set-param <profile> raw true)\n";
+    std::cout << "  device_id:    " << (dp.device_id.empty() ? "(all)" : dp.device_id) << "\n";
+    // T45-SHOW01: match_app was invisible in show/list — an app-scoped
+    // profile looked identical to a global one, and two lookup profiles
+    // with different curves looked identical too.  Surface both.
+    if (!dp.match_app.empty())
+        std::cout << "  match_app:    \"" << dp.match_app << "\"\n";
+    if (p.accel_x.length > 0)
+        std::cout << "  lut:          " << (p.accel_x.length / 2) << " points (X)\n";
+    if (p.accel_y.length > 0 && p.accel_x != p.accel_y)
+        std::cout << "  lut:          " << (p.accel_y.length / 2) << " points (Y)\n";
+    if (p.raw_passthrough) {
+        std::cout << "  raw:          true  (all processing bypassed)\n";
+        std::cout << "  dpi:          " << dp.dev_cfg.dpi         << "\n";
+        std::cout << "  polling_rate: " << dp.dev_cfg.polling_rate << "\n";
+        return;
+    }
+    std::cout << "  dpi:          " << dp.dev_cfg.dpi         << "\n";
+    std::cout << "  polling_rate: " << dp.dev_cfg.polling_rate << "\n";
+    std::cout << "  rotation:     " << p.degrees_rotation      << "°\n";
+    std::cout << "  snap:         " << p.degrees_snap          << "°\n";
+    // Use epsilon comparison: sub-ULP residue from JSON round-trip can leave
+    // speed_min as e.g. 1e-17 even when the user typed "0", which would print
+    // without the "(disabled)" hint and confuse status output.
+    std::cout << "  speed_min:    " << p.speed_min << (std::fabs(p.speed_min) < 1e-9 ? "  (disabled)" : "") << "\n";
+    std::cout << "  speed_max:    " << p.speed_max << (std::fabs(p.speed_max) < 1e-9 ? "  (disabled)" : "") << "\n";
+    std::cout << "  output_dpi:   " << p.output_dpi << (std::fabs(p.output_dpi - NORMALIZED_DPI) < 1e-9 ? "  (default 1000)" : "") << "\n";
+    std::cout << "  lr_ratio:     " << p.lr_output_dpi_ratio << (std::fabs(p.lr_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
+    std::cout << "  ud_ratio:     " << p.ud_output_dpi_ratio << (std::fabs(p.ud_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
+    std::cout << "  yx_ratio:     " << p.yx_output_dpi_ratio << (std::fabs(p.yx_output_dpi_ratio - 1.0) < 1e-9 ? "  (off)" : "") << "\n";
+    // L12-05 (MED): set-param'ın kabul ettiği alan show/list'te de görünmeli.
+    // domain_weights/range_weights (ve tek-eksen _x/_y varyantları) kabul edilen
+    // 40 anahtarın 6'sıydı ama print_profile hiçbirini basmıyordu; kullanıcı
+    // set-param rc=0 alıp JSON'a yazıldığı hâlde "ayarım yok" sanıyordu.  cap
+    // ile aynı [x, y] biçimi kullanılır; _x/_y varyantları bu aynı çiftin tek
+    // eksenini değiştirir, dolayısıyla tek satır üç anahtarı da görünür kılar.
+    std::cout << "  domain_weights: [" << p.domain_weights.x << ", " << p.domain_weights.y << "]\n";
+    std::cout << "  range_weights:  [" << p.range_weights.x << ", " << p.range_weights.y << "]\n";
+    {
+        auto& sp = p.speed_processor_args;
+        std::string dist = sp.whole ? (sp.lp_norm >= 16 || sp.lp_norm <= 0 ? "max" :
+                           (std::fabs(sp.lp_norm - 2.0) > 1e-9 ? "lp" : "euclidean")) : "separate";
+        std::cout << "  distance_mode:  " << dist << "\n";
+        if (dist == "lp")
+            std::cout << "  lp_norm:        " << sp.lp_norm << "\n";
+        if (sp.input_speed_smooth_halflife > 0)
+            std::cout << "  input_smooth_halflife:  " << sp.input_speed_smooth_halflife << "\n";
+        if (sp.scale_smooth_halflife > 0)
+            std::cout << "  scale_smooth_halflife:  " << sp.scale_smooth_halflife << "\n";
+        if (sp.output_speed_smooth_halflife > 0)
+            std::cout << "  output_smooth_halflife: " << sp.output_speed_smooth_halflife << "\n";
+    }
+    std::cout << "  Acceleration (X axis):\n";
+    print_accel_args(p.accel_x, "    ");
+    if (p.accel_x != p.accel_y) {
+        std::cout << "  Acceleration (Y axis):\n";
+        print_accel_args(p.accel_y, "    ");
+    } else {
+        std::cout << "  Acceleration (Y axis): same as X\n";
+    }
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+static int cmd_list(const app_config& cfg) {
+    std::cout << "Active profile: " << cfg.active_profile << "\n\n";
+    for (auto& dp : cfg.profiles) {
+        print_profile(dp);
+        std::cout << "\n";
+    }
+    return 0;
+}
+
+/// `rawaccel-cli list --json` — machine-readable rendering of the whole config.
+/// Round-trips the exact field names/values the daemon and GUI agree on, so
+/// scripts can cross-check preset loads against include/presets.hpp directly.
+static int cmd_list_json(const app_config& cfg) {
+    std::cout << app_config_to_json(cfg) << "\n";
+    return 0;
+}
+
+static int cmd_show(const app_config& cfg, const std::string& name) {
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == name) {
+            print_profile(dp);
+            return 0;
+        }
+    }
+    std::cerr << "Profile not found: " << name << "\n";
+    return 1;
+}
+
+static int cmd_set(app_config& cfg, const std::string& config_path, const std::string& name) {
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == name) {
+            cfg.active_profile = name;
+            if (!safe_save(cfg, config_path)) return 1;
+            std::cout << "Active profile set to: " << name << "\n";
+            // Push the new config to the daemon (IPC set_config) so it takes
+            // effect even when the daemon reads a different file (systemd /etc).
+            return daemon_apply_if_enabled(cfg);
+        }
+    }
+    std::cerr << "Profile not found: " << name << "\n";
+    return 1;
+}
+
+static int cmd_create(app_config& cfg, const std::string& config_path, const std::string& name) {
+    // BUG-12: empty profile name has no useful semantics — every later
+    // command (`delete ""`, `show ""`, `set-param "" ...`) would target the
+    // first nameless profile creating ambiguity.  Reject up front.
+    if (name.empty()) {
+        std::cerr << "Profile name must not be empty.\n";
+        return 1;
+    }
+    // P82-MED-1: a >256-char name persists full now but the load-side cap
+    // (MAX_NAME_LEN=256 in config.cpp) truncates anything longer to 256 on
+    // reload.  Reject up front so the stored name always matches what the
+    // user supplied.  256 chars is allowed (round-trips intact).
+    if (name.size() > MAX_NAME_LEN) {
+        std::cerr << "Profile name too long: " << name.size()
+                  << " chars (max " << MAX_NAME_LEN << ").\n";
+        return 1;
+    }
+    // Check duplicate
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == name) {
+            std::cerr << "Profile already exists: " << name << "\n";
+            return 1;
+        }
+    }
+    // CFG-3: SEC-9 caps the profile count at MAX_PROFILES, but until now the
+    // cap was only enforced on LOAD (config.cpp silently kept the first 256).
+    // A create beyond the cap used to write the extra profile to disk, only
+    // for it to vanish on the next load+save — silent data loss.  Refuse up
+    // front instead of truncating.
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot create '" << name << "': config is at the "
+                  << MAX_PROFILES << "-profile maximum (SEC-9). Delete a "
+                  << "profile first.\n";
+        return 1;
+    }
+    device_profile dp;
+    dp.name = name;
+    dp.dev_cfg.dpi = 800;
+    dp.dev_cfg.polling_rate = 1000;
+    dp.prof.accel_x.mode = accel_mode::noaccel;
+    dp.prof.accel_y.mode = accel_mode::noaccel;
+    cfg.profiles.push_back(dp);
+    if (!safe_save(cfg, config_path)) return 1;
+    std::cout << "Created profile: " << name << "\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_delete(app_config& cfg, const std::string& config_path, const std::string& name) {
+    auto it = std::remove_if(cfg.profiles.begin(), cfg.profiles.end(),
+                             [&](const device_profile& dp) { return dp.name == name; });
+    if (it == cfg.profiles.end()) {
+        std::cerr << "Profile not found: " << name << "\n";
+        return 1;
+    }
+    cfg.profiles.erase(it, cfg.profiles.end());
+    // If we just deleted the active profile, fall back to the first remaining one.
+    bool active_changed = false; // P156: only report a change when the active profile actually moved
+    if (cfg.active_profile == name && !cfg.profiles.empty()) {
+        cfg.active_profile = cfg.profiles[0].name;
+        active_changed = true;
+    }
+    // P115-A5-08: deleting the LAST profile used to leave a dangling
+    // active_profile persisted as {"active_profile":"p","profiles":[]}.
+    // Clear it so the JSON never advertises a profile that no longer exists.
+    if (cfg.profiles.empty()) {
+        cfg.active_profile.clear();
+        active_changed = true;
+        // C-7: report the empty state clearly instead of "Active profile is
+        // now: " (trailing blank) — the next run recreates the default profile.
+        std::cout << "No profiles remain — a fresh 'default' profile is "
+                     "recreated on the next run.\n";
+    }
+    if (!safe_save(cfg, config_path)) return 1;
+    std::cout << "Deleted profile: " << name << "\n";
+    if (active_changed && !cfg.active_profile.empty())
+        std::cout << "Active profile is now: " << cfg.active_profile << "\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_duplicate(app_config& cfg, const std::string& config_path,
+                         const std::string& src_name, const std::string& dst_name) {
+    // Reject empty new name
+    if (dst_name.empty()) {
+        std::cerr << "Profile name must not be empty.\n";
+        return 1;
+    }
+    // P82-MED-1: symmetric cap with load-side (MAX_NAME_LEN).
+    if (dst_name.size() > MAX_NAME_LEN) {
+        std::cerr << "Profile name too long: " << dst_name.size()
+                  << " chars (max " << MAX_NAME_LEN << ").\n";
+        return 1;
+    }
+    // Reject if destination already exists
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == dst_name) {
+            std::cerr << "Profile already exists: " << dst_name << "\n";
+            return 1;
+        }
+    }
+    // Find source profile
+    device_profile* src = nullptr;
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == src_name) {
+            src = &dp;
+            break;
+        }
+    }
+    if (!src) {
+        std::cerr << "Source profile not found: " << src_name << "\n";
+        return 1;
+    }
+    // CFG-3: refuse when the SEC-9 load cap is already reached (a duplicate
+    // would otherwise write past MAX_PROFILES and vanish on next load).
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot duplicate: config is at the " << MAX_PROFILES
+                  << "-profile maximum (SEC-9). Delete a profile first.\n";
+        return 1;
+    }
+    // Deep copy
+    device_profile dst = *src;
+    dst.name = dst_name;
+    // Clear device_id on duplicate — user must explicitly assign the new profile
+    // to a device if desired.  This avoids accidental device_id collision.
+    dst.device_id.clear();
+    cfg.profiles.push_back(std::move(dst));
+    if (!safe_save(cfg, config_path)) return 1;
+    std::cout << "Duplicated profile: '" << src_name << "' → '" << dst_name << "'\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_create_preset(app_config& cfg, const std::string& config_path,
+                             const std::string& preset_name, const std::string& profile_name) {
+    if (profile_name.empty()) {
+        std::cerr << "Profile name must not be empty.\n";
+        return 1;
+    }
+    // P82-MED-1: symmetric cap with load-side (MAX_NAME_LEN).
+    if (profile_name.size() > MAX_NAME_LEN) {
+        std::cerr << "Profile name too long: " << profile_name.size()
+                  << " chars (max " << MAX_NAME_LEN << ").\n";
+        return 1;
+    }
+    // Check duplicate
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == profile_name) {
+            std::cerr << "Profile already exists: " << profile_name << "\n";
+            return 1;
+        }
+    }
+    device_profile dp = make_preset(preset_name, profile_name);
+    if (dp.name.empty()) {
+        std::cerr << "Unknown preset: '" << preset_name
+                  << "'.  Available: gaming, office, precision, disable "
+                  << "(alias: none/off), cs2, valorant, apex, fps\n";
+        return 1;
+    }
+    // CFG-3: refuse when the SEC-9 load cap is already reached (creating a
+    // preset profile past MAX_PROFILES wrote it to disk only for it to vanish
+    // on the next load+save).
+    if (cfg.profiles.size() >= MAX_PROFILES) {
+        std::cerr << "Cannot create preset profile: config is at the "
+                  << MAX_PROFILES << "-profile maximum (SEC-9). Delete a "
+                  << "profile first.\n";
+        return 1;
+    }
+    cfg.profiles.push_back(dp);
+    if (!safe_save(cfg, config_path)) return 1;
+    std::cout << "Created profile '" << profile_name << "' from preset '" << preset_name << "'\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+/// Validate config file and report issues without modifying it.
+static int cmd_validate(const std::string& config_path) {
+    // P120-FAZ2 (A5-03): a missing config is an explicit error (rc=1) with a
+    // clear message — never a silent false-PASS, and validation
+    // must not CREATE the file (main() dispatches validate before any default
+    // creation).  An existing-but-broken config reports errors to stderr and
+    // the file is never written to.
+    if (::access(config_path.c_str(), F_OK) != 0) {
+        // M-BUG-16: the "config yok" token leaked Turkish into an otherwise
+        // English CLI.  Validation is distributed to non-Turkish users too.
+        std::cerr << "ERROR: config file not found: " << config_path << "\n";
+        return 1;
+    }
+    std::cout << "Validating config: " << config_path << "\n";
+    try {
+        app_config cfg = load_config(config_path);
+        bool has_errors = false;
+        bool has_warnings = false;
+
+        // Check 1: at least one profile
+        if (cfg.profiles.empty()) {
+            std::cerr << "ERROR: No profiles defined.\n";
+            has_errors = true;
+        }
+
+        // Check 2: active profile exists
+        bool active_found = false;
+        for (auto& dp : cfg.profiles) {
+            if (dp.name == cfg.active_profile) {
+                active_found = true;
+                break;
+            }
+        }
+        if (!active_found && !cfg.profiles.empty()) {
+            std::cerr << "ERROR: Active profile '" << cfg.active_profile
+                      << "' not found in profiles list.\n";
+            has_errors = true;
+        } else if (!active_found && cfg.profiles.empty()) {
+            // Already reported above
+        }
+
+        // Check 3: duplicate profile names
+        std::vector<std::string> names;
+        for (auto& dp : cfg.profiles) {
+            if (std::find(names.begin(), names.end(), dp.name) != names.end()) {
+                std::cerr << "ERROR: Duplicate profile name: '" << dp.name << "'\n";
+                has_errors = true;
+            }
+            names.push_back(dp.name);
+        }
+
+        // Check 4: duplicate device_ids (non-empty)
+        std::vector<std::string> device_ids;
+        for (auto& dp : cfg.profiles) {
+            if (!dp.device_id.empty()) {
+                if (std::find(device_ids.begin(), device_ids.end(), dp.device_id) != device_ids.end()) {
+                    std::cerr << "WARNING: Duplicate device_id: '" << dp.device_id
+                              << "' (first match wins in daemon)\n";
+                    has_warnings = true;
+                }
+                device_ids.push_back(dp.device_id);
+            }
+        }
+
+        // Check 5: validate each profile
+        for (auto& dp : cfg.profiles) {
+            if (dp.name.empty()) {
+                std::cerr << "ERROR: Profile with empty name found.\n";
+                has_errors = true;
+            }
+            // CFG-2: the numeric range/order checks that used to live here
+            // (speed_min>speed_max, output_dpi/dpi/polling_rate range, name
+            // length) were DEAD CODE — load_config sanitizes every profile on
+            // the way in (dpi→[1,32000], polling_rate→[125,8000],
+            // output_dpi→[0,32000] with (0,1)→1, speed_max≥speed_min, name →)
+            //  so a file with `"dpi":999999, speed_min 20 speed_max 5,
+            //  output_dpi 50000` always printed "All checks OK".  The real
+            //  clamped-vs-stored cross-check runs against the RAW JSON below.
+            auto& p = dp.prof;
+            // Check accel_x/accel_y for LUT length consistency
+            if (p.accel_x.mode == accel_mode::lookup && p.accel_x.length % 2 != 0) {
+                std::cerr << "WARNING: LUT data length is odd in profile '" << dp.name
+                          << "' (X axis) — should be even (speed, gain pairs)\n";
+                has_warnings = true;
+            }
+            if (p.accel_y.mode == accel_mode::lookup && p.accel_y.length % 2 != 0) {
+                std::cerr << "WARNING: LUT data length is odd in profile '" << dp.name
+                          << "' (Y axis) — should be even (speed, gain pairs)\n";
+                has_warnings = true;
+            }
+            // L12-08: warn about semantically meaningless (but in-range)
+            // settings — validate used to say "All checks OK" for all three.
+            // These are WARNINGS only; the exit code must stay 0.
+            // Axis helper: same condition checked for X and Y so a
+            // hand-edited file can't hide the dead setting in accel_y.
+            auto axis_warn = [&](const accel_args& a, const char* axis) {
+                // L12-01 (validate side): mode=lookup with no LUT data —
+                // set-param already warns with C-8, but validate (the command
+                // a user runs on a file) stayed silent about the dead profile.
+                if (a.mode == accel_mode::lookup && a.length == 0) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': mode=lookup but the " << axis
+                              << "-axis LUT is empty — the profile behaves like noaccel\n";
+                    has_warnings = true;
+                }
+                // L02-08: jump constructs smooth_rate = (smooth*cap.x < 1) ? 0
+                // : ... so a positive `smooth` that is too small to make the
+                // product reach 1 is silently ignored — the user tunes
+                // "smooth 0.01" and still gets a hard step.
+                if (a.mode == accel_mode::jump && a.smooth > 0.0 &&
+                    a.smooth * a.cap.x < 1.0) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': jump smoothing is ignored (" << axis
+                              << " axis) — smooth (" << a.smooth
+                              << ") × cap_x (" << a.cap.x
+                              << ") < 1; increase smooth or cap_x";
+                    if (a.cap.x > 0.0)
+                        std::cerr << " (needs smooth ≥ " << 1.0 / a.cap.x << ")";
+                    std::cerr << "\n";
+                    has_warnings = true;
+                }
+                // L02-14: natural's internal accel coefficient is
+                // decay_rate/limit; with a tiny decay_rate the GAIN branch's
+                // cancellation can flip the gain negative (measured: negative
+                // gain / inverted axis at limit=100 decay=1e-9 — the worst
+                // production-reachable case measured -30.25 at limit=100,
+                // decay_rate=1e-10, x=5e-4; end-to-end modifier::modify()
+                // turns in.x=+1 into out.x=-0.25).
+                //   2026-10-21: the band is closed at the CONFIG layer —
+                //   sanitize clamps natural decay_rate ∈ (0, 1e-4) up to
+                //   NATURAL_DECAY_RATE_MIN = 1e-4 (include/config.hpp,
+                //   src/config.cpp), so the value seen here is the SANITIZED
+                //   one and can only be 0 or ≥ 1e-4.
+                //   decay_rate = 0 is SAFE and explicit (accel = 0 hits the
+                //   `accel < 1e-12 → 1.0` guard in accel-natural.hpp: the
+                //   curve is flat at 1.0), so it must NOT be warned about.
+                //   A file that still carries the old unsafe band is reported
+                //   by the raw-vs-stored cross-check below
+                //   (accel_warn "decay_rate"), which names the clamped value.
+                if (a.mode == accel_mode::natural && a.decay_rate > 0.0 &&
+                    a.decay_rate < NATURAL_DECAY_RATE_MIN) {
+                    std::cerr << "WARNING: profile '" << dp.name
+                              << "': natural decay_rate (" << a.decay_rate
+                              << ", " << axis << " axis) < 1e-4 — gain can go "
+                                 "negative (axis reversal); increase decay_rate\n";
+                    has_warnings = true;
+                }
+            };
+            axis_warn(p.accel_x, "X");
+            axis_warn(p.accel_y, "Y");
+        }
+
+        // CFG-2: cross-check the RAW JSON (pre-sanitize) against the values
+        // load_config actually stored, so structurally broken files that were
+        // silently clamped now surface as warnings ("dpi 999999 → 32000") and
+        // the summary can honestly say "passed" vs "passed with warnings".
+        {
+            std::ifstream rawf(config_path, std::ios::in | std::ios::binary);
+            nlohmann::json raw;
+            if (rawf) { try { raw = nlohmann::json::parse(rawf); } catch (...) { raw = nlohmann::json(nullptr); } }
+            if (raw.is_object() && raw.contains("profiles") && raw["profiles"].is_array()) {
+                const auto& rps = raw["profiles"];
+                for (size_t i = 0; i < rps.size() && i < cfg.profiles.size(); ++i) {
+                    const auto& rp = rps[i];
+                    const auto& sp = cfg.profiles[i];
+                    if (!rp.is_object()) continue;
+                    auto clamp_warn = [&](const char* field,
+                                          const nlohmann::json& host,
+                                          double stored) {
+                        if (!host.contains(field) || !host[field].is_number())
+                            return;
+                        double rawv = host[field].get<double>();
+                        if (std::fabs(rawv - stored) < 1e-9) return;
+                        std::cerr << "WARNING: '" << field << "' = " << rawv
+                                  << " in profile '" << sp.name << "' will be "
+                                  << "stored as " << stored << " (sanitize "
+                                  << "clamps on load)\n";
+                        has_warnings = true;
+                    };
+                    clamp_warn("dpi", rp, (double)sp.dev_cfg.dpi);
+                    clamp_warn("polling_rate", rp, (double)sp.dev_cfg.polling_rate);
+                    if (rp.contains("profile") && rp["profile"].is_object()) {
+                        const auto& rpr = rp["profile"];
+                        clamp_warn("output_dpi", rpr, sp.prof.output_dpi);
+                        // T45-VAL01: the raw keys are degrees_rotation /
+                        // degrees_snap (see profile_to_json_obj) — the old
+                        // "rotation"/"snap" lookups never matched anything.
+                        clamp_warn("degrees_rotation", rpr, sp.prof.degrees_rotation);
+                        clamp_warn("degrees_snap", rpr, sp.prof.degrees_snap);
+                        clamp_warn("speed_min", rpr, sp.prof.speed_min);
+                        clamp_warn("speed_max", rpr, sp.prof.speed_max);
+                        clamp_warn("yx_output_dpi_ratio", rpr, sp.prof.yx_output_dpi_ratio);
+                        clamp_warn("lr_output_dpi_ratio", rpr, sp.prof.lr_output_dpi_ratio);
+                        clamp_warn("ud_output_dpi_ratio", rpr, sp.prof.ud_output_dpi_ratio);
+                        if (rpr.contains("domain_weights") && rpr["domain_weights"].is_array() && rpr["domain_weights"].size() >= 2) {
+                            if (rpr["domain_weights"][0].is_number() &&
+                                std::fabs(rpr["domain_weights"][0].get<double>() - sp.prof.domain_weights.x) >= 1e-9) {
+                                std::cerr << "WARNING: 'domain_weights[0]' = "
+                                          << rpr["domain_weights"][0].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.domain_weights.x << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                            if (rpr["domain_weights"][1].is_number() &&
+                                std::fabs(rpr["domain_weights"][1].get<double>() - sp.prof.domain_weights.y) >= 1e-9) {
+                                std::cerr << "WARNING: 'domain_weights[1]' = "
+                                          << rpr["domain_weights"][1].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.domain_weights.y << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                        }
+                        if (rpr.contains("range_weights") && rpr["range_weights"].is_array() && rpr["range_weights"].size() >= 2) {
+                            if (rpr["range_weights"][0].is_number() &&
+                                std::fabs(rpr["range_weights"][0].get<double>() - sp.prof.range_weights.x) >= 1e-9) {
+                                std::cerr << "WARNING: 'range_weights[0]' = "
+                                          << rpr["range_weights"][0].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.range_weights.x << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                            if (rpr["range_weights"][1].is_number() &&
+                                std::fabs(rpr["range_weights"][1].get<double>() - sp.prof.range_weights.y) >= 1e-9) {
+                                std::cerr << "WARNING: 'range_weights[1]' = "
+                                          << rpr["range_weights"][1].get<double>()
+                                          << " in profile '" << sp.name << "' will be stored as "
+                                          << sp.prof.range_weights.y << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            }
+                        }
+                        if (rpr.contains("speed_processor") && rpr["speed_processor"].is_object()) {
+                            const auto& rsp = rpr["speed_processor"];
+                            clamp_warn("lp_norm", rsp, sp.prof.speed_processor_args.lp_norm);
+                            clamp_warn("input_speed_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.input_speed_smooth_halflife);
+                            clamp_warn("scale_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.scale_smooth_halflife);
+                            clamp_warn("output_speed_smooth_halflife", rsp,
+                                       sp.prof.speed_processor_args.output_speed_smooth_halflife);
+                        }
+                        // T45-VAL01: accel_args fields sanitize clamps but
+                        // validate never looked at — a 1e9 scale/acceleration
+                        // used to print "All checks OK".
+                        for (int ai = 0; ai < 2; ++ai) {
+                            const char* axkey = ai == 0 ? "accel_x" : "accel_y";
+                            if (!rpr.contains(axkey) || !rpr[axkey].is_object()) continue;
+                            const auto& rax = rpr[axkey];
+                            const auto& sax = ai == 0 ? sp.prof.accel_x : sp.prof.accel_y;
+                            const char* axis = ai == 0 ? "X" : "Y";
+                            auto accel_warn = [&](const char* field, double stored) {
+                                if (!rax.contains(field) || !rax[field].is_number()) return;
+                                double rawv = rax[field].get<double>();
+                                if (std::fabs(rawv - stored) < 1e-9) return;
+                                std::cerr << "WARNING: '" << field << "' = " << rawv
+                                          << " (" << axis << " axis) in profile '"
+                                          << sp.name << "' will be stored as "
+                                          << stored << " (sanitize clamps on load)\n";
+                                has_warnings = true;
+                            };
+                            accel_warn("acceleration",     sax.acceleration);
+                            accel_warn("scale",            sax.scale);
+                            accel_warn("decay_rate",       sax.decay_rate);
+                            accel_warn("motivity",         sax.motivity);
+                            accel_warn("gamma",            sax.gamma);
+                            accel_warn("sync_speed",       sax.sync_speed);
+                            accel_warn("smooth",           sax.smooth);
+                            accel_warn("exponent_classic", sax.exponent_classic);
+                            accel_warn("exponent_power",   sax.exponent_power);
+                            accel_warn("limit",            sax.limit);
+                            accel_warn("input_offset",     sax.input_offset);
+                            accel_warn("output_offset",    sax.output_offset);
+                            if (rax.contains("cap") && rax["cap"].is_array()) {
+                                if (rax["cap"].size() >= 1 && rax["cap"][0].is_number() &&
+                                    std::fabs(rax["cap"][0].get<double>() - sax.cap.x) >= 1e-9) {
+                                    std::cerr << "WARNING: 'cap[0]' = "
+                                              << rax["cap"][0].get<double>()
+                                              << " (" << axis << " axis) in profile '"
+                                              << sp.name << "' will be stored as "
+                                              << sax.cap.x << " (sanitize clamps on load)\n";
+                                    has_warnings = true;
+                                }
+                                if (rax["cap"].size() >= 2 && rax["cap"][1].is_number() &&
+                                    std::fabs(rax["cap"][1].get<double>() - sax.cap.y) >= 1e-9) {
+                                    std::cerr << "WARNING: 'cap[1]' = "
+                                              << rax["cap"][1].get<double>()
+                                              << " (" << axis << " axis) in profile '"
+                                              << sp.name << "' will be stored as "
+                                              << sax.cap.y << " (sanitize clamps on load)\n";
+                                    has_warnings = true;
+                                }
+                            }
+                        }
+                        // CFG-2: speed_min > speed_max is silently equalized by
+                        // sanitize — clamp_warn can't see it (either value may
+                        // survive unchanged), so check the raw pair directly.
+                        if (rpr.contains("speed_min") && rpr.contains("speed_max") &&
+                            rpr["speed_min"].is_number() && rpr["speed_max"].is_number() &&
+                            rpr["speed_min"].get<double>() > rpr["speed_max"].get<double>()) {
+                            std::cerr << "WARNING: speed_min ("
+                                      << rpr["speed_min"].get<double>()
+                                      << ") > speed_max ("
+                                      << rpr["speed_max"].get<double>()
+                                      << ") in profile '" << sp.name
+                                      << "' — speed_max will be raised to speed_min on load\n";
+                            has_warnings = true;
+                        }
+                    }
+                    if (rp.contains("name") && rp["name"].is_string() &&
+                        rp["name"].get<std::string>().size() > MAX_NAME_LEN) {
+                        std::cerr << "WARNING: profile name is "
+                                  << rp["name"].get<std::string>().size()
+                                  << " chars; it will be truncated to "
+                                  << MAX_NAME_LEN << " on load\n";
+                        has_warnings = true;
+                    }
+                }
+            }
+        }
+
+        if (has_errors) {
+            std::cout << "\nValidation FAILED.\n";
+            return 1;
+        } else if (has_warnings) {
+            std::cout << "\nValidation passed with warnings.\n";
+            return 0;
+        } else {
+            std::cout << "\nValidation passed. All checks OK.\n";
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: Failed to load/parse config: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+/// Canonical string for a parameter key's post-sanitize stored value.
+/// sanitize_device_profile() clamps DPI/polling/rotation/speed ordering etc.,
+/// so reporting the raw entered string back can mislead (e.g. `dpi 999999`
+/// would print 999999 even though 32000 was stored).  Read the field back
+/// instead so the output always shows what actually landed in the config.
+static std::string stored_value_str(const device_profile& dp, const std::string& key) {
+    auto fmt = [](double x) {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(6) << x;
+        return o.str();
+    };
+    auto mode_name = [](accel_mode m) -> const char* {
+        switch (m) {
+        case accel_mode::classic:     return "classic";
+        case accel_mode::power:       return "power";
+        case accel_mode::natural:     return "natural";
+        case accel_mode::jump:        return "jump";
+        case accel_mode::synchronous: return "synchronous";
+        case accel_mode::lookup:      return "lookup";
+        default:                      return "noaccel";
+        }
+    };
+    const auto& a = dp.prof.accel_x;
+    const auto& sp = dp.prof.speed_processor_args;
+
+    if (key == "mode")            return mode_name(a.mode);
+    if (key == "device_id")       return dp.device_id.empty() ? "(all)" : dp.device_id;
+    if (key == "gain")            return a.gain ? "true" : "false";
+    if (key == "raw")             return dp.prof.raw_passthrough ? "true" : "false";
+    // T36-CLI01: make the two new set-param keys echo their stored values too.
+    if (key == "disable")         return dp.dev_cfg.disable ? "true" : "false";
+    if (key == "match_app")       return dp.match_app.empty() ? "(none)" : dp.match_app;
+    if (key == "dpi")             return std::to_string(dp.dev_cfg.dpi);
+    if (key == "polling_rate")    return std::to_string(dp.dev_cfg.polling_rate);
+    if (key == "cap_mode") {
+        switch (a.cap_mode_val) {
+        case cap_mode::in: return "in";
+        case cap_mode::io: return "io";
+        default:           return "out";
+        }
+    }
+    if (key == "distance_mode") {
+        // C-3: match print_profile() — lp_norm<=0 (hand-edited JSON) and
+        // lp_norm>=16 both behave as "max", so report the same string.
+        if (!sp.whole)                   return "separate";
+        if (sp.lp_norm >= 16 || sp.lp_norm <= 0) return "max";
+        if (std::fabs(sp.lp_norm - 2.0) < 1e-9) return "euclidean";
+        return "lp";
+    }
+    if (key == "acceleration")        return fmt(a.acceleration);
+    if (key == "exponent_classic")    return fmt(a.exponent_classic);
+    if (key == "exponent_power")      return fmt(a.exponent_power);
+    if (key == "limit")               return fmt(a.limit);
+    if (key == "decay_rate")          return fmt(a.decay_rate);
+    if (key == "input_offset")        return fmt(a.input_offset);
+    if (key == "output_offset")       return fmt(a.output_offset);
+    if (key == "scale")               return fmt(a.scale);
+    if (key == "sync_speed")          return fmt(a.sync_speed);
+    if (key == "smooth")              return fmt(a.smooth);
+    if (key == "motivity")            return fmt(a.motivity);
+    if (key == "gamma")               return fmt(a.gamma);
+    if (key == "cap_x")               return fmt(a.cap.x);
+    if (key == "cap_y")               return fmt(a.cap.y);
+    if (key == "rotation")            return fmt(dp.prof.degrees_rotation);
+    if (key == "snap")                return fmt(dp.prof.degrees_snap);
+    if (key == "speed_min")           return fmt(dp.prof.speed_min);
+    if (key == "speed_max")           return fmt(dp.prof.speed_max);
+    if (key == "output_dpi")          return fmt(dp.prof.output_dpi);
+    if (key == "lr_ratio")            return fmt(dp.prof.lr_output_dpi_ratio);
+    if (key == "ud_ratio")            return fmt(dp.prof.ud_output_dpi_ratio);
+    if (key == "yx_ratio")            return fmt(dp.prof.yx_output_dpi_ratio);
+    if (key == "lp_norm")             return fmt(sp.lp_norm);
+    if (key == "input_smooth_halflife")  return fmt(sp.input_speed_smooth_halflife);
+    if (key == "scale_smooth_halflife")  return fmt(sp.scale_smooth_halflife);
+    if (key == "output_smooth_halflife") return fmt(sp.output_speed_smooth_halflife);
+    if (key == "domain_weights")  return fmt(dp.prof.domain_weights.x);
+    if (key == "domain_weight_x") return fmt(dp.prof.domain_weights.x);
+    if (key == "domain_weight_y") return fmt(dp.prof.domain_weights.y);
+    if (key == "range_weights")   return fmt(dp.prof.range_weights.x);
+    if (key == "range_weight_x")  return fmt(dp.prof.range_weights.x);
+    if (key == "range_weight_y")  return fmt(dp.prof.range_weights.y);
+    return key; // fallback — unknown/string keys shouldn't reach here
+}
+
+/// Quick parameter setter: rawaccel set-param <profile> <key> <value>
+static int cmd_set_param(app_config& cfg, const std::string& config_path,
+                         const std::string& profile_name,
+                         const std::string& key, const std::string& val)
+{
+    device_profile* dp = nullptr;
+    for (auto& p : cfg.profiles) {
+        if (p.name == profile_name) { dp = &p; break; }
+    }
+    if (!dp) { std::cerr << "Profile not found: " << profile_name << "\n"; return 1; }
+
+    auto& a = dp->prof.accel_x;
+    auto& ay = dp->prof.accel_y;
+    // BUG-19: previously an unknown mode silently fell through to noaccel,
+    // so a typo like "classicc" would silently disable accel without
+    // feedback.  Returns false for unknown input so the caller can error.
+    auto set_mode = [](accel_args& a, const std::string& m) -> bool {
+        if      (m == "classic")     a.mode = accel_mode::classic;
+        else if (m == "power")       a.mode = accel_mode::power;
+        else if (m == "natural")     a.mode = accel_mode::natural;
+        else if (m == "jump")        a.mode = accel_mode::jump;
+        else if (m == "synchronous") a.mode = accel_mode::synchronous;
+        else if (m == "lookup")      a.mode = accel_mode::lookup;
+        else if (m == "noaccel" ||
+                 m == "off" ||
+                 m == "none")        a.mode = accel_mode::noaccel;
+        else return false;
+        return true;
+    };
+    // BUG-19: strict bool — only accept canonical truthy/falsey strings.
+    auto parse_strict_bool = [](const std::string& s, bool& out) -> bool {
+        if (s == "1" || s == "true"  || s == "yes" || s == "on")  { out = true;  return true; }
+        if (s == "0" || s == "false" || s == "no"  || s == "off") { out = false; return true; }
+        return false;
+    };
+
+    // P107: validate the key against the FULL set up front so an unknown key
+    // reports "Unknown key" instead of a misleading numerical parse failure
+    // ("Invalid numeric value: true" for the nonexistent 'disable' key, etc.).
+    static const std::vector<std::string> all_keys = {
+        "mode", "gain", "cap_mode", "cap_x", "cap_y", "acceleration",
+        "exponent_classic", "exponent_power", "limit", "decay_rate",
+        "input_offset", "output_offset", "scale", "sync_speed", "smooth",
+        "motivity", "gamma", "raw", "device_id", "rotation", "snap", "dpi",
+        "polling_rate", "speed_min", "speed_max", "output_dpi", "lr_ratio",
+        "ud_ratio", "yx_ratio", "distance_mode", "lp_norm",
+        "input_smooth_halflife", "scale_smooth_halflife",
+        "output_smooth_halflife", "domain_weights", "domain_weight_x",
+        "domain_weight_y", "range_weights", "range_weight_x", "range_weight_y",
+        "disable", "match_app", "use_raw_input"
+    };
+    // T36-CLI01: use_raw_input is a TOP-LEVEL switch, not a per-profile field —
+    // reject it here with an explicit note instead of letting it fall through
+    // to "Unknown key" (it is not unknown, it is just not per-profile) or to a
+    // misleading numeric-parse failure.
+    if (key == "use_raw_input") {
+        std::cerr << "'use_raw_input' is a top-level (global) setting, not a "
+                     "per-profile key — set it in the config file or via the GUI's "
+                     "'Raw Input' toggle; set-param cannot change it.\n";
+        return 1;
+    }
+    if (std::find(all_keys.begin(), all_keys.end(), key) == all_keys.end()) {
+        std::cerr << "Unknown key: " << key << "\n"
+                  << "Valid keys: " << join_keys(all_keys) << "\n";
+        return 1;
+    }
+    // Parse numeric value only for numeric params (not for string/bool keys)
+    static const std::vector<std::string> non_numeric_keys = {
+        "mode", "gain", "cap_mode", "distance_mode", "raw", "device_id",
+        "disable", "match_app"
+    };
+    double v = 0;
+    bool need_numeric = true;
+    for (auto& nk : non_numeric_keys) if (nk == key) { need_numeric = false; break; }
+    if (need_numeric) {
+        // BUG-11: std::stod("1.5junk") happily returns 1.5 and silently drops
+        // the trailing garbage — a typo would slip through unnoticed.  Use the
+        // optional `pos` out-param and require it to consume the entire string
+        // (allowing only trailing whitespace).
+        try {
+            size_t pos = 0;
+            v = std::stod(val, &pos);
+            // Skip trailing whitespace
+            while (pos < val.size() &&
+                   std::isspace(static_cast<unsigned char>(val[pos]))) ++pos;
+            if (pos != val.size()) {
+                std::cerr << "Invalid numeric value: " << val
+                          << " (trailing garbage)\n";
+                return 1;
+            }
+        } catch (...) { std::cerr << "Invalid numeric value: " << val << "\n"; return 1; }
+        // BUG-10: NaN/Inf passed straight through to JSON storage as "NaN"/
+        // "Infinity" — non-portable per the JSON spec.  Daemon would sanitize
+        // on load but the file itself is malformed.  Reject before persisting.
+        if (!std::isfinite(v)) {
+            std::cerr << "Invalid numeric value: " << val
+                      << " (NaN/Inf not allowed)\n";
+            return 1;
+        }
+    }
+
+    // P107: reject out-of-domain values instead of silently clamping them.
+    // sanitize_device_profile() still clamps hand-edited JSON at load time
+    // (a documented degrade path), but the CLI must not persist a different
+    // value than the user asked for while exiting 0 — a script checking $?
+    // would see "success" for e.g. `snap 90` that actually stored 45.
+    // Domains mirror the sanitize ranges in src/config.cpp exactly.
+    // Intentionally unconstrained (accept any finite value): rotation (any angle is
+    // normalized into [0,360) — documented aliasing).  Non-numeric keys
+    // (mode/gain/cap_mode/raw/distance_mode/device_id) never reach here.
+    // T43-11: acceleration keeps its negative (classic-decel) band accepted
+    // but is upper-clamped at ACCEL_MAX, and sync_speed is bounded at
+    // SYNC_SPEED_MAX — both mirror sanitize now.
+    auto range_ok = [&](const char* k, double lo, double hi) -> bool {
+        if (v >= lo && v <= hi) return true;
+        std::cerr << "Invalid value for '" << k << "': " << val
+                  << "  (valid range: " << lo << ".." << hi << ")\n";
+        return false;
+    };
+    auto int_ok = [&](const char* k, double lo, double hi) -> bool {
+        if (v != std::floor(v)) {
+            std::cerr << "Invalid value for '" << k << "': " << val
+                      << "  (must be an integer)\n";
+            return false;
+        }
+        return range_ok(k, lo, hi);
+    };
+
+    if (key == "dpi") {
+        if (!int_ok("dpi", 1, 32000)) return 1;
+    } else if (key == "output_dpi") {
+        // P156: output_dpi is a double field in the config schema — an integer
+        // coercion rejected legitimate fractional values (e.g. DPI != 1).  The
+        // sanitizer clamps the range anyway; 0 = "no output-DPI normalization"
+        // is a valid sentinel.
+        // CLI-2 (P107): the sanitizer maps the (0,1) band onto 1 — a fractional
+        // normalization below the 1-DPI floor is meaningless — so accepting
+        // `output_dpi 0.5` stored 1 while exiting 0 (silent mutation).  The CLI
+        // domain is therefore {0 sentinel} ∪ [1, 32000].
+        if (v == 0) { /* sentinel: no output-DPI normalization */ }
+        else if (!range_ok("output_dpi", 1, 32000)) return 1;
+    } else if (key == "polling_rate") {
+        if (!int_ok("polling_rate", POLL_RATE_MIN, POLL_RATE_MAX)) return 1;
+    } else if (key == "snap") {
+        if (!range_ok("snap", 0, 45)) return 1;
+    } else if (key == "lr_ratio" || key == "ud_ratio" || key == "yx_ratio") {
+        if (!range_ok(key.c_str(), 0.01, 100)) return 1;
+    } else if (key == "exponent_classic") {
+        if (!range_ok("exponent_classic", 1, 10)) return 1;
+    } else if (key == "exponent_power") {
+        // P120-FAZ2 (Aj8 BUG-3): clipped at the GUI gauge max (EXP_POWER_MAX).
+        if (!range_ok(key.c_str(), 1e-4, EXP_POWER_MAX)) return 1;
+    } else if (key == "acceleration") {
+        // T43-11: sanitize clamps acceleration to <= ACCEL_MAX at load, so
+        // the CLI must reject the same out-of-range band (P107 byte
+        // correctness).  Negatives stay accepted: classic deceleration is a
+        // documented feature (no sanitize lower bound exists), so only the
+        // upper domain is shared.
+        if (v > ACCEL_MAX) {
+            std::cerr << "Invalid value for 'acceleration': " << val
+                      << "  (must be <= " << ACCEL_MAX << ")\n";
+            return 1;
+        }
+    } else if (key == "sync_speed") {
+        // T43-11: mirror the sanitize domain [1e-4, SYNC_SPEED_MAX].
+        if (!range_ok(key.c_str(), 1e-4, SYNC_SPEED_MAX)) return 1;
+    } else if (key == "lp_norm") {
+        if (v <= 0) {
+            std::cerr << "Invalid value for 'lp_norm': " << val
+                      << "  (must be > 0)\n";
+            return 1;
+        }
+    } else if (key == "cap_x") {
+        // P120-FAZ2: GUI gauge max CAP_X_MAX.
+        if (!range_ok(key.c_str(), 0, CAP_X_MAX)) return 1;
+        // O31-L2: cap.x must stay >= input_offset (sanitize raises cap.x up to
+        // input_offset — BUG-7 — otherwise the stored cap would silently differ
+        // from the value the user asked for / the daemon runs).  cap_x sets BOTH
+        // axes, so the Y input_offset must satisfy the same constraint even when
+        // the axes are unlinked (otherwise unlinked Y stays silently mutated).
+        if (v < a.input_offset || v < ay.input_offset) {
+            double worst = (ay.input_offset > a.input_offset) ? ay.input_offset
+                                                              : a.input_offset;
+            std::cerr << "Invalid value for 'cap_x': " << val
+                      << "  (must be >= input_offset " << worst
+                      << " — a lower cap would make the loader silently raise "
+                      << "cap_x to the input_offset)\n";
+            return 1;
+        }
+    } else if (key == "cap_y") {
+        // P120-FAZ2: GUI gauge max CAP_Y_MAX.
+        if (!range_ok(key.c_str(), 0, CAP_Y_MAX)) return 1;
+    } else if (key == "output_offset") {
+        // P120-FAZ2: GUI gauge max OUTPUT_OFFSET_MAX.
+        if (!range_ok(key.c_str(), 0, OUTPUT_OFFSET_MAX)) return 1;
+    } else if (key == "scale") {
+        // P120-FAZ2: GUI gauge max SCALE_MAX.  MATH-2: scrub 0/negative (dead
+        // cursor / silent 1.5x boost) — sanitize floors those to 0.01, so the
+        // CLI domain must start at the same floor to keep P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0.01, SCALE_MAX)) return 1;
+    } else if (key == "decay_rate") {
+        // L03-03 (MED): sanitize enforces DECAY_RATE_MAX (include/config.hpp)
+        // but the CLI only checked the lower bound, so `set-param decay_rate
+        // 100` stored 10 with rc=0 — the P107 "bytes-birebir" contract was
+        // empty here.  Reject out-of-range values (rc=1, config untouched)
+        // like every other field; the ceiling constant is shared with
+        // sanitize so the CLI domain can never drift from it.
+        if (!range_ok(key.c_str(), 0, DECAY_RATE_MAX)) return 1;
+        // L02-14 (2026-10-21): natural's internal accel coefficient is
+        // decay_rate/|limit-1| and the GAIN branch's cancellation can flip the
+        // gain NEGATIVE for decay_rate ∈ (0, 1e-4) (measured: gain -30.25 at
+        // limit=100, decay_rate=1e-10 → the axis is inverted).  The config
+        // layer now clamps that band up to NATURAL_DECAY_RATE_MIN = 1e-4
+        // (include/config.hpp, applied by sanitize_accel_args in
+        // src/config.cpp), so accepting such a value here would store bytes
+        // that the loader silently rewrites — exactly the P107 violation.
+        // decay_rate = 0 is explicitly allowed (accel = 0 → the
+        // `accel < 1e-12 → 1.0` guard → flat gain 1.0).
+        // The floor is checked for EVERY mode, not just natural: decay_rate
+        // is read only by the natural algorithm, but the mode can be switched
+        // later (`set-param mode natural`) and the value already stored must
+        // not become a clamp-on-load surprise at that point.
+        if (v > 0.0 && v < NATURAL_DECAY_RATE_MIN) {
+            std::cerr << "Invalid value for 'decay_rate': " << val
+                      << "  (must be 0 or >= " << NATURAL_DECAY_RATE_MIN
+                      << " — in natural mode a smaller value makes the gain go "
+                         "negative and inverts the axis; the loader would clamp "
+                         "it to " << NATURAL_DECAY_RATE_MIN << " anyway)\n";
+            return 1;
+        }
+    } else if (key == "limit" || key == "motivity" ||
+               key == "gamma" || key == "smooth") {
+        // L03-03 (MED): sanitize enforces ceilings for these four
+        // (LIMIT_MAX/MOTIVITY_MAX/GAMMA_MAX/SMOOTH_MAX in include/config.hpp)
+        // but the CLI only checked the lower bound, so `set-param g smooth 16`
+        // stored 1.0 and `limit 5000` stored 100 with rc=0 — the P107
+        // "bytes-birebir" contract was empty here.  Reject out-of-range values
+        // (rc=1, config untouched) like every other field; the ceiling
+        // constants are shared with sanitize so the CLI domain can never
+        // drift from it.
+        const double hi = (key == "limit")      ? LIMIT_MAX
+                        : (key == "motivity")   ? MOTIVITY_MAX
+                        : (key == "gamma")      ? GAMMA_MAX
+                                                : SMOOTH_MAX;
+        if (!range_ok(key.c_str(), 0, hi)) return 1;
+    } else if (key == "speed_min" || key == "speed_max") {
+        // T46-05: engine/CLI used to accept any finite value while the GUI
+        // spin was capped — JSON/CLI > spin silently truncated on next GUI
+        // save.  Shared ceiling SPEED_MAX mirrors sanitize, so the CLI domain
+        // is now byte-correct with both.
+        if (!range_ok(key.c_str(), 0, SPEED_MAX)) return 1;
+    } else if (key == "input_offset") {
+        // O31-L2: sanitize clamps input_offset to CAP_X_MAX at load, so the
+        // CLI domain must mirror [0, CAP_X_MAX] for P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0, CAP_X_MAX)) return 1;
+        // And the BUG-7 rule: the loader raises cap.x up to input_offset — a
+        // bigger offset would silently rewrite the user's cap_x.  Reject so
+        // the persisted pair always equals what the user asked for.  input_offset
+        // sets BOTH axes, so the unlinked Y cap must satisfy the same relation.
+        if (v > a.cap.x || v > ay.cap.x) {
+            double worst_cap = (ay.cap.x > a.cap.x) ? ay.cap.x : a.cap.x;
+            std::cerr << "Invalid value for 'input_offset': " << val
+                      << "  (must be <= cap_x " << worst_cap
+                      << " — a larger offset would make the loader silently "
+                      << "raise cap_x to the input_offset)\n";
+            return 1;
+        }
+    } else if (key == "input_smooth_halflife" || key == "scale_smooth_halflife" ||
+               key == "output_smooth_halflife") {
+        // SM-7: bounded by the shared SMOOTH_HALFLIFE_MAX so the CLI never
+        // accepts a value sanitize would re-clamp — P107 byte-correctness.
+        if (!range_ok(key.c_str(), 0, SMOOTH_HALFLIFE_MAX)) return 1;
+    } else if (key == "domain_weights" || key == "domain_weight_x" ||
+               key == "domain_weight_y" || key == "range_weights" ||
+               key == "range_weight_x" || key == "range_weight_y") {
+        if (!range_ok(key.c_str(), 0, 1e6)) return 1;
+    }
+
+    if      (key == "mode")             {
+        if (!set_mode(a, val) || !set_mode(ay, val)) {
+            std::cerr << "Invalid mode: '" << val << "'.  Valid: classic, power, "
+                         "natural, jump, synchronous, lookup, noaccel\n";
+            return 1;
+        }
+        // C-8: with mode=lookup but no LUT data the daemon gets an empty
+        // curve; warn loudly instead of letting the user believe it took.
+        if (val == "lookup" && a.length == 0) {
+            std::cerr << "WARNING: mode=lookup has no LUT data yet — there is no "
+                         "set-param lut-data key; import a profile that already "
+                         "carries a lookup curve (e.g. `rawaccel-cli export "
+                         "<profile>` output) instead.\n";
+        }
+    }
+    else if (key == "gain")             {
+        bool b;
+        if (!parse_strict_bool(val, b)) {
+            std::cerr << "Invalid bool for 'gain': '" << val
+                      << "'.  Valid: true/false/1/0/yes/no/on/off\n";
+            return 1;
+        }
+        a.gain = ay.gain = b;
+    }
+    else if (key == "acceleration")     { a.acceleration = ay.acceleration = v; }
+    else if (key == "exponent_classic") { a.exponent_classic = ay.exponent_classic = v; }
+    else if (key == "exponent_power")   { a.exponent_power = ay.exponent_power = v; }
+    else if (key == "limit")            { a.limit = ay.limit = v; }
+    else if (key == "decay_rate")       { a.decay_rate = ay.decay_rate = v; }
+    else if (key == "input_offset")     { a.input_offset = ay.input_offset = v; }
+    else if (key == "output_offset")    { a.output_offset = ay.output_offset = v; }
+    else if (key == "scale")            { a.scale = ay.scale = v; }
+    else if (key == "sync_speed")       { a.sync_speed = ay.sync_speed = v; }
+    else if (key == "smooth")           { a.smooth = ay.smooth = v; }
+    else if (key == "motivity")         { a.motivity = ay.motivity = v; }
+    else if (key == "gamma")            { a.gamma = ay.gamma = v; }
+    else if (key == "cap_y")            { a.cap.y = ay.cap.y = v; }
+    else if (key == "cap_x")            { a.cap.x = ay.cap.x = v; }
+    else if (key == "cap_mode")         {
+        cap_mode m;
+        if      (val == "in")  m = cap_mode::in;
+        else if (val == "out") m = cap_mode::out;
+        else if (val == "io" || val == "in_out" || val == "both") m = cap_mode::io;
+        else {
+            std::cerr << "Invalid cap_mode: '" << val
+                      << "'.  Valid: in, out, io\n";
+            return 1;
+        }
+        a.cap_mode_val = ay.cap_mode_val = m;
+    }
+    else if (key == "raw")              {
+        bool b;
+        if (!parse_strict_bool(val, b)) {
+            std::cerr << "Invalid bool for 'raw': '" << val << "'\n";
+            return 1;
+        }
+        dp->prof.raw_passthrough = b;
+    }
+    // T36-CLI01: `disable` (PAS-2) was hand-JSON only — expose it via
+    // set-param with the same strict-bool contract as gain/raw.
+    else if (key == "disable")          {
+        bool b;
+        if (!parse_strict_bool(val, b)) {
+            std::cerr << "Invalid bool for 'disable': '" << val
+                      << "'.  Valid: true/false/1/0/yes/no/on/off\n";
+            return 1;
+        }
+        dp->dev_cfg.disable = b;
+    }
+    // T36-CLI01: `match_app` was GUI-only — expose it.  Trim + 128-char cap,
+    // mirroring the load-side json_get_string_limited(...,128) so the stored
+    // value is always the one the user asked for.
+    else if (key == "match_app")        {
+        std::string v = val;
+        size_t a = v.find_first_not_of(" \t\r\n");
+        size_t b = v.find_last_not_of(" \t\r\n");
+        v = (a == std::string::npos) ? "" : v.substr(a, b - a + 1);
+        if (v.size() > 128) {
+            std::cerr << "match_app too long: " << v.size()
+                      << " chars (max 128).\n";
+            return 1;
+        }
+        dp->match_app = v;
+    }
+    else if (key == "device_id")        {
+        // Per-device profile assignment. Empty string clears the assignment
+        // (profile then applies to all unmatched mice).  Non-empty values are
+        // matched against the daemon's composite ID "usb:VVVV:PPPP:serial" or a
+        // /dev/input/{by-id,eventN} node path — copy verbatim.
+        // C29-N4: "(all)" is the display form of "no constraint" (the load
+        // side normalizes it) — mirror that here so a literal "(all)"
+        // assignment can't dead-lock the profile.
+        std::string id = val;
+        if (id == "(all)" || id == "all" || id == "*") id.clear();
+        // P115-A5-01: the load-side cap is MAX_DP_DEVICE_ID (256) in
+        // src/config.cpp.  A longer value used to be accepted and then silently
+        // truncated on the next reload+resave — same trap P82-MED-1 fixed for
+        // names.  Reject up front so the stored ID always equals what the user
+        // supplied.
+        if (id.size() > 256) {
+            std::cerr << "device_id too long: " << id.size()
+                      << " chars (max 256).\n";
+            return 1;
+        }
+        dp->device_id = id;
+    }
+    else if (key == "rotation")         { dp->prof.degrees_rotation = v; }
+    else if (key == "snap")             { dp->prof.degrees_snap = v; }
+    else if (key == "dpi")              { dp->dev_cfg.dpi = finite_double_to_int(v); }
+    else if (key == "polling_rate")     { dp->dev_cfg.polling_rate = finite_double_to_int(v); }
+    else if (key == "speed_min")        {
+        dp->prof.speed_min = v;
+        // C-2/P107-FIX: reject when speed_min exceeds the existing speed_max
+        // (mirror the cap_x/input_offset cross-field constraint).  The old code
+        // warned then silently accepted, deferring the error to the next save —
+        // the user expected both fields valid, but one was clamped on write.
+        if (dp->prof.speed_max > 0 && dp->prof.speed_min > dp->prof.speed_max) {
+            std::cerr << "ERROR: speed_min (" << v
+                      << ") > speed_max (" << dp->prof.speed_max
+                      << ") — reject (set speed_max first or lower speed_min).\n";
+            return 1;
+        }
+    }
+    else if (key == "speed_max")        {
+        dp->prof.speed_max = v;
+        // C-2/P107-FIX: reject in the other direction too.
+        if (dp->prof.speed_max > 0 && dp->prof.speed_max < dp->prof.speed_min) {
+            std::cerr << "ERROR: speed_max (" << v
+                      << ") < speed_min (" << dp->prof.speed_min
+                      << ") — reject (set speed_min first or lower speed_max).\n";
+            return 1;
+        }
+    }
+    else if (key == "output_dpi")       { dp->prof.output_dpi = v; }
+    else if (key == "lr_ratio")         { dp->prof.lr_output_dpi_ratio = v; }
+    else if (key == "ud_ratio")         { dp->prof.ud_output_dpi_ratio = v; }
+    else if (key == "yx_ratio")         { dp->prof.yx_output_dpi_ratio = v; }
+    else if (key == "distance_mode")    {
+        if      (val == "separate" || val == "manhattan") {
+            dp->prof.speed_processor_args.whole = false;
+        }
+        else if (val == "max" || val == "chebyshev") {
+            dp->prof.speed_processor_args.whole = true;
+            dp->prof.speed_processor_args.lp_norm = 9999;
+        }
+        else if (val == "lp") {
+            dp->prof.speed_processor_args.whole = true;
+            // P115-A5-06: switching to lp-mode must not leave a stale max-mode
+            // sentinel (lp_norm=9999) behind — that kept the LAST lp_norm value
+            // and made stored_value_str() echo "max" after the user asked for
+            // "lp".  An explicit lp_norm set BEFORE this call is preserved
+            // (semantics: "lp, at my norm"); the sentinel is the only victim.
+            if (dp->prof.speed_processor_args.lp_norm >= 16)
+                dp->prof.speed_processor_args.lp_norm = 2.0;
+        }
+        else if (val == "euclidean") {
+            dp->prof.speed_processor_args.whole = true;
+            dp->prof.speed_processor_args.lp_norm = 2;
+        }
+        else {
+            std::cerr << "Invalid distance_mode: '" << val
+                      << "'.  Valid: euclidean, max, lp, separate\n";
+            return 1;
+        }
+    }
+    else if (key == "lp_norm")          { dp->prof.speed_processor_args.lp_norm = v; }
+    else if (key == "input_smooth_halflife")  { dp->prof.speed_processor_args.input_speed_smooth_halflife = v; }
+    else if (key == "scale_smooth_halflife")  { dp->prof.speed_processor_args.scale_smooth_halflife = v; }
+    else if (key == "output_smooth_halflife") { dp->prof.speed_processor_args.output_speed_smooth_halflife = v; }
+    else if (key == "domain_weights")  { dp->prof.domain_weights.x = dp->prof.domain_weights.y = v; }
+    else if (key == "domain_weight_x") { dp->prof.domain_weights.x = v; }
+    else if (key == "domain_weight_y") { dp->prof.domain_weights.y = v; }
+    else if (key == "range_weights")   { dp->prof.range_weights.x = dp->prof.range_weights.y = v; }
+    else if (key == "range_weight_x")  { dp->prof.range_weights.x = v; }
+    else if (key == "range_weight_y")  { dp->prof.range_weights.y = v; }
+    else                                {
+        std::cerr << "Unknown key: " << key << "\n"
+                  << "Valid keys: mode, gain, cap_mode, cap_x, cap_y, acceleration, "
+                     "exponent_classic, exponent_power, limit, decay_rate, motivity, "
+                     "gamma, input_offset, output_offset, scale, sync_speed, smooth, "
+                     "raw, device_id, rotation, snap, dpi, polling_rate, speed_min, "
+                     "speed_max, output_dpi, lr_ratio, ud_ratio, yx_ratio, "
+                     "distance_mode, lp_norm, input_smooth_halflife, "
+                     "scale_smooth_halflife, output_smooth_halflife, domain_weights, "
+                     "domain_weight_x, domain_weight_y, range_weights, range_weight_x, "
+                     "range_weight_y, disable, match_app\n";
+        return 1;
+    }
+
+    // Sanitize after setting — clamps DPI, polling rate, rotation, etc. to safe ranges
+    sanitize_device_profile(*dp);
+    if (!safe_save(cfg, config_path)) return 1;
+    // Print the post-sanitize value actually stored (sanitize may have clamped
+    // e.g. `dpi 999999` → 32000, or resolved speed_min/speed_max ordering).
+    std::cout << "Set " << key << " = " << stored_value_str(*dp, key)
+              << " in profile '" << profile_name << "'\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_export(const app_config& cfg, const std::string& name) {
+    if (name.empty()) {
+        for (auto& dp : cfg.profiles)
+            std::cout << profile_to_json(dp) << "\n";
+        return 0;
+    }
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == name) {
+            std::cout << profile_to_json(dp) << "\n";
+            return 0;
+        }
+    }
+    std::cerr << "Profile not found: " << name << "\n";
+    return 1;
+}
+
+/// Compare two profiles (either by profile name in the config, or by JSON file
+/// path) and print ONLY the fields that differ, using the same epsilon the
+/// accel_args operator== uses so legitimate round-trip precision differences
+/// never show up as bogus diffs.  Read-only: never touches the config file,
+/// the daemon, or the LUT data.
+static int cmd_diff(const app_config& cfg, const std::string& a, const std::string& b) {
+    // Where a diff side came from — the L13-10 note may only claim "one side is
+    // a file" when that is actually true.
+    enum class diff_kind { profile, file };
+    auto resolve = [&](const std::string& ref, device_profile& out,
+                       diff_kind& kind) -> bool {
+        // L13-09: load_config tolerates duplicate names (only import rejects
+        // them).  Silently returning the first match made `diff same same`
+        // compare one entry against itself while a second, different entry of
+        // the same name existed.  Keep first-match-wins (documented daemon
+        // semantics) but say so.
+        const device_profile* first = nullptr;
+        size_t matches = 0;
+        for (const auto& dp : cfg.profiles) {
+            if (dp.name == ref) {
+                if (!first) first = &dp;
+                ++matches;
+            }
+        }
+        if (first) {
+            if (matches > 1)
+                std::cerr << "Warning: duplicate profile name '" << ref << "' ("
+                          << matches << " entries in the config) — using the "
+                          << "first match.\n";
+            out = *first;
+            kind = diff_kind::profile;
+            return true;
+        }
+        // Not a profile name — try it as a JSON file (the `export` format).
+        // Same bounded chunked read as import (stat() can fail on FUSE/pipes).
+        std::ifstream f(ref, std::ios::in | std::ios::binary);
+        if (!f.is_open()) {
+            std::cerr << "Diff source is neither a profile name nor a readable "
+                      << "file: " << ref << "\n";
+            return false;
+        }
+        std::string content;
+        char chunk[1 << 16];
+        constexpr size_t kDiffMax = 1024 * 1024;
+        while (f && content.size() <= kDiffMax) {
+            f.read(chunk, sizeof(chunk));
+            content.append(chunk, (size_t)f.gcount());
+        }
+        if (content.size() > kDiffMax) {
+            std::cerr << "Refusing to diff: " << ref << " is larger than 1MB\n";
+            return false;
+        }
+        try {
+            // L13-05: `export` (no name) emits a {"profiles":[...]} wrapper.
+            // profile_from_json() has no top-level name/profile, so the wrapper
+            // silently degraded to an empty default profile — two completely
+            // different full-config exports diffed as "no differences", rc=0.
+            // Reject the ambiguous source instead of guessing which profile.
+            const nlohmann::json raw = nlohmann::json::parse(content);
+            if (raw.is_object() && raw.contains("profiles")) {
+                std::cerr << "diff: '" << ref << "' is a full-config export "
+                             "(has 'profiles'); extract a single profile first "
+                             "(rawaccel-cli export <name>).\n";
+                return false;
+            }
+            out = profile_from_json(content);
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid profile JSON in " << ref << ": " << e.what() << "\n";
+            return false;
+        }
+        kind = diff_kind::file;
+        return true;
+    };
+
+    device_profile A, B;
+    diff_kind kind_a = diff_kind::profile, kind_b = diff_kind::profile;
+    if (!resolve(a, A, kind_a) || !resolve(b, B, kind_b)) return 1;
+
+    std::cout << "diff '" << A.name << "' vs '" << B.name << "'\n";
+    // L13-10: the note is only meaningful when the two sides are (a) different
+    // sources, (b) one is a config profile and the other a file, and (c) they
+    // share a name.  It used to fire for a self-diff (a == b), claiming "one
+    // side is a file" when neither was, and "the values differ" when they did
+    // not.
+    if (a != b && A.name == B.name && kind_a != kind_b)
+        std::cout << "note: both sides share the name '" << A.name
+                  << "' (one side is a config profile, the other a file) — "
+                     "check the values below.\n";
+
+    int diffs = 0;
+    auto dnum = [](double v) -> std::string {
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), "%.10g", v);
+        return buf;
+    };
+    auto dbl = [&](const char* key, double x, double y) {
+        if (std::fabs(x - y) > accel_args::DBL_EPSILON_CMP) {
+            std::cout << "  " << std::left << std::setw(26) << key
+                      << dnum(x) << "  vs  " << dnum(y) << "\n";
+            ++diffs;
+        }
+    };
+    auto bval = [&](const char* key, bool x, bool y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key
+                      << (x ? "true" : "false") << "  vs  "
+                      << (y ? "true" : "false") << "\n";
+            ++diffs;
+        }
+    };
+    auto sval = [&](const char* key, const std::string& x, const std::string& y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key << "'"
+                      << x << "'  vs  '" << y << "'\n";
+            ++diffs;
+        }
+    };
+    auto ival = [&](const char* key, int x, int y) {
+        if (x != y) {
+            std::cout << "  " << std::left << std::setw(26) << key << x
+                      << "  vs  " << y << "\n";
+            ++diffs;
+        }
+    };
+    auto mode_name = [](accel_mode m) -> const char* {
+        switch (m) {
+        case accel_mode::noaccel:    return "noaccel";
+        case accel_mode::classic:    return "classic";
+        case accel_mode::power:      return "power";
+        case accel_mode::natural:    return "natural";
+        case accel_mode::jump:       return "jump";
+        case accel_mode::synchronous:return "synchronous";
+        case accel_mode::lookup:     return "lookup";
+        }
+        return "?";
+    };
+    auto cap_name = [](cap_mode m) -> const char* {
+        switch (m) {
+        case cap_mode::io:  return "io";
+        case cap_mode::in:  return "in";
+        case cap_mode::out: return "out";
+        }
+        return "?";
+    };
+
+    sval("name", A.name, B.name);
+    sval("device_id", A.device_id, B.device_id);
+    sval("match_app", A.match_app, B.match_app);
+    bval("disable", A.dev_cfg.disable, B.dev_cfg.disable);
+    ival("dpi", A.dev_cfg.dpi, B.dev_cfg.dpi);
+    ival("polling_rate", A.dev_cfg.polling_rate, B.dev_cfg.polling_rate);
+    bval("raw_passthrough", A.prof.raw_passthrough, B.prof.raw_passthrough);
+
+    // X and Y accel args (the X-only view; Y is reported separately only when
+    // it differs from X on EITHER side, to keep identical rows out of the diff).
+    auto cmp_args = [&](const char* axis, const accel_args& x, const accel_args& y) {
+        if (x.mode != y.mode) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".mode")
+                      << mode_name(x.mode) << "  vs  " << mode_name(y.mode) << "\n";
+            ++diffs;
+        }
+        if (x.gain != y.gain) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".gain")
+                      << (x.gain ? "true" : "false") << "  vs  "
+                      << (y.gain ? "true" : "false") << "\n";
+            ++diffs;
+        }
+        if (x.cap_mode_val != y.cap_mode_val) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".cap_mode")
+                      << cap_name(x.cap_mode_val) << "  vs  " << cap_name(y.cap_mode_val) << "\n";
+            ++diffs;
+        }
+        dbl((std::string(axis) + ".input_offset").c_str(),  x.input_offset, y.input_offset);
+        dbl((std::string(axis) + ".output_offset").c_str(), x.output_offset, y.output_offset);
+        dbl((std::string(axis) + ".acceleration").c_str(),  x.acceleration, y.acceleration);
+        dbl((std::string(axis) + ".decay_rate").c_str(),    x.decay_rate, y.decay_rate);
+        dbl((std::string(axis) + ".gamma").c_str(),         x.gamma, y.gamma);
+        dbl((std::string(axis) + ".motivity").c_str(),      x.motivity, y.motivity);
+        dbl((std::string(axis) + ".exponent_classic").c_str(), x.exponent_classic, y.exponent_classic);
+        dbl((std::string(axis) + ".scale").c_str(),         x.scale, y.scale);
+        dbl((std::string(axis) + ".exponent_power").c_str(),x.exponent_power, y.exponent_power);
+        dbl((std::string(axis) + ".limit").c_str(),         x.limit, y.limit);
+        dbl((std::string(axis) + ".sync_speed").c_str(),    x.sync_speed, y.sync_speed);
+        dbl((std::string(axis) + ".smooth").c_str(),        x.smooth, y.smooth);
+        dbl((std::string(axis) + ".cap_x").c_str(),         x.cap.x, y.cap.x);
+        dbl((std::string(axis) + ".cap_y").c_str(),         x.cap.y, y.cap.y);
+        if (x.length != y.length) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".lut.length") << x.length
+                      << "  vs  " << y.length << "\n";
+            ++diffs;
+        }
+        if (x.length == y.length) {
+            bool lut_eq = true;
+            for (int i = 0; i < x.length && i < (int)LUT_RAW_DATA_CAPACITY; ++i)
+                if (std::fabs(x.data[i] - y.data[i]) > accel_args::LUT_EPSILON) { lut_eq = false; break; }
+            if (!lut_eq) {
+                std::cout << "  " << std::left << std::setw(26)
+                          << (std::string(axis) + ".lut.data") << "[different]"
+                          << "\n";
+                ++diffs;
+            }
+        } else if (x.length > 0 || y.length > 0) {
+            std::cout << "  " << std::left << std::setw(26)
+                      << (std::string(axis) + ".lut.data") << "[different]" << "\n";
+            ++diffs;
+        }
+    };
+    // L13-06: these two were compared as %.10g STRINGS via sval(), so a real
+    // 1e-4 difference at |v| >= 1e5 was invisible (1e6 vs 1e6.0001 printed the
+    // same) while every other double uses dbl()'s raw-double 1e-9 epsilon.
+    // Compare component-by-component with dbl().
+    dbl("domain_weights.x", A.prof.domain_weights.x, B.prof.domain_weights.x);
+    dbl("domain_weights.y", A.prof.domain_weights.y, B.prof.domain_weights.y);
+    dbl("range_weights.x",  A.prof.range_weights.x,  B.prof.range_weights.x);
+    dbl("range_weights.y",  A.prof.range_weights.y,  B.prof.range_weights.y);
+    bval("speed.whole", A.prof.speed_processor_args.whole, B.prof.speed_processor_args.whole);
+    dbl("speed.lp_norm", A.prof.speed_processor_args.lp_norm, B.prof.speed_processor_args.lp_norm);
+    dbl("speed.input_smooth_halflife", A.prof.speed_processor_args.input_speed_smooth_halflife,
+                                       B.prof.speed_processor_args.input_speed_smooth_halflife);
+    dbl("speed.scale_smooth_halflife", A.prof.speed_processor_args.scale_smooth_halflife,
+                                       B.prof.speed_processor_args.scale_smooth_halflife);
+    dbl("speed.output_smooth_halflife", A.prof.speed_processor_args.output_speed_smooth_halflife,
+                                        B.prof.speed_processor_args.output_speed_smooth_halflife);
+    dbl("output_dpi", A.prof.output_dpi, B.prof.output_dpi);
+    dbl("yx_output_dpi_ratio", A.prof.yx_output_dpi_ratio, B.prof.yx_output_dpi_ratio);
+    dbl("lr_output_dpi_ratio", A.prof.lr_output_dpi_ratio, B.prof.lr_output_dpi_ratio);
+    dbl("ud_output_dpi_ratio", A.prof.ud_output_dpi_ratio, B.prof.ud_output_dpi_ratio);
+    dbl("degrees_rotation", A.prof.degrees_rotation, B.prof.degrees_rotation);
+    dbl("degrees_snap", A.prof.degrees_snap, B.prof.degrees_snap);
+    dbl("speed_min", A.prof.speed_min, B.prof.speed_min);
+    dbl("speed_max", A.prof.speed_max, B.prof.speed_max);
+
+    cmp_args("accel_x", A.prof.accel_x, B.prof.accel_x);
+    if (A.prof.accel_y != A.prof.accel_x || B.prof.accel_y != B.prof.accel_x)
+        cmp_args("accel_y", A.prof.accel_y, B.prof.accel_y);
+
+    std::cout << (diffs == 0 ? "no differences" : std::to_string(diffs) + " difference(s)")
+              << "\n";
+    return diffs == 0 ? 0 : 1;
+}
+
+static int cmd_import(app_config& cfg, const std::string& config_path, const std::string& json_file) {
+    std::ifstream f(json_file, std::ios::in | std::ios::binary);
+    if (!f.is_open()) { std::cerr << "Cannot open: " << json_file << "\n"; return 1; }
+    // L-BUG-8 + C-10: bound the file by reading chunked, not with stat() —
+    // stat can fail (FUSE, pipes, exotic filesystems) and would silently
+    // bypass the size limit, letting a malformed multi-GB file be slurped.
+    std::string content;
+    char chunk[1 << 16];
+    constexpr size_t kImportMax = 1024 * 1024;
+    while (f && content.size() <= kImportMax) {
+        f.read(chunk, sizeof(chunk));
+        content.append(chunk, (size_t)f.gcount());
+    }
+    if (content.size() > kImportMax) {
+        std::cerr << "Refusing to import: " << json_file
+                  << " is larger than 1MB\n";
+        return 1;
+    }
+
+    // R3-NEW-1: export with an empty <name> prints one profile object per line,
+    // so `export > all.json && import all.json` fed a multi-object stream to a
+    // single-object parser and failed.  Import now accepts any of:
+    //   1. a single profile object,
+    //   2. a {"profiles":[...]} wrapper,
+    //   3. a newline-delimited stream of profile objects (the export format),
+    //   4. a bare JSON array of profile objects.
+    std::vector<std::string> frags;
+    nlohmann::json wrapper_app; // C29-N2: capture a {"profiles":[...]} wrapper's app-level fields
+    try {
+        auto all = nlohmann::json::parse(content);
+        if (all.is_object() && all.contains("profiles") && all["profiles"].is_array()) {
+            wrapper_app = all;
+            for (auto& jp : all["profiles"]) frags.push_back(jp.dump());
+        } else if (all.is_object()) {
+            frags.push_back(content); // single profile object
+        } else if (all.is_array() && !all.empty() && all[0].is_object()) {
+            for (auto& jp : all) frags.push_back(jp.dump());
+        } else {
+            std::cerr << "Invalid profile JSON: expected a profile object, a "
+                         "{\"profiles\":[...]} array, or a line stream.\n";
+            return 1;
+        }
+    } catch (const std::exception&) {
+        // Not one JSON document → treat as the export line-stream format.
+        std::istringstream is(content);
+        std::string line;
+        while (std::getline(is, line)) {
+            size_t a = line.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) continue;
+            size_t b = line.find_last_not_of(" \t\r\n");
+            std::string t = line.substr(a, b - a + 1);
+            if (t.empty()) continue;
+            try {
+                const auto jl = nlohmann::json::parse(t);
+                if (!jl.is_object()) throw std::runtime_error("not a JSON object");
+            }
+            catch (...) {
+                std::cerr << "Invalid profile JSON line in stream: " << t << "\n";
+                return 1;
+            }
+            frags.push_back(t);
+        }
+    }
+    if (frags.empty()) {
+        std::cerr << "No profiles found in: " << json_file << "\n";
+        return 1;
+    }
+
+    std::vector<device_profile> batch;
+    std::vector<std::string> batch_versions; // CFG-1: per-profile embedded version
+    for (auto& fr : frags) {
+        device_profile dp;
+        try {
+            dp = profile_from_json(fr);
+        } catch (std::exception& e) {
+            std::cerr << "Invalid profile JSON: " << e.what() << "\n";
+            return 1;
+        }
+        // CFG-1: the profile JSON itself may carry a "version" stamp (all
+        // exports do since the stamp was added).  Capture it for the one-time
+        // migration decision; empty means the file predates the stamp and is
+        // treated as legacy.
+        std::string embedded_version;
+        try {
+            auto rawv = nlohmann::json::parse(fr);
+            if (rawv.is_object() && rawv.contains("version") &&
+                rawv["version"].is_string())
+                embedded_version = rawv["version"].get<std::string>();
+        } catch (...) { /* version stays empty → legacy */ }
+
+        // BUG-15-fix-followup: the LUT truncate warning was previously placed
+        // AFTER profile_from_json() which calls sanitize_profile() →
+        // sort_lut_data() — by then a.length is already clamped to
+        // LUT_POINTS_CAPACITY*2, so the warning was dead code.  Re-parse the raw
+        // JSON to count the original lut_data array size and warn at import time.
+        try {
+            auto raw = nlohmann::json::parse(fr);
+            // P120-FAZ2 (A5-04): an imported LUT larger than the engine capacity
+            // (> 514 raw elements, i.e. > 257 speed/gain points) is REJECTED with
+            // rc=1 + an explicit error.  Previously import warned and silently
+            // truncated the curve — that could swap a legit 257-point table for an
+            // unrelated prefix.  No silent truncation.
+            auto check_lut_raw = [&](const char* axis_key, const char* axis) -> bool {
+                // P115-A5-04: the raw LUT sits under "profile" (device_profile
+                // JSON), not at the top level — the previous check looked at
+                // raw["accel_x"] and never matched, silently dropping the
+                // truncation warning.
+                if (!raw.contains("profile")) return true;
+                auto& ax = raw["profile"];
+                if (!ax.contains(axis_key)) return true;
+                auto& a = ax[axis_key];
+                if (!a.contains("lut_data") || !a["lut_data"].is_array()) return true;
+                size_t n = a["lut_data"].size();
+                // O31-L1: n/2 floors an odd element count, so a 515-element
+                // table (257.5 points) was read as 257 points and the trailing
+                // value silently dropped on import.  Reject both odd counts
+                // and over-capacity tables up front.
+                if (n % 2 != 0 || n / 2 > LUT_POINTS_CAPACITY) {
+                    std::cerr << "ERROR: LUT (" << axis << " axis) in imported "
+                              << "profile has " << n << " raw elements ("
+                              << (n/2) << " points";
+                    if (n % 2 != 0) std::cerr << ", odd element count";
+                    std::cerr << "); maximum is " << LUT_POINTS_CAPACITY
+                              << " points (" << LUT_RAW_DATA_CAPACITY
+                              << " raw elements). Import rejected — fix the file.\n";
+                    return false;
+                }
+                return true;
+            };
+            if (!check_lut_raw("accel_x", "X")) return 1;
+            if (!check_lut_raw("accel_y", "Y")) return 1;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: could not inspect raw LUT size: " << e.what() << "\n";
+        }
+
+        // BUG-20: previously cmd_import did NOT validate the profile name.  An
+        // empty name or a duplicate of an existing profile would be silently
+        // appended, leaving the user with multiple ambiguous profiles that
+        // commands like delete/show/set-param target by first match.
+        if (dp.name.empty()) {
+            std::cerr << "Imported profile has no 'name' — refusing to import "
+                         "(would leave the config ambiguous).\n";
+            return 1;
+        }
+        // C-2: enforce the same MAX_NAME_LEN cap that every other
+        // profile-create/rename path enforces (P82-MED-1 symmetric cap).
+        // T45-IMP01: the old check on dp.name was DEAD — profile_from_json()
+        // already truncates to MAX_NAME_LEN/256/128 via
+        // json_get_string_limited(), so a 300-char name always passed here
+        // and got silently shrunk.  Gate on the RAW JSON instead: over-cap
+        // name / device_id / match_app / inner profile.name must REJECT the
+        // import (rc=1), exactly like create/duplicate/rename reject.
+        try {
+            const auto rawp = nlohmann::json::parse(fr);
+            auto raw_str_over = [](const nlohmann::json& parent,
+                                   const char* key, size_t cap) -> long {
+                if (!parent.contains(key) || !parent[key].is_string()) return -1;
+                const long n = static_cast<long>(parent[key].get<std::string>().size());
+                return n > static_cast<long>(cap) ? n : -1;
+            };
+            struct { const char* field; size_t cap; const nlohmann::json* host; }
+                fields[] = {
+                {"name",      MAX_NAME_LEN, &rawp},
+                {"device_id", 256,          &rawp},
+                {"match_app", 128,          &rawp},
+            };
+            for (auto& fl : fields) {
+                long nn;
+                if ((nn = raw_str_over(*fl.host, fl.field, fl.cap)) >= 0) {
+                    std::cerr << "ERROR: imported profile '" << fl.field
+                              << "' is " << nn << " chars (max " << fl.cap
+                              << ") — import rejected.\n";
+                    return 1;
+                }
+            }
+            if (rawp.contains("profile") && rawp["profile"].is_object()) {
+                long nn;
+                if ((nn = raw_str_over(rawp["profile"], "name", MAX_NAME_LEN)) >= 0) {
+                    std::cerr << "ERROR: imported profile.name is " << nn
+                              << " chars (max " << MAX_NAME_LEN
+                              << ") — import rejected.\n";
+                    return 1;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: could not inspect raw profile name fields: "
+                      << e.what() << "\n";
+        }
+        for (auto& existing : cfg.profiles) {
+            if (existing.name == dp.name) {
+                std::cerr << "Profile '" << dp.name << "' already exists. "
+                             "Delete it first or rename the JSON before importing.\n";
+                return 1;
+            }
+        }
+        // Duplicate within the import batch itself.
+        for (auto& pd : batch)
+            if (pd.name == dp.name) {
+                std::cerr << "Duplicate profile '" << dp.name
+                          << "' in import file — refusing to import.\n";
+                return 1;
+            }
+        batch.push_back(dp);
+        batch_versions.push_back(embedded_version);
+    }
+
+    // CFG-3: SEC-9 caps profiles at MAX_PROFILES, enforced on load.  A batch
+    // import past the cap used to write all entries, and only the first 256
+    // survived the next load+save — silent profile loss.  Check the full
+    // batch head-room up front and refuse rather than truncate.
+    if (cfg.profiles.size() + batch.size() > MAX_PROFILES) {
+        std::cerr << "Import rejected: importing " << batch.size()
+                  << " profile(s) would exceed the " << MAX_PROFILES
+                  << "-profile maximum (config already has "
+                  << cfg.profiles.size() << "). Delete profiles or split the "
+                  << "import file and try again.\n";
+        return 1;
+    }
+    // C29-N2: `list --json` emits a full app_config — its destructive import
+    // previous dropped active_profile/use_raw_input/version, so round-tripping
+    // a whole config silently lost which profile was active and the raw
+    // passthrough default.  Restore those from the wrapper (type-guarded).
+    std::string import_version; // T45-IMP02: version context of the imported batch
+    if (!wrapper_app.is_null()) {
+        if (wrapper_app.contains("active_profile")) {
+            if (wrapper_app["active_profile"].is_string())
+                cfg.active_profile = wrapper_app["active_profile"].get<std::string>();
+            else
+                std::cerr << "Warning: ignoring non-string active_profile in wrapper\n";
+        }
+        if (wrapper_app.contains("use_raw_input")) {
+            const auto& ur = wrapper_app["use_raw_input"];
+            bool ok = ur.is_boolean();
+            bool v = false;
+            if (ok) v = ur.get<bool>();
+            // T43-04: accept numeric 0/1 (int or float) like every other
+            // boolean field — a legacy exporter writing `"use_raw_input": 0`
+            // must not be silently ignored here.
+            else if (ur.is_number()) {
+                const double d = ur.get<double>();
+                if (d == 0.0) { ok = true; v = false; }
+                else if (d == 1.0) { ok = true; v = true; }
+            }
+            if (ok) {
+                // L13-07: a well-formed `false` used to be applied SILENTLY —
+                // the import itself ran, rc=0, and the daemon then grabbed no
+                // devices at all (global acceleration dead) with no warning.
+                // use_raw_input is the daemon's master intercept switch, so a
+                // flipped value from the imported wrapper must be loud.
+                if (v != cfg.use_raw_input) {
+                    std::cerr << "Warning: imported use_raw_input="
+                              << (v ? "true" : "false") << " (previous "
+                              << (cfg.use_raw_input ? "true" : "false")
+                              << ") — the daemon will "
+                              << (v ? "grab all devices." : "grab NO devices.")
+                              << "\n";
+                }
+                cfg.use_raw_input = v;
+            } else {
+                std::cerr << "Warning: ignoring non-boolean use_raw_input in wrapper\n";
+            }
+        }
+        // T45-IMP02: do NOT overwrite cfg.version from the wrapper.  cfg was
+        // already migrated+stamped by load_config(); stamping the wrapper's
+        // (possibly stale) version here made the later migrate_config(cfg)
+        // re-run migrate_lookup_gain() over ALL profiles — including the
+        // already-migrated existing ones — double-scaling their lookup+gain
+        // y values (y*x is not idempotent → silent data corruption).
+        // Capture the wrapper version separately and use it as the migration
+        // context of the imported batch only.
+        if (wrapper_app.contains("version") && wrapper_app["version"].is_string())
+            import_version = wrapper_app["version"].get<std::string>();
+    }
+    // T45-IMP02 / CFG-1: run the migration EXACTLY ONCE, per imported profile.
+    // Version context precedence: the profile's own embedded "version" stamp
+    // (present on every export since the stamp was added) wins; otherwise fall
+    // back to the wrapper's top-level version (full-config exports); otherwise
+    // the file predates stamping and is treated as legacy (empty version) so a
+    // pre-0.4 `lookup+gain` profile still gets its one-time y*x normalization.
+    // A modern (current-version) profile import is therefore a no-op instead of
+    // a wrong re-scale, and the existing cfg.profiles are never touched (they
+    // were already migrated at load).
+    for (size_t i = 0; i < batch.size(); ++i) {
+        app_config import_ctx;
+        import_ctx.version = !batch_versions[i].empty() ? batch_versions[i]
+                                                        : import_version;
+        import_ctx.profiles = { batch[i] };
+        migrate_config(import_ctx);
+        batch[i] = import_ctx.profiles[0];
+    }
+    for (auto& dp : batch) {
+        cfg.profiles.push_back(dp);
+        std::cout << "Imported profile: " << dp.name << "\n";
+    }
+    // Audit-D1: a wrapper whose active_profile names a profile that is NOT part
+    // of the import result (hand-crafted or stale export) would persist a config
+    // that fails `validate` on the next load ("Active profile not found").  Fall
+    // back to the first profile so the written config is always loadable.
+    bool active_found = false;
+    for (auto& dp : cfg.profiles)
+        if (dp.name == cfg.active_profile) { active_found = true; break; }
+    if (!active_found) {
+        if (!cfg.profiles.empty()) {
+            std::cerr << "Warning: active_profile '" << cfg.active_profile
+                      << "' is not among the import result — falling back to '"
+                      << cfg.profiles[0].name << "'.\n";
+            cfg.active_profile = cfg.profiles[0].name;
+        } else {
+            cfg.active_profile.clear();
+        }
+    }
+    // T45-IMP02: migration already ran on the imported batch above — never
+    // migrate the merged config again (that would double-scale the batch the
+    // second time and/or touch existing profiles).
+    if (!safe_save(cfg, config_path)) return 1;
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_reload() {
+    auto r = daemon_reload_via_any_path();
+    // L13-02: only the IPC path is a confirmation — the daemon answered with
+    // "ok":true after processing the request.  The SIGHUP fallback is merely a
+    // delivered signal (a frozen daemon that swallows it still looks "sent"),
+    // so it must not claim "reloaded".  It stays rc=0 (the signal WAS sent and
+    // that is the best a legacy daemon supports) but says so honestly.
+    if (r == reload_result::ipc_ok) {
+        std::cout << "Daemon reloaded.\n";
+        return 0;
+    }
+    if (r == reload_result::signal_sent) {
+        std::cout << "Reload signal sent (unverified — no IPC confirmation; the "
+                     "daemon may not have processed it).\n";
+        return 0;
+    }
+    signal_result sr = signal_result::other;
+    switch (r) {
+    case reload_result::not_running:       sr = signal_result::not_running; break;
+    case reload_result::permission_denied: sr = signal_result::permission_denied; break;
+    default:                               sr = signal_result::other; break;
+    }
+    if (r == reload_result::unsupported) {
+        std::cerr << "Daemon is running but does not support the 'reload' IPC "
+                     "command, and no PID file is available to send SIGHUP.\n";
+        return 1;
+    }
+    print_signal_failure(sr, "reload", "HUP");
+    return 1;
+}
+
+static int cmd_rename(app_config& cfg, const std::string& config_path, const std::string& old_name, const std::string& new_name) {
+    // Reject empty new name
+    if (new_name.empty()) {
+        std::cerr << "Profile name must not be empty.\n";
+        return 1;
+    }
+    // P82-MED-1: symmetric cap with load-side (MAX_NAME_LEN).
+    if (new_name.size() > MAX_NAME_LEN) {
+        std::cerr << "Profile name too long: " << new_name.size()
+                  << " chars (max " << MAX_NAME_LEN << ").\n";
+        return 1;
+    }
+    // Reject if new name already exists
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == new_name) {
+            std::cerr << "Profile already exists: " << new_name << "\n";
+            return 1;
+        }
+    }
+    // Find and rename
+    bool found = false;
+    for (auto& dp : cfg.profiles) {
+        if (dp.name == old_name) {
+            dp.name = new_name;
+            // P130-R49 (BUG): renaming the ACTIVE profile used to leave a
+            // dangling active_profile → the saved config instantly failed
+            // `validate` ("Active profile not found") even though rc was 0.
+            // Keep the pointer in sync like cmd_delete does.
+            if (cfg.active_profile == old_name)
+                cfg.active_profile = new_name;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        std::cerr << "Profile not found: " << old_name << "\n";
+        return 1;
+    }
+    if (!safe_save(cfg, config_path)) return 1;
+    std::cout << "Renamed profile: '" << old_name << "' → '" << new_name << "'\n";
+    return daemon_apply_if_enabled(cfg);
+}
+
+static int cmd_stop() {
+    pid_t pid = 0;
+    auto r = send_signal_to_daemon(SIGTERM, &pid);
+    if (r != signal_result::sent) {
+        print_signal_failure(r, "stop", "TERM");
+        return 1;
+    }
+    // L13-01 (CRIT): kill() == 0 only proves the signal was DELIVERED, not that
+    // the daemon exited.  A frozen daemon (stuck loop thread) keeps the PID
+    // file and its /proc entry, yet the old code printed "Daemon stopped."
+    // with rc=0.  Poll for up to ~2 s: a clean shutdown removes the PID file,
+    // and the process itself disappears (kill(pid,0) → ESRCH).  If it is still
+    // alive after the window, say so and fail — scripts that chain
+    // `stop && systemctl is-active` must not read success.
+    bool stopped = true;
+    if (pid > 0) {
+        stopped = false;
+        for (int i = 0; i < 20; ++i) {
+            if (kill(pid, 0) != 0 && errno == ESRCH) { stopped = true; break; }
+            usleep(100000); // 100 ms × 20 ≈ 2 s
+        }
+    }
+    if (!stopped) {
+        // rc=1 and a message that names the remediation; "did not stop" is the
+        // honest description of a signal that was sent but not acted upon.
+        std::cerr << "Daemon did not stop (signal sent; check with "
+                     "'systemctl status rawaccel').\n";
+        return 1;
+    }
+    std::cout << "Daemon stopped.\n";
+    return 0;
+}
+
+static bool daemon_running() {
+    std::vector<std::string> paths;
+    const char* xdg = std::getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0] != '\0') paths.push_back(std::string(xdg) + "/rawaccel.pid");
+    paths.push_back("/run/rawaccel.pid");
+    paths.push_back("/tmp/rawaccel.pid");
+    for (auto& path : paths) {
+        std::ifstream f(path);
+        if (!f.is_open()) continue;
+        pid_t pid = 0;
+        f >> pid;
+        // R5-S-1: a recycled/spoofed PID must not be reported as the daemon.
+        if (pid_is_rawaccel_daemon(pid)) return true;
+    }
+    return false;
+}
+
+// ── Daemon canlılığı: IPC birincil kanıt, PID dosyası ikincil ───────────────
+//
+// Tanım ve gerekçe yukarıda (daemon_ipc_query'ın ardında) verildi; burada
+// yalnızca gövde durur — daemon_running()'a bağlı olduğu için ondan sonra
+// tanımlanmak zorunda.
+static daemon_probe probe_daemon() {
+    daemon_probe p;
+    // 1) IPC = gerçek kanıt: daemon ayakta olduğunu YALNIZCA kendisi söyler.
+    const std::string resp = daemon_ipc_query("status");
+    if (!resp.empty()) {
+        try {
+            p.live = nlohmann::json::parse(resp);
+            p.state = daemon_liveness::running;
+            // Kimlik doğrulaması PID dosyasından gelir (R5-S-1: geri dönüşümü
+            // veya taklit edilmiş PID "daemon" sayılmaz).  IPC cevap verdi
+            // ama PID dosyası yok/sesizse daemon yanıt veriyor demektir,
+            // kimliği doğrulanmamıştır — bu "stopped" DEĞİLDİR (Aj-G kuralı).
+            p.pid_verified = daemon_running();
+            return p;
+        } catch (const std::exception& e) {
+            p.ipc_error = e.what();
+        }
+    }
+    // 2) IPC cevap vermedi → PID dosyası ikinci kanıt.
+    if (daemon_running()) {
+        // PID canlı ama IPC cevap vermiyor → donmuş daemon.
+        p.state = daemon_liveness::unreachable;
+        return p;
+    }
+    // 3) Ne IPC ne canlı PID.  Soket dosyası hâlâ diskteyse daemon ölmüş
+    //    ama iz bırakmış demektir: "stopped" değil, "unreachable".
+    if (any_socket_path_exists()) {
+        p.state = daemon_liveness::unreachable;
+        return p;
+    }
+    p.state = daemon_liveness::stopped;
+    return p;
+}
+
+// ── monitor: live per-device telemetry (reads the IPC status JSON) ───────────
+
+static volatile sig_atomic_t g_monitor_stop = 0;
+static void monitor_sigint_handler(int) { g_monitor_stop = 1; }
+
+static double monitor_monotonic_ms() {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static std::string monitor_time_stamp() {
+    std::time_t t = std::time(nullptr);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+    return buf;
+}
+
+/// Poll the daemon's `status` JSON and render a live per-device table
+/// (input/output IPS, gain, latency percentiles, real poll rate, battery,
+/// staleness).  Interactive on a TTY (re-drawn in place); line-stream mode
+/// (one sample per line, first line = header) when piped/redirected so it is
+/// script-friendly.  Never touches the config file.
+/// @param interval_ms  poll period; must be within [1, 60000] (L13-17: the
+///         doc used to claim [20, 60000] while the router at main() accepts
+///         any v > 0 — a 1 ms interval is legitimate, so the doc now matches
+///         the code instead of the router narrowing the domain).
+static int cmd_monitor(int interval_ms) {
+    // AJ-H: liveness IPC'den türetilir — PID dosyası silinmiş/sesiz olsa bile
+    // canlı daemon izlenebilir (eskiden "Daemon is not running" ile çıkıyordu).
+    if (probe_daemon().state == daemon_liveness::stopped) {
+        std::cerr << "Daemon is not running.  Start it with: sudo systemctl start rawaccel\n";
+        return 1;
+    }
+    struct sigaction sa {};
+    sa.sa_handler = monitor_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    // L13-18: capture the previous disposition and restore it on every exit
+    // path (RAII below).  cmd_monitor is a leaf command today, but a process
+    // that inherited SIG_IGN or a parent's handler must not keep ours after
+    // the monitor returns.
+    struct sigaction old_sa {};
+    const bool sigint_installed = (sigaction(SIGINT, &sa, &old_sa) == 0);
+    struct sigint_restore {
+        bool active;
+        const struct sigaction* old;
+        ~sigint_restore() { if (active) sigaction(SIGINT, old, nullptr); }
+    } sigint_guard{sigint_installed, &old_sa};
+
+    const bool tty = isatty(STDOUT_FILENO);
+    auto num = [](const nlohmann::json& j, const char* key, double fallback = 0.0) {
+        return j.contains(key) && j[key].is_number() ? j[key].get<double>() : fallback;
+    };
+    auto it  = [](const nlohmann::json& j, const char* key, int fallback = -1) {
+        return j.contains(key) && j[key].is_number() ? j[key].get<int>() : fallback;
+    };
+    // name column width — cap at 28 so device names can't wreck the layout
+    auto trimmed = [](std::string s, size_t w) {
+        if (s.size() > w) { s.resize(w > 1 ? w - 1 : w); s += "\u2026"; }
+        return s;
+    };
+
+    bool header_shown = false;
+    while (!g_monitor_stop) {
+        std::string resp = daemon_ipc_query("status");
+        if (resp.empty()) {
+            // Daemon stopped (or IPC socket vanished) mid-poll: report it
+            // instead of failing with a confusing JSON-parse error.  Give the
+            // daemon one quick re-check to distinguish "stopped" from a
+            // transient connect snag.  AJ-H: the re-check is IPC-first (the
+            // authoritative channel) — the PID file alone can no longer make
+            // the monitor quit on a live daemon.
+            usleep(50000);
+            if (probe_daemon().state == daemon_liveness::stopped) {
+                std::cerr << "Daemon stopped — monitor exiting.\n"
+                          << "Start it with: sudo systemctl start rawaccel\n";
+                return 1;
+            }
+            continue;
+        }
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(resp);
+        } catch (const std::exception& e) {
+            std::cerr << "Daemon returned unparseable status: " << e.what() << "\n";
+            return 1;
+        }
+        const double now_ms = monitor_monotonic_ms();
+        const std::string stamp = monitor_time_stamp();
+
+        const nlohmann::json devs = (j.contains("devices") && j["devices"].is_array())
+                                        ? j["devices"] : nlohmann::json::array();
+        if (!tty && !header_shown) {
+            std::cout << "   TIME  DEVICE                      IN_IPS  OUT_IPS    GAIN   "
+                      << "LATp50(m) LATp95(m)  HHZ  BAT  PROFILE"
+                      << (devs.empty() ? "  (no devices)" : "") << "\n";
+            header_shown = true;
+        }
+        if (tty) {
+            std::cout << "\033[2J\033[H";
+            std::cout << "rawaccel monitor [" << stamp << "]  active_profile="
+                      << (j.contains("active_profile") && j["active_profile"].is_string()
+                              ? j["active_profile"].get<std::string>() : "?")
+                      << "  poll=" << interval_ms << "ms  (Ctrl-C to quit)\n";
+        }
+        std::string rows;
+        for (const auto& d : devs) {
+            std::string name = d.contains("name") && d["name"].is_string()
+                                   ? d["name"].get<std::string>() : "(unnamed)";
+            const double t_in  = num(d, "telem_in_ips");
+            const double t_out = num(d, "telem_out_ips");
+            const double t_gain = num(d, "telem_gain");
+            const double t_wall = num(d, "telem_wall_ms");
+            const bool has_telem = d.contains("telem_in_ips");
+            const bool stale = has_telem && (now_ms - t_wall) > 2000.0;
+            const int has_lat = it(d, "lat_samples");
+            const double p50 = has_lat > 0 ? num(d, "lat_p50_us") : 0.0;
+            const double p95 = has_lat > 0 ? num(d, "lat_p95_us") : 0.0;
+            const int rpr = it(d, "real_polling_rate", it(d, "detected_polling_rate"));
+            const int batt = it(d, "detected_battery");
+            const std::string dev_id = d.contains("device_id") && d["device_id"].is_string()
+                                           ? d["device_id"].get<std::string>() : "";
+
+            std::ostringstream r;
+            if (!tty) r << stamp << "  ";
+            r << std::left << std::setw(28) << trimmed(name, 28);
+            if (has_telem) {
+                r << std::fixed << std::setprecision(1)
+                  << std::setw(7) << t_in << std::setw(8) << t_out
+                  << std::setprecision(3) << std::setw(8) << t_gain;
+            } else {
+                r << std::setw(23) << "-";
+            }
+            if (has_lat > 0)
+                r << std::fixed << std::setprecision(1)
+                  << std::setw(8) << p50 << std::setw(9) << p95;
+            else
+                r << std::setw(17) << "-";
+            r << std::setw(6) << (rpr > 0 ? std::to_string(rpr) : "-")
+              << std::setw(5) << (batt > 0 ? (std::to_string(batt) + "%") : "-")
+              << "  ";
+            if (has_telem) {
+                r << (tty ? (stale ? dev_id + " [stale]" : dev_id)
+                          : (stale ? "(stale)" : "(live)")) << "\n";
+            } else {
+                r << (tty ? dev_id : "(none)") << "\n";
+            }
+            rows += r.str();
+        }
+        std::cout << rows;
+        std::cout.flush();
+        // Downstream closed the pipe (e.g. `monitor | head`).  Default SIGPIPE
+        // already terminates us, but a parent that ignores SIGPIPE turns EPIPE
+        // into a badbit — exit cleanly instead of throwing on the next write.
+        if (!std::cout) { std::cout.clear(); return 0; }
+
+        if (g_monitor_stop) break;
+        // Sleep until deadline in ~50 ms slices (nanosleep, EINTR-retried) so a
+        // stray signal can never truncate the poll interval and Ctrl-C stays
+        // responsive for intervals up to 60 s.
+        double wake = monitor_monotonic_ms() + interval_ms;
+        while (!g_monitor_stop) {
+            const double remain = wake - monitor_monotonic_ms();
+            if (remain <= 0) break;
+            struct timespec ts {};
+            ts.tv_sec = (time_t)(remain / 1000.0);
+            ts.tv_nsec = (long)((remain - ts.tv_sec * 1000.0) * 1e6);
+            if (ts.tv_nsec > 49999999L) { ts.tv_nsec = 49999999L; }
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR && !g_monitor_stop) {}
+        }
+    }
+    std::cout << "\n";
+    return 0;
+}
+
+/// CLOCK_MONOTONIC_RAW milliseconds since boot — the same clock the daemon's
+/// telem_wall_ms uses, so a consumer can judge how fresh this status snapshot
+/// is (L13-04).  Integer milliseconds (not seconds) so a poller can also see
+/// sub-second jitter.
+static long long status_now_monotonic_raw_ms() {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static int cmd_status_json(const std::string& config_path) {
+    nlohmann::json out;
+    // AJ-H: liveness tek noktadan (probe_daemon) — IPC birincil, PID ikincil.
+    const daemon_probe probe = probe_daemon();
+    const bool running = probe.state == daemon_liveness::running;
+    out["daemon"] = running ? "running" : "stopped";
+    // AJ-H: IPC cevap verdi ama PID dosyası canlı daemon'u doğrulamadı —
+    // ayrı alanda bildirilir, "stopped" DEMEZ (Aj-G kuralı).
+    if (running) out["daemon_pid_verified"] = probe.pid_verified;
+    out["config"] = config_path;
+    // L13-04: no timestamp existed anywhere in status --json, and per-device
+    // telem_wall_ms is absent in raw passthrough — consumers had no number to
+    // answer "when was this measured?".
+    out["timestamp_ms"] = status_now_monotonic_raw_ms();
+    out["profiles"] = nlohmann::json::array();
+    bool config_ok = true;
+    // L13-03: probe IPC independently of the config load, so a frozen daemon
+    // is reported unreachable even when the config is also unreadable.
+    bool daemon_unreachable = false;
+    nlohmann::json live(nlohmann::json::object());
+    if (probe.state == daemon_liveness::unreachable) {
+        daemon_unreachable = true;
+        if (!probe.ipc_error.empty()) out["device_error"] = probe.ipc_error;
+    } else if (running) {
+        live = probe.live;
+    }
+    try {
+        auto cfg = load_config(config_path);
+        out["active_profile"] = cfg.active_profile;
+        out["use_raw_input"] = cfg.use_raw_input;
+        for (auto& p : cfg.profiles) {
+            nlohmann::json po;
+            po["name"]      = p.name;
+            po["active"]    = (p.name == cfg.active_profile);
+            po["device_id"] = p.device_id;
+            po["dpi"]       = p.dev_cfg.dpi;
+            po["polling_rate"] = p.dev_cfg.polling_rate;
+            // P115-A5-09: expose the per-profile disable flag so status --json
+            // can't claim a bypassed profile is active.
+            po["disable"]   = p.dev_cfg.disable;
+            const char* mode_s = "noaccel";
+            if (p.prof.raw_passthrough) {
+                mode_s = "raw";
+            } else {
+                switch (p.prof.accel_x.mode) {
+                case accel_mode::classic:     mode_s = "classic";     break;
+                case accel_mode::power:       mode_s = "power";       break;
+                case accel_mode::natural:     mode_s = "natural";     break;
+                case accel_mode::jump:        mode_s = "jump";        break;
+                case accel_mode::synchronous: mode_s = "synchronous"; break;
+                case accel_mode::lookup:      mode_s = "lookup";      break;
+                default: break;
+                }
+            }
+            po["mode"] = mode_s;
+            out["profiles"].push_back(po);
+        }
+        if (running && !daemon_unreachable &&
+            live.contains("devices") && live["devices"].is_array())
+            out["devices"] = live["devices"];
+    } catch (...) {
+        config_ok = false;
+        out["config_error"] = true;
+    }
+    // Schema consistency (L13-03): `devices` must always exist, even when the
+    // daemon is stopped/unreachable or reports none — the key used to vanish.
+    if (!out.contains("devices")) out["devices"] = nlohmann::json::array();
+    if (daemon_unreachable) out["daemon"] = "unreachable";
+    std::cout << out.dump(2) << "\n";
+    // P115-A5-07: config_error must be a failure exit, not daemon-status-only.
+    // L13-03: 3 = daemon unreachable (PID file present, IPC dead).
+    // Exit 0 = daemon running + config OK; 1 = config error; 2 = daemon stopped;
+    // 3 = daemon unreachable.
+    if (!config_ok)          return 1;
+    if (daemon_unreachable)  return 3;
+    if (!running)            return 2;
+    return 0;
+}
+
+static int cmd_status(const std::string& config_path) {
+    if (g_json) return cmd_status_json(config_path);
+    // AJ-H: liveness tek noktadan (probe_daemon) — IPC birincil, PID ikincil.
+    const daemon_probe probe = probe_daemon();
+    const bool running = probe.state == daemon_liveness::running;
+    // L13-03: probe the IPC channel up front so the Daemon line tells the truth
+    // (running vs unreachable) and the live-device block reuses this one
+    // response instead of querying twice.
+    bool daemon_unreachable = false;
+    nlohmann::json live(nlohmann::json::object());
+    if (probe.state == daemon_liveness::unreachable) {
+        daemon_unreachable = true;
+        if (!probe.ipc_error.empty())
+            std::cerr << "\n(daemon unreachable for live device details: "
+                      << probe.ipc_error << ")\n";
+    } else if (running) {
+        live = probe.live;
+    }
+    std::cout << "Daemon:  "
+              << (running ? "running"
+                          : (daemon_unreachable ? "unreachable" : "stopped"))
+              << "\n";
+    // AJ-H: daemon IPC'den cevap verdi ama PID dosyası onu doğrulamadı —
+    // "stopped" DEĞİLDİR (Aj-G kuralı: soket canlıyken asla "stopped"), ama
+    // kimliğin doğrulanmadığı da söylenmeli (Aj-G: parantezli ufak not).
+    if (running && !probe.pid_verified)
+        std::cout << "         (PID not verified)\n";
+    bool config_ok = true;
+    try {
+        auto cfg = load_config(config_path);
+        std::cout << "Config:  " << config_path << "\n";
+        std::cout << "Active:  " << cfg.active_profile << "\n";
+        // P115-A5-09: surface the global raw-input mode; it silently stayed
+        // hidden when set (status only showed per-profile fields before).
+        // PAS-1: the flag is no longer dormant — it is the daemon's master
+        // "intercept" switch: false = the daemon grabs no mice at all (the
+        // desktop handles them, i.e. OS-level raw pass-through).  Per-profile
+        // 1:1 raw is still set-param <profile> raw true.
+        if (!cfg.use_raw_input)
+            std::cout << "Raw-input: off (use_raw_input=false — daemon grabs NO "
+                         "devices; the desktop receives raw mouse input)\n";
+        else
+            std::cout << "Raw-input: on (use_raw_input=true — daemon intercepts "
+                         "devices; per-profile raw 1:1 = set-param <profile> raw true)\n";
+        std::cout << "Profiles (" << cfg.profiles.size() << "):\n";
+        for (auto& p : cfg.profiles) {
+            bool is_active = (p.name == cfg.active_profile);
+            std::cout << "  " << (is_active ? "* " : "  ") << p.name;
+            // P115-A5-09: flag disabled profiles in status output too.
+            if (p.dev_cfg.disable)
+                std::cout << "  [disabled]";
+            // Show device assignment if set
+            if (!p.device_id.empty())
+                std::cout << "  [device: " << p.device_id << "]";
+            // Show mode summary
+            const char* mode_s = "noaccel";
+            if (p.prof.raw_passthrough) {
+                mode_s = "raw";
+            } else {
+                switch (p.prof.accel_x.mode) {
+                case accel_mode::classic:     mode_s = "classic";     break;
+                case accel_mode::power:       mode_s = "power";       break;
+                case accel_mode::natural:     mode_s = "natural";     break;
+                case accel_mode::jump:        mode_s = "jump";        break;
+                case accel_mode::synchronous: mode_s = "synchronous"; break;
+                case accel_mode::lookup:      mode_s = "lookup";      break;
+                default: break;
+                }
+            }
+            std::cout << "  (mode: " << mode_s
+                      << ", DPI: " << p.dev_cfg.dpi
+                      << ", poll: " << p.dev_cfg.polling_rate << "Hz)\n";
+        }
+
+        // Live device details from a running daemon (detected DPI/poll/battery,
+        // effective profile match).  Only available when the daemon is reachable;
+        // the response was fetched once at the top (L13-03).
+        if (running && !daemon_unreachable) {
+            {
+                nlohmann::json& j = live;
+                if (j.contains("devices") && j["devices"].is_array()) {
+                    size_t ndev = j["devices"].size();
+                    std::cout << "\nDevices (" << ndev << "):\n";
+                    for (auto& d : j["devices"]) {
+                        std::string name    = d.value("name", "");
+                        std::string path    = d.value("path", "");
+                        std::string dev_id  = d.value("device_id", "");
+                        int dpi             = d.value("dpi", 0);
+                        int poll            = d.value("poll_rate", 0);
+                        int det_dpi         = d.value("detected_dpi", 0);
+                        int det_poll        = d.value("detected_polling_rate", 0);
+                        // R13-REALRATE: the ring-fed live-measured rate (median
+                        // kernel frame interval, accel path only; 0 while raw
+                        // passthrough since raw carries no telemetry).
+                        int real_poll       = d.value("real_polling_rate", 0);
+                        int battery         = d.value("detected_battery", -1);
+
+                        std::cout << "  - " << (name.empty() ? "(unnamed)" : name) << "\n";
+                        std::cout << "    path       : " << path << "\n";
+                        std::cout << "    device_id  : " << dev_id << "\n";
+                        std::cout << "    config dpi/poll: " << dpi << " / " << poll << " Hz";
+                        if (det_poll > 0 || real_poll > 0)
+                            std::cout << "    detected: "
+                                      << (det_dpi > 0 ? std::to_string(det_dpi) + " dpi" : "? dpi")
+                                      << " / " << (det_poll > 0 ? std::to_string(det_poll) + " Hz" : "? Hz");
+                        if (real_poll > 0)
+                            std::cout << "    live    : " << real_poll << " Hz";
+                        std::cout << "\n";
+                        if (battery >= 0 && battery <= 100)
+                            std::cout << "    battery    : " << battery
+                                      << (battery <= 20 ? "% (LOW)" : "%") << "\n";
+
+                        // Effective profile: same priority as the daemon's find_profile
+                        // (device-specific → empty-device_id catch-all → active → first).
+                        const device_profile* matched = nullptr;
+                        for (auto& p : cfg.profiles)
+                            if (!p.device_id.empty() && p.device_id == dev_id) { matched = &p; break; }
+                        // BUG-NEW-60: the daemon's find_profile() checks empty-device_id
+                        // ("All devices") catch-all profiles BEFORE active_profile; the
+                        // CLI previously skipped this step, showing a different profile
+                        // than the daemon actually applied.
+                        if (!matched) {
+                            for (auto& p : cfg.profiles)
+                                if (p.device_id.empty()) { matched = &p; break; }
+                        }
+                        if (!matched) {
+                            for (auto& p : cfg.profiles)
+                                if (p.name == cfg.active_profile) { matched = &p; break; }
+                        }
+                        if (!matched && !cfg.profiles.empty()) matched = &cfg.profiles[0];
+                        if (matched) {
+                            std::cout << "    profile    : " << matched->name;
+                            if (!matched->device_id.empty())
+                                std::cout << "  (device-specific)";
+                            else if (matched->name == cfg.active_profile)
+                                std::cout << "  (active)";
+                            else
+                                std::cout << "  (first-profile fallback)";
+                            // CLI-1: the daemon's effective-profile lookup also
+                            // gates on match_app (focused app); print it so the
+                            // CLI status guess does not silently claim a global
+                            // profile while the daemon applies an app-scoped one.
+                            if (!matched->match_app.empty())
+                                std::cout << "  (app-scoped \"" << matched->match_app
+                                          << "\" — only while the focused app matches)";
+                            std::cout << "\n";
+                        }
+
+                        // Latency stats (if any were recorded).
+                        if (d.contains("lat_samples") && d.value("lat_samples", static_cast<uint64_t>(0)) > 0) {
+                            std::cout << "    latency    : "
+                                      << d.value("lat_samples", static_cast<uint64_t>(0)) << " samples, "
+                                      << "p50 " << d.value("lat_p50_us", 0.0) << " µs, "
+                                      << "p95 " << d.value("lat_p95_us", 0.0) << " µs, "
+                                      << "max " << d.value("lat_max_us", 0.0) << " µs\n";
+                        }
+                    }
+                } else {
+                    std::cout << "\nDevices: daemon reports none grabbed.\n";
+                }
+            }
+        }
+        if (running && !daemon_unreachable)
+            std::cout << "\nTip: rawaccel-cli latency  → dump latency stats\n";
+    } catch (...) {
+        config_ok = false;
+        std::cerr << "Config:  " << config_path << " (unreadable or missing)\n";
+    }
+    // P115-A5-07: a broken config used to print to STDOUT and exit 0 whenever
+    // the daemon happened to be running — scripts saw "success" while the
+    // effective config was actually unreachable.  Report on stderr and fail.
+    // L13-03: rc=3 for a reachable-looking PID with a dead IPC channel.
+    if (!config_ok)          return 1;
+    if (daemon_unreachable)  return 3;
+    if (!running)            return 2;
+    return 0;
+}
+
+static int cmd_receivers() {
+    const auto receivers = discover_logitech_receivers();
+    if (g_json) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& r : receivers) {
+            out.push_back({
+                {"sysfs_path", r.sysfs_path}, {"product", r.product},
+                {"vendor_id", r.vendor_id}, {"product_id", r.product_id},
+                {"kind", logitech_receiver_kind_name(r.kind)},
+                {"max_paired_devices", r.max_paired_devices},
+                {"hidpp_supported", r.hidpp_supported},
+            });
+        }
+        std::cout << out.dump(2) << "\n";
+        return 0;
+    }
+    if (receivers.empty()) {
+        std::cout << "No Logitech USB receivers found.\n";
+        return 0;
+    }
+    for (const auto& r : receivers) {
+        std::cout << r.product << " ("
+                  << std::hex << std::setfill('0') << std::setw(4) << r.vendor_id
+                  << ":" << std::setw(4) << r.product_id << std::dec << ")\n"
+                  << "  Type: " << logitech_receiver_kind_name(r.kind)
+                  << " | Pairing slots: " << r.max_paired_devices
+                  << " | HID++: " << (r.hidpp_supported ? "supported" : "not supported")
+                  << "\n  Path: " << r.sysfs_path << "\n";
+    }
+    return 0;
+}
+
+static int cmd_hidpp() {
+    auto hidraw_devices = discover_logitech_hidraw_devices();
+    if (g_json) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& path : hidraw_devices) {
+            auto devs = identify_logitech_devices(path);
+            if (devs.empty()) {
+                nlohmann::json entry;
+                entry["hidraw_path"] = path;
+                entry["connected"] = false;
+                out.push_back(entry);
+                continue;
+            }
+            for (auto& dev : devs) {
+                nlohmann::json entry;
+                entry["hidraw_path"] = path;
+                entry["connected"] = dev.connected;
+                entry["protocol_version"] = dev.info.protocol_version;
+                if (dev.info.protocol_version == 0) {
+                    entry["name"] = dev.info.name;
+                    entry["hidpp_not_implemented"] = true;
+                    out.push_back(entry);
+                    continue;
+                }
+                entry["vendor_id"] = dev.vendor_id;
+                entry["product_id"] = dev.product_id;
+                entry["device_index"] = dev.device_index;
+                entry["name"] = dev.info.name;
+                entry["friendly_name"] = dev.info.friendly_name;
+                entry["serial"] = dev.info.serial;
+                entry["firmware_version"] = dev.info.firmware_version;
+                entry["firmware_name"] = dev.info.firmware_name;
+                entry["firmware_major"] = dev.info.firmware_major;
+                entry["firmware_minor"] = dev.info.firmware_minor;
+                entry["firmware_build"] = dev.info.firmware_build;
+                entry["unit_id"] = dev.info.unit_id;
+                entry["model_id"] = dev.info.model_id;
+                entry["transport_flags"] = dev.info.transport_flags;
+                entry["device_kind"] = dev.info.device_kind;
+                entry["bluetooth_id"] = dev.info.bluetooth_id;
+                entry["bluetooth_le_id"] = dev.info.bluetooth_le_id;
+                entry["wireless_pid"] = dev.info.wireless_pid;
+                entry["usb_id"] = dev.info.usb_id;
+                nlohmann::json firmware_records = nlohmann::json::array();
+                for (const auto& record : dev.info.firmware_records) {
+                    firmware_records.push_back({
+                        {"level", record.level},
+                        {"name", record.name},
+                        {"major", record.major},
+                        {"minor", record.minor},
+                        {"build", record.build},
+                        {"transport_flags", record.transport_flags},
+                        {"unit_id", record.unit_id},
+                        {"model_id", record.model_id},
+                        {"extras_hex", record.extras_hex}
+                    });
+                }
+                entry["firmware_records"] = firmware_records;
+                nlohmann::json feature_json = nlohmann::json::array();
+                for (const auto& feature : dev.feature_metadata) {
+                    const auto feature_id = feature.feature_id;
+                    feature_json.push_back({
+                        {"id", feature_id},
+                        {"id_hex", "0x" + [&] {
+                            std::ostringstream s;
+                            s << std::hex << std::uppercase << std::setw(4)
+                              << std::setfill('0') << feature_id;
+                            return s.str();
+                        }()},
+                        {"name", hidpp_feature_name(feature_id)},
+                        {"index", feature.index},
+                        {"flags", feature.flags},
+                        {"flags_hex", "0x" + [&] {
+                            std::ostringstream s;
+                            s << std::hex << std::uppercase << std::setw(2)
+                              << std::setfill('0') << static_cast<unsigned>(feature.flags);
+                            return s.str();
+                        }()},
+                        {"version", feature.version}
+                    });
+                }
+                entry["features"] = feature_json;
+
+                HidppTransport transport(path);
+                if (transport.is_open()) {
+                    transport.set_device_index(dev.device_index);
+                    if (auto battery = transport.get_battery_status(dev.device_index)) {
+                        entry["battery"]["level"] = battery->level;
+                        entry["battery"]["charging"] = battery->charging;
+                        entry["battery"]["online"] = battery->online;
+                    }
+                    if (auto dpi = transport.get_dpi_info(dev.device_index)) {
+                        entry["dpi"]["min"] = dpi->dpi_min;
+                        entry["dpi"]["max"] = dpi->dpi_max;
+                        entry["dpi"]["default"] = dpi->dpi_default;
+                        entry["dpi"]["current"] = dpi->dpi_current;
+                        entry["dpi"]["current_y"] = dpi->dpi_current_y;
+                        entry["dpi"]["extended"] = dpi->extended;
+                        entry["dpi"]["supports_lift_off_distance"] =
+                            dpi->supports_lift_off_distance;
+                        if (dpi->supports_lift_off_distance)
+                            entry["dpi"]["lift_off_distance"] = dpi->lift_off_distance;
+                        entry["dpi"]["levels"] = dpi->dpi_levels;
+                    }
+                    if (auto rate = transport.get_polling_rate(dev.device_index))
+                        entry["polling_rate_hz"] = *rate;
+                    if (auto onboard = transport.get_onboard_profile_info(
+                            dev.device_index)) {
+                        entry["onboard_profiles"]["memory"] = onboard->memory;
+                        entry["onboard_profiles"]["active_profile"] =
+                            onboard->active_profile;
+                        entry["onboard_profiles"]["macro_profile"] =
+                            onboard->macro_profile;
+                        entry["onboard_profiles"]["profile_count"] =
+                            onboard->profile_count;
+                        entry["onboard_profiles"]["button_count"] =
+                            onboard->button_count;
+                        entry["onboard_profiles"]["sector_count"] =
+                            onboard->sector_count;
+                        entry["onboard_profiles"]["profile_size"] =
+                            onboard->profile_size;
+                        entry["onboard_profiles"]["shift"] = onboard->shift;
+                        nlohmann::json headers = nlohmann::json::array();
+                        for (const auto& header : transport.get_onboard_profile_headers(
+                                 dev.device_index)) {
+                            headers.push_back({
+                                {"profile", header.profile},
+                                {"sector", header.sector},
+                                {"enabled", header.enabled}
+                            });
+                        }
+                        entry["onboard_profiles"]["headers"] = headers;
+                    }
+                    auto slots = transport.get_pairing_info(0xFF);
+                    nlohmann::json slots_json = nlohmann::json::array();
+                    for (const auto& slot : slots) {
+                        slots_json.push_back({
+                            {"slot", slot.slot},
+                            {"occupied", slot.occupied},
+                            {"pid", slot.pid},
+                            {"name", slot.name},
+                            {"serial", slot.serial},
+                            {"connection_type", slot.connection_type}
+                        });
+                    }
+                    entry["pairing_slots"] = slots_json;
+                }
+                out.push_back(entry);
+            }
+        }
+        std::cout << out.dump(2) << "\n";
+        return 0;
+    }
+
+    if (hidraw_devices.empty()) {
+        std::cout << "No Logitech hidraw devices found.\n";
+        return 0;
+    }
+
+    for (const auto& path : hidraw_devices) {
+        if (auto devs = identify_logitech_devices(path); !devs.empty()) {
+            bool first = true;
+            for (auto& dev : devs) {
+                if (!first) std::cout << "\n";
+                first = false;
+                std::cout << "Device: " << path << "  (target 0x" << std::hex
+                          << std::setw(2) << std::setfill('0')
+                          << static_cast<int>(dev.device_index) << ")\n" << std::dec
+                          << std::setfill(' ');
+                if (dev.info.protocol_version == 0) {
+                    std::cout << "  Name: " << dev.info.name << "\n"
+                              << "  (Logitech hidraw node without HID++ — neither\n"
+                              << "   HID++ 2.0 nor HID++ 1.0 is implemented by this\n"
+                              << "   hardware, so onboard DPI/rate/LOD are unavailable)\n";
+                    continue;
+                }
+                std::cout << "  Name: " << dev.info.name << "\n"
+                      << "  Friendly name: " << dev.info.friendly_name << "\n"
+                      << "  Serial: " << dev.info.serial << "\n"
+                      << "  VID:PID = " << std::hex << std::setfill('0')
+                      << std::setw(4) << dev.vendor_id << ":"
+                      << std::setw(4) << dev.product_id << std::dec << "\n"
+                      << "  Firmware: " << dev.info.firmware_version << "\n"
+                      << "  Firmware record: " << dev.info.firmware_name
+                      << " " << static_cast<int>(dev.info.firmware_major)
+                      << "." << static_cast<int>(dev.info.firmware_minor)
+                      << " build=" << dev.info.firmware_build << "\n"
+                      << "  Unit/model: " << dev.info.unit_id << "/"
+                      << dev.info.model_id << "\n"
+                      << "  Transport IDs: BT=" << dev.info.bluetooth_id
+                      << " BLE=" << dev.info.bluetooth_le_id
+                      << " WPID=" << dev.info.wireless_pid
+                      << " USB=" << dev.info.usb_id << "\n"
+                      << "  Protocol: " << static_cast<int>(dev.info.protocol_version) << "\n";
+             if (!dev.features.empty()) {
+                 std::cout << "  Features:";
+                 for (const auto& feature : dev.feature_metadata)
+                     std::cout << " " << hidpp_feature_name(feature.feature_id)
+                              << "=0x" << std::hex << std::setw(4)
+                              << std::setfill('0') << feature.feature_id
+                              << "@0x" << std::setw(2) << static_cast<int>(feature.index)
+                              << "/v" << std::dec << static_cast<int>(feature.version)
+                              << "/f0x" << std::hex << std::setw(2)
+                              << static_cast<int>(feature.flags);
+                 std::cout << std::dec << std::setfill(' ') << "\n";
+             }
+
+            HidppTransport transport(path);
+            if (transport.is_open()) {
+                transport.set_device_index(dev.device_index);
+                if (auto battery = transport.get_battery_status(dev.device_index)) {
+                    std::cout << "  Battery: " << (battery->level == 255 ? "unknown" : std::to_string(battery->level) + "%")
+                              << (battery->charging ? " (charging)" : "")
+                              << (battery->online ? "" : " (offline)") << "\n";
+                }
+                if (auto dpi = transport.get_dpi_info(dev.device_index)) {
+                    std::cout << "  DPI: current=" << dpi->dpi_current
+                              << " default=" << dpi->dpi_default
+                              << " range=[" << dpi->dpi_min << "," << dpi->dpi_max << "]\n";
+                    if (!dpi->dpi_levels.empty()) {
+                        std::cout << "  DPI levels: ";
+                        for (size_t i = 0; i < dpi->dpi_levels.size(); ++i) {
+                            if (i) std::cout << ", ";
+                            std::cout << dpi->dpi_levels[i];
+                        }
+                        std::cout << "\n";
+                    }
+                    if (dpi->supports_lift_off_distance) {
+                        static constexpr const char* lod_names[] = {"", "low", "medium", "high"};
+                        const auto lod = dpi->lift_off_distance <= 3
+                            ? lod_names[dpi->lift_off_distance] : "unknown";
+                        if (!std::string_view(lod).empty())
+                            std::cout << "  Lift-off distance: " << lod << "\n";
+                    }
+                }
+                if (auto rate = transport.get_polling_rate(dev.device_index))
+                    std::cout << "  Polling rate: " << *rate << " Hz\n";
+                if (auto onboard = transport.get_onboard_profile_info(
+                        dev.device_index)) {
+                    std::cout << "  Onboard profiles: count="
+                              << static_cast<int>(onboard->profile_count)
+                              << " active="
+                              << static_cast<int>(onboard->active_profile)
+                              << " sectors="
+                              << static_cast<int>(onboard->sector_count)
+                              << " size=" << onboard->profile_size << " bytes\n";
+                    for (const auto& header :
+                         transport.get_onboard_profile_headers(dev.device_index))
+                        std::cout << "    Profile "
+                                  << static_cast<int>(header.profile)
+                                  << ": sector=" << header.sector
+                                  << " enabled=" << static_cast<int>(header.enabled)
+                                  << "\n";
+                }
+                auto slots = transport.get_pairing_info(0xFF);
+                if (!slots.empty()) {
+                    std::cout << "  Pairing slots:\n";
+                    for (const auto& slot : slots) {
+                        std::cout << "    Slot " << static_cast<int>(slot.slot)
+                                  << ": " << (slot.occupied ? "occupied" : "empty");
+                        if (slot.occupied) {
+                            std::cout << " (PID=0x" << std::hex << std::setw(4) << std::setfill('0')
+                                      << slot.pid << std::dec << std::setfill(' ')
+                                      << ", conn_type=" << static_cast<int>(slot.connection_type);
+                            if (!slot.name.empty())
+                                std::cout << ", name=" << slot.name;
+                            if (!slot.serial.empty())
+                                std::cout << ", serial=" << slot.serial;
+                            std::cout << ")";
+                        }
+                        std::cout << "\n";
+                    }
+                }
+            }
+            }
+        } else {
+            std::cout << "  (Not a HID++ device or unable to communicate)\n";
+        }
+        std::cout << "\n";
+    }
+    return 0;
+}
+
+static bool parse_hidpp_uint(const std::string& text, uint32_t& value) {
+    if (text.empty() || text[0] == '-') return false;
+    char* end = nullptr;
+    errno = 0;
+    // Base 10 only.  strtoul(..., 0) auto-detects bases, so "0100" would be
+    // read as octal 64 and "0x100" as hex 256 — surprising for a DPI/rate
+    // argument and inconsistent with the GUI's always-decimal widgets.
+    const unsigned long parsed = std::strtoul(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' ||
+        parsed > UINT32_MAX)
+        return false;
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+static std::optional<uint8_t> hidpp_target_from_args(const std::string& path,
+                                                     const std::vector<std::string>& args,
+                                                     size_t index) {
+    if (args.size() > index) {
+        uint32_t value = 0;
+        if (parse_hidpp_uint(args[index], value) && value <= 0xFF)
+            return static_cast<uint8_t>(value);
+        return std::nullopt;
+    }
+    // Directly connected mice normally use 0x00.  Behind a single-interface
+    // receiver, the paired mouse lives on an index between 1 and 6 and the
+    // receiver itself (0xFF) has no DPI/rate features — so prefer the first
+    // identified device that actually carries a DPI feature when probing is
+    // needed.  Only when nothing DPI-capable exists fall back to the first
+    // identified endpoint.
+    auto devices = identify_logitech_devices(path);
+    for (const auto& d : devices) {
+        if (d.supports_feature(static_cast<uint16_t>(hidpp_feature_index::adjustable_dpi)) ||
+            d.supports_feature(static_cast<uint16_t>(hidpp_feature_index::extended_adjustable_dpi)))
+            return d.device_index;
+    }
+    if (!devices.empty())
+        return devices.front().device_index;
+    return 0x00;
+}
+
+static int cmd_hidpp_set_dpi(const std::vector<std::string>& args) {
+    uint32_t dpi = 0;
+    // Same 100..32000 window the GUI's Hardware DPI spin enforces
+    // (gui/hidpp_panel.inl HW_DPI_MIN/HW_DPI_MAX).  The device itself will
+    // reject values outside its advertised DPI list, but accepting 1..65535
+    // here lets the CLI promise settings the GUI can never make.
+    if (!parse_hidpp_uint(args[2], dpi) || dpi < 100 || dpi > 32000) {
+        std::cerr << "DPI must be an integer from 100 to 32000.\n";
+        return 1;
+    }
+    const auto target_value = hidpp_target_from_args(args[1], args, 3);
+    if (!target_value) {
+        std::cerr << "Device index must be an integer from 0 to 255.\n";
+        return 1;
+    }
+    const uint8_t target = *target_value;
+    HidppTransport transport(args[1]);
+    if (!transport.is_open() || transport.vendor_id() != 0x046d) {
+        std::cerr << "Unable to open HID++ device: " << args[1] << "\n";
+        return 1;
+    }
+    transport.set_device_index(target);
+    // Show supported DPI values if the requested one is not supported
+    if (auto dpi_info = transport.get_dpi_info(target)) {
+        if (dpi_info->dpi_levels.empty() ||
+            std::find(dpi_info->dpi_levels.begin(), dpi_info->dpi_levels.end(), static_cast<uint16_t>(dpi)) == dpi_info->dpi_levels.end()) {
+            std::cerr << "DPI " << dpi << " is not supported by this device.\n";
+            if (!dpi_info->dpi_levels.empty()) {
+                std::cerr << "Supported DPI values: ";
+                for (size_t i = 0; i < dpi_info->dpi_levels.size(); ++i) {
+                    if (i > 0) std::cerr << ", ";
+                    std::cerr << dpi_info->dpi_levels[i];
+                }
+                std::cerr << "\n";
+            }
+            return 1;
+        }
+    }
+    const bool ok = transport.set_dpi(static_cast<uint16_t>(dpi), target);
+    if (g_json) std::cout << nlohmann::json{{"ok", ok}, {"dpi", dpi}}.dump() << "\n";
+    else if (ok) std::cout << "DPI set to " << dpi << ".\n";
+    else std::cerr << "DPI was rejected by the device.\n";
+    return ok ? 0 : 1;
+}
+
+static int cmd_hidpp_set_rate(const std::vector<std::string>& args) {
+    uint32_t hz = 0;
+    // Same polarity set the GUI's Hardware Polling Rate dropdown offers
+    // (gui/hidpp_panel.inl HW_RATES: 125/250/500/1000/2000/4000/8000).
+    // A rate the GUI cannot represent would bypass the dropdown's guarantee
+    // and, worse, fall through to a misleading "unsupported" rejection.
+    static constexpr uint32_t supported_rates[] = {125, 250, 500, 1000, 2000, 4000, 8000};
+    const bool rate_supported = [&] {
+        if (!parse_hidpp_uint(args[2], hz) || hz == 0) return false;
+        for (uint32_t r : supported_rates)
+            if (hz == r) return true;
+        return false;
+    }();
+    if (!rate_supported) {
+        std::cerr << "Polling rate must be one of: 125, 250, 500, 1000, "
+                     "2000, 4000, 8000 Hz.\n";
+        return 1;
+    }
+    const auto target_value = hidpp_target_from_args(args[1], args, 3);
+    if (!target_value) {
+        std::cerr << "Device index must be an integer from 0 to 255.\n";
+        return 1;
+    }
+    const uint8_t target = *target_value;
+    HidppTransport transport(args[1]);
+    if (!transport.is_open() || transport.vendor_id() != 0x046d) {
+        std::cerr << "Unable to open HID++ device: " << args[1] << "\n";
+        return 1;
+    }
+    transport.set_device_index(target);
+    // Show supported polling rates if the requested one is not supported
+    if (auto rate_info = transport.get_polling_rate(target)) {
+        // The device supports some rate, but we need to check if the requested rate is supported
+        // We can't easily get the list of supported rates from the transport, so we'll just try to set it
+        // and if it fails, we'll show a generic message
+    }
+    const bool ok = transport.set_polling_rate(hz, target);
+    if (g_json) std::cout << nlohmann::json{{"ok", ok}, {"polling_rate_hz", hz}}.dump() << "\n";
+    else if (ok) std::cout << "Polling rate set to " << hz << " Hz.\n";
+    else {
+        std::cerr << "Polling rate " << hz << " Hz is not supported by this device.\n";
+        std::cerr << "Supported rates: 125, 250, 500, 1000, 2000, 4000, 8000 Hz (device may support a subset)\n";
+    }
+    return ok ? 0 : 1;
+}
+
+static int cmd_hidpp_set_lod(const std::vector<std::string>& args) {
+    std::string value = args[2];
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::optional<hidpp_lift_off_distance> distance;
+    if (value == "low") distance = hidpp_lift_off_distance::low;
+    else if (value == "medium" || value == "med")
+        distance = hidpp_lift_off_distance::medium;
+    else if (value == "high") distance = hidpp_lift_off_distance::high;
+    else {
+        std::cerr << "Lift-off distance must be low, medium, or high.\n";
+        return 1;
+    }
+    const auto target_value = hidpp_target_from_args(args[1], args, 3);
+    if (!target_value) {
+        std::cerr << "Device index must be an integer from 0 to 255.\n";
+        return 1;
+    }
+    const uint8_t target = *target_value;
+    HidppTransport transport(args[1]);
+    if (!transport.is_open() || transport.vendor_id() != 0x046d) {
+        std::cerr << "Unable to open HID++ device: " << args[1] << "\n";
+        return 1;
+    }
+    transport.set_device_index(target);
+    const bool ok = transport.set_lift_off_distance(*distance, target);
+    if (g_json)
+        std::cout << nlohmann::json{{"ok", ok}, {"lift_off_distance", value}}.dump() << "\n";
+    else if (ok) std::cout << "Lift-off distance set to " << value << ".\n";
+    else std::cerr << "Lift-off distance is not supported by this device.\n";
+    return ok ? 0 : 1;
+}
+
+// ── Help ──────────────────────────────────────────────────────────────────────
+
+/// O31-L4 — decide whether CLI-3's "recreate the default profile" repair may run.
+///
+/// The repair rewrites the whole file through save_config, which emits exactly
+/// four top-level keys (`version`, `active_profile`, `use_raw_input`,
+/// `profiles` — src/config.cpp).  `app_config` has exactly one array member
+/// (include/config.hpp), so **every other array of objects in the file is data
+/// this binary does not understand but would destroy.**  A config written by an
+/// older/renamed schema (measured: an 81-byte file whose only profile lived
+/// under `profile_list`) loads as an empty profile list; the repair then turned
+/// it into a 2679-byte file holding a single `default`, and a read-only `list`
+/// did it.
+///
+/// Returns:
+///   1  no foreign array key  -> repair is safe
+///   0  foreign array key     -> `foreign` set to the first offending key
+///  -1  could not determine   -> caller must NOT repair (fail closed)
+///
+/// Fails closed on purpose: refusing the repair leaves a profile-less config
+/// reporting no profiles (the pre-CLI-3 symptom, recoverable by hand), while
+/// running it destroys whatever the unrecognized key held.
+static int cli3_foreign_profile_key(const std::string& path, std::string& foreign) {
+    foreign.clear();
+    std::ifstream f(path);
+    if (!f.is_open()) return -1;              // load_config() already succeeded, so this is odd — fail closed
+    nlohmann::json j;
+    try { j = nlohmann::json::parse(f); }
+    catch (const std::exception&) { return -1; }
+    if (!j.is_object()) return -1;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string& k = it.key();
+        if (k == "version" || k == "active_profile" || k == "use_raw_input" || k == "profiles")
+            continue;
+        // An empty array carries no data, so it cannot make the repair lossy.
+        if (it.value().is_array() && !it.value().empty()) {
+            foreign = k;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void print_help() {    std::cout <<
+R"(rawaccel-cli v)" << VERSION << R"( — Raw Accel Linux
+
+Usage: rawaccel-cli [OPTIONS] <COMMAND> [ARGS...]
+
+Commands:
+  list                          List all profiles
+  show <profile>                Show profile details
+  set <profile>                 Set active profile
+  create <profile>              Create new profile with defaults
+  create-preset <preset> <name> Create profile from preset (gaming, office, precision, disable, cs2, valorant, apex, fps)
+  delete <profile>              Delete a profile
+  rename <old> <new>            Rename a profile
+  duplicate <src> <dst>         Duplicate a profile (clears device_id)
+  set-param <profile> <key> <value>
+                                 Set a parameter in a profile
+  export [profile]              Export profile as JSON to stdout
+  import <file.json>            Import profile from JSON file
+  diff <a> <b>                  Diff two profiles (name in the config or JSON
+                                 file — e.g. an `export`) and print the fields
+                                 that differ; exit 0 = identical, 1 = differ
+  monitor [interval-ms]         Live per-device telemetry (IPS, gain, latency,
+                                 poll rate, battery) from the running daemon.
+                                 Default 500 ms; valid range 1-60000 ms.
+                                 Interactive on a TTY, line-stream when piped.
+                                 Ctrl-C to quit.
+  status                        Show daemon status, profiles, and device assignments
+  receivers                     List detected Logitech receivers and HID++ capability
+  hidpp                         List detected Logitech HID++ devices and query info
+  hidpp-set-dpi <hidraw> <dpi> [device-index]
+                                Set Logitech HID++ DPI (HID++ 2.0), 100-32000
+  hidpp-set-rate <hidraw> <hz> [device-index]
+                                Set Logitech HID++ polling/report rate
+                                (125, 250, 500, 1000, 2000, 4000, 8000 Hz)
+  hidpp-set-polling-rate <hidraw> <hz> [device-index]
+                                Alias for hidpp-set-rate
+  hidpp-set-report-rate <hidraw> <hz> [device-index]
+                                Alias for hidpp-set-rate
+  hidpp-set-lod <hidraw> <low|medium|high> [device-index]
+                                Set sensor lift-off distance when supported
+                                (HID++ 0x2202 LOD capability only)
+  validate                      Validate config file for errors/warnings
+  reload                        Reload daemon config (IPC, else SIGHUP)
+  stop                          Stop daemon (SIGTERM)
+  latency                       Dump per-device processing latency stats (IPC, else SIGUSR1)
+
+Options:
+  -c, --config PATH             Config file path
+  -h, --help                    Show this help
+  -V, --version                 Show version
+  --json                        Emit machine-readable JSON for list, show, status,
+                                receivers, and hidpp (P99 — every command that
+                                renders device/config output)
+  -n, --no-daemon, --dry-run    Save config changes locally only — do NOT push
+                                them to the running daemon (default: live-apply)
+
+Presets (values loaded by `create-preset <preset> <name>`):
+  preset      mode            gain  exp-power  cap [in,out]  output-offset
+  gaming      classic         on    —          [15.0, 1.8]  —
+  office      natural         on    —          —             —
+  precision   classic         on    —          [24.0, 1.2]  —
+  disable     raw-passthrough (noaccel, all processing bypassed)
+  cs2         classic         on    —          [18.0, 1.6]   —
+  valorant    natural         on    —          [30.0, 2.0]   —
+  apex        power           on    0.8        [28.0, 2.2]   1.0
+  fps         classic         on    —          [20.0, 1.8]   —
+  exp-power = power-mode exponent; classic/natural presets use
+  exponent_classic/other defaults instead.  All presets: dpi 800, poll 1000.
+
+Top-level config key — NOT a set-param, it is global (not per-profile):
+  use_raw_input     true  = the daemon grabs every mouse and applies the active
+                        profile, so acceleration WORKS (this is the default).
+                  false = the daemon grabs NOTHING; every mouse passes through
+                        untouched — no acceleration and no telemetry.
+                  ⚠ Distinct from the per-profile `raw` parameter below, which
+                    bypasses processing for ONE profile only. The two names are
+                    easy to confuse, and turning use_raw_input off disables
+                    acceleration for EVERY mouse. Read it as "the daemon is
+                    allowed to take over the raw input device".
+
+Parameters (for set-param). Domain = accepted range — out-of-range values are
+REJECTED (exit 1, config untouched); default = fresh `create` profile value:
+  raw               true|false|1|0  (raw passthrough — bypass all processing for
+                    THIS profile). Default false.
+  mode              classic|power|natural|jump|synchronous|lookup|noaccel. Default noaccel.
+  device_id         Assign profile to a device ("usb:VVVV:PPPP:serial", by-id path,
+                    or event node); empty string = all mice. Hint: run `status`
+                    to list devices with their device_id values. Default: empty.
+  gain              true|false|1|0  (gain mode on/off). Default true.
+  acceleration      Acceleration multiplier. Domain any finite (negative = classic
+                    decel only when NO input cap is set — with a cap the curve is
+                    degenerate). Default 0.005.
+  exponent_classic  Classic exponent. Domain 1–10. Default 2.
+  exponent_power    Power exponent (synchronous ignores it). Domain 1e-4–5. Default 0.05.
+  limit             Upper multiplier asymptote (natural mode). Domain 0–100. Default 1.5.
+  decay_rate        Natural decay rate. Domain 0–10, and in natural mode 0 or ≥1e-4
+                    (values in between make the gain go negative and invert the axis;
+                    the loader clamps them to 1e-4). Default 0.1.
+  motivity          Synchronous motivity. Domain 0–10. Default 1.5.
+  gamma             Synchronous gamma. Domain 0–10. Default 1.
+  input_offset      Speed offset before acceleration starts. Domain 0–500, and must
+                    stay ≤ cap_x (checked against both X and Y). Default 0.
+  output_offset     Output offset (power mode). Domain 0–100. Default 0.
+  scale             Scale factor (power mode). Domain 0.01–100. Default 1.
+  sync_speed        Synchronous sync speed. Domain ≥ 1e-4. Default 5.
+  smooth            Jump/synchronous smoothness. Domain 0–1. Default 0.5.
+  cap_x             Input speed cap. Domain 0–500, and ≥ input_offset on both axes.
+                    Default 15.
+  cap_y             Output gain cap. Domain 0–100. Default 1.5.
+  cap_mode          out|in|io  (cap mode; in_out|both = io). Default out.
+  rotation          Rotation in degrees. Domain any finite (normalized mod 360:
+                    −45 → 315, 400 → 40). Default 0.
+  snap              Snap angle in degrees. Domain 0–45. Default 0.
+  dpi               Mouse DPI. Domain 1–32000 (integer). Default 800.
+  polling_rate      Mouse polling rate (Hz). Domain 125–8000 (integer). Default 1000.
+  speed_min         Minimum speed clamp (ips). Domain ≥ 0. Default 0 (off).
+  speed_max         Maximum speed clamp (ips). Domain ≥ 0; if both set, max ≥ min.
+                    Default 0 (off).
+  output_dpi        Output DPI normalization value. Domain {0} ∪ [1,32000]; a
+                    fractional value in (0,1) is REJECTED (P107: sanitizer maps it
+                    to 1 — persisting it while exiting 0 would be a silent
+                    mutation). 0 disables output-DPI normalization (1:1 counts).
+                    Default 1000.
+  lr_ratio          Left/right output DPI ratio. Domain 0.01–100. Default 1 (off).
+  ud_ratio          Up/down output DPI ratio. Domain 0.01–100. Default 1 (off).
+  yx_ratio          Y-axis output DPI ratio (relative to X). Domain 0.01–100. Default 1.
+  distance_mode     euclidean|max|lp|separate  (aliases: chebyshev = max,
+                    manhattan = separate). Default euclidean.
+  lp_norm           Lp-norm value (when distance_mode=lp). Domain > 0. Default 2.
+                    Large values (≳ MAX_NORM) behave as max.
+  input_smooth_halflife   Input speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
+  scale_smooth_halflife   Scale EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
+  output_smooth_halflife  Output speed EMA halflife (ms). Domain 0–10000; 0=off. Default 0.
+  domain_weights    Both-axis domain weight. Domain 0–1e6. Default 1.
+  domain_weight_x / domain_weight_y
+                    Per-axis domain weight. Domain 0–1e6. Default 1.
+  range_weights     Both-axis range weight. Domain 0–1e6. Default 1.
+  range_weight_x / range_weight_y
+                    Per-axis range weight. Domain 0–1e6. Default 1.
+
+Examples:
+  rawaccel-cli list
+  rawaccel-cli create gaming
+  rawaccel-cli set-param gaming mode classic
+  rawaccel-cli set-param gaming acceleration 0.005
+  rawaccel-cli set-param gaming exponent_classic 2
+  rawaccel-cli set-param gaming limit 1.8
+  rawaccel-cli set gaming
+  rawaccel-cli export gaming > backup.json
+)";
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    std::string config_path;
+    bool config_path_explicit = false;  // set when the user passed -c/--config at all
+    std::vector<std::string> args;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            // Trailing "-c" with no value used to be pushed into `args` and then
+            // reported as "Unknown command: -c".  Say what's actually wrong.
+            if (i + 1 >= argc) {
+                std::cerr << "Option '" << argv[i] << "' requires a path argument.\n";
+                return 1;
+            }
+            // O31-H3 parity (daemon/main.cpp): `-c --json list` / `-c --no-daemon
+            // set …` silently swallowed the next OPTION token as a path — the
+            // user's intent was discarded and a mutating command believed a
+            // daemon push was required.  Reject option-looking values; keep the
+            // parser honest like the daemon's `-c`/`-f` guard does.
+            if (argv[i + 1][0] == '-' && argv[i + 1][1] != '\0') {
+                std::cerr << "Option '" << argv[i] << "' requires a path argument — '"
+                          << argv[i + 1] << "' is an option, not a path.\n";
+                return 1;
+            }
+            config_path = argv[++i];
+            config_path_explicit = true;
+        } else if (strncmp(argv[i], "--config=", 9) == 0) {
+            // P115-A5-10: accept the `--config=path` (= form) like the daemon's
+            // parser does (P53).  Previously this was rejected as an unknown
+            // command with a 101-line help dump to stdout — CLI/daemon parity gap.
+            config_path = argv[i] + 9;
+            config_path_explicit = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help();
+            return 0;
+        } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+            std::cout << "rawaccel-cli " << VERSION << "\n";
+            return 0;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            g_json = true;
+        } else if (strcmp(argv[i], "-n") == 0 ||
+                   strcmp(argv[i], "--no-daemon") == 0 ||
+                   strcmp(argv[i], "--dry-run") == 0) {
+            g_no_daemon = true;
+        // POSIX: "--" ends option processing; every following token is a
+        // positional argument (command or value) even if it looks like an
+        // option.  Without this, `rawaccel-cli -c /tmp/x.json -- set ...`
+        // misinterpreted "--" or flagged it as an unknown command.
+        } else if (strcmp(argv[i], "--") == 0) {
+            for (int j = i + 1; j < argc; j++) args.push_back(argv[j]);
+            break;
+        } else {
+            args.push_back(argv[i]);
+        }
+    }
+
+    if (args.empty()) { print_help(); return 0; }
+
+    // P99: an explicit `-c ""` used to be indistinguishable from "no -c given"
+    // and silently fell back to find_config_path() — mutating the real
+    // ~/.config/rawaccel/settings.json (or /etc) when the user fat-fingered an
+    // empty path.  An explicit empty path is a user error: reject it.
+    if (config_path_explicit && config_path.empty()) {
+        std::cerr << "Option '-c/--config' requires a non-empty path (empty string "
+                     "would silently edit the default config).\n";
+        return 1;
+    }
+
+    // Targeted arity errors (P99): every subcommand has a min/max argument count.
+    // Too few → "missing N argument(s)", too many → "takes at most N" — both exit
+    // 1 with a clear message instead of silently ignoring the extras (previously
+    // `rawaccel-cli create foo bar` created "foo" and dropped "bar").
+    struct arity_spec { const char* cmd; int min; int max; };
+    static constexpr arity_spec arities[] = {
+        { "show",          1, 1 },
+        { "set",           1, 1 },
+        { "create",        1, 1 },
+        { "delete",        1, 1 },
+        { "rename",        2, 2 },
+        { "duplicate",     2, 2 },
+        { "create-preset", 2, 2 },
+        { "set-param",     3, 3 },
+        { "import",        1, 1 },
+        { "export",        0, 1 },
+        { "diff",          2, 2 },
+        { "monitor",       0, 1 },
+        { "list",          0, 0 },
+        { "validate",      0, 0 },
+        { "status",        0, 0 },
+        { "receivers",     0, 0 },
+        { "hidpp",         0, 0 },
+        { "hidpp-set-dpi", 2, 3 },
+        { "hidpp-set-rate", 2, 3 },
+        { "hidpp-set-polling-rate", 2, 3 },
+        { "hidpp-set-report-rate", 2, 3 },
+        { "hidpp-set-lod", 2, 3 },
+        { "reload",        0, 0 },
+        { "stop",          0, 0 },
+        { "latency",       0, 0 },
+    };
+    int min_args = -1, max_args = -1;
+    for (auto& a : arities) {
+        if (a.cmd == args[0]) { min_args = a.min; max_args = a.max; break; }
+    }
+    if (min_args >= 0) {
+        // `args` includes the command word itself; the table counts positional
+        // arguments only (matching the usage lines in --help).
+        const int nargs = static_cast<int>(args.size()) - 1;
+        if (nargs < min_args) {
+            std::cerr << "Command '" << args[0] << "' is missing "
+                      << (min_args - nargs) << " argument(s).\n";
+            std::cerr << "Usage: rawaccel-cli " << args[0];
+            if      (args[0] == "show" || args[0] == "set" ||
+                     args[0] == "create" || args[0] == "delete")
+                std::cerr << " <profile>";
+            else if (args[0] == "rename")          std::cerr << " <old> <new>";
+            else if (args[0] == "duplicate")       std::cerr << " <src> <dst>";
+            else if (args[0] == "create-preset")   std::cerr << " <preset> <name>";
+            else if (args[0] == "set-param")       std::cerr << " <profile> <key> <value>";
+            else if (args[0] == "import")          std::cerr << " <file.json>";
+            else if (args[0] == "export")          std::cerr << " [profile]";
+            else if (args[0] == "diff")            std::cerr << " <profile-or-file> <profile-or-file>";
+            else if (args[0] == "monitor")         std::cerr << " [interval-ms]";
+            else if (args[0] == "hidpp-set-dpi")   std::cerr << " <hidraw> <dpi> [device-index]";
+            else if (args[0] == "hidpp-set-rate" ||
+                     args[0] == "hidpp-set-polling-rate" ||
+                     args[0] == "hidpp-set-report-rate")
+                std::cerr << " <hidraw> <hz> [device-index]";
+            else if (args[0] == "hidpp-set-lod")   std::cerr << " <hidraw> <low|medium|high> [device-index]";
+            std::cerr << "\n";
+            return 1;
+        }
+        if (nargs > max_args) {
+            std::cerr << "Command '" << args[0] << "' takes at most " << max_args
+                      << " argument(s), but got " << nargs << ".\n";
+            std::cerr << "Usage: rawaccel-cli " << args[0];
+            if      (args[0] == "set-param")       std::cerr << " <profile> <key> <value>";
+            else if (args[0] == "rename")          std::cerr << " <old> <new>";
+            else if (args[0] == "duplicate")       std::cerr << " <src> <dst>";
+            else if (args[0] == "create-preset")   std::cerr << " <preset> <name>";
+            else if (args[0] == "import")          std::cerr << " <file.json>";
+            else if (args[0] == "export")          std::cerr << " [profile]";
+            else if (args[0] == "diff")            std::cerr << " <profile-or-file> <profile-or-file>";
+            else if (args[0] == "monitor")         std::cerr << " [interval-ms]";
+            else if (args[0] == "hidpp-set-dpi")   std::cerr << " <hidraw> <dpi> [device-index]";
+            else if (args[0] == "hidpp-set-rate" ||
+                     args[0] == "hidpp-set-polling-rate" ||
+                     args[0] == "hidpp-set-report-rate")
+                std::cerr << " <hidraw> <hz> [device-index]";
+            else if (args[0] == "hidpp-set-lod")   std::cerr << " <hidraw> <low|medium|high> [device-index]";
+            else if (args[0] == "show" || args[0] == "set" ||
+                     args[0] == "create" || args[0] == "delete")
+                std::cerr << " <profile>";
+            std::cerr << "\n";
+            return 1;
+        }
+    }
+
+    // P130-R49 (BUG): an UNKNOWN command must fail before any config access.
+    // Previously `rawaccel-cli <typo>` fell through to the config-load block,
+    // which CREATED a fresh default settings.json as a side effect of a typo
+    // (verified: `rawaccel-cli -c /tmp/x/settings.json bogus` wrote a file).
+    // Reject up front, before find_config_path() / load / default-creation.
+    bool known_cmd = false;
+    for (auto& a : arities) {
+        if (a.cmd == args[0]) { known_cmd = true; break; }
+    }
+    if (!known_cmd) {
+        std::cerr << "Unknown command: " << args[0] << "\n";
+        print_help();
+        return 1;
+    }
+
+    if (!config_path_explicit && config_path.empty()) config_path = find_config_path();
+
+    // SEC-2: validate the config path (daemon does this too).  The policy check
+    // runs on EVERY path, not only an explicit -c: find_config_path() derives
+    // the default from XDG_CONFIG_HOME / SUDO_USER / HOME, and that path used
+    // to skip validation entirely — the same defect class as the R5-S-9 half-fix
+    // above.  The parent-directory requirement stays explicit-only, because the
+    // default ~/.config/rawaccel/ may legitimately not exist yet.
+    if (!validate_config_path(config_path,
+                              /*require_existing_parent=*/config_path_explicit)) {
+        return 1;
+    }
+
+    // Commands that don't need config loaded
+    if (args[0] == "reload") return cmd_reload();
+    if (args[0] == "stop")   return cmd_stop();
+    if (args[0] == "status") return cmd_status(config_path);
+    if (args[0] == "monitor") {
+        int interval_ms = 500;
+        if (args.size() >= 2) {
+            char* end = nullptr;
+            long v = std::strtol(args[1].c_str(), &end, 10);
+            if (!args[1].empty() && *end == '\0' && v > 0 && v <= 60000)
+                interval_ms = (int)v;
+            else {
+                std::cerr << "Monitor interval must be 1-60000 ms: " << args[1] << "\n";
+                return 1;
+            }
+        }
+        return cmd_monitor(interval_ms);
+    }
+    if (args[0] == "receivers") return cmd_receivers();
+    if (args[0] == "hidpp") return cmd_hidpp();
+    if (args[0] == "hidpp-set-dpi") return cmd_hidpp_set_dpi(args);
+    if (args[0] == "hidpp-set-rate") return cmd_hidpp_set_rate(args);
+    if (args[0] == "hidpp-set-polling-rate") return cmd_hidpp_set_rate(args);
+    if (args[0] == "hidpp-set-report-rate") return cmd_hidpp_set_rate(args);
+    if (args[0] == "hidpp-set-lod") return cmd_hidpp_set_lod(args);
+    if (args[0] == "validate") return cmd_validate(config_path);
+    if (args[0] == "latency") {
+        // Try the IPC "latency" command first — works for any user in the
+        // input group regardless of who owns the daemon.  Falls back to
+        // SIGUSR1 if the running daemon doesn't speak that command yet.
+        std::string ipc_resp = daemon_ipc_query("latency");
+        if (ipc_resp.find("\"ok\":true") != std::string::npos) {
+            std::cout << "Latency dump scheduled. View it with: journalctl -u rawaccel -n 30\n";
+            return 0;
+        }
+        auto r = send_signal_to_daemon(SIGUSR1);
+        if (r == signal_result::sent) {
+            std::cout << "SIGUSR1 sent. View stats with: journalctl -u rawaccel -n 30\n";
+            return 0;
+        }
+        // AJ-H: "not running" burada YANLIŞ olabilir — sinyal gönderilemedi
+        // çünkü PID dosyası yok/sesiz, ama daemon canlı olabilir (IPC cevap
+        // veriyorsa).  Bu ayrım eskiden yapılamıyordu: CLI "not running"
+        // deyip canlı bir daemon'ı yok sayıyordu.
+        if (r == signal_result::not_running &&
+            probe_daemon().state == daemon_liveness::running) {
+            std::cerr << "Daemon is running but does not support the 'latency' "
+                         "IPC command, and no PID file is available to send "
+                         "SIGUSR1.\n";
+            return 1;
+        }
+        print_signal_failure(r, "request latency stats from", "USR1");
+        return 1;
+    }
+
+    // Load config (create default only if the file is genuinely missing).
+    // Overwriting on *any* load failure would silently destroy a config that
+    // is merely corrupt (bad JSON) or unreadable — a preventable data loss.
+    const bool config_exists = ::access(config_path.c_str(), F_OK) == 0;
+    app_config cfg;
+    if (!config_exists) {
+        // Create minimal default.  C-1: keep active_profile non-empty and
+        // pointing at the very profile we just created so the saved file is
+        // self-consistent (a dangling/empty active_profile makes the first
+        // `rawaccel-cli delete default` fail confusingly).
+        device_profile dp;
+        dp.name = "default";
+        dp.dev_cfg.dpi = 800;
+        dp.dev_cfg.polling_rate = 1000;
+        cfg.profiles.push_back(dp);
+        cfg.active_profile = dp.name;
+        try { save_config(cfg, config_path); }
+        catch (const std::exception& e) {
+            // C-9: a missing default config is fatal — without it every
+            // later command runs against an empty/phantom in-memory config.
+            std::cerr << "ERROR: could not save default config: " << e.what() << "\n";
+            return 1;
+        } catch (...) {
+            std::cerr << "ERROR: could not save default config.\n";
+            return 1;
+        }
+    } else {
+        try {
+            cfg = load_config(config_path);
+        } catch (const std::exception& e) {
+            std::cerr << "Config is unreadable or invalid: " << config_path << "\n"
+                      << "  (" << e.what() << ")\n"
+                      << "  Refusing to overwrite it — run `rawaccel-cli validate` for details.\n";
+            return 1;
+        } catch (...) {
+            std::cerr << "Config is unreadable or invalid: " << config_path << "\n"
+                      << "  Refusing to overwrite it — run `rawaccel-cli validate` for details.\n";
+            return 1;
+        }
+        // CLI-3: a config that exists but holds zero profiles is what
+        // `delete` on the last profile deliberately writes (empty
+        // {"active_profile":"","profiles":[]}).  cmd_delete promises "a fresh
+        // 'default' is recreated on the next run" — make that true so the
+        // config self-heals instead of staying permanently empty (which also
+        // left active_profile dangling).  Mirrors the missing-file branch; a
+        // read-only `list`/`show` on such a config now regenerates it rather
+        // than reporting "no profiles".
+        //
+        // O31-L4: that repair is only safe when the emptiness is the ONE
+        // condition this block exists for.  It ran before command dispatch, so
+        // even a read-only `list`/`show`/`list --json` rewrote the file.  If
+        // the file has no `profiles` key at all but DOES carry another
+        // top-level array of objects (an older/renamed schema key — measured
+        // with an 81-byte `profile_list` config: `list` exited 0 and grew the
+        // file 81 -> 2679 bytes, destroying the only profile it held), the
+        // sanitizer saw an empty list while the FILE still held the data, and
+        // save_config's four top-level keys (src/config.cpp) overwrote it.
+        //
+        // `app_config` has exactly one array member (include/config.hpp), so by
+        // definition any other array of objects is foreign data.  Repair only
+        // when: `profiles` is present and empty (the delete case), or
+        // `profiles` is absent AND no foreign array key exists.  Narrowing, not
+        // removal — delete-last-profile must keep self-healing.
+        bool cli3_repair = cfg.profiles.empty();
+        std::string foreign;
+        if (cli3_repair) {
+            switch (cli3_foreign_profile_key(config_path, foreign)) {
+                case 1: break;                       // no foreign data — repair
+                case 0: cli3_repair = false; break;  // foreign data — do NOT
+                default: cli3_repair = false; break; // could not tell — do NOT
+            }
+        }
+        if (cli3_repair) {
+            device_profile dp;
+            dp.name = "default";
+            dp.dev_cfg.dpi = 800;
+            dp.dev_cfg.polling_rate = 1000;
+            cfg.profiles.push_back(dp);
+            cfg.active_profile = dp.name;
+            try { save_config(cfg, config_path); }
+            catch (const std::exception& e) {
+                std::cerr << "ERROR: could not save recreated default config: "
+                          << e.what() << "\n";
+                return 1;
+            }
+        } else if (!foreign.empty()) {
+            // Loud, not silent: the user must know why the file is being
+            // reported as profile-less when the parser can see no 'profiles'.
+            std::cerr << "WARNING: '" << config_path << "' has no 'profiles' key but has '"
+                      << foreign << "' — NOT rewriting it, that array is not a "
+                      << "recognized profile list and would be lost.\n"
+                      << "  Fix the key name by hand, or run `rawaccel-cli validate`.\n";
+        }
+    }
+
+    const std::string& cmd = args[0];
+
+    if (cmd == "list") {
+        if (g_json) return cmd_list_json(cfg);
+        return cmd_list(cfg);
+    }
+    if (cmd == "show") {
+        if (g_json) {
+            // P99: --json is a global flag — honor it for show too, not just list.
+            for (auto& dp : cfg.profiles) {
+                if (dp.name == args[1]) {
+                    std::cout << profile_to_json(dp) << "\n";
+                    return 0;
+                }
+            }
+            std::cerr << "Profile not found: " << args[1] << "\n";
+            return 1;
+        }
+        return cmd_show(cfg, args[1]);
+    }
+    if (cmd == "set")    return cmd_set(cfg, config_path, args[1]);
+    if (cmd == "create") return cmd_create(cfg, config_path, args[1]);
+    if (cmd == "delete") return cmd_delete(cfg, config_path, args[1]);
+    if (cmd == "rename") return cmd_rename(cfg, config_path, args[1], args[2]);
+    if (cmd == "duplicate") return cmd_duplicate(cfg, config_path, args[1], args[2]);
+    if (cmd == "create-preset") return cmd_create_preset(cfg, config_path, args[1], args[2]);
+    if (cmd == "set-param") return cmd_set_param(cfg, config_path, args[1], args[2], args[3]);
+    if (cmd == "export") return cmd_export(cfg, args.size() >= 2 ? args[1] : "");
+    if (cmd == "diff")   return cmd_diff(cfg, args[1], args[2]);
+    if (cmd == "import") return cmd_import(cfg, config_path, args[1]);
+
+    std::cerr << "Unknown command: " << cmd << "\n";
+    print_help();
+    return 1;
+}

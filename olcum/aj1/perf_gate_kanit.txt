@@ -1,0 +1,32 @@
+AJ1 — CI perf-gate atlanan-ölçüm görünürlüğü
+=============================================
+Araç : olcum/aj1/perf_gate_gorunurluk.sh  (bash olcum/aj1/perf_gate_gorunurluk.sh)
+Yöntem: .github/workflows/ci.yml'in GERÇEK `run: |` bloğu dosyadan çıkarılır
+        (elle kopyalanmaz), sahte bench betikleriyle dört yol koşturulur, her
+        birinin job rc'si ve GitHub işareti ölçülür.
+
+ÖLÇÜM — DÜZELTİLMİŞ HÂL (HEAD+1)
+  bash -n (sözdizimi)        : TEMİZ  (30 satır)
+  bench exit 77  -> job rc=0  işaret=::warning::   PASS
+  bench exit 126 -> job rc=0  işaret=::warning::   PASS
+  bench exit 1   -> job rc=1  işaret=::error::     PASS
+  bench exit 0   -> job rc=0  işaret=(yok)         PASS
+  SONUÇ: PASS
+
+ÖLÇÜM — MUTASYON (HEAD'deki eski hâl, `git show HEAD:.github/workflows/ci.yml`)
+  bench exit 77  -> job rc=0  işaret=(yok)         FAIL  ← atlandı ama SESSİZ
+  bench exit 126 -> job rc=0  işaret=(yok)         FAIL  ← atlandı ama SESSİZ
+  bench exit 1   -> job rc=1  işaret=::error::     PASS
+  bench exit 0   -> job rc=0  işaret=(yok)         PASS
+  SONUÇ: FAIL — 2 sapma  (rc=1)
+
+⭐ YORUM
+Eski hâlde hiçbir regresyon ölçülmemiş olmasına rağmen kapı sessiz bir yeşil
+tik üretiyordu. Bu, "doğrulandı" anlamına gelmeyen bir yeşil — tam olarak bu
+repo'nun başka yerlerde yasakladığı sınıf (run_cli_sanitized.sh:20 ve
+run_simd_parity.sh: "sessizce atlamaz").
+
+`exit 0` KORUNDU: kullanılamayan host bir regresyon değildir ve pipeline'ı
+düşürmemelidir. Değişen yalnızca görünürlük — `::warning::` GitHub iş
+özetinde sarı uyarı üretir. Ölçülen gerçek geçiş (exit 0) sessiz yeşil
+kalır; yani "yeşil = gerçekten ölçüldü" ayrımı artık arayüzde okunabiliyor.

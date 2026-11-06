@@ -1,0 +1,42 @@
+AJ1 — GitHub Actions hiçbir zaman çalışmadı (ölçüm, 1 Oct 2026)
+===============================================================
+SONUÇ: 8/8 koşuda steps=0. Hiçbir iş adımı TEK BİR KEZ yürütülmedi.
+
+Kanıt (gh run view --json jobs, her koşunun her işi için):
+  koşu 36786252955 (ci.yml görünürlük düzeltmesi, HEAD)
+    Build (portable) + Unit tests + Warning gate : steps=0  failure
+    Tests under ASan + UBSan                   : steps=0  failure
+    Hot-path performance gate (P137)            : steps=0  failure
+    CLI under ASan + UBSan                     : steps=0  failure
+    Fuzz smoke (60s per harness)                : steps=0  failure
+  koşu 36785947210 (1.2.5 düzeltme commit'i)
+    ...aynı 5 iş, hepsi steps=0 failure
+  koşu 36767300428 (v1.2.4 release) → steps=0
+  koşu 36766194793 (gate6 düzeltmesi) → steps=0
+  koşu 36765060283 → steps=0
+  koşu 36637070952 (29 Sep) → steps=0
+  koşu 36636626747 (29 Sep) → steps=0
+  koşu 36636176910 (29 Sep) → steps=0
+
+Ek kanıt — log indirme denemesi:
+  gh api repos/Abrek34/AbrekMouse/actions/jobs/110127252039/logs
+    → HTTP 404, BlobNotFound "The specified blob does not exist."
+  Yani iş çalışsaydı bir log blob'u OLURDU. Yok = hiç başlamadı.
+
+ZAMAN: her koşu 3-6 saniye. Gerçek bir derleme + 34 164 test + oracle
++ ASan + fuzz en az dakikalarca sürer; 3 saniyede biten bir iş ölçüm
+değil, başlatılamama.
+
+⭐ AYRIM (kod hatası mı, hesap engeli mi):
+  steps=[] + BlobNotFound + 3 saniye = runner hiç tahsis edilmedi, hiçbir
+  komut çalışmadı. Bu, kodun derlenmemesi / testin kırılması / kapının
+  kırmızı olması DEĞİLDİR — o zaman log'da derleyici veya test çıktısı
+  görünürdü. Daha önce alınan açık mesaj: "The job was not started because
+  your account is locked due to a billing issue."
+
+  ⛔ Bu bir HESAP engelidir ve bu ortamdan çözülemez. `gh` yetkileri repo
+  kapsamlı ve push çalışıyor (commit'ler gönderiliyor), yani sorun yazma
+  yetkisi değil, hesabın Actions kotası/billing durumu.
+
+SONUÇ: "yedi kapı yeşil" yerel olarak doğrudur ve ölçülmüştür. GitHub'da
+hiçbir commit doğrulanmamıştır. Bu ikisi birbirinin yerine geçmez.

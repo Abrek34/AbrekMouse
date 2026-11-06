@@ -1,0 +1,131 @@
+[Unit]
+Description=RawAccel Linux Mouse Acceleration Daemon
+# Start after udevd so that udev rules (99-rawaccel.rules) are already loaded.
+# No dependency on network.target — this is an input daemon.
+# On KDE Wayland sessions, KWin should be up before mice are grabbed so that
+# the virtual uinput device is visible to the compositor.  NOTE (T51-14):
+# plasma-kwin_wayland.service is a USER-session unit — referencing it with
+# Wants=/After= in a system unit evaluated by the SYSTEM manager is a no-op
+# (the name does not exist there).  Kept out of this unit; if ordering is
+# needed it belongs in a user unit or is guaranteed in practice because KWin
+# starts at graphical-session time, before a user enables rawaccel.service.
+After=systemd-udevd.service systemd-modules-load.service
+Documentation=https://github.com/rawaccel-linux/rawaccel-linux
+# SVC-1: make the restart burst limit explicit (systemd defaults are
+# StartLimitIntervalSec=10s / StartLimitBurst=5 — an invisible surprise if
+# RestartSec is ever tuned).  60s window / 10 attempts.  These directives
+# belong in [Unit], not [Service] (a misplaced StartLimitIntervalSec is
+# silently ignored with a journal warning).
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Config is stored in /etc/rawaccel/settings.json when running as a system service.
+# The GUI/CLI store settings in ~/.config/rawaccel/settings.json for the user;
+# run `rawaccel-cli` or the GUI to create/edit profiles, then they are copied to
+# /etc/rawaccel/ by the install script.
+# T51-15: guarantee the uinput module is loaded before the daemon opens
+# /dev/uinput, otherwise the first boot after fresh install can hit a
+# /dev/uinput-missing Restart loop.  systemd-modules-load.service (above, via
+# /usr/lib/modules-load.d/rawaccel.conf) does the real load; the ExecStartPre
+# below is a belt-and-suspenders fallback and intentionally failure-tolerant
+# ('-' prefix) because ProtectKernelModules=true may block a second modprobe
+# attempt — that is fine, the primary path is modules-load.  Kernels with
+# uinput built in have no loadable module; checking /dev/uinput first keeps
+# "Module uinput not found" out of the journal on those kernels.
+ExecStartPre=-/bin/sh -c 'test -e /dev/uinput || /sbin/modprobe uinput 2>/dev/null'
+ExecStart=/usr/bin/rawaccel-daemon -c /etc/rawaccel/settings.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+# BS-11: no PIDFile= — that directive is only honoured for Type=forking and
+# would be dead (systemd warns).  The daemon writes /run/rawaccel.pid for the
+# CLI/GUI's PID discovery, which must not be confused with systemd's notion.
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+RemoveIPC=true
+ProtectHostname=true
+# Restrict to native syscall ABI only — defeats exploits that pivot through
+# 32-bit / x32 syscall variants on a 64-bit kernel.
+SystemCallArchitectures=native
+# UMask=0077 → files created by the daemon (incl. /run/rawaccel.pid) default
+# to 0600 / dirs 0700 instead of world-readable.  The IPC socket is chmod'd
+# to 0660 explicitly after creation, so this doesn't break the GUI/CLI access.
+UMask=0077
+# T51-16: /run must stay writable for the PID file and IPC socket.
+# Do NOT list the individual files here: with ProtectSystem=strict systemd
+# resolves ReadWritePaths during mount-namespace setup, before the daemon has
+# created them.  A clean install (or a daemon stop that removes its PID file)
+# then fails with status 226/NAMESPACE:
+#   Failed to set up mount namespacing: /run/rawaccel.pid: No such file or directory
+# /run is a tmpfs owned by root; granting the daemon the directory keeps the
+# rest of the filesystem read-only and is robust across first start/restart.
+ReadWritePaths=/etc/rawaccel /run
+# Capability bounding set: only what the daemon actually exercises.
+#   CAP_CHOWN              : chown(IPC socket) to root:input
+#   CAP_DAC_OVERRIDE       : open /dev/uinput + /dev/input/event* as root
+#   CAP_FOWNER             : chmod the IPC socket regardless of effective uid
+# CAP_DAC_READ_SEARCH is intentionally absent (M-7): the daemon runs as root,
+# so DAC_OVERRIDE covers opening input nodes, and DAC_READ_SEARCH has been
+# unprivileged-incompatible / container-noise since kernel 5.x for no gain
+# here (it is also useless in a User Namespace where our cap bounding set
+# would be ignored anyway).
+# Drops everything else (CAP_SYS_*, CAP_NET_*, CAP_KILL, CAP_BPF, etc.).
+# If a future kernel/distro change requires more, a clear EPERM in journald
+# will indicate which cap is missing.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+
+# Network: this is a 100% local mouse driver — no network access ever.
+# IPC-FIX: PrivateNetwork=true is DELIBERATELY NOT used.  AF_UNIX sockets
+# are scoped to their network namespace on Linux (unix_find_socket_byname
+# resolves within the connecting socket's netns).  A daemon started in its
+# own netns (PrivateNetwork=true) binds /run/rawaccel.sock inside that
+# namespace, so the GUI/CLI in the host netns can never reach the accept
+# loop — every set_config/status ping silently fails and the daemon keeps
+# running the stale config (settings appear frozen / "DPI stuck").  The
+# network-blocking posture below (AF_UNIX-only + no IP traffic) is preserved
+# without namespacing: with RestrictAddressFamilies=AF_UNIX the process
+# cannot create a single AF_INET/AF_INET6/AF_PACKET socket, and
+# IPAddressDeny=any denies all IP traffic on top of that.
+#   - AF_UNIX is needed for the IPC socket (local file, not network).
+#   - AF_NETLINK is dropped: the daemon uses inotify, not udev/netlink.
+#   - IP families (AF_INET/AF_INET6/AF_PACKET/...) are explicitly forbidden.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Needs access to input devices (uinput virtual device creation required).
+# DeviceAllow= is intentionally NOT set: when it is, systemd switches to a
+# strict device cgroup policy that, on some kernels (notably with cachyos /
+# bpf-based device cgroups), prevents the daemon from listing /dev/input/event*
+# and results in "No physical mice found" even when running as root.
+# The service still drops privileges to the input group via SupplementaryGroups
+# and the udev rule (99-rawaccel.rules) keeps /dev/uinput accessible.
+SupplementaryGroups=input
+
+# Performance: elevate scheduling priority to prevent input jitter under heavy system load
+Nice=-10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rawaccel
+
+[Install]
+WantedBy=multi-user.target

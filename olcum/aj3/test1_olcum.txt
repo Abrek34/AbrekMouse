@@ -1,0 +1,44 @@
+# TEST-1 (AJ3) — asan kapısı artık koşullu değil
+#
+# Bu dosya yalnız ÖLÇÜLMÜŞ SAYILARI tutar. Ham loglar (her biri ~1 MB,
+# toplam 40 MB) .gitignore:10 (build-manual/) altında zaten repoya girmiyor.
+# Buradaki her sayı canlı dosyadan yeniden okunarak YAZILDI, tahmin edilmedi.
+
+## Test edilen üretim betiği
+  md5: c7b6d0d65f26fd41942eaef76bc10540  tests/run_tests_asan.sh
+
+## 10 ARDIŞIK koşu (varsayılan argümansız çağrı)
+# seq_*.rc DOSYALARI YOK — yalnız log var, rc ayrı dosyaya yazılmamış.
+# Bu yüzden rc listesi yerine logun SON SATIRI kanıtlanıyor.
+  son satır (x/y): 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 
+  'Sonuç: 34164/34164 geçti' içeren log: 10/10
+  (set -e + 'geçti' satırı => rc=0; geçersiz denemede script çıkar)
+
+## 3 PARALEL ÇİFT x 2 kopya = 6 koşu (rc dosyaları VAR)
+  rc: 0 0 0 0 0 0   -> 6/6
+
+## v3 turu (raporun dayandığı son ölçüm)
+  ardışık son satır: 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 34164/34164 
+  paralel rc        : 0 0 0 0 0 0   -> 6/6
+
+## MUTASYONLAR (bozulan kontrol -> gözlenen kırmızı)
+  M3 (ikili paylaşılan yola geri al) rc: 0 126 0 126 0 0 
+     -> 126 = ETXTBSY 'Metin dosyası meşgul' = giderilen arıza GERİ GELDİ
+  M2 (paylaşılan TMPDIR + paylaşılan ikili) rc: 1 1 1 1 
+     -> kapı burada KIRMIZI. AJ3'ün notuna göre M2 'yanlış biçimde yeşil'
+        olmalıydı; ölçülen bu, yani ya not eski bir sürümü anlatıyor ya da
+        M2 artık geri alınamıyor. KAYIT BU KONUDA TARTIŞMALI — sebeplenmedi.
+  M1 (BIN=/proc/olmayan_yol): negatif kontrol, log'da 'ld: cannot open output file'.
+
+## AJ1 BAĞIMSIZ DOĞRULAMA (temiz ortam, ajan süreci yokken)
+  5 ardışık asan koşusu başlatıldı; 4'ü TAMAMLANDI, hepsi 34723 satır ve
+  34164/34164. 5. koşu sunucu yeniden başlamasında kesildi -> 4/4 tamamlandı.
+
+  ⭐ ÖLÇÜM ORTAMA BAĞLI — bu ölçümü AJ3 AJANLARI AÇIKKEN yapmak imkansız:
+      ajanlar açıkken        3 paralel -> 0/3   ⛔
+      ajanlar durdurulmuşken 3 paralel -> 3/3   ✅
+      ajanlar açıkken        8 ardışık -> 8/8   ✅
+      arka planda sürekli g++ yükü altında 4 ardışık -> 4/4 ✅
+  Sonuç: arıza tam eşzamanlılıkta tetikleniyor, yükte değil. AJ3'ün
+  düzeltmesi işe yarıyor; ilk %50'lik arızanın bir kısmı BENİM kendi
+  ölçüm yarışımdı.

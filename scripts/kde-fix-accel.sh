@@ -1,0 +1,454 @@
+#!/bin/bash
+# kde-fix-accel.sh — Disable KDE Plasma mouse acceleration for RawAccel
+#
+# KDE applies its own libinput acceleration curve on top of your mouse input.
+# When RawAccel is running, this causes double-acceleration (two curves stacked).
+# This script sets Pointer Acceleration to "Flat" (profile=1) in kwinrc
+# and reloads KWin input settings immediately — no logout required.
+#
+# Usage:
+#   bash scripts/kde-fix-accel.sh          # fix + reload
+#   bash scripts/kde-fix-accel.sh --check  # check current state only
+#   bash scripts/kde-fix-accel.sh --undo   # restore adaptive acceleration
+
+set -euo pipefail
+
+# ── Config file location ──────────────────────────────────────────────────────
+# T51-09: under `sudo -u <user>` the caller's HOME (e.g. /root) survives
+# and XDG_CONFIG_HOME may leak from another account, so a plain
+# "$HOME/.config/kwinrc" would silently edit the WRONG file (and uninstall
+# would report fixing the target user's setup while it fixed /root's).
+# Derive the effective user's home from the passwd database instead.
+_eff_user="$(id -un 2>/dev/null || true)"
+_eff_home="$(getent passwd "$_eff_user" 2>/dev/null | cut -d: -f6 || true)"
+if [[ -n "$_eff_home" && "${HOME:-}" != "$_eff_home" ]]; then
+    if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == "${HOME:-/nonexistent}"* ]]; then
+        XDG_CONFIG_HOME="$_eff_home/.config"
+    fi
+    HOME="$_eff_home"
+fi
+KWINRC="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrc"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+check_kde() {
+    local desktop="${XDG_CURRENT_DESKTOP:-}"
+    local session="${DESKTOP_SESSION:-}"
+    if [[ "$desktop" == *KDE* || "$desktop" == *plasma* ||
+          "$session" == *plasma* || "$session" == *kde* ||
+          -f "$KWINRC" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+get_current_profile() {
+    # Returns the PointerAccelerationProfile value from [Libinput] section, or "" if not set.
+    awk '/^\[Libinput\]/{found=1; next} /^\[/{if(found) exit} found && /^PointerAccelerationProfile=/{print $0; exit}' \
+        "$KWINRC" 2>/dev/null | cut -d= -f2
+}
+
+write_kwinrc() {
+    local profile="$1"  # 1 = flat, 2 = adaptive
+    local accel="$2"    # 0 for flat, -0.5 or 0 for adaptive
+
+    # Create backup (keep only the newest 5 — M-2)
+    if [[ -f "$KWINRC" ]]; then
+        local ts
+        # T51-07: %N + $RANDOM keeps backups distinct even for two
+        # snapshots inside the same second from the same PID; rotate via
+        # find/sort -z so paths with spaces or newlines can't be
+        # word-split (the old `ls -1t | xargs rm` could delete the wrong
+        # files or clobber the newest backup).
+        ts="$(date +%Y%m%d-%H%M%S)-%N-$$-${RANDOM}"
+        cp -a "$KWINRC" "$KWINRC.rawaccel-backup.$ts"
+        find "$(dirname "$KWINRC")" -maxdepth 1 -name "$(basename "$KWINRC").rawaccel-backup.*" \
+            -printf '%T@ %p\0' 2>/dev/null | sort -z -k1,1rn | tail -z -n +6 \
+            | cut -z -d' ' -f2- | xargs -0 -r rm -f
+    fi
+
+    # Use python3 for clean INI manipulation (preserves comments/sections).
+    # We write BOTH the global [Libinput] section AND per-device overrides
+    # for any "(RawAccel)" virtual device found in /proc/bus/input/devices —
+    # KDE Plasma 6 stores per-device libinput config as nested sections like
+    # [Libinput][bustype][vendor_decimal][product_decimal][Device Name],
+    # which override the global setting.
+    if command -v python3 &>/dev/null; then
+        python3 - "$KWINRC" "$profile" "$accel" << 'PYEOF'
+import sys, os, re, tempfile
+
+kwinrc, profile, accel = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Read existing file (if any) as raw text so nested [Libinput][a][b]...
+# sections (which configparser cannot represent) are preserved.
+text = ""
+if os.path.exists(kwinrc):
+    with open(kwinrc) as f:
+        text = f.read()
+
+# 1) Enumerate live RawAccel virtual devices from /proc/bus/input/devices.
+devices = []
+try:
+    with open("/proc/bus/input/devices") as f:
+        block = {}
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                if block.get("name", "").endswith("(RawAccel)"):
+                    devices.append(block)
+                block = {}
+                continue
+            m = re.match(r"I: Bus=([0-9a-fA-F]+) Vendor=([0-9a-fA-F]+) Product=([0-9a-fA-F]+)", line)
+            if m:
+                block["bus"]     = int(m.group(1), 16)
+                block["vendor"]  = int(m.group(2), 16)
+                block["product"] = int(m.group(3), 16)
+            elif line.startswith('N: Name="'):
+                block["name"] = line[len('N: Name="'):-1]
+        if block.get("name", "").endswith("(RawAccel)"):
+            devices.append(block)
+except FileNotFoundError:
+    pass
+
+def upsert_section(text, section_header, kv):
+    """Replace or append [section_header] block with the given key=value pairs.
+    section_header includes the brackets, e.g. '[Libinput]' or '[Libinput][3][1133][...]'.
+    kv is a list of (key, value) tuples preserving order.
+    """
+    # Match this section up to the next top-level (non-nested) section header.
+    # Sections in kwinrc are line-anchored.
+    esc = re.escape(section_header)
+    pattern = rf"(?ms)^{esc}\s*\n(.*?)(?=^\[|\Z)"
+    m = re.search(pattern, text)
+    if m:
+        # T51-06: preserve foreign keys/comments in the section body — only
+        # replace-or-append the target keys instead of rewriting the whole
+        # block (the old version silently deleted user-set libinput keys).
+        body = m.group(1)
+        for k, v in kv:
+            if re.search(rf"(?m)^{re.escape(k)}\s*=", body):
+                body = re.sub(rf"(?m)^{re.escape(k)}\s*=.*$", f"{k}={v}", body, count=1)
+            else:
+                if body and not body.endswith("\n"):
+                    body += "\n"
+                body += f"{k}={v}\n"
+        new_block = f"{section_header}\n{body}"
+        return re.sub(pattern, new_block, text, count=1)
+    sep = "" if text.endswith("\n") or not text else "\n"
+    new_block = f"{section_header}\n" + "".join(f"{k}={v}\n" for k, v in kv)
+    return text + sep + "\n" + new_block
+
+kv = [("PointerAccelerationProfile", profile), ("PointerAcceleration", accel)]
+
+# 2) Global section (fallback for any device without a specific override)
+text = upsert_section(text, "[Libinput]", kv)
+
+# 3) Per-device override for every RawAccel virtual device.
+#    Plasma stores these as nested headers like [Libinput][3][1133][50498][Name]
+for d in devices:
+    header = f"[Libinput][{d['bus']}][{d['vendor']}][{d['product']}][{d['name']}]"
+    text = upsert_section(text, header, kv)
+
+# Atomic rename (M-2): mkstemp in the same dir + fsync + replace, and
+# fsync the parent dir so a crash cannot leave a stale/zero-byte kwinrc.
+# Resolve a symlinked kwinrc (dotfiles-managed KDE) so the link is kept.
+d = os.path.dirname(kwinrc) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kwinrc.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    target = os.path.realpath(kwinrc)
+    os.replace(tmp, target)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+
+print(f"  Updated {kwinrc}")
+print(f"  + global [Libinput] → profile={profile}")
+if devices:
+    for d in devices:
+        print(f"  + per-device: {d['name']} (bus={d['bus']}, vid={d['vendor']}, pid={d['product']})")
+else:
+    print("  (No (RawAccel) virtual devices found — start the daemon first, then re-run.)")
+PYEOF
+    else
+        # Fallback: manual INI editing with sed + append
+        if grep -q '^\[Libinput\]' "$KWINRC" 2>/dev/null; then
+            sed -i "/^\[Libinput\]/,/^\[/{
+                s/^PointerAccelerationProfile=.*/PointerAccelerationProfile=$profile/
+                s/^PointerAcceleration=.*/PointerAcceleration=$accel/
+            }" "$KWINRC"
+            # If keys not present in section, append them
+            if ! grep -A20 '^\[Libinput\]' "$KWINRC" | grep -q '^PointerAccelerationProfile='; then
+                sed -i "/^\[Libinput\]/a PointerAccelerationProfile=$profile" "$KWINRC"
+            fi
+            if ! grep -A20 '^\[Libinput\]' "$KWINRC" | grep -q '^PointerAcceleration='; then
+                sed -i "/^\[Libinput\]/a PointerAcceleration=$accel" "$KWINRC"
+            fi
+        else
+            printf '\n[Libinput]\nPointerAccelerationProfile=%s\nPointerAcceleration=%s\n' \
+                "$profile" "$accel" >> "$KWINRC"
+        fi
+    fi
+}
+
+reload_kwin() {
+    echo "  Reloading KWin input settings..."
+    local reloaded=0
+    for cmd in qdbus6 qdbus-qt6 qdbus; do
+        if command -v "$cmd" &>/dev/null; then
+            if "$cmd" org.kde.KWin /KWin reconfigure 2>/dev/null; then
+                echo "  ✓ KWin reconfigured via $cmd."
+                reloaded=1
+                break
+            fi
+        fi
+    done
+    if [[ $reloaded -eq 0 ]]; then
+        echo "  ℹ Could not reach KWin D-Bus. Changes will apply on next KWin start."
+        echo "    (If running under Wayland, log out and back in.)"
+    fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+MODE="${1:---fix}"
+
+case "$MODE" in
+--check)
+    echo "=== KDE Acceleration State Check ==="
+    if ! check_kde; then
+        echo "  Not a KDE session (kwinrc not found). Nothing to do."
+        exit 0
+    fi
+    PROFILE=$(get_current_profile)
+    echo "  kwinrc: $KWINRC"
+    echo "  PointerAccelerationProfile: '${PROFILE:-not set}'"
+    # BUG-NEW-84: also verify every per-device (RawAccel) override section is
+    # Flat.  A per-device override shadows the global [Libinput] section, so
+    # a global check alone can report "✓ Flat" while a (RawAccel) device is
+    # still adaptive → silent double-acceleration on that device.
+    nonflat=0
+    if command -v python3 &>/dev/null; then
+        nonflat=$(python3 - "$KWINRC" << 'PYEOF'
+import sys, re
+kwinrc = sys.argv[1]
+try:
+    with open(kwinrc) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    sys.exit(0)
+header = re.compile(r"^\[Libinput\](?:\[[^\]]*\]){3,4}\[[^\]]*\(RawAccel\)\]$")
+cur = None
+bad = 0
+for line in lines:
+    line = line.rstrip("\n")
+    if line.startswith("["):
+        cur = bool(header.match(line))
+        continue
+    if cur and line.startswith("PointerAccelerationProfile") and not line.startswith("PointerAccelerationProfile=1"):
+        bad += 1
+print(bad)
+PYEOF
+)
+    fi
+    if [[ "$PROFILE" == "1" ]] && [[ "$nonflat" -eq 0 ]]; then
+        echo "  ✓ Flat (disabled) — correct for RawAccel."
+        exit 0
+    elif [[ "$PROFILE" == "1" ]]; then
+        echo "  ⚠ Global profile is Flat, but $nonflat per-device (RawAccel)"
+        echo "    override(s) are NOT Flat — double-acceleration on those devices!"
+        echo "  Run: bash scripts/kde-fix-accel.sh"
+        exit 1
+    else
+        echo "  ⚠ NOT flat — double-acceleration will occur with RawAccel!"
+        echo "  Run: bash scripts/kde-fix-accel.sh"
+        exit 1
+    fi
+    ;;
+
+--undo)
+    echo "=== Restoring KDE adaptive acceleration ==="
+    if ! check_kde; then
+        echo "  Not a KDE session. Nothing to do."; exit 0
+    fi
+    write_kwinrc "2" "-0.5"
+    reload_kwin
+    echo "  ✓ Restored adaptive acceleration (profile=2, accel=-0.5)."
+    echo "  Note: adjust the exact value in System Settings → Input Devices → Mouse."
+    ;;
+
+--remove)
+    echo "=== Removing RawAccel traces from kwinrc ==="
+    if ! check_kde; then
+        echo "  Not a KDE session. Nothing to do."; exit 0
+    fi
+    # P121/BUG-09: uninstall leaves traces behind — per-device (RawAccel)
+    # libinput override sections survive in kwinrc, and the global profile is
+    # left Flat even though RawAccel is gone.  This removes every nested
+    # "[Libinput][bus][vid][pid][... (RawAccel)]" section AND restores the
+    # global [Libinput] to adaptive (profile=2, accel=-0.5), exactly matching
+    # what --undo promises.  (Backups written by write_kwinrc are kept; they
+    # are the user's own restorable snapshots.)
+    # T51-08: restore the user's pre-install [Libinput] values from the
+    # newest rawaccel backup instead of unconditionally day-0-forcing
+    # adaptive — a user who preferred Flat (or a custom accel) must get
+    # their preference back. Adaptive is only the fallback.
+    RESTORE_PROFILE="2"
+    RESTORE_ACCEL="-0.5"
+    newest_backup="$(ls -1t "$KWINRC".rawaccel-backup.* 2>/dev/null | head -1 || true)"
+    if [[ -n "$newest_backup" ]]; then
+        bp="$(awk '/^\[Libinput\]/{found=1; next} /^\[/{if(found) exit} found && /^PointerAccelerationProfile=/{print $0; exit}' "$newest_backup" | cut -d= -f2)"
+        ba="$(awk '/^\[Libinput\]/{found=1; next} /^\[/{if(found) exit} found && /^PointerAcceleration=/{print $0; exit}' "$newest_backup" | cut -d= -f2)"
+        [[ -n "$bp" ]] && RESTORE_PROFILE="$bp"
+        [[ -n "$ba" ]] && RESTORE_ACCEL="$ba"
+        echo "  Restoring pre-install values from $(basename "$newest_backup"): profile=$RESTORE_PROFILE accel=$RESTORE_ACCEL"
+    else
+        echo "  No rawaccel backup found — falling back to adaptive (profile=2, accel=-0.5)."
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 - "$KWINRC" "$RESTORE_PROFILE" "$RESTORE_ACCEL" << 'PYEOF'
+import sys, os, re, tempfile
+kwinrc = sys.argv[1]
+RESTORE_PROFILE, RESTORE_ACCEL = sys.argv[2], sys.argv[3]
+try:
+    with open(kwinrc) as f:
+        text = f.read()
+except FileNotFoundError:
+    sys.exit(0)
+
+# 1) Drop every nested per-device (RawAccel) override section.
+# BUG-NEW-83: the writer (script + GUI) emits
+#   [Libinput][bus][vid][pid][Name (RawAccel)]
+# i.e. THREE groups between [Libinput] and the name.  The old `{4}` regex
+# demanded four and therefore never matched any real section, so --remove
+# left the per-device (RawAccel) overrides in kwinrc while printing "✓".
+# Match 3 or 4 groups to be robust across KWin's historical formats.
+header = re.compile(r"^\[Libinput\](?:\[[^\]]*\]){3,4}\[[^\]]*\(RawAccel\)\]$")
+lines = text.split("\n")
+out, i, skip = [], 0, False
+while i < len(lines):
+    line = lines[i]
+    if header.match(line):
+        skip = True            # remove this block until the next section header
+        i += 1
+        continue
+    if skip:
+        if line.startswith("["):
+            skip = False       # next section header ends the stripped block
+        else:
+            i += 1
+            continue
+    out.append(line)
+    i += 1
+text = "\n".join(out)
+
+# 2) Restore the global [Libinput] section to adaptive (kde-fix-accel --undo).
+def upsert(text, header, kv):
+    esc = re.escape(header)
+    pat = re.compile(r"(?ms)^%s\s*\n(.*?)(?=^\[|\Z)" % esc)
+    m = pat.search(text)
+    if m:
+        # T51-06: keep foreign keys — only replace-or-append target keys.
+        body = m.group(1)
+        for k, v in kv:
+            if re.search(r"(?m)^%s\s*=" % re.escape(k), body):
+                body = re.sub(r"(?m)^%s\s*=.*$" % re.escape(k), f"{k}={v}", body, count=1)
+            else:
+                if body and not body.endswith("\n"):
+                    body += "\n"
+                body += f"{k}={v}\n"
+        block = f"{header}\n{body}"
+        return pat.sub(block, text, count=1)
+    body = "".join(f"{k}={v}\n" for k, v in kv)
+    block = f"{header}\n{body}"
+    return text.rstrip("\n") + "\n\n" + block + "\n"
+
+text = upsert(text, "[Libinput]", [("PointerAccelerationProfile", RESTORE_PROFILE),
+                                   ("PointerAcceleration", RESTORE_ACCEL)])
+# Atomic rename, O31-H5 (HIDPP C3): mirror the --fix writer's pattern
+# (mkstemp + realpath + fsync, kde-fix-accel.sh:122-145) instead of a fixed
+# "kwinrc.tmp" name + plain os.replace.  The old path replaced the symlink
+# inode itself (dotfiles-managed kwinrc broke) and could leave a stale
+# non-hidden tmp behind.
+d = os.path.dirname(kwinrc) or "."
+fd, tmp = tempfile.mkstemp(prefix=".kwinrc.", suffix=".tmp", dir=d)
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    target = os.path.realpath(kwinrc)
+    os.replace(tmp, target)
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        os.fsync(dfd)
+        os.close(dfd)
+    except OSError:
+        pass
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+print(f"  ✓ Removed (RawAccel) per-device sections and restored global values.")
+PYEOF
+    else
+        write_kwinrc "$RESTORE_PROFILE" "$RESTORE_ACCEL"
+    fi
+    reload_kwin
+    echo "  ✓ RawAccel traces removed from kwinrc (profile=$RESTORE_PROFILE, accel=$RESTORE_ACCEL)."
+    ;;
+
+--fix)
+    echo "=== KDE RawAccel Fix: Disable Pointer Acceleration ==="
+    if ! check_kde; then
+        echo "  Not a KDE session (XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP)."
+        echo "  This script is only needed on KDE Plasma. Exiting."
+        exit 0
+    fi
+
+    PROFILE=$(get_current_profile)
+    if [[ "$PROFILE" == "1" ]]; then
+        # H-2: global Flat alone does NOT cover per-device overrides.  If a
+        # RawAccel virtual device was recreated (daemon restart/hot-plug)
+        # after the last fix, KDE's own curve silently applies on that device
+        # despite the global "already Flat" state.  Re-run the idempotent
+        # writer so every live (RawAccel) device gets its override too.
+        echo "  ✓ Global acceleration is already Flat — ensuring per-device overrides."
+        write_kwinrc "1" "0"
+        reload_kwin
+        echo "  ✓ Per-device overrides ensured (flat). No change needed for global."
+        exit 0
+    fi
+
+    echo "  Current profile: '${PROFILE:-not set}'"
+    echo "  Setting PointerAccelerationProfile=1 (Flat) in: $KWINRC"
+    write_kwinrc "1" "0"
+    reload_kwin
+    echo ""
+    echo "  ✓ Done. KDE will no longer apply an extra acceleration curve."
+    echo "  RawAccel is now the sole acceleration provider."
+    echo ""
+    echo "  To verify: bash scripts/kde-fix-accel.sh --check"
+    echo "  To undo:   bash scripts/kde-fix-accel.sh --undo"
+    ;;
+*)
+    # L-5: reject unknown options instead of silently running the fix.
+    die "Bilinmeyen seçenek: '$MODE'. Kullanım: ${0##*/} [--check|--undo|--fix]"
+    ;;
+esac

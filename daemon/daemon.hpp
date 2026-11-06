@@ -1,0 +1,451 @@
+#pragma once
+#include "../include/rawaccel.hpp"
+#include "../include/config.hpp"
+#include "../include/logitech_hidpp.hpp"
+#include "lat_stats.hpp"              // latency histogram — no libevdev dependency
+#include <libevdev/libevdev-uinput.h>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <deque>
+#include <functional>
+#include <set>
+#include <unordered_map>
+#include <memory>
+#include <cstdint>
+#include <limits>
+
+namespace rawaccel {
+
+/// Represents one grabbed input device + its virtual output device.
+struct mouse_device {
+    struct telemetry_state {
+        std::atomic<uint64_t> samples { 0 };
+        std::atomic<double> speed_ips { 0.0 };
+        std::atomic<double> out_ips { 0.0 };
+        std::atomic<double> gain { 0.0 };
+        std::atomic<double> dx { 0.0 };
+        std::atomic<double> dy { 0.0 };
+        std::atomic<double> wall_ms { 0.0 };
+        // R7-PRATE: real polling rate (Hz, 0 = unknown) — computed by the loop
+        // thread (process_device) from median kernel frame intervals but read by
+        // the IPC thread (status_json).  Every other status field is written
+        // under devices_mutex_; a plain int here was a C++ data race (UB under
+        // TSan, torn median on weak-memory hardware).  Kept atomic alongside the
+        // other loop→IPC fields instead of re-adding a per-frame lock.
+        std::atomic<int> real_polling_rate { 0 };
+    };
+    std::string      name;
+    std::string      path;           // e.g. /dev/input/event3
+    std::string      device_id;
+    // O31-D1: what we have already pushed to this device's HID++ hardware.
+    // Plain ints, guarded by the same devices_mutex_ that guards dpi/poll_rate
+    // just above — apply_profile() is only ever reached with that held.
+    hidpp_hw_sync    hw_sync;
+    int              fd_in  = -1;    // grabbed evdev fd
+    libevdev_uinput* uidev  = nullptr; // uinput virtual device handle
+    int              dpi    = 800;
+    int              poll_rate = 1000;
+    int              detected_dpi          = 0;  // sysfs-detected DPI (0 = unknown)
+    int              detected_polling_rate = 0;  // sysfs-detected polling rate in Hz (0 = unknown)
+    int              detected_battery      = -1; // sysfs-detected battery % (0-100, -1 = unknown)
+
+    // Per-device state
+    modifier_settings  settings;
+    speed_processor    sp;
+    modifier           mod;
+
+    // Timing
+    double last_time_ms = 0;
+    // R13-perf: pre-computed NORMALIZED_DPI / dpi — updated only on profile change,
+    // avoids a floating-point division on every mouse event.
+    // O6: direction matches reference input_dpi_normalization_factor (was dpi/NORMALIZED_DPI).
+    double dpi_factor   = NORMALIZED_DPI / 800.0;
+
+    // Subpixel accumulation: carry fractional remainder between frames
+    double remainder_x   = 0.0;
+    double remainder_y   = 0.0;
+    // Set to true when a fatal I/O error occurs; run_loop removes the device
+    bool   disconnected  = false;
+
+    // LOW-1/SM-2: a motion tail that read() closed a batch on WITHOUT a
+    // terminating SYN_REPORT (the kernel coalesced [REL_X:+5, SYN, REL_X:+3]
+    // and EAGAIN fired before the second frame's SYN).  Holding it here lets
+    // the next process_device() merge it into its own frame and flush it at
+    // that frame's REAL SYN — correct interval (SM-1) and no synthetic SYN
+    // (LOW-1 double-SYN).  A deferred non-motion tail (buttons/wheel read
+    // after the last SYN) rides along in pending_events so the whole
+    // unterminated frame stays atomic and is written at the next SYN.
+    // Lines: daemon.cpp process_device().
+    double pending_dx        = 0.0;
+    double pending_dy        = 0.0;
+    bool   has_pending_motion = false;
+    // T38-HOT03: the deferred-event queue capacity is a single named constant
+    // shared with `queued_events` / write_batch in daemon.cpp, so the three
+    // "16" literals can no longer drift apart.
+    static constexpr size_t kPendingEventsMax = 16;
+    std::array<input_event, kPendingEventsMax> pending_events;
+    size_t pending_ev_count    = 0;
+    // T38-HOT03: non-motion events silently truncated because a pending/
+    // queued buffer filled up.  Counts every drop; the accompanying log line
+    // is throttled (per site, ~2 s) so a stuck consumer can't flood the log.
+    uint64_t ev_tail_overruns  = 0;
+
+    // SM-1: kernel ev.time (µs) of the last frame we closed with a SYN_REPORT.
+    // Running frame-to-frame intervals off the kernel timestamp instead of the
+    // processing wall clock gives the true USB poll period, so a coalesced
+    // batch (loop-thread stall, scheduler preemption) can no longer shrink
+    // time_ms toward zero and spike the gain.
+    uint64_t last_frame_ev_us = 0;
+
+    // Real polling rate detection from event timestamps (POLL-1 fix).
+    // We track the kernel timestamps of SYN_REPORT events and compute the
+    // median interval over recent frames. This gives the actual device polling
+    // rate regardless of what sysfs reports.
+    static constexpr int POLL_RATE_SAMPLES = 16;
+    uint64_t frame_ev_us_samples[POLL_RATE_SAMPLES] = {};
+    int      frame_ev_us_count = 0;
+    int      frame_ev_us_next = 0;
+    // PERF (P0): the median interpolates over POLL_RATE_SAMPLES intervals and
+    // ran on EVERY motion frame (copy + insertion sort + divide ≈ 40–80 ns,
+    // i.e. 1–2× the classic no-smoothing cost).  The true poll rate changes
+    // only when the device is replugged or its config is switched, so
+    // recompute the estimate at most once every POLL_RATE_SAMPLES frames the
+    // moment POLL_RATE_SAMPLES accepted samples pass.  Loop thread only.
+    int      poll_median_tick = 0;
+
+    // BUG-18: SYN_DROPPED state must persist across process_device() calls.
+    // The Linux input protocol says all events between a SYN_DROPPED and the
+    // next SYN_REPORT are unreliable.  A previous bug had this as a function-
+    // local flag — if SYN_DROPPED fell at the end of one read batch and the
+    // matching SYN_REPORT arrived in the next epoll cycle, the flag was reset
+    // to false in between and the daemon would forward unreliable events.
+    bool   syn_dropped   = false;
+
+    // ── Live telemetry (T30): last-motion sample per device ────────────────
+    // Written by flush_motion() (loop thread) and read by status_json() (IPC
+    // thread).  Every field is atomic: the generation counter provides a
+    // consistent snapshot while the atomics themselves avoid the C++ data
+    // race/UB that a seqlock over plain doubles would have.  The state is
+    // held via shared_ptr so mouse_device remains movable AND so the IPC
+    // thread can keep a live pointer (shared ownership) into a device that
+    // may already be erased from devices_ — that lets status_json() run the
+    // seqlock spin loop AFTER releasing devices_mutex_, shortening the
+    // per-event fd_to_dev_ lookup stall (T38-HOT05).
+    std::shared_ptr<telemetry_state> telemetry =
+        std::make_shared<telemetry_state>();
+    // ── Latency statistics — see lat_stats.hpp for the full implementation ──
+    // Thread safety: flush_motion() (loop thread) writes; dump_latency_stats()
+    // (main thread, on SIGUSR1) reads and resets.  lat_stats::mtx serialises access.
+    lat_stats lat;
+};
+
+class AccelDaemon {
+public:
+    AccelDaemon();
+    ~AccelDaemon();
+
+    /// Load config and start processing. Returns false on error.
+    bool start(const std::string& config_path = "");
+
+    /// Stop gracefully (joins thread — do NOT call from a signal handler).
+    void stop();
+
+    /// Signal-safe stop: sets running_ = false without joining.
+    /// Call from signal handlers; the main loop will complete shutdown.
+    void request_stop() { running_.store(false); }
+
+    /// Reload config (hot reload via SIGHUP).
+    bool reload();
+
+    /// Apply a full config pushed over IPC (the "set_config" RPC used by the
+    /// GUI/CLI).  Parses + sanitizes the JSON, atomically persists it to the
+    /// daemon's own config path (so it survives a daemon restart — this is what
+    /// lets a root systemd daemon pick up edits made in the user's GUI, whose
+    /// ~/.config copy differs from /etc/rawaccel/settings.json), then stores it
+    /// for the event loop to live-apply.  Returns false on parse/persist error
+    /// (the previous config is kept).
+    bool push_config(const std::string& json_str);
+
+    bool is_running() const { return running_.load(); }
+
+    /// Set callback for logging.
+    void set_log_cb(std::function<void(const std::string&)> cb) { log_cb_ = cb; }
+
+    /// Enable/disable verbose debug output.
+    void set_verbose(bool v) { verbose_ = v; }
+
+    /// Print per-device latency statistics to stdout and reset counters.
+    /// Call periodically (e.g. on SIGUSR1) to observe real-time performance.
+    void dump_latency_stats();
+
+    /// Atomically read-and-clear the IPC latency-dump flag.
+    /// The IPC server (input-group accessible) sets this flag when an
+    /// unprivileged client requests a stats dump; the main thread polls it
+    /// alongside the SIGUSR1 path so latency reporting works without
+    /// kill() permission on the (root-owned) daemon process.
+    bool consume_latency_dump_request() {
+        return latency_dump_flag_.exchange(false);
+    }
+
+    /// Build a JSON status string describing the daemon's current state.
+    /// Thread-safe: acquires per-device lat_mtx for snapshot reads.
+    std::string status_json() const;
+
+    // ── Unix socket IPC ───────────────────────────────────────────────────────
+    // start_ipc_server() opens a Unix domain socket at the given path and spawns
+    // ipc_thread_ to accept connections.  stop_ipc_server() closes the socket and
+    // joins the thread.  The path is typically $XDG_RUNTIME_DIR/rawaccel.sock or
+    // /run/rawaccel.sock.  The protocol is line-based:
+    //   client → "status\n"  → server → <json>\n
+    //   client → "ping\n"    → server → "pong\n"
+    //   client → "reload\n"  → server → {"ok":true,...}\n  (schedules config reload)
+    //   client → "latency\n" → server → {"ok":true,...}\n  (schedules latency dump)
+    //   client → "set_config <n>\n" followed by exactly <n> bytes of config JSON
+    //            → server → {"ok":true,"config":path}\n   (persists + live-applies)
+    //   client → <other>\n   → server → {"error":"unknown command"}\n
+    // The socket is chmod 0660 root:input, so only members of the input group can
+    // issue these commands (the same trust boundary as grabbing /dev/input anyway).
+    bool start_ipc_server(const std::string& sock_path);
+    void stop_ipc_server();
+    static std::string ipc_sock_path(); ///< Derive socket path from PID-file convention.
+
+private:
+    void run_loop();
+    /// P171-BFIX: HID++ notification drain on its own background thread so
+    /// the 1–2 s hidraw open/poll/read cycles can never delay the motion
+    /// hot path (mouse stutter regression on Logitech Unifying receivers).
+    void run_hidpp_worker();
+    bool setup_devices();
+    void teardown_devices();
+    bool open_input_device(mouse_device& dev);
+    bool create_virtual_device(mouse_device& dev);
+    void process_device(mouse_device& dev);
+    void apply_profile(mouse_device& dev, const device_profile& prof);
+    /// LIVE-DISABLE: drop a grabbed device (epoll del, map erases, grab
+    /// release, uinput destroy, fd close) when a live reload / app-switch marks
+    /// its matched profile disabled.  Caller must hold devices_mutex_.
+    void release_device(mouse_device& dev);
+    /// T35-DMN02: blocking teardown half of release_device(), deferred until
+    /// devices_mutex_ is dropped.  Caller must NOT hold devices_mutex_.
+    void destroy_device(mouse_device& dev);
+    /// Shared apply path for both the SIGHUP reload and the IPC config push.
+    /// Runs on the loop thread; live-updates open devices without dropping the
+    /// grab, and falls back to a full setup when no devices are open yet.
+    void apply_new_config(const app_config& new_cfg);
+    /// Search order: device_id+app match, then "all devices"+app match, then
+    /// device_id, then "all devices", then active_profile, then profiles[0].
+    /// P-APP: an app-scoped profile (non-empty match_app) applies only while the
+    /// focused application (current_app_) matches its substring; while a match
+    /// exists it is preferred over generic bindings for the same device.
+    const device_profile* find_profile(const std::string& dev_id) const;
+    /// P-APP: applies the profile that matches the currently focused application.
+    /// Called from the loop thread when the GUI reports a focus change via
+    /// "set_active_app" IPC; live-reapplies per-device settings without dropping
+    /// grabs (same contract as apply_new_config).
+    void apply_active_app();
+    void handle_hotplug();
+    void do_hotplug_scan();
+    /// P168: non-blocking HID++ notification drain hook.  Runs on a DEDICATED
+    /// worker thread (not the loop thread) at a bounded cadence: re-scans
+    /// Logitech hidraw nodes, re-identifies replugged devices, drains each
+    /// transport ONCE and routes notifications to their owning device
+    /// (R8-HIDN), and forwards classified battery/link events to log().  Never
+    /// touches the evdev/uinput motion hot path.
+    void poll_hidpp_notifications();
+    void log(const std::string& msg, bool verbose_only = false);
+
+    std::atomic<bool>   running_             { false };
+    std::atomic<bool>   reload_flag_         { false };
+    std::atomic<bool>   latency_dump_flag_   { false };
+    std::thread         loop_thread_;
+    // P171-BFIX: dedicated thread for HID++ notification draining.  Keeps the
+    // hidraw open/poll/read cycles (1000–2000 ms cadence) fully off the loop
+    // thread, which handles mouse motion events synchronously.
+    std::thread         hidpp_thread_;
+    app_config          config_;
+    std::string         config_path_;
+    size_t              config_hash_ = 0;  // hash of config_ JSON for fast no-op guard (PERF-2)
+    std::vector<mouse_device> devices_;
+    // Guards devices_ against concurrent access from ipc_thread_ (status_json)
+    // and loop_thread_ (setup/hotplug/cleanup).  Always held briefly (< 1µs typical).
+    mutable std::mutex        devices_mutex_;
+    // R1-04: log() is called from the loop, hidpp, ipc and main threads —
+    // serialise the write so lines never interleave / race iostream+cb_.
+    mutable std::mutex        log_mu_;
+    std::function<void(const std::string&)> log_cb_;
+    bool                verbose_     = false;
+
+    // epoll fd for event loop
+    int epoll_fd_   = -1;
+    // inotify fd + watch descriptor for /dev/input hot-plug
+    int inotify_fd_ = -1;
+    int inotify_wd_ = -1;
+    // Track which paths are already opened (avoid re-grabbing on spurious events)
+    std::set<std::string> opened_paths_;
+    // HP-3: track OPEN device_ids so two evdev nodes with the same
+    // VID:PID:serial (multi-interface/HID-composite mice) are not double-
+    // grabbed — a physical report would otherwise reach the compositor twice.
+    // Access only from the loop thread (setup + hotplug) — no sync needed.
+    std::set<std::string> opened_device_ids_;
+    // P121/BUG-02: paths with failed I/O are denied re-open until this
+    // (ms, CLOCK_MONOTONIC_RAW).  A broken-but-still-listed node would
+    // otherwise churn grab/uinput-create/destroy every ~2 s forever.
+    // Access only from the loop thread (setup + hotplug) — no sync needed.
+    std::unordered_map<std::string, double> path_deny_until_ms_;
+    // P131/BUG-02: same backoff keyed by the stable device_id, so a device
+    // that errored under eventN is not re-grabbed instantly when the kernel
+    // renumbers it to eventM.  Loop thread only.
+    std::unordered_map<std::string, double> dev_deny_until_ms_;
+    // O(1) fd -> device index lookup (avoids linear scan in hot path)
+    std::unordered_map<int, size_t> fd_to_dev_;
+    // Hot-plug retry: wall-clock timestamp (ms, CLOCK_MONOTONIC_RAW) when
+    // the retry window started.  0 means no pending retry.
+    // Accessed only from run_loop() thread; no sync needed.
+    double hotplug_start_ms_ = 0;
+    // Pending hot-plug flag: set by inotify, processed at safe point in loop
+    std::atomic<bool> pending_hotplug_ { false };
+    // Next time to run an empty-device re-scan (ms, CLOCK_MONOTONIC_RAW).
+    // When devices_ is empty (no mice at boot, permission/conflict fixed later),
+    // the loop re-scans every ~2 s instead of giving up — self-healing startup.
+    double empty_rescan_ms_ = 0;
+    // R5-B: at least one candidate mouse failed transiently during the last
+    // scan and is still waiting to be reopened — keep the ~2 s self-heal
+    // rescan running even while other devices are open (declared/read on the
+    // loop thread + written by do_hotplug_scan on the same thread).
+    std::atomic<bool> rescan_needed_ { false };
+
+    // ── P168: HID++ device tracking & notification drain state ─────────────
+    // Only touched from the hidpp thread (no sync needed).
+    // Paths of currently-identified Logitech hidraw devices with their
+    // cached feature maps (post-replug cache is cleared + re-identified).
+    std::vector<hidpp_device> hidpp_devs_;
+    std::set<std::string> non_hidpp_paths_;
+    // shared_ptr, not unique_ptr (O31-D1): a queued HID++ write job holds its
+    // own reference, so an unplug that erases this map entry cannot dangle an
+    // in-flight write on a kernel hidraw fd.  The rescan at daemon.cpp:1693
+    // erases entries freely; with unique_ptr a queued job's pointer died with
+    // the entry.
+    std::unordered_map<std::string, std::shared_ptr<HidppTransport>> hidpp_transports_;
+    double hidpp_rescan_ms_ = 0;    // next hidraw re-scan time
+    double hidpp_drain_ms_  = 0;    // next notification drain time
+
+    // BUG-24 (aj2): merge a HID++ battery event / active query into the single
+    // matching evdev mouse (matched by vid:pid).  Ambiguous matches (several
+    // mice behind one receiver) merge nothing — only log.  Hidpp-worker thread.
+    void apply_hidpp_battery(const hidpp_device& dev, const hidpp_battery_info& b);
+    void apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi);
+
+    /// Find the HID++ transport and device index matching the given evdev mouse.
+    /// Matches by serial number (Unifying receiver) or vendor:product (direct).
+    /// Returns {transport_ptr, device_index} or {nullptr, 0xFF} if no match.
+    ///
+    /// PRECONDITION: the caller must hold hidpp_devs_mutex_.  This function
+    /// deliberately does not lock it itself — see the AB-BA note in its
+    /// definition in daemon.cpp.  Returns an OWNING reference (O31-D1): the
+    /// periodic rescan erases hidpp_transports_ entries, so a bare pointer was
+    /// only valid while that lock was held, and the queued write path outlives
+    /// the lock by design.  An empty shared_ptr means "no transport".
+    std::pair<std::shared_ptr<HidppTransport>, uint8_t>
+    find_hidpp_transport(const mouse_device& dev) const;
+
+    // Guards hidpp_devs_ and hidpp_transports_ against concurrent access from
+    // hidpp_thread_ (poll_hidpp_notifications) and loop_thread_ (find_hidpp_transport).
+    //
+    // LOCK ORDER: hidpp_devs_mutex_ is the OUTER lock, devices_mutex_ the INNER
+    // one — never the reverse.  A path needing both must acquire them with
+    // std::scoped_lock, never by taking devices_mutex_ first and then reaching
+    // for hidpp_devs_mutex_.  The two live threads reach this pair in opposite
+    // orders (loop_thread_'s apply_active_app vs hidpp_thread_'s
+    // poll_hidpp_notifications), so inverting them dead-locks the daemon for
+    // good.  See the comment on find_hidpp_transport in daemon.cpp.
+    mutable std::mutex hidpp_devs_mutex_;
+
+    // ── O31-D1: async HID++ hardware writes ───────────────────────────────
+    // apply_profile() no longer performs set_polling_rate()/set_dpi() inline.
+    // Those are USB round-trips whose worst case is 5.8 s per device (2.6 s
+    // DPI + 3.2 s rate, both hit exactly when the device is not answering),
+    // and the motion loop thread was paying it while holding devices_mutex_
+    // AND hidpp_devs_mutex_ — a full input freeze on a 125 µs frame budget.
+    // It now enqueues a hidpp_hw_job (see include/logitech_hidpp.hpp) and
+    // returns; hidpp_thread_'s drain performs the writes.
+    //
+    // LOCK ORDER: hidpp_wq_mu_ is a LEAF.  It guards the deque and nothing
+    // else — never held while taking devices_mutex_ or hidpp_devs_mutex_, and
+    // never held across a blocking HID++ write.  The enqueue side takes it
+    // while already holding both daemon mutexes, which is safe for a leaf; the
+    // drain pops under it, RELEASES, and only then writes.  Holding it across
+    // the write would stall every other thread exactly as badly as before, and
+    // taking a daemon mutex under it would add a second lock cycle.
+    //
+    // Following the codebase's sticky-flag + sleep-poll convention (the project
+    // uses no condition_variable anywhere): hidpp_wq_pending_ is a hint only —
+    // the worker's cadence shortens when it is set, and a lost wakeup costs at
+    // most one sleep tick, never a dropped job.  Correctness never depends on
+    // the flag, only latency does.
+    std::mutex                hidpp_wq_mu_;
+    std::deque<hidpp_hw_job>  hidpp_wq_;
+    std::atomic<bool>         hidpp_wq_pending_{false};
+    void drain_hidpp_writes();
+
+    // Config push slot: filled by the IPC thread (push_config), consumed by the
+    // loop thread.  push_cfg_ is fully parsed+sanitized before being stored, so
+    // the loop thread never throws on it.
+    std::mutex   push_cfg_mu_;
+    app_config   push_cfg_;
+    bool         push_cfg_pending_ = false;
+
+    // ── R1-11 / TS-3: async config persistence ────────────────────────────
+    // save_config() is disk I/O — never run it on the IPC thread, where a slow
+    // filesystem would stall every client round-trip (GUI save/CLI set-*).
+    // push_config() enqueues (config, path) and returns after the enqueue;
+    // save_thread_ drains the queue and, only after a successful atomic write,
+    // arms the apply slot so the loop thread can live-apply — preserving the
+    // old "persist before apply" ordering.  Save failures are logged by the
+    // worker (the client already got its "accepted" reply).  The codebase
+    // deliberately avoids condition variables (sticky-atomic-flag/sleep-poll
+    // convention), so the worker polls the queue with a bounded sleep and
+    // drains any items still queued when stop() clears running_.
+    std::mutex                                    save_q_mu_;
+    std::deque<std::pair<app_config, std::string>> save_q_;
+    std::thread                                   save_thread_;
+    void save_worker();
+
+    // ── P-APP: per-application profile switching ──────────────────────────
+    // Focused application (WM_CLASS class / cmdline basename, lowercased) as
+    // reported by the GUI over IPC ("set_active_app <app>").  Only ever mutated
+    // on the loop thread; the IPC thread stashes a pending value in the slot
+    // below and the loop consumes it at a safe point (same pattern as the
+    // config push).  Empty = "no focused app reported / desktop matching off".
+    std::mutex   active_app_mu_;
+    std::string  pending_app_;
+    bool         active_app_dirty_ = false;
+    std::string  current_app_;
+
+    // ── PAS-1: top-level use_raw_input master switch ──────────────────────
+    // Previously dormant (parsed + serialized but never read anywhere).  It is
+    // now honored as a global "intercept" gate: when false the daemon does NOT
+    // grab any mouse (devices stay owned by the desktop — raw passthrough at
+    // the OS level), so the flag is no longer misleading.
+    // N-BUG: atomic because a SIGHUP/IPC reload may now flip it on a worker
+    // thread while the loop thread reads it inside setup_devices()/hot-plug.
+    std::atomic<bool> raw_input_enabled_ = true;
+
+    // IPC server state
+    std::thread         ipc_thread_;
+    std::atomic<int>    ipc_sock_fd_  { -1 };  // listening socket (atomic: shared with ipc_thread_)
+    // TH-1: ipc_sock_path_ is a plain std::string mutated by stop_ipc_server(),
+    // which the IPC thread's catch handler and the main thread can both call
+    // (concurrent unlink/clear of the same string is a data race → UB).  A
+    // dedicated mutex serialises the path read+clear; it is never on a hot path.
+    std::mutex          ipc_path_mu_;
+    std::string         ipc_sock_path_;
+    std::atomic<bool>   ipc_running_  { false };
+
+    void ipc_serve_loop(); // runs in ipc_thread_
+    void handle_ipc_client(int client_fd);
+};
+
+} // namespace rawaccel

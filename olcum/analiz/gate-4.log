@@ -1,0 +1,8 @@
+=== SIMD backend parity ===
+    envanter: 26 v2d_* · kapsamlı 16 · canlı 8 · beyan edilmiş ölü 10 (A canlı-özellik-ikizi 2 · B spekülatif 8)
+    envanter denetimi: OK (her v2d_* kapsamlı, canlı ya da beyan edilmiş ölü)
+--- avx2: backend AVX2 ---
+--- sse2: backend SSE2 ---
+--- scalar: backend SCALAR ---
+
+Sonuç: PASS — 3 backend test edildi ve birebir aynı sonucu üretti

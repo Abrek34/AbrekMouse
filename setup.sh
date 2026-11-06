@@ -1,0 +1,665 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# RawAccel Linux — One-shot Setup
+#
+# Tek komutla:
+#   1. Bağımlılıkları otomatik kurar (Arch/CachyOS, Debian/Ubuntu, Fedora)
+#   2. Eski/bozuk kurulumu tamamen temizler (servis durdur, dosya sil)
+#   3. Sıfırdan derler
+#   4. Sistem geneline yükler (binary, servis, udev, polkit, desktop)
+#   5. KDE Plasma (Wayland/X11) için pointer acceleration'ı Flat'e çeker
+#   6. Kullanıcıyı input grubuna ekler, uinput modülünü yükler
+#   7. Servisi başlatır ve durumu raporlar
+#
+# Kullanım:
+#   sudo bash setup.sh             # tam kurulum
+#   sudo bash setup.sh --uninstall # tamamen kaldır
+#   sudo bash setup.sh --reinstall # eski varsa tamamen sil + yeni kur (varsayılan)
+#   sudo bash setup.sh --no-deps   # bağımlılık kurulumunu atla
+#
+# Idempotent: birden fazla çalıştırılabilir, eski sürümün üstüne temiz yazar.
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$SCRIPT_DIR"
+
+# ── Renkler ──────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+    C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[34m'; C_M=$'\e[35m'
+    C_BOLD=$'\e[1m'; C_RESET=$'\e[0m'
+else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_BOLD=""; C_RESET=""
+fi
+say()  { echo "${C_BOLD}${C_B}::${C_RESET} ${C_BOLD}$*${C_RESET}"; }
+ok()   { echo "  ${C_G}✓${C_RESET} $*"; }
+warn() { echo "  ${C_Y}!${C_RESET} $*"; }
+err()  { echo "  ${C_R}✗${C_RESET} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ── Argümanlar ───────────────────────────────────────────────────────────────
+ACTION="install"
+SKIP_DEPS=0
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall|-u)  ACTION="uninstall" ;;
+        --reinstall|-r)  ACTION="install" ;;  # zaten varsayılan: önce sil sonra kur
+        --no-deps)       SKIP_DEPS=1 ;;
+        --help|-h)
+            sed -n '2,20p' "$0"; exit 0 ;;
+        *) die "Bilinmeyen argüman: $arg (--help için bakın)" ;;
+    esac
+done
+
+# ── Root kontrolü ────────────────────────────────────────────────────────────
+[[ $EUID -eq 0 ]] || die "Lütfen sudo ile çalıştırın: sudo bash setup.sh"
+
+# ── Paket çakışma kontrolü ────────────────────────────────────────────────────
+if command -v pacman &>/dev/null && pacman -Qi rawaccel-linux &>/dev/null 2>&1; then
+    warn "Arch paketi rawaccel-linux yüklü (pacman)."
+    warn "setup.sh ile üstüne kurmak /etc/rawaccel/settings.json ve .desktop dosyalarında"
+    warn "çakışmaya neden olur ve paket kurulumunu bozar."
+    warn "Tavsiye ya da: sudo pacman -Rns rawaccel-linux ile kaldırın, ya da sadece paketi kullanın."
+    if [[ -t 0 ]]; then
+        echo "Devam etmek için Enter'a basın (iptal için Ctrl+C)..."
+        read -r _ || true
+    else
+        # L-6: with a closed/non-tty stdin (CI, scripts) `read` returns instantly
+        # and the user is never asked — proceed, but say so loudly instead of a
+        # silent "install continued over the package" surprise.
+        warn "Girdi terminal değil — etkileşimli onay atlandı. Çakışma riskiyle DEVAM EDİLİYOR."
+    fi
+fi
+
+# ── Gerçek kullanıcı ──────────────────────────────────────────────────────────
+REAL_USER="${SUDO_USER:-${USER:-}}"
+if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
+    # /home altındaki ilk normal kullanıcıyı dene
+    REAL_USER=$(getent passwd | awk -F: '$3>=1000 && $3<65000 {print $1; exit}')
+fi
+if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
+    warn "Normal kullanıcı tespit edilemedi; bazı adımlar atlanacak (KDE fix, input grubu)."
+    REAL_USER=""
+    REAL_HOME=""
+else
+    REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+fi
+
+# Run a helper as the desktop user while preserving the session variables that
+# KDE needs.  Prefer runuser over sudo: setup.sh is already root (via pkexec),
+# and sudo may be unavailable/require a TTY in a GUI-launched pkexec session.
+run_as_real_user() {
+    if [[ -z "$REAL_USER" ]]; then return 1; fi
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -m -u "$REAL_USER" -- "$@"
+    else
+        sudo -u "$REAL_USER" \
+            --preserve-env=XDG_CURRENT_DESKTOP,DESKTOP_SESSION,DBUS_SESSION_BUS_ADDRESS,XDG_RUNTIME_DIR \
+            "$@"
+    fi
+}
+
+# ── Distro tespiti ────────────────────────────────────────────────────────────
+DISTRO_ID=""
+if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    DISTRO_ID="${ID:-}${ID_LIKE:+ ${ID_LIKE}}"
+fi
+
+is_arch_like()   { [[ "$DISTRO_ID" =~ (arch|cachyos|manjaro|endeavouros) ]]; }
+is_debian_like() { [[ "$DISTRO_ID" =~ (debian|ubuntu|mint|pop) ]]; }
+is_fedora_like() { [[ "$DISTRO_ID" =~ (fedora|rhel|centos|nobara) ]]; }
+
+# ── 1) Bağımlılıklar ─────────────────────────────────────────────────────────
+install_deps() {
+    if [[ $SKIP_DEPS -eq 1 ]]; then warn "--no-deps verildi, bağımlılık kurulumu atlandı."; return; fi
+    say "[1/7] Bağımlılıklar kuruluyor..."
+    if is_arch_like; then
+        ok "Arch/CachyOS tespit edildi → pacman"
+        # P121/BUG-08: "-Sy" tek başına kısmi yükseltmeye (partial upgrade)
+        # yol açar — paket veritabanı ilerletilir ama sistemin geri kalanı eski
+        # kütüphanelerde kalır (ABI uyumsuzluğu riski). P131: veritabanını
+        # HİÇ senkronlamıyoruz; yalnızca kurulum yapan "-S" kullanılır.
+        if [[ ${SKIP_SYSUPGRADE_WARN:-0} -ne 1 ]]; then
+            warn "Kurulum paket veritabanını güncellemez (kısmi yükseltme yok)."
+            warn "Paket bulunamaz/versiyon uyuşmazsa önce: sudo pacman -Syu"
+            warn "sonra bu kurulumu tekrar çalıştırın."
+            warn "Bu uyarıyı atlamak için: SKIP_SYSUPGRADE_WARN=1 bash setup.sh"
+        fi
+        # qt6-tools: qdbus6 → KDE Plasma 6 canlı reconfigure
+        pacman -S --needed --noconfirm \
+            base-devel cmake pkgconf libevdev gtk4 polkit systemd python \
+            qt6-tools
+    elif is_debian_like; then
+        ok "Debian/Ubuntu tespit edildi → apt"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        # M-6: qt6-tools-dev-tools (qdbus6) yalnızca Ubuntu ≥ 24.04 /
+        # Debian ≥ 13'tedir; 20.04/22.04'te "Unable to locate package" verir ve
+        # set -e altında kurulumu tamamen öldürürdü.  Çekirdek bağımlılıklar ÖNCE
+        # (qt6 hariç) ayrı kurulur, qt6 paketi ayrı bir turda kapılanır: önce
+        # qt6-tools-dev-tools, bulunamazsa qt6-tools, o da yoksa yalnızca uyarı
+        # (KDE canlı reconfigure devre dışı kalır, kurulum yine de sürer).
+        apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libevdev-dev libgtk-4-dev \
+            libpolkit-gobject-1-dev systemd udev policykit-1 python3
+        if ! apt-get install -y --no-install-recommends qt6-tools-dev-tools; then
+            warn "qt6-tools-dev-tools yok (Ubuntu < 24.04 / Debian < 13) — qt6-tools deneniyor."
+            if ! apt-get install -y --no-install-recommends qt6-tools; then
+                warn "qt6-tools da kurulamadı — KDE canlı reload (qdbus6) eksik kalacak."
+                warn "GUI'deki 'Fix Now' düğmesi yine çalışır, sadece anlık KWin yeniden yükleme atlanır."
+            fi
+        fi
+    elif is_fedora_like; then
+        ok "Fedora/RHEL tespit edildi → dnf"
+        # qt6-qttools sağlar: qdbus-qt6
+        # make: base-devel/build-essential karşılığı; gcc-c++ make'i çekmez —
+        # minimal Fedora'da build.sh:67 depend'sini verification durdurmasın.
+        dnf install -y \
+            gcc-c++ make cmake pkgconf-pkg-config libevdev-devel gtk4-devel \
+            polkit polkit-devel systemd python3 \
+            qt6-qttools
+    else
+        warn "Bilinmeyen dağıtım ($DISTRO_ID); el ile şu paketleri kurun:"
+        warn "  g++/clang++, make, cmake, pkg-config, libevdev (devel), gtk4 (devel),"
+        warn "  systemd, polkit, python3, qt6-tools (qdbus6; KDE fix için)"
+        warn "Devam etmek için Enter'a basın..."
+        read -r _ || true
+    fi
+
+    # ── Tam doğrulama: herhangi biri eksikse "bağımlılık hatası" görmeden
+    #    kurulumu açık mesajla durdur. GUI dahil HER ŞEY kurulacak.
+    say "Kurulu araçlar/kütüphaneler doğrulanıyor..."
+    command -v g++     >/dev/null || command -v clang++ >/dev/null \
+        || die "C++ derleyici yok. Kurun: gcc"
+    command -v make    >/dev/null || die "make yok. Kurun: make (base-devel/build-essential)"
+    command -v cmake   >/dev/null || die "cmake yok. Kurun: cmake"
+    command -v pkg-config >/dev/null || command -v pkgconf >/dev/null \
+        || die "pkg-config yok. Kurun: pkg-config"
+    command -v python3 >/dev/null \
+        || warn "python3 yok — KDE fix (kwinrc düzenleme) çalışmayacak."
+    pkg-config --exists libevdev \
+        || die "libevdev devel paketi eksik. Kurun: libevdev (Arch) / libevdev-dev (Debian) / libevdev-devel (Fedora)"
+    pkg-config --exists gtk4 \
+        || die "gtk4 devel paketi eksik — GUI DERLENEMEZ. Kurun: gtk4 (Arch) / libgtk-4-dev (Debian) / gtk4-devel (Fedora)"
+    # M-6: KDE canlı reconfigure aracı — Plasma 6'da qdbus6, Plasma 5'te qdbus.
+    # İkisi de eksikse canlı reload çalışmaz; kurulumu durdurmaz (yalnız uyarı).
+    if command -v qdbus6 >/dev/null 2>&1 || command -v qdbus >/dev/null 2>&1; then
+        ok "qdbus doğrulandı (KDE canlı reconfigure)."
+    else
+        warn "qdbus6/qdbus bulunamadı — KDE canlı reconfigure devre dışı."
+        warn "Kur: Arch 'qt6-tools', Ubuntu ≥ 24.04 'qt6-tools-dev-tools', Fedora 'qt6-qttools'."
+        warn "Kuruluma devam ediliyor (yalnız KDE anlık yeniden yükleme eksik)."
+    fi
+    ok "Tüm bağımlılıklar mevcut."
+}
+
+# ── 2) Eski kurulumu temizle ──────────────────────────────────────────────────
+clean_old_install() {
+    say "[2/7] Eski kurulum temizleniyor (varsa)..."
+
+    # Servisi durdur ve devre dışı bırak (varsa)
+    if systemctl list-unit-files 2>/dev/null | grep -q '^rawaccel\.service'; then
+        systemctl stop rawaccel.service 2>/dev/null || true
+        systemctl disable rawaccel.service 2>/dev/null || true
+        ok "Eski servis durduruldu ve devre dışı bırakıldı."
+    fi
+
+    # Çalışan daemon süreçlerini öldür (servis dışı manuel başlatılmış olabilir)
+    pkill -TERM -x rawaccel-daemon 2>/dev/null || true
+    sleep 0.3
+    pkill -KILL -x rawaccel-daemon 2>/dev/null || true
+
+    # Açık GUI'leri kapat (eski binary çalışır halde olabilir)
+    pkill -TERM -x rawaccel-gui 2>/dev/null || true
+    sleep 0.3
+    pkill -KILL -x rawaccel-gui 2>/dev/null || true
+
+    # PID/socket dosyalarını temizle — XDG runtime dizinleri dahil.  Reinstall
+    # sırasında /run/user/$UID altında kalan bayat kilit yeni daemon'ı
+    # "zaten çalışıyor" gibi gösterebiliyordu (T52-05).
+    shopt -s nullglob
+    for d in /run/user/*; do
+        rm -f "$d/rawaccel.pid" "$d/rawaccel.sock" 2>/dev/null || true
+    done
+    shopt -u nullglob
+    rm -f /run/rawaccel.pid /run/rawaccel.sock /tmp/rawaccel.pid /tmp/rawaccel.sock 2>/dev/null || true
+
+    # Eski binary, servis, udev, desktop dosyaları (+ PKGBUILD yolları,
+    # + setup.sh tarafından kurulan quirks/modprobe dosyaları)
+    local files=(
+        /usr/local/bin/rawaccel-daemon
+        /usr/local/bin/rawaccel-cli
+        /usr/local/bin/rawaccel-gui
+        /usr/bin/rawaccel-daemon
+        /usr/bin/rawaccel-cli
+        /usr/bin/rawaccel-gui
+        /etc/systemd/system/rawaccel.service
+        /etc/systemd/user/rawaccel.service
+        /usr/lib/systemd/system/rawaccel.service
+        /etc/udev/rules.d/99-rawaccel.rules
+        /usr/lib/udev/rules.d/99-rawaccel.rules
+        /etc/modules-load.d/rawaccel.conf
+        /usr/lib/modules-load.d/rawaccel.conf   # PKGBUILD kurulum yolu (R7-UNMLU)
+        /etc/modprobe.d/rawaccel.conf
+        /usr/share/libinput/50-rawaccel.quirks
+        /usr/share/applications/rawaccel.desktop
+    )
+    # 0.6.4 (BUG-02): polkit policy (+rules) etkisizdi — pkexec özel action
+    # desteklemez. Kuruluysa temizle:
+    files+=(
+        /usr/share/polkit-1/actions/org.rawaccel.policy
+        /usr/share/polkit-1/rules.d/49-rawaccel.rules
+    )
+    # M-1: user-level binaries shadow the system ones on PATH and live on
+    # after upgrade, making "already fixed" bugs look unfixed.
+    if [[ -n "$REAL_HOME" ]]; then
+        rm -f "$REAL_HOME/.local/bin/rawaccel-daemon" \
+              "$REAL_HOME/.local/bin/rawaccel-cli" \
+              "$REAL_HOME/.local/bin/rawaccel-gui" 2>/dev/null || true
+        # T52-06: an old user-level unit shadows the system unit on login and
+        # can start a second daemon.  Remove the generated unit, not arbitrary
+        # user files.
+        rm -f "$REAL_HOME/.config/systemd/user/rawaccel.service" 2>/dev/null || true
+    fi
+    # M-1: also every homedir (in case of multi-user boxes).
+    # nullglob: a literal /home/* must not be iterated when /home is empty/missing.
+    shopt -s nullglob
+    for home in /home/*; do
+        [[ "$home" == "$REAL_HOME" ]] && continue
+        rm -f "$home/.local/bin/rawaccel-daemon" \
+              "$home/.local/bin/rawaccel-cli" \
+              "$home/.local/bin/rawaccel-gui" 2>/dev/null || true
+        rm -f "$home/.config/systemd/user/rawaccel.service" 2>/dev/null || true
+    done
+    shopt -u nullglob
+    rm -f /root/.config/systemd/user/rawaccel.service 2>/dev/null || true
+    for f in "${files[@]}"; do
+        [[ -e "$f" ]] && rm -f "$f" && ok "Silindi: $f"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+}
+
+# ── 3) Build ──────────────────────────────────────────────────────────────────
+build_project() {
+    say "[3/7] Derleniyor..."
+    [[ -x "$ROOT/scripts/build.sh" ]] || die "scripts/build.sh bulunamadı."
+    # Mümkünse gerçek kullanıcı olarak derle (build-manual root'a ait olmasın).
+    # Ama repo dizini bu kullanıcıya yazılabilir değilse root olarak dene —
+    # kurulum "bağımlılık / izin hatası" yüzünden yarıda kalmasın.
+    # M-BUG-19: bu noktada zaten root'uz, o yüzden `${ROOT}` üzerinde
+    # `[[ -w ]]` her zaman true döner (root her yere yazabilir) ve test asla
+    # gerçek kullanıcının iznini ölçmez.  İzni gerçek kullanıcı adıyla sor.
+    if [[ -n "$REAL_USER" ]] && sudo -n -u "$REAL_USER" true 2>/dev/null && \
+       sudo -n -u "$REAL_USER" test -w "$ROOT" 2>/dev/null; then
+        sudo -u "$REAL_USER" bash "$ROOT/scripts/build.sh"
+    else
+        warn "Gerçek kullanıcı olarak derlenemiyor; root olarak derleniyor."
+        bash "$ROOT/scripts/build.sh"
+    fi
+    [[ -x "$ROOT/build-manual/rawaccel-daemon" ]] || die "Build başarısız."
+}
+
+# ── 4) Yeni kurulum ───────────────────────────────────────────────────────────
+do_install() {
+    say "[4/7] Sistem dosyaları yükleniyor..."
+
+    install -Dm755 "$ROOT/build-manual/rawaccel-daemon" /usr/bin/rawaccel-daemon
+    install -Dm755 "$ROOT/build-manual/rawaccel-cli"    /usr/bin/rawaccel-cli
+    [[ -f "$ROOT/build-manual/rawaccel-gui" ]] && \
+        install -Dm755 "$ROOT/build-manual/rawaccel-gui" /usr/bin/rawaccel-gui
+
+    # System config
+    install -d -m755 /etc/rawaccel
+    if [[ ! -f /etc/rawaccel/settings.json ]]; then
+        # T52-10: install explicitly sets mode/owner instead of inheriting the
+        # caller's umask from cp.
+        install -Dm644 -o root -g root "$ROOT/config/default.json" \
+            /etc/rawaccel/settings.json
+        ok "Varsayılan config yazıldı: /etc/rawaccel/settings.json"
+    else
+        ok "Mevcut config korundu: /etc/rawaccel/settings.json"
+    fi
+
+    # Kullanıcı configi varsa, sistem config olarak da kopyala (daemon görsün).
+    # Mevcut /etc/rawaccel/settings.json'ı timestamp'li yedeğe alıp üzerine yaz —
+    # böylece "kullanıcı configi sistem configini sessizce ezdi" sürprizini önler.
+    if [[ -n "$REAL_HOME" && -f "$REAL_HOME/.config/rawaccel/settings.json" ]]; then
+        local user_cfg="$REAL_HOME/.config/rawaccel/settings.json"
+        if [[ -h "$user_cfg" ]]; then
+            warn "Kullanıcı config sembolik bağlantı (symlink), güvenlik nedeniyle atlanıyor."
+        elif [[ ! -f "$user_cfg" ]]; then
+            warn "Kullanıcı config geçerli bir dosya değil, atlanıyor."
+        else
+            # SEC-4: validate ownership of user config before copying to system location
+            local cfg_uid=$(stat -c %u "$user_cfg" 2>/dev/null || echo "")
+            local real_uid=$(id -u "$REAL_USER" 2>/dev/null || echo "")
+            if [[ -z "$cfg_uid" || -z "$real_uid" ]]; then
+                # T52-10: an unverifiable owner is fail-closed.  The old
+                # condition only compared non-empty values, so a failed stat/id
+                # silently copied the file to /etc as root.
+                warn "Kullanıcı config sahipliği doğrulanamadı (cfg_uid=${cfg_uid:-?}, real_uid=${real_uid:-?}), güvenlik nedeniyle atlanıyor."
+            elif [[ "$cfg_uid" != "$real_uid" ]]; then
+                warn "Kullanıcı config sahipliği uyuşmuyor (cfg_uid=$cfg_uid, real_uid=$real_uid), güvenlik nedeniyle atlanıyor."
+            else
+                if [[ -f /etc/rawaccel/settings.json ]] && \
+                   ! cmp -s "$user_cfg" /etc/rawaccel/settings.json; then
+                    # BS-6/L-7: %S-second granularity — two runs in the same second
+                    # silently overwrote the previous backup.  Append the PID so the
+                    # name is unique even within the same second.
+                    local backup="/etc/rawaccel/settings.json.bak.$(date +%Y%m%d-%H%M%S).$$"
+                    cp /etc/rawaccel/settings.json "$backup"
+                    warn "Mevcut sistem config farklı; yedeklendi: $backup"
+                fi
+                install -Dm644 -o root -g root "$user_cfg" /etc/rawaccel/settings.json
+                ok "Kullanıcı config /etc/rawaccel/'a senkronlandı."
+            fi
+        fi
+    fi
+
+    # uinput modülü.  T52-07: a minimal container may not have
+    # /etc/modules-load.d; do not let set -e abort a half-finished install.
+    if mkdir -p /etc/modules-load.d 2>/dev/null &&
+       echo "uinput" > /etc/modules-load.d/rawaccel.conf 2>/dev/null; then
+        :
+    else
+        warn "/etc/modules-load.d/rawaccel.conf yazılamadı (container/CI?)."
+    fi
+    modprobe uinput 2>/dev/null || warn "uinput modülü yüklenemedi (yeniden başlatma gerekebilir)."
+
+    # udev kuralı
+    install -Dm644 "$ROOT/scripts/99-rawaccel.rules" /etc/udev/rules.d/99-rawaccel.rules
+    # BS-7: `udevadm control`/`trigger` sistemde udev yokken (container/CI,
+    # systemd-less chroot) fail eder ve `set -eo pipefail` altında tüm kurulumu
+    # abort ederdi.  Kural dosyası zaten yerinde; reload/trigger yalnızca
+    # çalışan bir udev'in kuralları hemen yeniden okumasını istiyor — bu adım
+    # sessizce atlanabilir (bir sonraki udev trigger/reboot'ta otomatik uygulanır).
+    udevadm control --reload-rules 2>/dev/null || \
+        warn "udevadm control başarısız (container/CI?). 264u kuralı reboot'ta uygulanır."
+    # SH-4: selectorless `udevadm trigger` replays the full system device
+    # inventory (thousands of events, pointless churn).  The rules installed
+    # here concern input devices AND the Logitech HID++ hidraw nodes (GUI/CLI
+    # onboard DPI/rate control) — scope the trigger to both subsystems.
+    udevadm trigger --subsystem-match=input --action=change 2>/dev/null || \
+        warn "udevadm trigger başarısız (container/CI?). Mekanik cihazlar ulaşılabilir olmayabilir."
+    udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || \
+        warn "udevadm trigger (hidraw) başarısız (container/CI?). HID++ erişimi reboot'ta uygulanır."
+    # T52-08: /dev/uinput is a misc device, not input/hidraw.  Without this
+    # trigger the 99-rawaccel.rules uinput permission only applies after a
+    # reboot/replug.
+    udevadm trigger --subsystem-match=misc --action=change 2>/dev/null || \
+        warn "udevadm trigger (misc/uinput) başarısız (container/CI?). uinput izni reboot'ta uygulanır."
+
+    # libinput quirk: RawAccel sanal cihazını "trackball" olarak işaretle.
+    # Use a dedicated vendor-style file so existing local overrides are never
+    # overwritten or removed by install/uninstall.
+    # → libinput kendi accel curve'ünü uygulamaz (ModelTrackball=1 → flat default).
+    # Compositor-agnostik: KDE/GNOME/sway/X11 hepsi libinput kullanıyor.
+    install -Dm644 "$ROOT/scripts/rawaccel.quirks" \
+        /usr/share/libinput/50-rawaccel.quirks
+    ok "libinput quirk yüklendi: /usr/share/libinput/50-rawaccel.quirks"
+
+    # NB: polkit action/rules yok (0.6.4, BUG-02).  pkexec özel action
+    # (--action) desteklemez — org.freedesktop.policykit.exec kullanır — bu
+    # yüzden org.rawaccel.daemon.start politika + 49-rawaccel.rules ölü koddan
+    # ibaretti ve "input grubu şifresiz yetkili" iddiası fiilen hiçbir şey
+    # yapmıyordu. GUI düz `pkexec rawaccel-daemon` çalıştırır.
+
+    # desktop entry
+    [[ -f "$ROOT/build-manual/rawaccel-gui" ]] && \
+        install -Dm644 "$ROOT/scripts/rawaccel.desktop" \
+            /usr/share/applications/rawaccel.desktop
+
+    # systemd servis → /usr/lib/systemd/system'e kur (/etc'de gölgeleme yapmaz)
+    install -Dm644 "$ROOT/scripts/rawaccel.service" /usr/lib/systemd/system/rawaccel.service
+    # BS-7 pattern: a systemd-less chroot/container has no PID1 to reload and
+    # `set -eo pipefail` turns that into a hard install abort (the unit file is
+    # already in place; a later systemctl/reboot picks it up).  Mirror the
+    # udevadm guard above.
+    systemctl daemon-reload 2>/dev/null || \
+        warn "systemctl daemon-reload başarısız (systemd-less ortam?). Servis reboot'ta tanınır."
+
+    # SH-3: a leftover USER-level unit (an earlier --user install) runs a
+    # second rawaccel daemon in the user session and silently shadows the
+    # system service.  Warn instead of silently uninstalling the user's copy.
+    if [[ -f /etc/systemd/user/rawaccel.service ]] || \
+       [[ -n "$REAL_HOME" && -f "$REAL_HOME/.config/systemd/user/rawaccel.service" ]]; then
+        warn "Kullanıcı seviyesi rawaccel.service mevcut (kullanıcı oturumunda ikinci bir daemon)."
+        warn "Sistem servisiyle çakışır — kaldırın: systemctl --user disable --now rawaccel; rm /etc/systemd/user/rawaccel.service (veya ~/.config/systemd/user/rawaccel.service)"
+    fi
+
+    # input grubu
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+        if id -nG "$REAL_USER" | grep -qw input; then
+            ok "$REAL_USER zaten 'input' grubunda."
+        elif ! getent group input >/dev/null 2>&1; then
+            warn "'input' grubu yok — kullanıcı gruba eklenemedi (container/CI?)."
+        elif usermod -aG input "$REAL_USER" 2>/dev/null; then
+            ok "$REAL_USER 'input' grubuna eklendi (oturum açıp kapatmanız gerek)."
+        else
+            # T52-07: a missing/immutable group must not abort the install
+            # after binaries and config have already landed.
+            warn "$REAL_USER 'input' grubuna eklenemedi — /dev/input izinlerini elle kontrol edin."
+        fi
+    fi
+
+    ok "Sistem dosyaları yüklendi."
+}
+
+# ── 5) Servisi başlat ─────────────────────────────────────────────────────────
+# Servis önce başlamalı ki "RawAccel" sanal uinput cihazı oluşsun;
+# KDE fix adımı bu sanal cihaz için per-device override yazacak.
+start_service() {
+    say "[5/7] Servis başlatılıyor..."
+    # A previous unit can be in start-limit-hit after a failed upgrade; clear
+    # the failed state so a repaired unit is allowed to start immediately.
+    systemctl reset-failed rawaccel.service 2>/dev/null || true
+    # H-1: with `set -euo pipefail` an unbounded `systemctl enable --now`
+    # would abort the whole install on any service problem (bad config,
+    # blocked uinput…) and dead-code the graceful warning below.  Fail
+    # soft: warn, then let verify_install/report the final status.
+    if ! systemctl enable --now rawaccel.service; then
+        warn "Servis başlatılamadı — kuruluma devam ediliyor; günlük: journalctl -u rawaccel -n 50"
+        return 0
+    fi
+    sleep 2 # virtual device'ın evdev/proc'a yansıması için kısa bekle
+    if systemctl is-active --quiet rawaccel.service; then
+        ok "Servis ÇALIŞIYOR."
+    else
+        warn "Servis başlatılamadı — günlüğü inceleyin: journalctl -u rawaccel -n 50"
+    fi
+}
+
+# ── 6) KDE Plasma fix (Wayland/X11) ──────────────────────────────────────────
+# Hem global [Libinput] hem de RawAccel sanal cihazı için per-device override
+# yazar. KDE Plasma 6 per-device sections (ör. [Libinput][3][1133][50498][...])
+# global ayarı override eder — ikisini birden yazmazsak çift hızlanma yaşanır.
+fix_kde_plasma() {
+    say "[6/7] KDE Plasma kontrolü..."
+    if [[ -z "$REAL_HOME" ]]; then warn "Kullanıcı yok, KDE fix atlandı."; return; fi
+
+    local kwinrc="$REAL_HOME/.config/kwinrc"
+    local is_kde=0
+    if [[ -f "$kwinrc" ]] || command -v plasmashell &>/dev/null \
+        || command -v kwin_wayland &>/dev/null || command -v kwin_x11 &>/dev/null; then
+        is_kde=1
+    fi
+    if [[ $is_kde -eq 0 ]]; then
+        warn "KDE Plasma tespit edilmedi — atlandı."
+        return
+    fi
+
+    ok "KDE Plasma tespit edildi."
+    # kde-fix-accel.sh global + per-device override yazar; gerçek kullanıcı olarak
+    # çalıştırılmalı (kwinrc kullanıcının ev dizininde, sahibinin user olması lazım).
+    if [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
+        # H-3: without XDG_CURRENT_DESKTOP/DESKTOP_SESSION/
+        # DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR the KDE detection and live
+        # KWin reload are silently skipped.  run_as_real_user preserves them
+        # and, unlike sudo, works without a TTY under a pkexec GUI launch.
+        if ! run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --fix; then
+            # KWin can be writing kwinrc while the first attempt runs (the
+            # installer starts KDE right after the service); one short retry
+            # avoids a spurious "fix failed" report on an otherwise healthy
+            # session.
+            warn "kde-fix-accel.sh ilk denemede başarısız — yeniden deneniyor..."
+            sleep 1
+            run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --fix \
+                || warn "kde-fix-accel.sh hata verdi"
+        fi
+    else
+        warn "scripts/kde-fix-accel.sh bulunamadı; KDE fix atlandı."
+    fi
+}
+
+# ── 7) Özet ───────────────────────────────────────────────────────────────────
+verify_install() {
+    say "Kurulum doğrulanıyor..."
+    local missing=0
+    for b in rawaccel-daemon rawaccel-cli; do
+        if command -v "$b" >/dev/null 2>&1; then ok "Binary mevcut: $(command -v "$b")"
+        else err "Binary EKSİK: $b"; missing=1; fi
+    done
+    # rawaccel-gui is optional (requires GTK4 at build time). Only check if it was built.
+    if [[ -f "$ROOT/build-manual/rawaccel-gui" ]]; then
+        if command -v rawaccel-gui >/dev/null 2>&1; then ok "Binary mevcut: $(command -v rawaccel-gui)"
+        else err "Binary EKSİK: rawaccel-gui"; missing=1; fi
+    else
+        ok "GUI atlandı (GTK4 build-time dependency not met)"
+    fi
+    [[ -f /etc/rawaccel/settings.json ]]   && ok "Config: /etc/rawaccel/settings.json" || { err "Config EKSİK"; missing=1; }
+    # udev: accept EITHER install path (setup.sh installs /etc/udev/rules.d,
+    # the PKGBUILD/pacman package installs /usr/lib/udev/rules.d — a system
+    # provisioned only via the package would otherwise false-negative as
+    # "EKSİK").  Content-check whichever copy is present (hidraw rule).
+    local udev_rule=""
+    if [[ -f /etc/udev/rules.d/99-rawaccel.rules ]]; then
+        udev_rule=/etc/udev/rules.d/99-rawaccel.rules
+    elif [[ -f /usr/lib/udev/rules.d/99-rawaccel.rules ]]; then
+        udev_rule=/usr/lib/udev/rules.d/99-rawaccel.rules
+    fi
+    if [[ -n "$udev_rule" ]]; then
+        [[ -s "$udev_rule" ]] || { err "udev kuralı BOŞ: $udev_rule"; missing=1; }
+        grep -q "KERNEL==\"hidraw\*" "$udev_rule" \
+            || { err "udev kuralı GÜNCEL DEĞİL (hidraw eksik): $udev_rule"; missing=1; }
+        [[ $missing -eq 1 ]] || ok "udev kuralı mevcut (uinput+hidraw): $udev_rule"
+    else err "udev kuralı EKSİK (ne /etc ne /usr/lib): 99-rawaccel.rules"; missing=1; fi
+    [[ -f /usr/share/libinput/50-rawaccel.quirks ]] && ok "libinput quirk mevcut" || { err "libinput quirk EKSİK"; missing=1; }
+    if systemctl is-active --quiet rawaccel.service; then ok "Servis ÇALIŞIYOR"
+    else err "Servis ÇALIŞMIYOR — journalctl -u rawaccel -n 50"; missing=1; fi
+    if [[ -n "$REAL_USER" ]] && id -nG "$REAL_USER" | grep -qw input; then
+        ok "$REAL_USER 'input' grubunda"
+    elif [[ -n "$REAL_USER" ]]; then
+        warn "$REAL_USER henüz 'input' grubunda değil (çıkış-giriş gerekir)"
+    fi
+    echo ""
+    if [[ $missing -eq 1 ]]; then
+        err "Yukarıda EKSİK işaretli öğeler var — lütfen tekrar gözden geçirin."
+        echo "(Çoğu durumda: sudo bash setup.sh --reinstall)"
+    else
+        ok "Her şey yerinde — kurulum EKSİKSİZ."
+    fi
+}
+
+print_summary() {
+    say "[7/7] Kurulum tamamlandı."
+    echo ""
+    verify_install
+    echo ""
+    # KDE Plasma 6 için tek-seferlik manuel adım (mimari sınır)
+    if command -v kwin_wayland &>/dev/null || command -v plasmashell &>/dev/null; then
+        echo "${C_BOLD}${C_Y}═══════════════════════════════════════════════════════════════${C_RESET}"
+        echo "${C_BOLD}${C_Y}  ÖNEMLİ — KDE Plasma 6 için TEK SEFERLİK manuel adım${C_RESET}"
+        echo "${C_BOLD}${C_Y}═══════════════════════════════════════════════════════════════${C_RESET}"
+        echo ""
+        echo "  KDE, yeni keşfedilen sanal mouse'a kendi acceleration'ını uyguluyor."
+        echo "  Bunu kapatmak için ${C_BOLD}bir kere${C_RESET} şu adımı yapın:"
+        echo ""
+        echo "    1. ${C_BOLD}System Settings → Fare ve Dokunmatik Yüzey${C_RESET}"
+        echo "    2. Aygıt seç → ${C_BOLD}\"... (RawAccel)\"${C_RESET}"
+        echo "    3. ${C_BOLD}\"İşaretçi ivmelendirmesini etkinleştir\"${C_RESET} → AÇ → KAPAT → Uygula"
+        echo ""
+        echo "  Bu ayar ${C_BOLD}kalıcıdır${C_RESET} — reboot/restart sonrası kaybolmaz."
+        echo "  RawAccel zaten doğru kcminputrc'yi yazdı, KWin'in okumasını"
+        echo "  bir kere tetiklemek için bu manuel toggle gerekiyor."
+        echo ""
+        echo "${C_BOLD}${C_Y}═══════════════════════════════════════════════════════════════${C_RESET}"
+        echo ""
+    fi
+    echo "${C_BOLD}Komutlar:${C_RESET}"
+    echo "  rawaccel-gui              — GUI'yi aç"
+    echo "  rawaccel-cli list         — profilleri listele"
+    echo "  rawaccel-cli --help       — CLI yardım"
+    echo ""
+    echo "${C_BOLD}Servis kontrolü:${C_RESET}"
+    echo "  systemctl status rawaccel"
+    echo "  journalctl -u rawaccel -f"
+    echo ""
+    echo "${C_BOLD}Config:${C_RESET}"
+    echo "  /etc/rawaccel/settings.json       (servis kullanıyor)"
+    echo "  ~/.config/rawaccel/settings.json  (GUI kullanıyor)"
+    echo ""
+    if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]] && ! id -nG "$REAL_USER" | grep -qw input; then
+        warn "$REAL_USER 'input' grubuna eklendi ama mevcut oturumda etkin değil."
+        warn "Bir kez ${C_BOLD}çıkış-giriş${C_RESET} yapın (veya yeniden başlatın)."
+        echo ""
+    fi
+    echo "${C_BOLD}Servis durumu:${C_RESET}"
+    systemctl status rawaccel --no-pager 2>&1 | head -8 || true
+}
+
+# ── Uninstall yolu ────────────────────────────────────────────────────────────
+do_uninstall() {
+    say "Kaldırılıyor..."
+    clean_old_install
+    # P121/BUG-09: setup.sh --uninstall ve scripts/uninstall.sh artık aynı
+    # davranıyor — /etc/rawaccel (kullanıcı configi) KORUNUR, silinmez.
+    # "Tamamen silmek için: rm -rf /etc/rawaccel" notu yazılır.
+    # XDG_RUNTIME_DIR socket/pid izleri (PID önceliği: $XDG_RUNTIME_DIR →
+    # /run → /tmp; /run/user/$UID altında kalıyordu).
+    shopt -s nullglob
+    for d in /run/user/*; do
+        rm -f "$d/rawaccel.pid" "$d/rawaccel.sock" 2>/dev/null || true
+    done
+    shopt -u nullglob
+    # KDE kwinrc izleri: per-device (RawAccel) override bölümlerini kaldır ve
+    # global [Libinput]'i adaptive'e döndür (kde-fix-accel.sh --remove).
+    if [[ -n "$REAL_USER" ]] && [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
+        # H-3: preserve the session env so kwinrc detection + D-Bus reload work.
+        run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
+            || warn "kwinrc iz temizliği hata verdi (önemsiz)."
+    fi
+    ok "Kaldırma tamamlandı. Kullanıcı configi (~/.config/rawaccel + /etc/rawaccel) korundu."
+    echo "  /etc/rawaccel'i da silmek için: sudo rm -rf /etc/rawaccel"
+    if [[ -n "$REAL_HOME" ]]; then
+        echo "  Tamamen silmek için: rm -rf $REAL_HOME/.config/rawaccel"
+    fi
+}
+
+# ── Akış ──────────────────────────────────────────────────────────────────────
+echo ""
+echo "${C_BOLD}${C_M}╔═══════════════════════════════════════════════╗${C_RESET}"
+echo "${C_BOLD}${C_M}║        RawAccel Linux — Otomatik Kurulum     ║${C_RESET}"
+echo "${C_BOLD}${C_M}╚═══════════════════════════════════════════════╝${C_RESET}"
+echo "  Distro: ${DISTRO_ID:-unknown}    Kullanıcı: ${REAL_USER:-(yok)}"
+echo "  İşlem : $ACTION"
+echo ""
+
+if [[ "$ACTION" == "uninstall" ]]; then
+    do_uninstall
+    exit 0
+fi
+
+# M-BUG-20: build before cleaning.  The old order cleaned the previous
+# install (removing /usr/bin binaries and stopping the service) and THEN
+# built; any build failure left the system with no RawAccel at all.  Building
+# first keeps the old install working until the new one is verified.
+install_deps
+build_project
+clean_old_install   # eski/bozuk varsa tamamen temizle (build zaten başarılı)
+do_install
+start_service       # servis önce başlasın → sanal RawAccel cihazı oluşsun
+fix_kde_plasma      # sonra per-device kwinrc override yazılsın
+print_summary
