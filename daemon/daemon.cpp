@@ -1322,7 +1322,8 @@ void AccelDaemon::apply_profile(mouse_device& dev, const device_profile& prof) {
 
     // O6: reference uses input_dpi_normalization_factor = NORMALIZED_DPI / dpi
     // (true inches/s input speed); previously (dpi/NORMALIZED_DPI) was inverted.
-    dev.dpi_factor = NORMALIZED_DPI / dev.dpi; // R13-perf: pre-compute
+    dev.telemetry->dpi_factor.store(NORMALIZED_DPI / dev.dpi,
+                                    std::memory_order_relaxed); // R13-perf: pre-compute
     dev.settings.prof = prof.prof;
     init_settings(dev.settings);
     // SM-5: reconfigure (not init) — a running smoother keeps its EMA state so
@@ -1925,9 +1926,9 @@ void AccelDaemon::drain_hidpp_writes() {
 /// serial number — match by that instead.  When several mice share the same
 /// identifier we deliberately label nothing rather than risk painting the wrong
 /// device; the reading is still logged.
-void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
-                                      const hidpp_battery_info& b) {
-    if (b.level == 255) return; // unknown level — nothing meaningful to merge
+std::string AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
+                                             const hidpp_battery_info& b) {
+    if (b.level == 255) return {}; // unknown level — nothing meaningful to merge
 
     std::string needle;
     // Prefer the HID++ device's serial number (mouse's serial) for matching,
@@ -1941,33 +1942,37 @@ void AccelDaemon::apply_hidpp_battery(const hidpp_device& dev,
         needle = buf;
     }
 
-    std::lock_guard<std::mutex> lk(devices_mutex_);
-    mouse_device* match = nullptr;
-    int match_count = 0;
-    for (auto& m : devices_) {
-        if (m.device_id.find(needle) != std::string::npos) {
-            match = &m;
-            match_count++;
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(devices_mutex_);
+        mouse_device* match = nullptr;
+        int match_count = 0;
+        for (auto& m : devices_) {
+            if (m.device_id.find(needle) != std::string::npos) {
+                match = &m;
+                match_count++;
+            }
+        }
+        if (match_count == 1) {
+            if (match->detected_battery != static_cast<int>(b.level)) {
+                match->detected_battery = static_cast<int>(b.level);
+                msg = "HID++ battery: " + match->name + " = " +
+                      std::to_string(static_cast<int>(b.level)) + "%";
+            }
+        } else if (match_count == 0) {
+            msg = "HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
+                  "% (no evdev mouse matched id " + needle + ")";
+        } else {
+            msg = "HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
+                  "% (multiple mice share id " + needle + " — not merged)";
         }
     }
-    if (match_count == 1) {
-        if (match->detected_battery != static_cast<int>(b.level)) {
-            match->detected_battery = static_cast<int>(b.level);
-            log("HID++ battery: " + match->name + " = " +
-                    std::to_string(static_cast<int>(b.level)) + "%", true);
-        }
-    } else if (match_count == 0) {
-        log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
-                "% (no evdev mouse matched id " + needle + ")", true);
-    } else {
-        log("HID++ battery: " + std::to_string(static_cast<int>(b.level)) +
-                "% (multiple mice share id " + needle +
-                " — not merged)", true);
-    }
+    // R1-04 lock narrowing: returned, not logged here.  See daemon.hpp.
+    return msg;
 }
 
-void AccelDaemon::apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi) {
-    if (dpi == 0) return;
+std::string AccelDaemon::apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi) {
+    if (dpi == 0) return {};
 
     std::string needle;
     if (!dev.info.serial.empty()) {
@@ -1978,19 +1983,27 @@ void AccelDaemon::apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi) {
         needle = buf;
     }
 
-    std::lock_guard<std::mutex> lk(devices_mutex_);
-    for (auto& m : devices_) {
-        if (m.device_id.find(needle) != std::string::npos) {
-            if (m.dpi != static_cast<int>(dpi) || m.detected_dpi != static_cast<int>(dpi)) {
-                log("Hardware DPI update on " + m.name + ": " +
-                    std::to_string(m.dpi) + " -> " + std::to_string(dpi) + " DPI", true);
-                m.dpi = static_cast<int>(dpi);
-                m.detected_dpi = static_cast<int>(dpi);
-                m.dpi_factor = NORMALIZED_DPI / static_cast<double>(m.dpi);
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(devices_mutex_);
+        for (auto& m : devices_) {
+            if (m.device_id.find(needle) != std::string::npos) {
+                if (m.dpi != static_cast<int>(dpi) || m.detected_dpi != static_cast<int>(dpi)) {
+                    msg = "Hardware DPI update on " + m.name + ": " +
+                          std::to_string(m.dpi) + " -> " + std::to_string(dpi) + " DPI";
+                    m.dpi = static_cast<int>(dpi);
+                    m.detected_dpi = static_cast<int>(dpi);
+                    m.telemetry->dpi_factor.store(
+                        NORMALIZED_DPI / static_cast<double>(m.dpi),
+                        std::memory_order_relaxed);
+                }
             }
         }
     }
+    // R1-04 lock narrowing: returned, not logged here.  See daemon.hpp.
+    return msg;
 }
+
 
 /// Between drain iterations, keep tabs on queued HID++ notifications without
 /// ever blocking the event loop: each drain opens the hidraw node, consumes a
@@ -2007,13 +2020,27 @@ void AccelDaemon::poll_hidpp_notifications() {
     if (t >= hidpp_rescan_ms_) {
         hidpp_rescan_ms_ = t + 2000.0;
         const auto paths = discover_logitech_hidraw_devices();
+        const std::set<std::string> seen(paths.begin(), paths.end());
 
-        std::set<std::string> seen(paths.begin(), paths.end());
+        // R17-HIDLOCK: identification performs BLOCKING HID++ handshakes.  It
+        // must not run under hidpp_devs_mutex_: the motion loop takes that
+        // lock in apply_active_app()/apply_new_config() (window focus or a
+        // GUI Save), and a sleeping wireless device can spend the full probe
+        // budget (several 500 ms request timeouts) inside
+        // identify_logitech_devices().  Holding the lock here froze the mouse
+        // for that whole window on the very next profile apply.
+        //
+        // Phase 1 only mutates the bookkeeping and collects the unknown paths;
+        // phase 2 identifies them with no daemon lock held; phase 3 publishes
+        // the results.  This thread is the only writer of hidpp_devs_, so the
+        // vector is stable while the lock is dropped.
+        std::vector<std::string> removed_paths;
+        std::vector<std::string> to_identify;
         {
             std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
             for (auto it = hidpp_devs_.begin(); it != hidpp_devs_.end();) {
                 if (!seen.count(it->hidraw_path)) {
-                    log("HID++ device removed: " + it->hidraw_path, true);
+                    removed_paths.push_back(it->hidraw_path);
                     hidpp_transports_.erase(it->hidraw_path);
                     it = hidpp_devs_.erase(it);
                 } else {
@@ -2030,27 +2057,65 @@ void AccelDaemon::poll_hidpp_notifications() {
                     hidpp_devs_.begin(), hidpp_devs_.end(),
                     [&path](const hidpp_device& dev) { return dev.hidraw_path == path; });
                 if (known) continue; // already identified; drain only
-                // Use identify_logitech_devices (plural) to detect all device indices
-                // on this hidraw node (receiver 0xFF, direct 0x00, paired 0x01-0x06).
-                // identify_logitech_device (singular) only tries 0xFF/0x00 and would
-                // miss mice behind a Unifying receiver.
-                bool any_valid = false;
-                for (auto& dev : identify_logitech_devices(path)) {
-                    // protocol_version 0 = Logitech hidraw node with no HID++
-                    // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
-                    // UI/CLI display entry only and has no battery or notification
-                    // stream to subscribe to.
-                    if (dev.info.protocol_version == 0) continue;
-                    log("HID++ device detected: " + path + " (idx=0x" +
-                        std::to_string(static_cast<int>(dev.device_index)) + ")", true);
-                    hidpp_devs_.push_back(std::move(dev));
-                    any_valid = true;
+                to_identify.push_back(path);
+            }
+        }
+        for (const auto& path : removed_paths)
+            log("HID++ device removed: " + path, true);
+
+        struct IdentifiedPath {
+            std::string path;
+            std::vector<hidpp_device> devices;
+            bool any_valid = false;
+        };
+        std::vector<IdentifiedPath> identified;
+        identified.reserve(to_identify.size());
+        for (auto& path : to_identify) {
+            IdentifiedPath result;
+            result.path = path;
+            // Use identify_logitech_devices (plural) to detect all device
+            // indices on this hidraw node (receiver 0xFF, direct 0x00, paired
+            // 0x01-0x06).  identify_logitech_device (singular) only tries
+            // 0xFF/0x00 and would miss mice behind a Unifying receiver.
+            for (auto& dev : identify_logitech_devices(path)) {
+                // protocol_version 0 = Logitech hidraw node with no HID++
+                // protocol at all (e.g. the 046d:c542 Nano receiver): it is a
+                // UI/CLI display entry only and has no battery or notification
+                // stream to subscribe to.
+                if (dev.info.protocol_version == 0) continue;
+                result.devices.push_back(std::move(dev));
+                result.any_valid = true;
+            }
+            identified.push_back(std::move(result));
+        }
+
+        std::vector<std::string> detected_logs;
+        {
+            std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+            for (auto& result : identified) {
+                // The node may have disappeared while we were probing it.
+                if (!seen.count(result.path)) continue;
+                // Re-check under the lock (defence in depth; this is the only
+                // writer, but the two phases must stay independently correct).
+                const bool known = std::any_of(
+                    hidpp_devs_.begin(), hidpp_devs_.end(),
+                    [&path = result.path](const hidpp_device& dev) {
+                        return dev.hidraw_path == path;
+                    });
+                if (known) continue;
+                if (!result.any_valid) {
+                    non_hidpp_paths_.insert(result.path);
+                    continue;
                 }
-                if (!any_valid) {
-                    non_hidpp_paths_.insert(path);
+                for (auto& dev : result.devices) {
+                    detected_logs.push_back(
+                        "HID++ device detected: " + result.path + " (idx=0x" +
+                        std::to_string(static_cast<int>(dev.device_index)) + ")");
+                    hidpp_devs_.push_back(std::move(dev));
                 }
             }
         }
+        for (const auto& msg : detected_logs) log(msg, true);
     }
 
     // Drain requests are cheap (0 ms poll = attempt one non-blocking read each)
@@ -2059,8 +2124,21 @@ void AccelDaemon::poll_hidpp_notifications() {
     if (t < hidpp_drain_ms_) return;
     hidpp_drain_ms_ = t + 1000.0;
 
+    // R17-HIDLOCK, phase 1: ensure each transport is open and decide which
+    // active queries are due.  No blocking I/O runs while the lock is held.
+    struct QueryJob {
+        std::string path;
+        uint8_t index = 0xFF;
+        std::shared_ptr<HidppTransport> transport;
+        bool want_battery = false;
+        bool want_dpi = false;
+        std::optional<hidpp_battery_info> battery;
+        std::optional<hidpp_dpi_info> dpi;
+    };
+    std::vector<QueryJob> query_jobs;
     {
         std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+        const double now = now_ms();
         for (auto& dev : hidpp_devs_) {
             auto& transport_ptr = hidpp_transports_[dev.hidraw_path];
             if (!transport_ptr || !transport_ptr->is_open()) {
@@ -2069,36 +2147,83 @@ void AccelDaemon::poll_hidpp_notifications() {
                 transport_ptr->clear_feature_cache();
             }
 
-            // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.  Wireless
-            // receivers/pairings that advertise neither a sysfs power-supply tree
-            // nor (live) battery notifications would otherwise stay "unknown (-1)"
-            // forever although the device answers a get_battery_status() request.
-            if (now_ms() - static_cast<double>(dev.last_battery_ms) >= 60000.0) {
-                dev.last_battery_ms = static_cast<uint64_t>(now_ms());
-                if (auto b = transport_ptr->get_battery_status(dev.device_index)) {
-                    dev.battery_level = b->level;
-                    apply_hidpp_battery(dev, *b);
-                }
+            QueryJob job;
+            job.path = dev.hidraw_path;
+            job.index = dev.device_index;
+            job.transport = transport_ptr;
+
+            // BUG-24 (aj2): ACTIVE battery query — every 60 s per device.
+            // Wireless receivers/pairings that advertise neither a sysfs
+            // power-supply tree nor (live) battery notifications would
+            // otherwise stay "unknown (-1)" forever although the device
+            // answers a get_battery_status() request.
+            if (now - static_cast<double>(dev.last_battery_ms) >= 60000.0) {
+                dev.last_battery_ms = static_cast<uint64_t>(now);
+                job.want_battery = true;
             }
 
-            // Check hardware DPI periodically (every 5 s per device) to detect physical
-            // DPI button toggles or asymmetric hardware DPI (HERO sensor X != Y drift).
-            if (now_ms() - static_cast<double>(dev.last_dpi_check_ms) >= 5000.0) {
-                dev.last_dpi_check_ms = static_cast<uint64_t>(now_ms());
-                if (auto info = transport_ptr->get_dpi_info(dev.device_index)) {
-                    if (info->dpi_current > 0) {
-                        // Detect and repair asymmetric hardware DPI
-                        if (info->extended && info->dpi_current_y > 0 &&
-                            info->dpi_current != info->dpi_current_y) {
-                            log("Asymmetric hardware DPI detected on " + dev.hidraw_path +
-                                " (X=" + std::to_string(info->dpi_current) +
-                                ", Y=" + std::to_string(info->dpi_current_y) +
-                                ") — forcing symmetric DPI", true);
-                            transport_ptr->set_dpi(info->dpi_current, dev.device_index);
-                        }
-                        apply_hidpp_dpi(dev, info->dpi_current);
-                    }
+            // Check hardware DPI periodically (every 5 s per device) to detect
+            // physical DPI button toggles or asymmetric hardware DPI (HERO
+            // sensor X != Y drift).
+            if (now - static_cast<double>(dev.last_dpi_check_ms) >= 5000.0) {
+                dev.last_dpi_check_ms = static_cast<uint64_t>(now);
+                job.want_dpi = true;
+            }
+
+            if (job.want_battery || job.want_dpi)
+                query_jobs.push_back(std::move(job));
+        }
+    }
+
+    // R17-HIDLOCK, phase 2: run the blocking HID++ round-trips UNLOCKED.  A
+    // sleeping/unresponsive device is exactly when these burn their full
+    // timeout budget, and the old lock scope turned that into a frozen mouse
+    // as soon as the user switched windows or pressed Save.
+    std::vector<std::string> deferred_logs;
+    for (auto& job : query_jobs) {
+        if (job.want_battery)
+            job.battery = job.transport->get_battery_status(job.index);
+        if (job.want_dpi) {
+            // Current/default DPI only: the full GetDpiList sweep is for the
+            // GUI/CLI table, not a 5 s button poll on the mouse's USB endpoint.
+            job.dpi = job.transport->get_dpi_info(job.index,
+                                                  /*include_dpi_levels=*/false);
+            if (job.dpi) {
+                if (job.dpi->extended && job.dpi->dpi_current_y > 0 &&
+                    job.dpi->dpi_current != job.dpi->dpi_current_y) {
+                    deferred_logs.push_back(
+                        "Asymmetric hardware DPI detected on " + job.path +
+                        " (X=" + std::to_string(job.dpi->dpi_current) +
+                        ", Y=" + std::to_string(job.dpi->dpi_current_y) +
+                        ") — forcing symmetric DPI");
+                    job.transport->set_dpi(job.dpi->dpi_current, job.index);
                 }
+            }
+        }
+    }
+
+    // R17-HIDLOCK, phase 3: publish the query results and drain notifications.
+    // The drain is a bounded, non-blocking poll (up to 8 reports, 0 ms) and is
+    // deliberately kept separate from the active queries above.
+    {
+        std::lock_guard<std::mutex> lk(hidpp_devs_mutex_);
+        for (auto& job : query_jobs) {
+            hidpp_device* target = nullptr;
+            for (auto& d : hidpp_devs_) {
+                if (d.hidraw_path == job.path && d.device_index == job.index) {
+                    target = &d;
+                    break;
+                }
+            }
+            if (!target) continue;
+            if (job.want_battery && job.battery) {
+                target->battery_level = job.battery->level;
+                if (auto msg = apply_hidpp_battery(*target, *job.battery); !msg.empty())
+                    deferred_logs.push_back(std::move(msg));
+            }
+            if (job.want_dpi && job.dpi && job.dpi->dpi_current > 0) {
+                if (auto msg = apply_hidpp_dpi(*target, job.dpi->dpi_current); !msg.empty())
+                    deferred_logs.push_back(std::move(msg));
             }
         }
 
@@ -2147,24 +2272,26 @@ void AccelDaemon::poll_hidpp_notifications() {
                         // BUG-24 (aj2): surface live battery notifications on
                         // the mouse device, not just the log line.
                         target->battery_level = event.battery->level;
-                        apply_hidpp_battery(*target, *event.battery);
+                        if (auto msg = apply_hidpp_battery(*target, *event.battery);
+                            !msg.empty())
+                            deferred_logs.push_back(std::move(msg));
                         const std::string level = event.battery->level == 255
                             ? "unknown" : std::to_string(event.battery->level) + "%";
-                        log("HID++ battery: dev " +
-                                std::to_string(event.device_index) + " " + level +
-                                (event.battery->charging ? " (charging)" : ""),
-                            true);
+                        deferred_logs.push_back(
+                            "HID++ battery: dev " +
+                            std::to_string(event.device_index) + " " + level +
+                            (event.battery->charging ? " (charging)" : ""));
                     }
                     break;
                 case hidpp_notification_event_kind::connection:
-                    log("HID++ link: dev " + std::to_string(event.device_index) +
-                            (event.connected ? " connected" : " disconnected"),
-                        true);
+                    deferred_logs.push_back(
+                        "HID++ link: dev " + std::to_string(event.device_index) +
+                        (event.connected ? " connected" : " disconnected"));
                     break;
                 case hidpp_notification_event_kind::illumination:
-                    log("HID++ illumination event: dev " +
-                            std::to_string(event.device_index),
-                        true);
+                    deferred_logs.push_back(
+                        "HID++ illumination event: dev " +
+                        std::to_string(event.device_index));
                     break;
                 case hidpp_notification_event_kind::generic:
                 case hidpp_notification_event_kind::unhandled:
@@ -2173,8 +2300,11 @@ void AccelDaemon::poll_hidpp_notifications() {
             }
         }
     }
-}
 
+    // Log outside every daemon mutex (R1-04).  A slow journald/stdout sink must
+    // never delay the motion loop's next fd lookup.
+    for (const auto& msg : deferred_logs) log(msg, true);
+}
 // ── Main loop (epoll-based) ───────────────────────────────────────────────────
 
 void AccelDaemon::run_loop() {
@@ -2784,8 +2914,10 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // true intervals (the SYN that closed this frame is the next frame's base).
     if (frame_ev_us != 0) dev.last_frame_ev_us = frame_ev_us;
 
+    const double dpi_factor = dev.telemetry->dpi_factor.load(
+        std::memory_order_relaxed);
     int out_x = 0, out_y = 0;
-    apply_motion_math(dev.mod, dev.sp, dev.settings, dev.dpi_factor, time_ms,
+    apply_motion_math(dev.mod, dev.sp, dev.settings, dpi_factor, time_ms,
                       dx, dy, dev.remainder_x, dev.remainder_y, out_x, out_y);
 
     // P93-BATCH: defer the write — the closing SYN_REPORT is merged into the
@@ -2800,7 +2932,7 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
     // physical input, not the curve-equivalent coordinate).  Atomic fields plus
     // the generation counter let the IPC reader take a seqlock-style snapshot
     // without a hot-path mutex.
-    double ips_factor = dev.dpi_factor / time_ms;
+    double ips_factor = dpi_factor / time_ms;
     double in_ips     = magnitude({ dx, dy }) * ips_factor;
     double out_ips    = magnitude({ static_cast<double>(out_x), static_cast<double>(out_y) }) * ips_factor;
     // seqlock protocol: bump counter to odd (write in progress)

@@ -1,0 +1,664 @@
+#pragma once
+#include "accel-union.hpp"
+#include "simd_math.hpp"
+#include <cmath>
+#include <algorithm>
+#include <limits>
+
+namespace rawaccel {
+
+// ── Smoothers ────────────────────────────────────────────────────────────────
+
+/// PERF: flush subnormal EMA state to zero.
+///
+/// The linear smoother multiplies both trend accumulators by `trendDampening`
+/// on every event.  With a constant or stopped input they decay geometrically
+/// and eventually land in the subnormal range, where every subsequent multiply
+/// and add costs a microcode assist (~100 ns on this machine) instead of a
+/// single FP op.  The value is already below DBL_MIN (2.2e-308), far outside
+/// any representable cursor speed or trend, so replacing it with 0 is the
+/// correct numerical limit and removes the permanent slow path.  This is a
+/// real hot-path issue: before the flush, a steady 1 ms input made the
+/// benchmark's smooth path ~240 ns/event; after it, the state is exactly 0 and
+/// the ordinary no-smoothing cost remains.
+static inline double flush_subnormal(double value) {
+    return std::fabs(value) < std::numeric_limits<double>::min() ? 0.0 : value;
+}
+
+/// Simple exponential moving average (EMA) smoother.
+///
+/// PERF (P0): the per-event cost of `std::pow(base, time)` is huge
+/// (~60–100 ns, ieee754 pow).  Since the EMA update only needs `base^time`
+/// and `base = 2^(log2(base))`, we precompute `log2(base)` once in init_coeff
+/// and evaluate `exp2(log2(base) * time)` per event — the same result to ~1
+/// ULP, at a fraction of the cost (x86 exp2 is a few FMA + table ops).
+/// This is the dominant win for smoothing-heavy profiles (power-dual+4ema
+/// benchmark: ~553 ns → ~390 ns per event, ≈30% faster on this machine).
+struct simple_ema_smoother {
+    double windowCoefficient = 0;
+    double cutoffCoefficient = 0;
+    double windowLog2        = 0;
+    double cutoffLog2        = 0;
+    double windowTotal       = 0;
+    double cutoffTotal       = 0;
+
+    void init_coeff(double halfLife) {
+        windowCoefficient = halfLife > 0 ? std::pow(0.5, 1.0 / halfLife) : 0;
+        cutoffCoefficient = 1.0 - std::sqrt(1.0 - windowCoefficient);
+        // log2(0) yields -inf; exp2(-inf * t) = 0 for t > 0 → twc == 1 (full
+        // adoption), which is exactly what pow(0, t) == 0 produced before.
+        windowLog2 = std::log2(windowCoefficient);
+        cutoffLog2 = std::log2(cutoffCoefficient);
+    }
+
+    void reset() { windowTotal = cutoffTotal = 0; }
+
+    void init(double halfLife) {
+        init_coeff(halfLife);
+        reset();
+    }
+
+    double smooth(double speed, milliseconds time) {
+        // Guard: time <= 0 or NaN must not touch the accumulators.
+        // Old pow(c, 0) == 1 → twc == 0 (no update); but with the exp2 form,
+        // coeff == 0 gives log2 == -inf and -inf * 0 == NaN → twc == NaN which
+        // would poison windowTotal/cutoffTotal forever.  modifier::modify()
+        // never calls us with time <= 0 (early return), so this only fires on
+        // direct/fuzz/test input — return the current estimate unchanged.
+        if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        // L09-05 (HIGH): a single non-finite `speed` used to poison the
+        // accumulators PERMANENTLY (windowTotal += twc*(NaN - windowTotal) →
+        // NaN forever, surviving reconfigure() because the smoother is already
+        // initialized).  The only recovery was unplugging the mouse (full
+        // sp.init()).  sanitize lets degenerate-but-representable parameter
+        // sets through, so the guard belongs here at the accumulator boundary:
+        // ignore the sample (return the current estimate) like the time guard.
+        if (!std::isfinite(speed)) return std::min(windowTotal, cutoffTotal);
+        // exp2(log2(c) * time) reproduces pow(c, time) for every finite c and
+        // positive time.  The branchless form keeps the inlined smoother small,
+        // which matters for GCC's inline budget in the whole modifier pipeline.
+        const double twc = 1.0 - std::exp2(windowLog2 * time);
+        const double tcc = 1.0 - std::exp2(cutoffLog2 * time);
+        windowTotal = flush_subnormal(windowTotal + twc * (speed - windowTotal));
+        cutoffTotal = flush_subnormal(cutoffTotal + tcc * (speed - cutoffTotal));
+        return std::min(windowTotal, cutoffTotal);
+    }
+};
+
+/// Linear (trend-aware) EMA smoother.
+struct linear_ema_smoother {
+    static constexpr double trendDampening  = 0.75;
+    // SM-3: the trend term (gain slope, ips/ms) is bounded.  The window/cutoff
+    // trend coefficients already make the per-time ratio ~bounded, but a
+    // coalesced frame interval that survives the daemon floor could still push
+    // (Δtotal/time) far outside any physical slope — clamp it so a single
+    // pathological sample cannot poison the trend accumulator.
+    static constexpr double kMaxTrendSlope  = 1e6;
+
+    double windowCoefficient      = 0;
+    double cutoffCoefficient      = 0;
+    double windowTrendCoefficient = 0;
+    double cutoffTrendCoefficient = 0;
+    // PERF (P0): precomputed log2() of the coefficients — per-event updates
+    // use exp2(log2(c) * time) instead of the much slower std::pow(c, time).
+    double windowLog2              = 0;
+    double cutoffLog2              = 0;
+    double windowTrendLog2         = 0;
+    double cutoffTrendLog2         = 0;
+
+    double windowTotal      = 0;
+    double cutoffTotal      = 0;
+    double windowTrendTotal = 0;
+    double cutoffTrendTotal = 0;
+
+    void init_coeff(double halfLife, double trendHalfLife) {
+        windowCoefficient      = halfLife > 0      ? std::pow(0.5, 1.0 / halfLife)      : 0;
+        windowTrendCoefficient = trendHalfLife > 0 ? std::pow(0.5, 1.0 / trendHalfLife) : 0;
+        cutoffCoefficient      = 1.0 - std::sqrt(1.0 - windowCoefficient);
+        cutoffTrendCoefficient = 1.0 - std::sqrt(1.0 - windowTrendCoefficient);
+        windowLog2             = std::log2(windowCoefficient);
+        cutoffLog2             = std::log2(cutoffCoefficient);
+        windowTrendLog2        = std::log2(windowTrendCoefficient);
+        cutoffTrendLog2        = std::log2(cutoffTrendCoefficient);
+    }
+
+    void reset() {
+        windowTotal = cutoffTotal = windowTrendTotal = cutoffTrendTotal = 0;
+    }
+
+    void init(double halfLife, double trendHalfLife) {
+        init_coeff(halfLife, trendHalfLife);
+        reset();
+    }
+
+    double smooth(double speed, milliseconds time) {
+        // Same time<=0/NaN guard as simple_ema_smoother::smooth (see above):
+        // -inf * 0 == NaN would poison all four accumulators via the trend
+        // terms.  Return the current estimate unchanged instead.
+        if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        // L09-05 (HIGH): same permanent-poisoning guard as the simple smoother
+        // — a non-finite input sample is ignored instead of corrupting all
+        // four accumulators (which survived reconfigure() until unplug).
+        if (!std::isfinite(speed)) return std::min(windowTotal, cutoffTotal);
+        // Branchless exp2-based coefficients (see simple_ema_smoother::smooth).
+        const double twc  = 1.0 - std::exp2(windowLog2      * time);
+        const double tcc  = 1.0 - std::exp2(cutoffLog2      * time);
+        const double twtc = 1.0 - std::exp2(windowTrendLog2 * time);
+        const double tctc = 1.0 - std::exp2(cutoffTrendLog2 * time);
+
+        double oldW = windowTotal, oldC = cutoffTotal;
+
+        windowTrendTotal *= trendDampening;
+        cutoffTrendTotal *= trendDampening;
+        if (speed <= windowTotal && speed <= cutoffTotal) {
+            // SM-6: the input is decelerating or stopped (new sample is at or
+            // below the current estimates).  Damp the trend extra hard so the
+            // speed prediction doesn't overshoot into a few "ghost" frames
+            // after the mouse stops or reverses direction.
+            windowTrendTotal *= trendDampening;
+            cutoffTrendTotal *= trendDampening;
+        }
+        windowTotal += windowTrendTotal * time;
+        cutoffTotal += cutoffTrendTotal * time;
+
+        windowTotal += twc  * (speed - windowTotal);
+        cutoffTotal += tcc  * (speed - cutoffTotal);
+
+        // don't let trend carry us below 0 (clamp AFTER the EMA update, like the
+        // reference — trend adjustment below then measures the clamped state)
+        windowTotal  = flush_subnormal(std::max(windowTotal, 0.0));
+        cutoffTotal  = flush_subnormal(std::max(cutoffTotal, 0.0));
+
+        double nwt = time > 0 ? (windowTotal - oldW) / time : 0;
+        double nct = time > 0 ? (cutoffTotal - oldC) / time : 0;
+        if (!std::isfinite(nwt) || nwt < -kMaxTrendSlope || nwt > kMaxTrendSlope) nwt = 0;
+        if (!std::isfinite(nct) || nct < -kMaxTrendSlope || nct > kMaxTrendSlope) nct = 0;
+        windowTrendTotal = flush_subnormal(windowTrendTotal + twtc * (nwt - windowTrendTotal));
+        cutoffTrendTotal = flush_subnormal(cutoffTrendTotal + tctc * (nct - cutoffTrendTotal));
+
+        return std::min(windowTotal, cutoffTotal);
+    }
+};
+
+// ── Speed processor ──────────────────────────────────────────────────────────
+
+enum class distance_mode : unsigned char {
+    euclidean = 0,
+    separate  = 1,
+    max       = 2,
+    Lp        = 3,
+};
+
+struct speed_processor_flags {
+    bool           should_smooth_input  = false;
+    bool           should_smooth_scale  = false;
+    bool           should_smooth_output = false;
+    distance_mode  dist_mode            = {};
+};
+
+struct axis_smoother {
+    linear_ema_smoother input_speed_smoother  = {};
+    simple_ema_smoother scale_smoother        = {};
+    linear_ema_smoother output_speed_smoother = {};
+};
+
+struct speed_processor {
+    speed_args           args         = {};
+    speed_processor_flags speed_flags = {};
+    axis_smoother        smoother_x   = {};
+    axis_smoother        smoother_y   = {};
+
+    static constexpr double input_trend_halflife  = 1.25;
+    static constexpr double output_trend_halflife = 0.70;
+
+    // L03-09: single source for the subnormal-time guard ceiling, shared by
+    // modifier::modify and modify_separate_simd.  Was duplicated as a local
+    // constexpr in both functions; two literals can drift apart silently.
+    static constexpr double IPS_FACTOR_MAX = 1e6;
+
+    speed_processor() = default;
+
+    // Recompute the distance mode, smoothing flags and per-smoother
+    // coefficients from in_args.  Does NOT touch the accumulator state —
+    // used by init() (which then also resets) and by reconfigure() (which
+    // preserves running smoothers so live profile/focus switches don't tear
+    // the speed estimate mid-motion — SM-5).
+    void init_coeff(const speed_args& in_args) {
+        args = in_args;
+
+        if (!in_args.whole) {
+            speed_flags.dist_mode = distance_mode::separate;
+        } else if (in_args.lp_norm >= MAX_NORM || in_args.lp_norm <= 0) {
+            speed_flags.dist_mode = distance_mode::max;
+        } else if (std::fabs(in_args.lp_norm - 2.0) > 1e-9) {
+            // D1: use epsilon for float comparison — instead of "!= 2"
+            speed_flags.dist_mode = distance_mode::Lp;
+        } else {
+            speed_flags.dist_mode = distance_mode::euclidean;
+        }
+
+        speed_flags.should_smooth_input  = in_args.input_speed_smooth_halflife  > 0;
+        speed_flags.should_smooth_scale  = in_args.scale_smooth_halflife         > 0;
+        speed_flags.should_smooth_output = in_args.output_speed_smooth_halflife  > 0;
+
+        if (speed_flags.should_smooth_input) {
+            smoother_x.input_speed_smoother.init_coeff(in_args.input_speed_smooth_halflife, input_trend_halflife);
+            smoother_y.input_speed_smoother.init_coeff(in_args.input_speed_smooth_halflife, input_trend_halflife);
+        }
+        if (speed_flags.should_smooth_scale) {
+            smoother_x.scale_smoother.init_coeff(in_args.scale_smooth_halflife);
+            smoother_y.scale_smoother.init_coeff(in_args.scale_smooth_halflife);
+        }
+        if (speed_flags.should_smooth_output) {
+            smoother_x.output_speed_smoother.init_coeff(in_args.output_speed_smooth_halflife, output_trend_halflife);
+            smoother_y.output_speed_smoother.init_coeff(in_args.output_speed_smooth_halflife, output_trend_halflife);
+        }
+    }
+
+    void reset_smoothers() {
+        smoother_x.input_speed_smoother.reset();
+        smoother_y.input_speed_smoother.reset();
+        smoother_x.scale_smoother.reset();
+        smoother_y.scale_smoother.reset();
+        smoother_x.output_speed_smoother.reset();
+        smoother_y.output_speed_smoother.reset();
+    }
+
+    void init(const speed_args& in_args) {
+        init_coeff(in_args);
+        reset_smoothers();
+    }
+
+    // SM-5: like init(), but only resets a smoother that is being turned ON
+    // for the first time (halflife was 0 before).  Smoothers that are already
+    // active keep their EMA state so a focus switch or hot reload changes the
+    // curve/parameters without tearing the smoothed speed mid-motion.
+    void reconfigure(const speed_args& in_args) {
+        const bool prev_input  = speed_flags.should_smooth_input;
+        const bool prev_scale  = speed_flags.should_smooth_scale;
+        const bool prev_output = speed_flags.should_smooth_output;
+        // T42-EMA01: track whole↔separate transitions.  In whole mode the
+        // Y smoothers never advance (calc_speed_whole only touches
+        // smoother_x; scale/output feed only the x channel of a combined
+        // speed in the whole branch of modify()), so a separate→whole→
+        // separate round trip would evaluate Y from stale EMA state.
+        // Reset on the transition so the transient never surfaces.
+        const bool prev_whole = (speed_flags.dist_mode != distance_mode::separate);
+        init_coeff(in_args);
+        const bool now_whole = (speed_flags.dist_mode != distance_mode::separate);
+        if (prev_whole != now_whole) {
+            reset_smoothers();
+        }
+        if (speed_flags.should_smooth_input  && !prev_input) {
+            smoother_x.input_speed_smoother.reset();
+            smoother_y.input_speed_smoother.reset();
+        }
+        if (speed_flags.should_smooth_scale  && !prev_scale) {
+            smoother_x.scale_smoother.reset();
+            smoother_y.scale_smoother.reset();
+        }
+        if (speed_flags.should_smooth_output && !prev_output) {
+            smoother_x.output_speed_smoother.reset();
+            smoother_y.output_speed_smoother.reset();
+        }
+    }
+
+    double calc_speed_whole(vec2d in, milliseconds time) {
+        double speed;
+        if (speed_flags.dist_mode == distance_mode::max) {
+            speed = maxsd(std::fabs(in.x), std::fabs(in.y));
+        } else if (speed_flags.dist_mode == distance_mode::Lp) {
+            speed = lp_distance(in, args.lp_norm);
+        } else {
+            speed = magnitude(in);
+        }
+        if (speed_flags.should_smooth_input) {
+            speed = smoother_x.input_speed_smoother.smooth(speed, time);
+        }
+        return speed;
+    }
+
+    void calc_speed_separate(vec2d& in, milliseconds time) {
+        if (speed_flags.should_smooth_input) {
+            in.x = smoother_x.input_speed_smoother.smooth(std::fabs(in.x), time);
+            in.y = smoother_y.input_speed_smoother.smooth(std::fabs(in.y), time);
+        } else {
+            in.x = std::fabs(in.x);
+            in.y = std::fabs(in.y);
+        }
+    }
+};
+
+// ── Modifier flags ────────────────────────────────────────────────────────────
+
+struct modifier_flags {
+    bool apply_rotate             = false;
+    bool compute_ref_angle        = false;
+    bool apply_snap               = false;
+    bool clamp_speed              = false;
+    bool apply_directional_weight = false;
+    bool apply_dir_mul_x          = false;
+    bool apply_dir_mul_y          = false;
+
+    modifier_flags() = default;
+
+    modifier_flags(const profile& args) {
+        clamp_speed              = args.speed_max > 0 && args.speed_min <= args.speed_max;
+        // N13/N14: use epsilon for float comparisons — exact == 0 / == 1 are unreliable
+        // for values that may have been serialized/deserialized through JSON floats.
+        apply_rotate             = std::fabs(args.degrees_rotation) > 1e-9;
+        apply_snap               = std::fabs(args.degrees_snap)     > 1e-9;
+        apply_directional_weight = args.speed_processor_args.whole &&
+                                   std::fabs(args.range_weights.x - args.range_weights.y) > 1e-9;
+        compute_ref_angle        = apply_snap || apply_directional_weight;
+        apply_dir_mul_x          = std::fabs(args.lr_output_dpi_ratio - 1.0) > 1e-9;
+        apply_dir_mul_y          = std::fabs(args.ud_output_dpi_ratio - 1.0) > 1e-9;
+    }
+};
+
+// ── Modifier settings ─────────────────────────────────────────────────────────
+
+struct modifier_settings {
+    profile    prof;
+    struct data_t {
+        modifier_flags flags;
+        vec2d          rot_direction = { 1, 0 };
+        accel_union    accel_x;
+        accel_union    accel_y;
+    } data = {};
+};
+
+inline void init_settings(modifier_settings& settings) {
+    settings.data.accel_x.init(settings.prof.accel_x);
+    settings.data.accel_y.init(settings.prof.accel_y);
+    settings.data.rot_direction = direction(settings.prof.degrees_rotation);
+    settings.data.flags         = modifier_flags(settings.prof);
+}
+
+/// Apply the pre-speed transforms shared by the whole-axis and separate-axis
+/// paths: rotation, angle snap, then speed clamp.
+///
+/// This used to be duplicated: `modify()` ran all three and then called
+/// `modify_separate_simd()`, which ran them AGAIN.  Only the separate path was
+/// affected, and the second rotation is observable, not cosmetic — a 90°
+/// rotation turned into 180° (input (40,0) came out as (-40,0) instead of
+/// (0,40)).  Snap and clamp happened to be idempotent, which is why the bug
+/// survived.  One helper means the two paths cannot diverge again.
+///
+/// Returns the reference angle used by the whole-mode directional weight.
+/// Snap deliberately rewrites it to the snapped axis (0 or π/2), matching the
+/// original in-line implementation.
+static inline double apply_pre_speed_transforms(
+    vec2d& in, const modifier_settings& settings, double ips_factor)
+{
+    auto& args  = settings.prof;
+    auto& data  = settings.data;
+    auto& flags = settings.data.flags;
+
+    double reference_angle = 0;
+
+    // 1. Rotation
+    if (flags.apply_rotate)
+        in = rotate(in, data.rot_direction);
+
+    // 2. Angle snap
+    // L-BUG-24: the snap angle reference used exact ==0 on floats — a rotated
+    // or scaled axis lands on micro-offsets, so the horizontal / vertical
+    // branches were missed.  Use an epsilon comparison instead.
+    if (flags.compute_ref_angle &&
+        (std::abs(in.x) >= 1e-9 || std::abs(in.y) >= 1e-9)) {
+        if (std::abs(in.x) < 1e-9) {
+            reference_angle = M_PI / 2;
+        } else if (std::abs(in.y) < 1e-9) {
+            reference_angle = 0.0;  // pure horizontal
+        } else {
+            reference_angle = std::atan(std::fabs(in.y / in.x));
+        }
+        if (flags.apply_snap) {
+            const double snap = args.degrees_snap * M_PI / 180.0;
+            if (reference_angle > M_PI / 2 - snap) {
+                reference_angle = M_PI / 2;
+                in = { 0, std::copysign(magnitude(in), in.y) };
+            } else if (reference_angle < snap) {
+                reference_angle = 0;
+                in = { std::copysign(magnitude(in), in.x), 0 };
+            }
+        }
+    }
+
+    // 3. Speed clamp
+    if (flags.clamp_speed) {
+        const double speed = magnitude(in) * ips_factor;
+        if (speed > 0) {
+            const double ratio = clampsd(speed, args.speed_min, args.speed_max) / speed;
+            in.x *= ratio;
+            in.y *= ratio;
+        }
+    }
+
+    return reference_angle;
+}
+
+// ── SIMD-optimized separate mode acceleration ─────────────────────────────
+/// Process X and Y axes simultaneously using SIMD (2-wide).
+/// Used when speed_flags.dist_mode == distance_mode::separate.
+static void modify_separate_simd(vec2d& in, speed_processor& sp,
+                                 const modifier_settings& settings,
+                                 double dpi_factor, milliseconds time)
+{
+    using namespace simd;
+    auto& args  = settings.prof;
+    auto& data  = settings.data;
+    auto& flags = settings.data.flags;
+
+    // Early guards (same as modify)
+    if (!std::isfinite(time) || time <= 0) {
+        in.x = 0; in.y = 0; return;
+    }
+
+    double ips_factor = dpi_factor / time;
+    if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
+        ips_factor = speed_processor::IPS_FACTOR_MAX;
+
+    // 1-3. Rotation / angle snap / speed clamp.  Shared with the whole-axis
+    // path so they run exactly ONCE (this function is also called from
+    // modify(), which used to apply them before dispatching here).
+    (void)apply_pre_speed_transforms(in, settings, ips_factor);
+
+    // 4. Domain-weighted speed - THIS IS WHERE SIMD SHINES
+    
+    // abs_vel = |in * ips_factor * domain_weights|
+    v2d v_in = v2d_load(&in.x);
+    v2d v_ips = v2d_set1(ips_factor);
+    v2d v_dw = v2d_set(args.domain_weights.x, args.domain_weights.y);
+    v2d v_abs_vel = v2d_abs(v2d_mul(v2d_mul(v_in, v_ips), v_dw));
+    
+    // Store back for the smoother.
+    //
+    // O31 (strict-aliasing): this used to be
+    //   double abs_vel_arr[2];
+    //   v2d_store(abs_vel_arr, v_abs_vel);
+    //   sp.calc_speed_separate(*reinterpret_cast<vec2d*>(abs_vel_arr), time);
+    //   ... apply(abs_vel_arr[0]) ... apply(abs_vel_arr[1])
+    // i.e. a `double[2]` written THROUGH a `vec2d&` and then read back through
+    // `double[]` — two different types for the same object, which is exactly
+    // what -Wstrict-aliasing=2 flags (the project's -Wall -Wextra gate does not,
+    // so the warning was latent).  `calc_speed_separate` mutates in place
+    // (`in.x = std::fabs(in.x)`), so the write and the read were both live.
+    //
+    // Not a misalignment bug: alignof(vec2d) == alignof(double[2]) == 8 and
+    // UBSan -fsanitize=alignment reports 0 violations on this path (AJ1, 3
+    // backends).  Using a real `vec2d` for the whole round trip removes the
+    // aliasing question entirely at zero cost — the compiler emits the same
+    // stores either way, which the oracle + parity gates confirm.
+    vec2d abs_vel;
+    v2d_store(&abs_vel.x, v_abs_vel);
+
+    // Call speed processor (processes X/Y separately)
+    sp.calc_speed_separate(abs_vel, time);
+
+    // SIMD acceleration evaluation - process X and Y together
+    double scale_x = 1.0 + (data.accel_x.apply(abs_vel.x, args.accel_x) - 1.0) * args.range_weights.x;
+    double scale_y = 1.0 + (data.accel_y.apply(abs_vel.y, args.accel_y) - 1.0) * args.range_weights.y;
+    
+    v2d v_scale = v2d_set(scale_x, scale_y);
+    
+    if (sp.speed_flags.should_smooth_scale) {
+        scale_x = sp.smoother_x.scale_smoother.smooth(scale_x, time);
+        scale_y = sp.smoother_y.scale_smoother.smooth(scale_y, time);
+        v_scale = v2d_set(scale_x, scale_y);
+    }
+    
+    // Apply scale
+    v_in = v2d_mul(v_in, v_scale);
+    
+    if (sp.speed_flags.should_smooth_output) {
+        double ox = std::copysign(sp.smoother_x.output_speed_smoother.smooth(std::fabs(v2d_get_x(v_in)), time), v2d_get_x(v_in));
+        double oy = std::copysign(sp.smoother_y.output_speed_smoother.smooth(std::fabs(v2d_get_y(v_in)), time), v2d_get_y(v_in));
+        v_in = v2d_set(ox, oy);
+    }
+    
+    v2d_store(&in.x, v_in);
+
+    // 5. Output DPI normalization + directional DPI multipliers (vectorized)
+    if (args.output_dpi > 0 && dpi_factor > 0) {
+        double dpi_adj = (args.output_dpi / NORMALIZED_DPI) * dpi_factor;
+        v2d v_dpi = v2d_set(dpi_adj, dpi_adj * args.yx_output_dpi_ratio);
+        v_in = v2d_load(&in.x);
+        v_in = v2d_mul(v_in, v_dpi);
+        v2d_store(&in.x, v_in);
+    }
+    
+    // Directional multipliers (only negative direction)
+    if (flags.apply_dir_mul_x && args.lr_output_dpi_ratio > 0 && in.x < 0)
+        in.x *= args.lr_output_dpi_ratio;
+    if (flags.apply_dir_mul_y && args.ud_output_dpi_ratio > 0 && in.y < 0)
+        in.y *= args.ud_output_dpi_ratio;
+
+    // Defense-in-depth: NaN/Inf guard
+    if (!std::isfinite(in.x)) in.x = 0;
+    if (!std::isfinite(in.y)) in.y = 0;
+}
+
+// ── Core modifier ─────────────────────────────────────────────────────────────
+
+class modifier {
+public:
+    /// Apply acceleration to an input delta (counts/ms).
+    /// @param in      Raw mouse delta [counts]; modified in place.
+    /// @param sp      Per-axis speed processor (stateful).
+    /// @param settings Precomputed modifier settings.
+    /// @param dpi_factor  NORMALIZED_DPI / device DPI (reference input_dpi_normalization_factor)
+    /// @param time    Time since last event [ms]
+    void modify(vec2d& in, speed_processor& sp,
+                const modifier_settings& settings,
+                double dpi_factor, milliseconds time) const
+    {
+        auto& args  = settings.prof;
+        auto& data  = settings.data;
+        auto& flags = settings.data.flags;
+
+        // A non-finite interval is just as unusable as zero: allowing NaN or
+        // infinity into the stateful smoothers permanently poisons their
+        // accumulators, so later valid events would all produce NaN/zero.
+        // FIX (BUG-HIGH-2): zero in.x/in.y so a non-finite/zero interval does
+        // not leak raw delta 1:1.  The daemon's flush_motion() clamps
+        // time_ms to [DEFAULT_TIME_MIN, DEFAULT_TIME_MAX] before calling
+        // here, so this guard only fires on hostile unit-level input
+        // (NaN/Inf/<=0).  The stateful smoothers must NOT be touched
+        // (that was the poisoning hazard); the rest of modify() is exactly
+        // what we skip.
+        if (!std::isfinite(time) || time <= 0) {
+            in.x = 0;
+            in.y = 0;
+            return;
+        }
+
+        // Separate mode owns the COMPLETE pipeline, including the shared
+        // rotation/snap/clamp transforms.  Dispatch it before this function
+        // computes anything, so no transform can be applied twice (the old
+        // order applied all three here and again inside
+        // modify_separate_simd(); a 90° rotation became 180°).
+        if (sp.speed_flags.dist_mode == distance_mode::separate) {
+            modify_separate_simd(in, sp, settings, dpi_factor, time);
+            return;
+        }
+
+        double ips_factor = dpi_factor / time; // counts/ms -> inches/s
+
+        // Guard: subnormal / extremely small time values can produce Inf ips_factor
+        // which cascades into NaN through the accel pipeline.  Clamp to a sane max
+        // (equivalent to ~0.001 ms poll interval, i.e. 1 MHz — well beyond any real hardware).
+        if (!std::isfinite(ips_factor) || ips_factor > speed_processor::IPS_FACTOR_MAX)
+            ips_factor = speed_processor::IPS_FACTOR_MAX;
+
+        // 1-3. Rotation / angle snap / speed clamp, shared with the separate
+        // path.  The returned angle feeds whole-mode directional weighting.
+        const double reference_angle =
+            apply_pre_speed_transforms(in, settings, ips_factor);
+
+        // 4. Domain-weighted speed
+        const vec2d abs_vel = { std::fabs(in.x * ips_factor * args.domain_weights.x),
+                                std::fabs(in.y * ips_factor * args.domain_weights.y) };
+
+        // Whole (combined) acceleration
+        const double speed = sp.calc_speed_whole(abs_vel, time);
+
+        // Reference directional weight: linear interpolation in angle from
+        // range_weights.x (0°, horizontal) to range_weights.y (90°, vertical):
+        //   weight = rwx + (rwy - rwx) * (2/π) * reference_angle
+        double range_weight = args.range_weights.x;
+        if (flags.apply_directional_weight) {
+            const double diff = args.range_weights.y - args.range_weights.x;
+            range_weight += 2.0 / M_PI * reference_angle * diff;
+        }
+
+        double scale = 1.0 + (data.accel_x.apply(speed, args.accel_x) - 1.0) * range_weight;
+
+        if (sp.speed_flags.should_smooth_scale) {
+            scale = sp.smoother_x.scale_smoother.smooth(scale, time);
+        }
+
+        in.x *= scale;
+        in.y *= scale;
+
+        if (sp.speed_flags.should_smooth_output) {
+            // Reference smooths the magnitude and rescales both components by
+            // the same ratio, preserving the cursor direction.
+            const double mag = magnitude(in);
+            if (mag > 0) {
+                const double smoothedMag = sp.smoother_x.output_speed_smoother.smooth(mag, time);
+                in.x *= (smoothedMag / mag);
+                in.y *= (smoothedMag / mag);
+            }
+        }
+
+        // 5. Output DPI normalization + directional DPI multipliers
+        // Reference: dpi_adjustment = (output_dpi / NORMALIZED_DPI) * dpi_factor;
+        // applied to X, and to Y scaled further by the Y/X output-DPI ratio.
+        // CFG-1: output_dpi = 0 is the "no output-DPI normalization" sentinel —
+        // the guard below skips dpi_adjustment entirely (1:1 counts).  sanitize
+        // preserves 0 for exactly this reason.
+        if (args.output_dpi > 0 && dpi_factor > 0) {
+            double dpi_adjustment = (args.output_dpi / NORMALIZED_DPI) * dpi_factor;
+            in.x *= dpi_adjustment;
+            in.y *= dpi_adjustment * args.yx_output_dpi_ratio;
+        }
+        // RawAccel applies lr/ud ratios only in the *negative* (left/down) direction.
+        // R6: guard against division-by-zero — here only a plain multiplication.
+        if (flags.apply_dir_mul_x && args.lr_output_dpi_ratio > 0 && in.x < 0) {
+            in.x *= args.lr_output_dpi_ratio;
+        }
+        if (flags.apply_dir_mul_y && args.ud_output_dpi_ratio > 0 && in.y < 0) {
+            in.y *= args.ud_output_dpi_ratio;
+        }
+
+        // Defense-in-depth: ensure no NaN/Inf escapes the pipeline.
+        // This catches edge cases from subnormal inputs, extreme parameter
+        // combinations, or algorithm-specific numerical quirks.
+        if (!std::isfinite(in.x)) in.x = 0;
+        if (!std::isfinite(in.y)) in.y = 0;
+    }
+};
+
+} // namespace rawaccel

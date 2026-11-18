@@ -36,6 +36,14 @@ struct mouse_device {
         // TSan, torn median on weak-memory hardware).  Kept atomic alongside the
         // other loop→IPC fields instead of re-adding a per-frame lock.
         std::atomic<int> real_polling_rate { 0 };
+        // R18-DPIRACE: NORMALIZED_DPI / device DPI.  The hidpp worker updates
+        // this when a hardware DPI-button toggle is detected, while
+        // flush_motion() reads it on the motion path — a plain double written
+        // under devices_mutex_ and read without it is a data race (UB) even
+        // though x86-64 happens to store it atomically.  Keeping it in the
+        // shared telemetry block makes mouse_device stay movable and costs one
+        // relaxed load on a cache line the hot path already touches.
+        std::atomic<double> dpi_factor { NORMALIZED_DPI / 800.0 };
     };
     std::string      name;
     std::string      path;           // e.g. /dev/input/event3
@@ -59,10 +67,11 @@ struct mouse_device {
 
     // Timing
     double last_time_ms = 0;
-    // R13-perf: pre-computed NORMALIZED_DPI / dpi — updated only on profile change,
-    // avoids a floating-point division on every mouse event.
+    // R13-perf: pre-computed NORMALIZED_DPI / dpi — updated only on profile
+    // change, avoids a floating-point division on every mouse event.
     // O6: direction matches reference input_dpi_normalization_factor (was dpi/NORMALIZED_DPI).
-    double dpi_factor   = NORMALIZED_DPI / 800.0;
+    // R18-DPIRACE: the value now lives in telemetry_state::dpi_factor (atomic)
+    // because the hidpp worker updates it while the motion path reads it.
 
     // Subpixel accumulation: carry fractional remainder between frames
     double remainder_x   = 0.0;
@@ -334,9 +343,17 @@ private:
 
     // BUG-24 (aj2): merge a HID++ battery event / active query into the single
     // matching evdev mouse (matched by vid:pid).  Ambiguous matches (several
-    // mice behind one receiver) merge nothing — only log.  Hidpp-worker thread.
-    void apply_hidpp_battery(const hidpp_device& dev, const hidpp_battery_info& b);
-    void apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi);
+    // mice behind one receiver) merge nothing — only report.  Hidpp-worker thread.
+    //
+    // Returns the log line to emit (empty when there is nothing to report).
+    // The caller logs it AFTER dropping hidpp_devs_mutex_/devices_mutex_: the
+    // motion loop takes devices_mutex_ for every fd lookup, so a slow stdout /
+    // journald write must never extend the critical section.  Keeping the
+    // message out of the function also keeps apply_hidpp_battery() callable
+    // while the hidpp lock is held without risking a loop-thread stall.
+    std::string apply_hidpp_battery(const hidpp_device& dev,
+                                    const hidpp_battery_info& b);
+    std::string apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi);
 
     /// Find the HID++ transport and device index matching the given evdev mouse.
     /// Matches by serial number (Unifying receiver) or vendor:product (direct).

@@ -1782,7 +1782,8 @@ std::vector<hidpp_pairing_slot> HidppTransport::get_pairing_info(uint8_t target_
     return slots;
 }
 
-std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device_index) {
+std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device_index,
+                                                           bool include_dpi_levels) {
     const auto request = [&](hidpp_feature_index feature, uint8_t function,
                              const uint8_t* params, size_t length)
         -> std::optional<std::vector<uint8_t>> {
@@ -1835,6 +1836,10 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
         // full 256 × 700 ms budget (BUG-01): cap with the shared budget and
         // bail after a short timeout streak.
         if (query_ok) {
+        // The daemon's periodic DPI-button poll needs the current value only.
+        // Skipping the whole list sweep removes up to 256 round-trips from the
+        // shared mouse USB endpoint every 5 s.
+        if (!include_dpi_levels) return info;
         std::vector<uint8_t> list_bytes;
         const auto dpi_deadline =
             std::chrono::steady_clock::now() + kIdentifyBudget;
@@ -1876,6 +1881,8 @@ std::optional<hidpp_dpi_info> HidppTransport::get_dpi_info(uint8_t target_device
         const uint16_t current_dpi = read_be16(&(*current)[1]);
         info.dpi_default = read_be16(&(*current)[3]);
         info.dpi_current = current_dpi != 0 ? current_dpi : info.dpi_default;
+        // Same daemon fast path as the extended branch above.
+        if (!include_dpi_levels) return info;
         std::vector<uint8_t> list_bytes;
         const auto dpi_deadline =
             std::chrono::steady_clock::now() + kIdentifyBudget;

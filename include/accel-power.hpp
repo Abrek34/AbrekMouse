@@ -1,0 +1,238 @@
+#pragma once
+#include "rawaccel-base.hpp"
+#include <cmath>
+#include <cfloat>
+
+namespace rawaccel {
+
+/// Power acceleration: output = (scale * x)^n + C/x
+/// Smooth curve that naturally approaches a cap.
+/// Two forms (reference RawAccel power<GAIN>/<LEGACY>):
+///   gain:   continuous gain curve, cap handled via constant_b/x tail
+///   legacy: raw base curve hard-capped at cap.y (blocky tail)
+/// For legacy + io cap mode the reference uses a special scale derivation
+/// (scale_from_output_point) that ignores the output offset entirely.
+struct power {
+    bool   gain_mode    = false;
+    vec2d  offset       = {};
+    double scale        = 1;
+    // BUG-02: the single shared exponent floor — scale derivation (io gain
+    // point) and curve evaluation must use the SAME n = max(ep, 1e-3).
+    double exponent     = 1;
+    double constant     = 0;
+    double cap_x        = DBL_MAX;
+    double cap_y        = DBL_MAX;
+    double constant_b   = 0;
+    double legacy_cap   = DBL_MAX; // LEGACY hard cap
+
+    power() = default;
+
+    power(const accel_args& args) : gain_mode(args.gain) {
+        // BUG-02: previously scale_from_gain_point floored the exponent at
+        // 1e-3 while base_fn_impl evaluated the raw exponent_power, so for
+        // ep ∈ [1e-4, 1e-3) gain(cap_x) < cap_y. Floor once here and share the
+        // same n everywhere (offset, constant, cap, evaluation).
+        double in_n = args.exponent_power > 0 ? args.exponent_power : 1e-4;
+        exponent = in_n < 1e-3 ? 1e-3 : in_n;
+        auto n = exponent;
+
+        if (args.cap_mode_val != cap_mode::io) {
+            // MATH-2: a non-positive (or non-finite) scale must never reach the
+            // curve — args.scale <= 0 gives pow(0*x,n) == 0 (dead cursor) or a
+            // silent constant boost via gain_inverse(sc<=0 → 0).  sanitize floors
+            // accel_args at 0.01, but programmatically-built args bypass it, so
+            // the ctor treats an invalid scale as "no curve requested": identity.
+            scale = (args.scale > 0 && std::isfinite(args.scale)) ? args.scale : 1.0;
+        } else if (args.cap.y <= 0 || (gain_mode && args.cap.x <= 0)) {
+            // P155: io cap with cap.y <= 0 or (gain_mode && cap.x <= 0) is degenerate —
+            // ref derives scale=0 from the "gain 0" output point, or produces a flat
+            // zero-threshold clamp that freezes the cursor gain. Treat as "no cap
+            // requested": identity scale, no legacy clamp, base curve active.
+            //
+            // This guard is a DELIBERATE divergence from the official reference,
+            // not an accident, and it is the reason the oracle carries 12
+            // deviations for the degenerate input (measured 2026-09-28, cap.x=15,
+            // cap.y=0, %.17g, the oracle's own -O1, all 12 grid speeds):
+            //
+            //   p155_io_cap0_legacy   ref = 0 (hard zero, every speed)
+            //   p155_io_cap0_gain     ref = NaN (every speed)
+            //   both families          local = 0.063095734448019331 at spd 1e-4
+            //                          ... 1 at spd 1 ... 31.622776601683789 at
+            //                          spd 1e5 — identical in both modes, which is
+            //                          what "no cap requested" means.
+            //
+            // A frozen zero/NaN is a dead curve, so the local answer is the more
+            // useful one; but the 12 legacy rows ARE listed in
+            // tests/oracle/known_deviations.txt (class 4) because ref's hard 0
+            // is comparable. The sibling gain family is deliberately NOT listed:
+            // `NaN > tol` is never true, so those rows can never surface as a
+            // deviation and listing them would only raise a stale-row error.
+            // Do not "fix" this by matching the reference — that is the bug
+            // P155 was filed for.
+            scale = 1.0;
+            legacy_cap = DBL_MAX;
+            constant = 0;
+            offset = {};
+            return;
+        } else if (gain_mode) {
+            scale = scale_from_gain_point(args.cap.x, args.cap.y, n);
+        } else {
+            // reference special case: legacy + io — offset is ignored because of
+            // the circular dependency (scale -> constant -> offset).
+            offset = {};
+            constant = 0;
+            scale = scale_from_output_point(args.cap.x, args.cap.y, n, constant);
+            legacy_cap = args.cap.y; // P81: cap the legacy curve at cap.y (io mode)
+            return;
+        }
+
+        offset.x = gain_inverse(args.output_offset, n, scale);
+        offset.y = args.output_offset;
+        constant = offset.x * offset.y * n / (n + 1);
+        // Audit-POW-1: gain_inverse clamps offset.x to DBL_MAX (BUG-NEW-11/16),
+        // so offset.x*offset.y can overflow to Inf.  Dormant today (base_fn_impl
+        // short-circuits at x <= offset.x, and the reference overflows the same
+        // way), but keep the struct's "Inf-free" invariant like classic does.
+        if (!std::isfinite(constant)) constant = 0;
+
+        if (!gain_mode) {
+            switch (args.cap_mode_val) {
+            case cap_mode::io:
+                legacy_cap = args.cap.y;
+                break;
+            case cap_mode::in:
+                if (args.cap.x > 0) legacy_cap = base_fn_impl(args.cap.x);
+                break;
+            case cap_mode::out:
+            default:
+                if (args.cap.y > 0) legacy_cap = args.cap.y;
+                break;
+            }
+            return;
+        }
+
+        switch (args.cap_mode_val) {
+        case cap_mode::io:
+            if (args.cap.x <= 0) {
+                cap_x = DBL_MAX;
+                cap_y = DBL_MAX;
+            } else {
+                cap_x = args.cap.x;
+                cap_y = args.cap.y;
+            }
+            break;
+        case cap_mode::in:
+            if (args.cap.x > 0) {
+                if (args.cap.x <= offset.x) { cap_x = 0; cap_y = offset.y; break; }
+                cap_x = args.cap.x;
+                cap_y = gain_fn(args.cap.x, n, scale);
+            }
+            break;
+        case cap_mode::out:
+        default:
+            if (args.cap.y > 0) {
+                cap_x = gain_inverse(args.cap.y, n, scale);
+                cap_y = args.cap.y;
+            }
+            break;
+        }
+
+        constant_b = integration_constant(cap_x, cap_y, base_fn_impl(cap_x));
+    }
+
+    double operator()(double speed, const accel_args&) const {
+        if (speed <= 0) return 1.0;
+        if (!gain_mode) {
+            double out = base_fn_impl(speed);
+            // A9 (CUR-3 parity): the GAIN branch below has a local finiteness
+            // guard (ORTA-BUG-ALG-02 / CUR-3); the LEGACY branch had none.  minsd
+            // already folds NaN/±Inf to legacy_cap when a cap is set, but for
+            // an UNBOUNDED legacy curve (legacy_cap == DBL_MAX) an overflowed
+            // pow() left a non-finite/absurd value in the pipeline.  Mirror
+            // CUR-3 exactly: a requested cap is the continuous ceiling, an
+            // unbounded curve falls back to identity (never a dead frame).
+            if (!std::isfinite(out)) {
+                out = legacy_cap < DBL_MAX ? legacy_cap : 1.0;
+            }
+            return minsd(out, legacy_cap);
+        }
+        // P155: match the reference GAIN order — the cap branch is checked
+        // FIRST, offset handling lives inside base_fn_impl (returns offset.y
+        // at/under offset.x).  Previously the offset check ran before the cap
+        // check, so when output_offset > cap_y (offset.x > cap.x) the cap tail
+        // was unreachable and the requested cap was silently ignored.
+        // ORTA-BUG-ALG-02: GAIN path had no local Inf guard — pow(scale·x, exp)
+        // overflows to Inf for extreme inputs, and the value propagated to the
+        // downstream modifier.  All other accel modes guard locally; match them.
+        // CUR-3: when the raw curve DOES overflow, a hard fallback to 1.0
+        // (identity) mid-flick is a C0 step — the cursor suddenly drops from a
+        // large (or saturated) gain to 1:1.  When a cap is requested clamp to
+        // cap_y instead (a continuous ceiling the tail already converges to);
+        // only the unbounded curve (cap never requested → cap_y stays DBL_MAX)
+        // falls back to identity, since it has no finite ceiling to sit on and
+        // identity is the safe defensive behavior (never a dead frame).  The
+        // oracle grid never reaches this guard (max speed 1e5, exp ≤ 10 →
+        // ~1e53 « DBL_MAX), so deviation rows are unaffected.
+        double out;
+        if (speed < cap_x) {
+            out = base_fn_impl(speed);
+        } else {
+            out = cap_y + constant_b / speed;
+        }
+        if (!std::isfinite(out)) {
+            out = cap_y < DBL_MAX ? cap_y : 1.0;
+        }
+        return out;
+    }
+
+private:
+    double base_fn_impl(double x) const {
+        if (x <= offset.x) return offset.y;
+        return std::pow(scale * x, exponent) + constant / x;
+    }
+
+    static double gain_fn(double input, double power, double sc) {
+        return (power + 1) * std::pow(input * sc, power);
+    }
+
+    static double gain_inverse(double g, double power, double sc) {
+        if (sc <= 0) return 0;
+        // BUG-NEW-11/16 (aj4): with a tiny floored exponent (n=1e-3) and a
+        // large requested gain the true inverse ~ g^(1/n) far exceeds DBL_MAX,
+        // so pow() returns Inf and offset.x/constant become Inf.  Clamp to a
+        // finite DBL_MAX: it is still larger than any reachable speed, so the
+        // plateau (x <= offset.x → offset.y) is numerically identical, while
+        // the struct stays free of Inf (scale_from_* keep their own guard).
+        double r = std::pow(g / (power + 1), 1.0 / power) / sc;
+        return std::isfinite(r) ? r : DBL_MAX;
+    }
+
+    static double scale_from_gain_point(double input, double gain, double power) {
+        if (input <= 0) return 1.0; // guard: degenerate io cap → identity scale (no dead curve)
+        // The caller already passes the shared floored exponent n = max(ep,1e-3)
+        // (BUG-02), so 1.0/power ≤ 1000 cannot overflow to Inf; the isfinite
+        // fallback below still protects a pathologically large requested gain.
+        double sc = std::pow(gain / (power + 1), 1.0 / power) / input;
+        return std::isfinite(sc) ? sc : 1.0;
+    }
+
+    static double scale_from_output_point(double input, double output, double power, double C) {
+        if (input <= 0) return 1.0; // guard: degenerate io cap → identity scale (no dead curve)
+        double diff = output - C / input;
+        if (diff < 0) return 1.0;
+        double sc = std::pow(diff, 1.0 / power) / input;
+        return std::isfinite(sc) ? sc : 1.0;
+    }
+
+    static double integration_constant(double input, double gain, double output) {
+        // Avoid catastrophic cancellation when output ≈ gain:
+        // (output - gain) * input is unreliable for large values.
+        // When the difference is negligible relative to gain, the curve is
+        // essentially flat in the cap region — return 0 (no tail needed).
+        if (gain > 0 && std::fabs(output - gain) < 1e-12 * gain)
+            return 0.0;
+        return (output - gain) * input;
+    }
+};
+
+} // namespace rawaccel
