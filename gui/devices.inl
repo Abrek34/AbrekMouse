@@ -25,7 +25,9 @@ static guint device_refresh_retry_id = 0;
 static gboolean device_refresh_retry_cb(gpointer data) {
     device_refresh_retry_id = 0;
     auto* S = static_cast<AppState*>(data);
-    if (!S || !S->window || !S->device_id_combo) return G_SOURCE_REMOVE;
+    // O31-G1: never touch widgets after teardown.
+    if (!S || S->window_destroyed || !S->window || !S->device_id_combo)
+        return G_SOURCE_REMOVE;
     refresh_mice_combo(S, /*is_auto=*/true, /*quiet=*/true);
     return G_SOURCE_REMOVE;
 }
@@ -305,19 +307,19 @@ gboolean on_inotify_event(GIOChannel* chan, GIOCondition /*cond*/, gpointer user
         if (st != G_IO_STATUS_NORMAL || bytes_read < sizeof(struct inotify_event)) break;
 
         // BUG-NEW-14 (aj4): a single read() may pack several inotify events;
-        // walk them all (fixed header + variable name), not just the first.
+        // walk them all (fixed header + variable name).  Collect whether any
+        // "event*" node appeared, then refresh ONCE after the read loop so a
+        // hot-plug burst is not dropped by an early return.
+        bool changed = false;
         size_t off = 0;
         while (off + sizeof(struct inotify_event) <= bytes_read) {
             const auto* ev = reinterpret_cast<const struct inotify_event*>(buf + off);
             off += sizeof(struct inotify_event) + ev->len;
-            // Only process nodes starting with "event"
-            if (ev->len > 0 && std::strncmp(ev->name, "event", 5) == 0) {
-                // O8: skip refresh if the profile list is not yet loaded
-                if (!S->config.profiles.empty())
-                    refresh_mice_combo(S, /*is_auto=*/true);
-                return TRUE; // one refresh per callback is enough (batches consecutive events)
-            }
+            if (ev->len > 0 && std::strncmp(ev->name, "event", 5) == 0)
+                changed = true;
         }
+        if (changed && !S->config.profiles.empty())
+            refresh_mice_combo(S, /*is_auto=*/true);
     }
     return TRUE; // keep the source active
 }

@@ -32,9 +32,9 @@ inline double magnitude(vec2d v) {
         ax = ay;
         ay = t;
     }
-    if (ax == 0.0) return 0.0;
     if (!std::isfinite(ax) || !std::isfinite(ay))
         return std::hypot(v.x, v.y);
+    if (ax == 0.0) return 0.0;
     const double r = ay / ax;
     return ax * std::sqrt(1.0 + r * r);
 }
@@ -45,6 +45,7 @@ inline double lp_distance(vec2d v, double p) {
     double ax = std::fabs(v.x);
     double ay = std::fabs(v.y);
     if (ax == 0 && ay == 0) return 0;
+    if (!std::isfinite(p)) return std::max(ax, ay);
     // Defense-in-depth for a non-finite COMPONENT, deliberately placed on the
     // inputs and NOT on M: with ax = NaN the comparison `ax > ay` is false, so
     // M silently becomes ay — a finite number — and a `!isfinite(M)` guard
@@ -207,14 +208,19 @@ inline double lp_distance(vec2d v, double p) {
 }
 
 inline double maxsd(double a, double b) {
+    if (!std::isfinite(a)) return b;
+    if (!std::isfinite(b)) return a;
     return a > b ? a : b;
 }
 
 inline double minsd(double a, double b) {
+    if (!std::isfinite(a)) return b;
+    if (!std::isfinite(b)) return a;
     return a < b ? a : b;
 }
 
 inline double clampsd(double val, double lo, double hi) {
+    if (!std::isfinite(val)) return lo;
     return val < lo ? lo : (val > hi ? hi : val);
 }
 

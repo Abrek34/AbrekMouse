@@ -622,7 +622,14 @@ bool AccelDaemon::push_config(const std::string& json_str) {
         // The IPC listener is created before start() by the executable so its
         // startup failure is non-fatal.  Do not let a client race that window
         // and make save_config() operate on an empty path.
-        if (!running_.load(std::memory_order_acquire) || config_path_.empty())
+        // R18-SYNC: config_path_ is written under devices_mutex_ in start();
+        // snapshot it under the same lock to avoid a data race on std::string.
+        std::string cfg_path;
+        {
+            std::lock_guard<std::mutex> lk(devices_mutex_);
+            cfg_path = config_path_;
+        }
+        if (!running_.load(std::memory_order_acquire) || cfg_path.empty())
             return false;
         // R10-PUSHG: a revert pushed while the PREVIOUS push is still armed
         // but not yet applied would slip through the guard below (it compares
@@ -684,7 +691,7 @@ bool AccelDaemon::push_config(const std::string& json_str) {
             }
             save_q_.emplace_back(std::move(cfg), config_path_);
         }
-        log("Config push queued for save (" + config_path_ + ").", true);
+        log("Config push queued for save (" + cfg_path + ").", true);
         return true;
     } catch (std::exception& e) {
         log("Config push rejected: " + std::string(e.what()));
@@ -1986,18 +1993,32 @@ std::string AccelDaemon::apply_hidpp_dpi(const hidpp_device& dev, uint16_t dpi) 
     std::string msg;
     {
         std::lock_guard<std::mutex> lk(devices_mutex_);
+        // Mirror apply_hidpp_battery(): only apply when exactly one device
+        // matches, so a shared id (Unifying receiver / serial-less twins)
+        // cannot corrupt another mouse's DPI/telemetry.
+        mouse_device* match = nullptr;
+        int match_count = 0;
         for (auto& m : devices_) {
             if (m.device_id.find(needle) != std::string::npos) {
-                if (m.dpi != static_cast<int>(dpi) || m.detected_dpi != static_cast<int>(dpi)) {
-                    msg = "Hardware DPI update on " + m.name + ": " +
-                          std::to_string(m.dpi) + " -> " + std::to_string(dpi) + " DPI";
-                    m.dpi = static_cast<int>(dpi);
-                    m.detected_dpi = static_cast<int>(dpi);
-                    m.telemetry->dpi_factor.store(
-                        NORMALIZED_DPI / static_cast<double>(m.dpi),
-                        std::memory_order_relaxed);
-                }
+                match = &m;
+                match_count++;
             }
+        }
+        if (match_count == 1) {
+            if (match->dpi != static_cast<int>(dpi) ||
+                match->detected_dpi != static_cast<int>(dpi)) {
+                msg = "Hardware DPI update on " + match->name + ": " +
+                      std::to_string(match->dpi) + " -> " + std::to_string(dpi) + " DPI";
+                match->dpi = static_cast<int>(dpi);
+                match->detected_dpi = static_cast<int>(dpi);
+                match->telemetry->dpi_factor.store(
+                    NORMALIZED_DPI / static_cast<double>(match->dpi),
+                    std::memory_order_relaxed);
+            }
+        } else if (match_count == 0) {
+            // no evdev mouse matched — nothing to merge
+        } else {
+            // ambiguous: refuse to paint the wrong device
         }
     }
     // R1-04 lock narrowing: returned, not logged here.  See daemon.hpp.
@@ -2763,21 +2784,10 @@ static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
         double lat_us = static_cast<double>(t_now - lat_anchor_ns) / 1000.0;
         lat_anchor_ns = t_now;
         dev.lat.record(lat_us);
-        // Live telemetry: raw-passthrough path (no modifier). Fill counters and
-        // deltas only — speeds are undefined without the speed pipeline.
-        // NOTE (P121/BUG-05 doc): in practice this branch is currently
-        // UNREACHABLE — raw REL_X/REL_Y are forwarded one-by-one inline in
-        // process_device() and has_motion is never set, so flush_motion() is
-        // never called in raw mode.  The block is kept as the telemetry
-        // contract for a future batched raw path, and is harmless dead code.
-        // seqlock protocol: bump counter to odd (write in progress)
-        dev.telemetry->samples.fetch_add(1, std::memory_order_release);
-        dev.telemetry->dx.store(static_cast<double>(ix), std::memory_order_relaxed);
-        dev.telemetry->dy.store(static_cast<double>(iy), std::memory_order_relaxed);
-        dev.telemetry->wall_ms.store(static_cast<double>(t_now) / 1'000'000.0,
-                                     std::memory_order_relaxed);
-        // bump counter to even (write complete)
-        dev.telemetry->samples.fetch_add(1, std::memory_order_release);
+        // Contract (P121/BUG-05): raw passthrough never fills telemetry — REL_X/REL_Y
+        // are forwarded inline in process_device() and flush_motion() is not reached
+        // in raw mode.  This branch is retained only for a future batched raw path;
+        // it must NOT publish a misleading live sample, so no seqlock bump is done.
         return true;
     }
 
@@ -4088,8 +4098,13 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
             if (body.size() != (size_t)body_len) {
                 response = "{\"ok\":false,\"error\":\"incomplete config payload\"}\n";
             } else if (push_config(body)) {
+                std::string cfg_path;
+                {
+                    std::lock_guard<std::mutex> lk(devices_mutex_);
+                    cfg_path = config_path_;
+                }
                 response = std::string("{\"ok\":true,\"config\":") +
-                           json_str(config_path_) + "}\n";
+                           json_str(cfg_path) + "}\n";
             } else {
                 response = "{\"ok\":false,\"error\":\"config rejected\"}\n";
             }

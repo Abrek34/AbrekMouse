@@ -1082,6 +1082,12 @@ void build_ui(AppState* S, GtkApplication* gapp) {
                 g_source_remove(S2->hidpp_notify_poll_id);
                 S2->hidpp_notify_poll_id = 0;
             }
+            // Device-refresh retry timer (devices.inl): remove it so a deferred
+            // refresh cannot fire into destroyed widgets after teardown.
+            if (device_refresh_retry_id != 0) {
+                g_source_remove(device_refresh_retry_id);
+                device_refresh_retry_id = 0;
+            }
             // GUI-O4: drop the pkexec child-watch source.  Without this a
             // pkexec+systemctl child that exits AFTER the window is gone would
             // fire pkexec_child_report() → set_status() into destroyed widgets.

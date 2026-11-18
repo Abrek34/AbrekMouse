@@ -6,7 +6,7 @@
 namespace rawaccel {
 
 /// Single source of truth for the version number — read by GUI and daemon.
-inline constexpr const char* RAWACCEL_VERSION = "1.2.9";
+inline constexpr const char* RAWACCEL_VERSION = "1.2.8";
 
 using milliseconds = double;
 
@@ -116,8 +116,13 @@ struct accel_args {
         if (!deq(sync_speed,       o.sync_speed)      || !deq(smooth,       o.smooth))        return false;
         if (!deq(cap.x,            o.cap.x)           || !deq(cap.y,        o.cap.y))         return false;
         if (length != o.length) return false;
-        for (int i = 0; i < length && i < (int)LUT_RAW_DATA_CAPACITY; ++i)
+        for (int i = 0; i < length && i < (int)LUT_RAW_DATA_CAPACITY; ++i) {
+            if (std::isnan(data[i]) || std::isnan(o.data[i])) {
+                if (!(std::isnan(data[i]) && std::isnan(o.data[i]))) return false;
+                continue;
+            }
             if (std::fabs(data[i] - o.data[i]) > LUT_EPSILON) return false;
+        }
         return true;
     }
     bool operator!=(const accel_args& o) const { return !(*this == o); }

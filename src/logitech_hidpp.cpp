@@ -1286,6 +1286,12 @@ std::optional<hidpp_notification> HidppTransport::receive_notification(
         }
         return std::nullopt;
     };
+    // Surface stashed notifications first (BUG-22 parity with drain_notifications).
+    if (!pending_notifications_.empty()) {
+        auto n = pending_notifications_.front();
+        pending_notifications_.erase(pending_notifications_.begin());
+        return n;
+    }
     return read_one(timeout);
 }
 
@@ -1381,7 +1387,11 @@ std::vector<hidpp_feature_metadata> HidppTransport::get_feature_metadata(uint8_t
     // enumerating dynamic indices.  The fourth byte of GetFeatureId is the
     // feature version, not the dynamic index; the request index is the
     // authoritative metadata.
-    const uint16_t count = static_cast<uint16_t>((*count_response)[0]) + 1;
+    // Cap the advertised count: a hostile/garbled reply must not drive a
+    // multi-thousand-iteration enumeration even though the budget/timeout
+    // streaks already bound it.
+    const uint16_t count = static_cast<uint16_t>(
+        std::min<int>((*count_response)[0] + 1, 256));
     features.push_back({0x0000, 0, 0, 0});
     features.push_back({0x0001, feature_set_index, 0, 0});
     // A non-responding device would otherwise stall the daemon for minutes
@@ -2063,23 +2073,28 @@ bool HidppTransport::restore_onboard_profiles(uint8_t target_device_index) {
 bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
     disable_onboard_profiles_for_write(target_device_index);
     const auto info = get_dpi_info(target_device_index);
-    if (!info || dpi == 0) return false;
+    if (!info || dpi == 0) {
+        // Re-enable onboard profiles if the query failed, so the device is not
+        // left in a half-disabled state.
+        (void)restore_onboard_profiles(target_device_index);
+        return false;
+    }
     // Solaar only exposes this setting after GetDpiList succeeds.  Do the
     // same here instead of sending an arbitrary value to model firmware.
     if (info->dpi_levels.empty() ||
         std::find(info->dpi_levels.begin(), info->dpi_levels.end(), dpi) ==
-            info->dpi_levels.end())
+            info->dpi_levels.end()) {
+        (void)restore_onboard_profiles(target_device_index);
         return false;
-    // P-BUG-1: do not refuse the whole DPI change just because the advertised
-    // LOD byte is not a valid level (1=low, 2=medium, 3=high; 0 is the
-    // "not supported" sentinel and is rejected by firmware when written).
-    // Clamp into 1..3 so writing DPI also carries a writable LOD byte,
-    // matching set_lift_off_distance().
+    }
     const auto index = resolve_feature_index(
         info->extended ? hidpp_feature_index::extended_adjustable_dpi
                        : hidpp_feature_index::adjustable_dpi,
         target_device_index);
-    if (!index) return false;
+    if (!index) {
+        (void)restore_onboard_profiles(target_device_index);
+        return false;
+    }
 
     if (info->extended) {
         // DPIFIX-1: a single-value set_dpi is symmetric — write the SAME DPI
@@ -2096,9 +2111,11 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
             static_cast<uint8_t>(info->supports_lift_off_distance
                 ? std::clamp<uint16_t>(info->lift_off_distance, 1, 3) : 0)
         };
-        return send_feature_request(*index, 0x6, params, sizeof(params),
+        bool ok = send_feature_request(*index, 0x6, params, sizeof(params),
                                     std::chrono::milliseconds(700),
                                     target_device_index).has_value();
+        if (!ok) (void)restore_onboard_profiles(target_device_index);
+        return ok;
     }
     const uint8_t params[3] = {
         0, static_cast<uint8_t>(dpi >> 8), static_cast<uint8_t>(dpi)
@@ -2109,9 +2126,11 @@ bool HidppTransport::set_dpi(uint16_t dpi, uint8_t target_device_index) {
     // (read back through GetSensorDpi, fn 0x02).  fn 0x01 is the DPI *list*
     // reader (GetSensorDpiList), not a setter — sending a value there only
     // reads a list chunk and never changes the DPI (P-HIDPP-1).
-    return send_feature_request(*index, 0x3, params, sizeof(params),
+    bool ok = send_feature_request(*index, 0x3, params, sizeof(params),
                                 std::chrono::milliseconds(700),
                                 target_device_index).has_value();
+    if (!ok) (void)restore_onboard_profiles(target_device_index);
+    return ok;
 }
 
 std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_index) {
@@ -2218,6 +2237,7 @@ bool HidppTransport::set_polling_rate(uint32_t hz, uint8_t target_device_index) 
             }
         }
     }
+    (void)restore_onboard_profiles(target_device_index);
     return false;
 }
 
@@ -2237,11 +2257,16 @@ bool HidppTransport::set_lift_off_distance(hidpp_lift_off_distance distance,
     const auto info = get_dpi_info(target_device_index);
     if (!info || !info->extended || !info->supports_lift_off_distance ||
         static_cast<uint8_t>(distance) < static_cast<uint8_t>(hidpp_lift_off_distance::low) ||
-        distance > hidpp_lift_off_distance::high)
+        distance > hidpp_lift_off_distance::high) {
+        (void)restore_onboard_profiles(target_device_index);
         return false;
+    }
     const auto index = resolve_feature_index(hidpp_feature_index::extended_adjustable_dpi,
                                              target_device_index);
-    if (!index) return false;
+    if (!index) {
+        (void)restore_onboard_profiles(target_device_index);
+        return false;
+    }
     const uint16_t y = info->supports_y && info->dpi_current_y
         ? info->dpi_current_y : info->dpi_current;
     const uint8_t params[6] = {

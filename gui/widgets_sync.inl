@@ -641,11 +641,13 @@ void on_xy_link_toggled(GtkCheckButton* btn, gpointer user_data) {
                 [](gpointer p) { delete static_cast<xy_link_ctx*>(p); });
             g_signal_connect(cancel_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {
                 auto* c = static_cast<xy_link_ctx*>(g_object_get_data(G_OBJECT(d), "ctx"));
+                if (c->S->window_destroyed) { gtk_window_destroy(GTK_WINDOW(d)); return; }
                 // Revert the checkbox without re-entering this handler.
                 c->S->updating = true;
                 gtk_check_button_set_active(c->btn, FALSE);
                 c->S->updating = false;
-                gtk_widget_set_sensitive(c->S->y_axis_frame, TRUE);
+                if (c->S->y_axis_frame)
+                    gtk_widget_set_sensitive(c->S->y_axis_frame, TRUE);
                 gtk_window_destroy(GTK_WINDOW(d));
             }), dlg);
             g_signal_connect(ok_btn, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer d) {

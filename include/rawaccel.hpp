@@ -22,6 +22,7 @@ namespace rawaccel {
 /// benchmark's smooth path ~240 ns/event; after it, the state is exactly 0 and
 /// the ordinary no-smoothing cost remains.
 static inline double flush_subnormal(double value) {
+    if (!std::isfinite(value)) return 0.0;
     return std::fabs(value) < std::numeric_limits<double>::min() ? 0.0 : value;
 }
 
@@ -65,7 +66,7 @@ struct simple_ema_smoother {
         // would poison windowTotal/cutoffTotal forever.  modifier::modify()
         // never calls us with time <= 0 (early return), so this only fires on
         // direct/fuzz/test input — return the current estimate unchanged.
-        if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        if (!std::isfinite(time) || time <= 0) return std::min(windowTotal, cutoffTotal);
         // L09-05 (HIGH): a single non-finite `speed` used to poison the
         // accumulators PERMANENTLY (windowTotal += twc*(NaN - windowTotal) →
         // NaN forever, surviving reconfigure() because the smoother is already
@@ -135,7 +136,7 @@ struct linear_ema_smoother {
         // Same time<=0/NaN guard as simple_ema_smoother::smooth (see above):
         // -inf * 0 == NaN would poison all four accumulators via the trend
         // terms.  Return the current estimate unchanged instead.
-        if (!(time > 0)) return std::min(windowTotal, cutoffTotal);
+        if (!std::isfinite(time) || time <= 0) return std::min(windowTotal, cutoffTotal);
         // L09-05 (HIGH): same permanent-poisoning guard as the simple smoother
         // — a non-finite input sample is ignored instead of corrupting all
         // four accumulators (which survived reconfigure() until unplug).

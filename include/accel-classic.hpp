@@ -42,6 +42,7 @@ struct classic {
     }
 
     double operator()(double x, const accel_args& args) const {
+        if (!std::isfinite(x)) return 1.0;
         if (x <= args.input_offset) return 1.0;
         // Linear path (exponent <= 1): constant gain = acceleration, capped at cap_y
         if (args.exponent_classic <= 1.0)

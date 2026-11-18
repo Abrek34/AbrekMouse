@@ -24,6 +24,7 @@ struct jump {
     jump(const accel_args& args) : gain_mode(args.gain) {
         step = { args.cap.x, args.cap.y - 1 };
         double rate_inverse = args.smooth * step.x;
+        if (!std::isfinite(rate_inverse)) rate_inverse = 0.0;
         smooth_rate = (rate_inverse < 1) ? 0.0 : (2 * M_PI) / rate_inverse;
         if (gain_mode && smooth_rate != 0)
             smooth_log0 = std::log1p(std::exp(-smooth_rate * step.x));

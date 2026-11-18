@@ -141,6 +141,7 @@ struct power {
     }
 
     double operator()(double speed, const accel_args&) const {
+        if (!std::isfinite(speed)) return 1.0;
         if (speed <= 0) return 1.0;
         if (!gain_mode) {
             double out = base_fn_impl(speed);

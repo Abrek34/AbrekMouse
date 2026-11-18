@@ -60,6 +60,7 @@ struct lookup {
 
     double operator()(double x, const accel_args& args) const {
         if (size <= 0) return 1.0; // empty LUT → no acceleration (port guard)
+        if (!std::isfinite(x)) return 1.0;
 
         const float* pts = args.data; // pairs [x0,y0, x1,y1, ...]
 

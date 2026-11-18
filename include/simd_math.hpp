@@ -152,7 +152,10 @@ static inline v2d v2d_load(const double* ptr) {
     return _mm256_set_pd(0, 0, ptr[1], ptr[0]);
 }
 static inline v2d v2d_set1(double x) {
-    return _mm256_set1_pd(x);
+    // X in lane 0, Y in lane 1; lanes 2/3 are zero padding (see v2d_set).
+    // _mm256_set1_pd would broadcast into the padding and break hmin/hmax-style
+    // reductions, so set only the live lanes.
+    return _mm256_set_pd(0, 0, x, x);
 }
 static inline v2d v2d_set(double x, double y) {
     return _mm256_set_pd(0, 0, y, x);

@@ -927,6 +927,15 @@ void hw_query_current(AppState* S) {
     if (!S->hw_dev_combo) return;
     int idx = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->hw_dev_combo));
     if (idx < 0 || idx >= (int)S->hidpp_devs.size()) { S->hw_pending_query = -1; return; }
+    // GUI-Y3: a busy scan/query/apply would previously drop this selection
+    // silently, leaving stale onboard values on screen.  Stash it and let the
+    // in-flight task's completion idle callback re-issue the query.  This
+    // check must come BEFORE the protocol-0 early return so a protocol-0
+    // selection made while a worker is still running does not clobber hw_busy.
+    if (S->hw_busy) {
+        S->hw_pending_query = idx;
+        return;
+    }
     // Protocol 0 devices (e.g. 046d:c542 Nano receiver) implement no HID++:
     // skip querying feature registers that will inevitably time out and block.
     if (S->hidpp_devs[idx].info.protocol_version == 0) {
@@ -935,13 +944,6 @@ void hw_query_current(AppState* S) {
         hw_update_ui_state(S);
         hw_render_caps(S, idx);
         hw_set_status(S, tr("No Logitech HID++ devices found."));
-        return;
-    }
-    // GUI-Y3: a busy scan/query/apply would previously drop this selection
-    // silently, leaving stale onboard values on screen.  Stash it and let the
-    // in-flight task's completion idle callback re-issue the query.
-    if (S->hw_busy) {
-        S->hw_pending_query = idx;
         return;
     }
     // Consume any stashed pending selection (a fresh query supersedes it).
