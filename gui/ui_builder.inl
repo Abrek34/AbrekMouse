@@ -1381,6 +1381,13 @@ static bool kde_atomic_write(const std::string& path,
     // O_NOFOLLOW: never follow a symlink (prevents symlink-follow attack).
     // O_EXCL:     fail if tmp already exists (prevents two-writer race).
     int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        // A stale temp from an earlier aborted write is not a reason to refuse
+        // (write_text_file / save_config recover the same way).  Unlink the
+        // pathname, never the symlink target, then retry O_EXCL.
+        unlink(tmp.c_str());
+        fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    }
     if (fd < 0) return false;
     FILE* fw = fdopen(fd, "w");
     if (!fw) { close(fd); unlink(tmp.c_str()); return false; }

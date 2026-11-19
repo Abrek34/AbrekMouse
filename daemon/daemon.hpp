@@ -16,6 +16,7 @@
 #include <memory>
 #include <cstdint>
 #include <limits>
+#include <sys/types.h>               // dev_t / ino_t (IPC socket identity)
 
 namespace rawaccel {
 
@@ -440,6 +441,9 @@ private:
     std::string  pending_app_;
     bool         active_app_dirty_ = false;
     std::string  current_app_;
+    // T39-IPC06: loop-thread timestamp of the last real re-apply; reports that
+    // arrive inside the debounce window stay dirty and are coalesced.
+    uint64_t     active_app_last_apply_ns_ = 0;
 
     // ── PAS-1: top-level use_raw_input master switch ──────────────────────
     // Previously dormant (parsed + serialized but never read anywhere).  It is
@@ -459,7 +463,20 @@ private:
     // dedicated mutex serialises the path read+clear; it is never on a hot path.
     std::mutex          ipc_path_mu_;
     std::string         ipc_sock_path_;
+    // D26-N1: identity of the socket we bound.  stop_ipc_server() only unlinks
+    // the pathname if it still refers to THIS inode, so a stale stop (or a
+    // second daemon that rebound the path) cannot delete a live socket.
+    dev_t               ipc_sock_dev_  {};
+    ino_t               ipc_sock_ino_  {};
     std::atomic<bool>   ipc_running_  { false };
+
+    // T39-IPC04: 'input' gid resolved once at IPC startup, plus a short-TTL
+    // cache of per-uid membership decisions.  NSS backends (SSSD/LDAP) can
+    // block for seconds; the IPC worker is serial and must not stall per
+    // connection.  Only the IPC thread touches the cache after startup.
+    gid_t               input_gid_ = static_cast<gid_t>(-1);
+    struct peer_auth_entry { bool allowed; uint64_t expires_ns; };
+    std::unordered_map<uid_t, peer_auth_entry> peer_auth_cache_;
 
     void ipc_serve_loop(); // runs in ipc_thread_
     void handle_ipc_client(int client_fd);

@@ -80,6 +80,9 @@ uint16_t read_be16(const uint8_t* p) {
 std::vector<uint16_t> decode_dpi_levels(const std::vector<uint8_t>& list_bytes) {
     std::vector<uint16_t> levels;
     for (size_t i = 0; i + 1 < list_bytes.size(); i += 2) {
+        // Device-driven list: cap EVERY path (plain levels, step expansion and
+        // the explicit last append) at the same defensive ceiling.
+        if (levels.size() >= 2048) break;
         const uint16_t value = read_be16(&list_bytes[i]);
         if (value == 0) break;
         // 0xE000..0xFFFF denotes a step/last pair in Logitech's DPI
@@ -2200,24 +2203,10 @@ std::optional<uint32_t> HidppTransport::get_polling_rate(uint8_t target_device_i
 
 bool HidppTransport::set_polling_rate(uint32_t hz, uint8_t target_device_index) {
     disable_onboard_profiles_for_write(target_device_index);
-    if (auto code = hz_to_rate_code(false, hz)) {
-        if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
-                                               target_device_index)) {
-            // REPORT_RATE.GetSupportedRates returns one bit per 1..8 ms
-            // setting.  Refuse values not advertised by the device.
-            if (auto supported = send_feature_request(
-                    *index, 0x0, nullptr, 0, std::chrono::milliseconds(500),
-                    target_device_index);
-                supported && !supported->empty() &&
-                (((*supported)[0] >> (*code - 1)) & 0x01) != 0) {
-            const uint8_t params[3] = {*code, 0, 0};
-            if (send_feature_request(*index, 0x2, params, sizeof(params),
-                                     std::chrono::milliseconds(500),
-                                     target_device_index))
-                return true;
-            }
-        }
-    }
+    // Probe EXTENDED_ADJUSTABLE_REPORT_RATE first, matching get_polling_rate().
+    // A device that advertises both features may only expose rates above
+    // 1000 Hz through the extended one; the legacy REPORT_RATE path silently
+    // caps there.  Fall back to legacy if the extended write fails.
     if (auto code = hz_to_rate_code(true, hz)) {
         if (auto index = resolve_feature_index(
                 hidpp_feature_index::extended_adjustable_report_rate,
@@ -2230,10 +2219,29 @@ bool HidppTransport::set_polling_rate(uint32_t hz, uint8_t target_device_index) 
                 supported && supported->size() >= 2 &&
                 ((static_cast<uint16_t>((*supported)[0]) << 8 |
                   (*supported)[1]) & (static_cast<uint16_t>(1) << *code)) != 0) {
-            const uint8_t params[3] = {*code, 0, 0};
-            return send_feature_request(*index, 0x3, params, sizeof(params),
-                                        std::chrono::milliseconds(500),
-                                        target_device_index).has_value();
+                const uint8_t params[3] = {*code, 0, 0};
+                if (send_feature_request(*index, 0x3, params, sizeof(params),
+                                         std::chrono::milliseconds(500),
+                                         target_device_index))
+                    return true;
+            }
+        }
+    }
+    if (auto code = hz_to_rate_code(false, hz)) {
+        if (auto index = resolve_feature_index(hidpp_feature_index::report_rate,
+                                               target_device_index)) {
+            // REPORT_RATE.GetSupportedRates returns one bit per 1..8 ms
+            // setting.  Refuse values not advertised by the device.
+            if (auto supported = send_feature_request(
+                    *index, 0x0, nullptr, 0, std::chrono::milliseconds(500),
+                    target_device_index);
+                supported && !supported->empty() &&
+                (((*supported)[0] >> (*code - 1)) & 0x01) != 0) {
+                const uint8_t params[3] = {*code, 0, 0};
+                if (send_feature_request(*index, 0x2, params, sizeof(params),
+                                         std::chrono::milliseconds(500),
+                                         target_device_index))
+                    return true;
             }
         }
     }
@@ -2400,6 +2408,14 @@ bool HidppTransport::write_onboard_profile_sector(
     uint16_t sector, const std::vector<uint8_t>& data,
     uint8_t target_device_index) {
     // 0x8100 OnboardProfiles — write a single flash sector.
+    // Validate against the device descriptor before touching flash: an
+    // out-of-range sector or an oversized payload used to be chunked and sent
+    // anyway, and a failed write mid-sequence left a partially programmed
+    // sector.  Same bounds as read_onboard_profile_sector().
+    const auto info = get_onboard_profile_info(target_device_index);
+    if (!info || sector == 0 || sector >= info->sector_count ||
+        data.empty() || data.size() > info->profile_size || data.size() > 4096)
+        return false;
     // fn=0x70 write_sector: params = sector (u16 BE) + flash data (Solaar / HID++ 2.0 Feature 0x8100 spec).
     // The data chunk is derived from HIDPP_SHORT_PAYLOAD_MAX rather than written out, so
     // it cannot drift past the budget again (O31-H1: chunk 16 made the vector
@@ -2457,7 +2473,9 @@ std::vector<std::string> discover_logitech_hidraw_devices(const char* root) {
 
 static std::string hidraw_export_name(const std::string& path) {
     char buf[256] = {};
-    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    // O_NONBLOCK: HIDIOCGRAWNAME on a device that is being unplugged (or a
+    // busy/broken node) must not block the GUI's hot-plug worker.
+    int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) return std::string();
     if (ioctl(fd, HIDIOCGRAWNAME(sizeof(buf) - 1), buf) < 0)
         buf[0] = '\0';

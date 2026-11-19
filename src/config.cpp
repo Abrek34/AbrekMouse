@@ -739,6 +739,19 @@ static std::string json_get_string_limited(const json& v,
     return s;
 }
 
+/// T36-CFG01: the GUI trims a typed match_app before storing it, but the JSON
+/// loader did not.  A hand-edited/imported `" match_app ": " firefox "` then
+/// loaded with the spaces intact; the daemon compares it as a substring, so the
+/// binding could never match a real WM_CLASS.  Trim the same ASCII whitespace
+/// set on load so both entry points agree.
+static std::string trim_ascii_whitespace(std::string s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
 static device_profile device_profile_from_json(const json& j) {
     device_profile dp;
     // B4 (P43): type guard + length cap for the free-form string fields.
@@ -753,7 +766,9 @@ static device_profile device_profile_from_json(const json& j) {
     // silently become a dead literal ID that matches no device.
     if (dp.device_id == "(all)" || dp.device_id == "all" || dp.device_id == "*")
         dp.device_id.clear();
-    if (j.contains("match_app"))  dp.match_app = json_get_string_limited(j["match_app"], "", 128);
+    if (j.contains("match_app"))
+        dp.match_app = trim_ascii_whitespace(
+            json_get_string_limited(j["match_app"], "", 128));
     if (j.contains("dpi"))          dp.dev_cfg.dpi   = json_get_int_safe(j["dpi"], 800);
     if (j.contains("polling_rate")) dp.dev_cfg.polling_rate = json_get_int_safe(j["polling_rate"], 1000);
     // L05-01 (CRIT): numeric 0/1 accepted for `disable` like the O31-C3

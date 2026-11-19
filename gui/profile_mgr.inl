@@ -54,6 +54,16 @@ static bool write_text_file(const char* path, const std::string& content) {
         ::unlink(tmp.c_str());
         return false;
     }
+    // Durability: fsync the parent directory so the rename itself survives a
+    // power loss (same discipline as save_config's tmp+rename path).
+    std::string dir(path);
+    const size_t slash = dir.find_last_of('/');
+    dir = (slash == std::string::npos) ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+    int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        (void)::fsync(dfd);
+        ::close(dfd);
+    }
     return true;
 }
 

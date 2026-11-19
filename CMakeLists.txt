@@ -63,7 +63,10 @@ add_compile_options(
     -Wformat-security
 )
 if(NOT RAWACCEL_FORTIFY_PREDEFINED)
-    add_compile_options(-D_FORTIFY_SOURCE=2)
+    # _FORTIFY_SOURCE needs the optimizer; in a Debug (-O0) build glibc warns
+    # ("requires compiling with optimization") on every TU.  Keep the hardened
+    # default for every optimized configuration only.
+    add_compile_options($<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>)
 endif()
 if(NOT RAWACCEL_PORTABLE)
     add_compile_options(-march=native)

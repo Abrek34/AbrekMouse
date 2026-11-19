@@ -85,6 +85,25 @@ struct InputDeviceInfo {
 
 // ── Application state ─────────────────────────────────────────────────────────
 
+// P1-2: values of the X-only scalar controls as last loaded by
+// profile_to_widgets().  With X/Y unlinked, widgets_to_profile() copies one of
+// these fields X→Y only when its X control actually changed.  The old
+// unconditional copy silently replaced a DISTINCT Y value (imported JSON /
+// hand-edited asymmetric profile) on the first unrelated GUI edit + save.
+struct XYUnlinkedSnapshot {
+    bool   gain           = true;
+    int    cap_mode       = 0;   // cap_to_idx(out) == 0
+    double cap_x          = 15;
+    double exponent_power = 0.05;
+    double decay_rate     = 0.1;
+    double scale          = 1;
+    double output_offset  = 0;
+    double motivity       = 1.5;
+    double gamma          = 1;
+    double smooth         = 0.5;
+    double sync_speed     = 5;
+};
+
 // STALE-1 (AJ1, 1 Oct 2026): "unreadable" sentinel for a config-file mtime.
 //
 // ⭐ WHY NOT -1, AND WHY NOT A SIGN TEST.  `fs::file_time_type` is NOT
@@ -115,6 +134,7 @@ struct AppState {
     bool        xy_linked  = true;
     bool        updating   = false;
     bool        unsaved    = false;
+    XYUnlinkedSnapshot xy_snapshot; // P1-2: X-only controls as last loaded
 
     // STALE-1 (AJ1, 30 Sep 2026): the config file is read ONCE at startup
     // (`state.config = load_config(...)`, gui/main.cpp), and `save_config_now`

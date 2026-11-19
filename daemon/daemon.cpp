@@ -45,12 +45,14 @@ static double now_ms() {
            static_cast<double>(ts.tv_nsec) / 1'000'000.0;
 }
 
-/// Kernel ev.time is filled by the input core on CLOCK_REALTIME.  We never mix
-/// it with CLOCK_MONOTONIC_RAW — only DELTAs of consecutive frame timestamps
-/// are used for the SM-1 interval, so the clock base is irrelevant.
+/// ev.time is pinned to CLOCK_MONOTONIC via EVIOCSCLOCKID in open_input_device().
+/// This helper reads the SAME clock for the SM-1 re-anchor on profile apply;
+/// using CLOCK_REALTIME here would make the first delta after a profile switch
+/// garbage.  We never mix it with CLOCK_MONOTONIC_RAW — only DELTAs of
+/// consecutive frame timestamps are used, so the clock base is irrelevant.
 static inline uint64_t ev_now_us() {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1'000'000ULL +
            static_cast<uint64_t>(ts.tv_nsec / 1000);
 }
@@ -746,6 +748,15 @@ bool AccelDaemon::open_input_device(mouse_device& dev) {
         log("Cannot open " + dev.path + ": " + strerror(errno));
         return false;
     }
+    // SM-1 derives the USB poll period from DELTAS of ev.time.  The kernel
+    // stamps events on CLOCK_REALTIME by default, so an NTP step/settimeofday
+    // between two frames would inject a bogus (possibly negative→huge) gap.
+    // Pin the event clock to CLOCK_MONOTONIC.  Best-effort: old kernels may
+    // reject it; REALTIME deltas still work, just without step immunity.
+    int ev_clock = CLOCK_MONOTONIC;
+    if (ioctl(dev.fd_in, EVIOCSCLOCKID, &ev_clock) < 0)
+        log("Cannot set monotonic event clock for " + dev.path + ": " +
+            strerror(errno), true);
 
     char name[256] = {};
     // O4: check return value; fall back to path if the name cannot be read.
@@ -1146,7 +1157,20 @@ const device_profile* AccelDaemon::find_profile(const std::string& dev_id) const
     return nullptr;
 }
 
+// Defined with the timing helpers below; used by the focus debounce.
+static inline uint64_t now_ns();
+
 void AccelDaemon::apply_active_app() {
+    // T39-IPC06: coalesce focus flapping (A/B/A/B) instead of re-applying
+    // every profile and kicking a rescan on each report.  A report inside the
+    // window leaves active_app_dirty_ set; a later loop pass applies the
+    // latest value, so the final focus still wins.
+    static constexpr uint64_t kActiveAppDebounceNs = 200'000'000ULL;
+    const uint64_t now = now_ns();
+    if (active_app_last_apply_ns_ != 0 &&
+        now - active_app_last_apply_ns_ < kActiveAppDebounceNs)
+        return;
+
     // Consume the GUI's latest focus report (loop thread only).  IPC thread
     // wrote pending_app_ under active_app_mu_; we copy it into current_app_
     // and re-apply profiles only when the focused app actually changed.
@@ -1158,6 +1182,8 @@ void AccelDaemon::apply_active_app() {
         next = pending_app_;
     }
     if (next == current_app_) return;
+
+    active_app_last_apply_ns_ = now;
 
     if (next.empty())
         log("Focus: no application focused — app-specific profiles inactive.");
@@ -2754,11 +2780,12 @@ struct write_batch {
 /// work instead of re-measuring the whole batch (MED-4).  The final uinput
 /// write() duration is measured separately by write_batch::flush() via its
 /// on_write_us callback (T38-HOT01).
-/// frame_ev_us = kernel ev.time (µs, CLOCK_REALTIME) of the SYN_REPORT that
-/// closed this frame — the SM-1 interval is measured as
-/// DELTA(last_frame_ev_us → frame_ev_us), the true USB poll period.  Wall
-/// clock (last_time_ms) remains the fallback for the first frame and for the
-/// raw path, and stays in sync so a later raw→accel switch re-anchors cleanly.
+/// frame_ev_us = kernel ev.time (µs, CLOCK_MONOTONIC — pinned via
+/// EVIOCSCLOCKID) of the SYN_REPORT that closed this frame — the SM-1 interval
+/// is measured as DELTA(last_frame_ev_us → frame_ev_us), the true USB poll
+/// period.  Wall clock (last_time_ms) remains the fallback for the first frame
+/// and for the raw path, and stays in sync so a later raw→accel switch
+/// re-anchors cleanly.
 /// Returns false if a uinput write fails (caller should mark dev as disconnected).
 static bool flush_motion(mouse_device& dev, libevdev_uinput* uidev,
                          double dx, double dy, uint64_t& lat_anchor_ns,
@@ -3814,6 +3841,10 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
     // If chown fails (e.g. no input group), fall back to owner-only (0600).
     {
         struct group* grp = getgrnam("input");
+        // T39-IPC04: resolve once here; the per-connection peer check must not
+        // hit NSS on the serial accept path.
+        input_gid_ = grp ? grp->gr_gid : static_cast<gid_t>(-1);
+        peer_auth_cache_.clear();
         if (grp) {
             // Best-effort group ownership; if chown fails (e.g. unprivileged
             // start) we fall through to chmod which still tightens permissions.
@@ -3843,11 +3874,21 @@ bool AccelDaemon::start_ipc_server(const std::string& sock_path) {
         close(fd);
         return false;
     }
+    // D26-N1: record the inode we bound.  stop_ipc_server() may only unlink
+    // the pathname while it still names THIS socket; after a concurrent
+    // rebind the path belongs to the new daemon and must survive our stop.
+    struct stat sock_st {};
+    const bool have_identity = lstat(sock_path.c_str(), &sock_st) == 0;
+    if (!have_identity)
+        log("IPC: cannot stat bound socket: " + std::string(strerror(errno)) +
+            " — it will not be unlinked on shutdown.");
     // Claim the socket path for stop_ipc_server() only now that the socket
     // is bound, listening and being served (D26-N1).
     {
         std::lock_guard<std::mutex> lk(ipc_path_mu_);
         ipc_sock_path_ = sock_path;
+        ipc_sock_dev_  = have_identity ? sock_st.st_dev : 0;
+        ipc_sock_ino_  = have_identity ? sock_st.st_ino : 0;
     }
     ipc_sock_fd_.store(fd);
 
@@ -3889,15 +3930,29 @@ void AccelDaemon::stop_ipc_server() {
     if (fd >= 0) close(fd);
     // TH-1: ipc_sock_path_ can be cleared concurrently (the IPC thread's catch
     // handler and the main thread's normal shutdown may both reach here).  Copy
-    // the path under the mutex, then unlink outside it.
+    // the path and the bound inode under the mutex, then unlink outside it.
     std::string path_to_unlink;
+    dev_t sock_dev = 0;
+    ino_t sock_ino = 0;
     {
         std::lock_guard<std::mutex> lk(ipc_path_mu_);
         path_to_unlink = ipc_sock_path_;
+        sock_dev = ipc_sock_dev_;
+        sock_ino = ipc_sock_ino_;
         ipc_sock_path_.clear();
+        ipc_sock_dev_ = 0;
+        ipc_sock_ino_ = 0;
     }
-    if (!path_to_unlink.empty())
-        unlink(path_to_unlink.c_str());
+    if (!path_to_unlink.empty() && (sock_dev != 0 || sock_ino != 0)) {
+        // D26-N1: only remove the pathname if it is still our inode.  A stale
+        // stop (or a second daemon that rebound the path) must not delete a
+        // live control socket.
+        struct stat st {};
+        if (lstat(path_to_unlink.c_str(), &st) == 0 &&
+            st.st_dev == sock_dev && st.st_ino == sock_ino &&
+            S_ISSOCK(st.st_mode))
+            unlink(path_to_unlink.c_str());
+    }
 }
 
 void AccelDaemon::ipc_serve_loop() {
@@ -3934,38 +3989,72 @@ void AccelDaemon::ipc_serve_loop() {
             socklen_t clen = sizeof(cred);
             if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &cred, &clen) == 0) {
                 bool allowed = (cred.uid == 0); // root always allowed
-                if (!allowed) {
-                    struct group* grp = getgrnam("input");
-                    if (grp) {
-                        // Check primary group
-                        if (cred.gid == grp->gr_gid) allowed = true;
-                        // Check supplementary groups via the peer's UID
-                        if (!allowed) {
+                if (!allowed && input_gid_ != static_cast<gid_t>(-1)) {
+                    if (cred.gid == input_gid_) {
+                        allowed = true;
+                    } else {
+                        // T39-IPC04: cache the NSS decision briefly.  Without
+                        // this every non-root connection paid for getpwuid()
+                        // plus getgrouplist(); a slow SSSD/LDAP backend
+                        // stalled the serial IPC worker for seconds.
+                        const uint64_t now = now_ns();
+                        auto cached = peer_auth_cache_.find(cred.uid);
+                        if (cached != peer_auth_cache_.end() &&
+                            now < cached->second.expires_ns) {
+                            allowed = cached->second.allowed;
+                        } else {
                             struct passwd* pw = getpwuid(cred.uid);
                             if (pw) {
+                                // SEC-1-FIX: getgrouplist() always includes
+                                // its `group` argument.  Passing input_gid_
+                                // made every passwd user a member of input;
+                                // use the user's real primary gid and scan
+                                // the resulting list for input_gid_.
+                                const std::string user = pw->pw_name;
+                                const gid_t pw_gid = pw->pw_gid;
+                                // Size first (returns -1 with the required
+                                // count in ngroups); the fill call below
+                                // retries if the list grew in between.
                                 int ngroups = 0;
-                                getgrouplist(pw->pw_name, grp->gr_gid,
-                                             nullptr, &ngroups);
-                                if (ngroups > 0) {
-                                    std::vector<gid_t> groups(ngroups);
-                                    // SEC-1-BUG: getgrouplist() returns the
-                                    // NUMBER OF GROUPS on success (>=0), not 0;
-                                    // -1 is the only failure signal.  The old
-                                    // `== 0` check never matched, so every
-                                    // non-root client (even an 'input' group
-                                    // member) was rejected and its connection
-                                    // closed unread -> client saw ECONNRESET.
-                                    if (getgrouplist(pw->pw_name, grp->gr_gid,
-                                                     groups.data(), &ngroups) >= 0) {
-                                        for (int i = 0; i < ngroups; i++) {
-                                            if (groups[i] == grp->gr_gid) {
-                                                allowed = true;
-                                                break;
-                                            }
+                                (void)getgrouplist(user.c_str(), pw_gid,
+                                                   nullptr, &ngroups);
+                                if (ngroups <= 0) ngroups = 16;
+                                std::vector<gid_t> groups;
+                                bool have_list = false;
+                                for (int attempt = 0; attempt < 4; ++attempt) {
+                                    if (ngroups > 4096) break;
+                                    groups.resize(static_cast<size_t>(ngroups));
+                                    int n = ngroups;
+                                    // SEC-1-BUG: success returns the NUMBER OF
+                                    // GROUPS (>= 0); -1 is the only failure.
+                                    if (getgrouplist(user.c_str(), pw_gid,
+                                                     groups.data(), &n) >= 0) {
+                                        groups.resize(static_cast<size_t>(n));
+                                        have_list = true;
+                                        break;
+                                    }
+                                    // Buffer too small: glibc writes the needed
+                                    // size into n.  Retry with headroom so a
+                                    // group added between sizing and filling
+                                    // cannot produce a false reject.
+                                    if (n > 4096) break;
+                                    if (n <= ngroups)
+                                        n = (ngroups > 0) ? ngroups * 2 : 16;
+                                    ngroups = n;
+                                }
+                                if (have_list) {
+                                    for (gid_t g : groups) {
+                                        if (g == input_gid_) {
+                                            allowed = true;
+                                            break;
                                         }
                                     }
                                 }
                             }
+                            if (peer_auth_cache_.size() >= 256)
+                                peer_auth_cache_.clear();
+                            peer_auth_cache_[cred.uid] = {
+                                allowed, now_ns() + 60'000'000'000ULL };
                         }
                     }
                 }
@@ -3994,6 +4083,22 @@ void AccelDaemon::ipc_serve_loop() {
     }
 }
 
+// P-APP: the WM_CLASS arrives from another process over IPC.  Keep the stashed
+// value printable ASCII and trimmed so a control byte cannot poison the
+// log/status path or make a substring match behave surprisingly.
+static std::string sanitize_app_class(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        if (c >= 0x20 && c != 0x7f) out.push_back(static_cast<char>(c));
+    const size_t b = out.find_first_not_of(' ');
+    if (b == std::string::npos) return {};
+    const size_t e = out.find_last_not_of(' ');
+    out = out.substr(b, e - b + 1);
+    if (out.size() > 128) out.resize(128);
+    return out;
+}
+
 void AccelDaemon::handle_ipc_client(int client_fd) {
     // P121/BUG-01: SO_SNDTIMEO + SO_RCVTIMEO.  A client that sends a request
     // but never reads the (potentially large status) response would otherwise
@@ -4002,8 +4107,19 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     // send timeout the worker drops the non-responsive peer and moves on.
     struct timeval tv { .tv_sec = 2, .tv_usec = 0 };
     struct timeval stv { .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
+        // T35-DMN05: without a receive timeout a silent peer can pin this
+        // serial worker forever (the deadline checks only run after recv
+        // returns).  The caller owns client_fd and closes it after we return.
+        log("IPC: cannot set receive timeout: " + std::string(strerror(errno)) +
+            " — dropping client to protect the accept loop.");
+        return;
+    }
+    if (setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv)) != 0) {
+        log("IPC: cannot set send timeout: " + std::string(strerror(errno)) +
+            " — dropping client to protect the accept loop.");
+        return;
+    }
 
     // P121/BUG-07: total-request deadline.  The per-recv timeout alone lets a
     // low-and-slow client dribble (1 byte per <2 s) and hold the worker for
@@ -4021,6 +4137,7 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
     // Read the command line (up to a newline / 256 bytes).  Byte-wise recv is
     // fine here — IPC traffic is one short line per client.
     std::string line;
+    bool line_complete = false;
     char ch;
     while (line.size() < 256) {
         if (now_ns() >= deadline_ns) { reply_timeout(); return; } // slow command line
@@ -4035,9 +4152,22 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
             reply_timeout();
             return;
         }
-        if (r <= 0) return;
-        if (ch == '\n') break;
+        if (r <= 0) {
+            // EOF with a partial command used to be dropped silently, leaving
+            // the client waiting for a reply that never came.  Name the reason.
+            if (!line.empty()) {
+                const char* resp = "{\"ok\":false,\"error\":\"incomplete command\"}\n";
+                (void)send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+            }
+            return;
+        }
+        if (ch == '\n') { line_complete = true; break; }
         line.push_back(ch);
+    }
+    if (!line_complete) {
+        const char* resp = "{\"ok\":false,\"error\":\"command too long\"}\n";
+        (void)send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+        return;
     }
 
     std::string response;
@@ -4053,9 +4183,8 @@ void AccelDaemon::handle_ipc_client(int client_fd) {
         // Empty payload clears the report ("none" / unescaped "{}").  We stash
         // the value under active_app_mu_; the loop thread consumes it and
         // re-applies app-scoped profiles without dropping any grab.
-        std::string app = line.substr(std::strlen("set_active_app "));
+        std::string app = sanitize_app_class(line.substr(std::strlen("set_active_app ")));
         if (app == "none") app.clear();
-        if (app.size() > 128) app.resize(128);
         std::lock_guard<std::mutex> lk(active_app_mu_);
         pending_app_ = app;
         active_app_dirty_ = true;

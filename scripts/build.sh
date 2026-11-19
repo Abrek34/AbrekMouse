@@ -82,9 +82,11 @@ esac
 # -- the load-bearing part of the fix is DROPPING -mavx2 -mfma.
 if [ "${RAWACCEL_PORTABLE:-0}" = "1" ]; then
     MARCH=""
+    CMAKE_PORTABLE=ON
     echo "[INFO] Baseline build ( -march=native and AVX2/AVX/FMA disabled )"
 else
     MARCH="-march=native"
+    CMAKE_PORTABLE=OFF
     echo "[INFO] Native architecture build ( -march=native )"
 fi
 
@@ -189,6 +191,7 @@ if [ "${USE_CMAKE:-0}" = "1" ]; then
     fi
     mkdir -p "$BUILD_CMAKE"
     cmake -S "$ROOT" -B "$BUILD_CMAKE" -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_COMPILER="$CXX" -DRAWACCEL_PORTABLE="$CMAKE_PORTABLE" \
         -DBUILD_DAEMON=ON -DBUILD_CLI=ON $GUI_FLAG -DBUILD_TESTS=ON \
         2>&1
     make -C "$BUILD_CMAKE" -j$(nproc) 2>&1

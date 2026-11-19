@@ -127,10 +127,21 @@ install_deps() {
             warn "sonra bu kurulumu tekrar çalıştırın."
             warn "Bu uyarıyı atlamak için: SKIP_SYSUPGRADE_WARN=1 bash setup.sh"
         fi
+        # systemd is part of Arch's base and is deliberately NOT listed here:
+        # `pacman -S systemd` on a partially-updated system upgrades systemd
+        # alone, while systemd-resolvconf/systemd-sysvcompat still pin the old
+        # version -> "systemd=... required" dependency failure.  A full -Syu
+        # updates those split packages together.  Catch that state up front.
+        if [[ -n "$(pacman -Qu systemd 2>/dev/null || true)" ]]; then
+            warn "Bekleyen systemd güncellemesi: $(pacman -Qu systemd 2>/dev/null | head -1)"
+            die "Kısmi yükseltme çakışmasını önlemek için önce tam güncelleme: sudo pacman -Syu"
+        fi
         # qt6-tools: qdbus6 → KDE Plasma 6 canlı reconfigure
-        pacman -S --needed --noconfirm \
-            base-devel cmake pkgconf libevdev gtk4 polkit systemd python \
-            qt6-tools
+        if ! pacman -S --needed --noconfirm \
+            base-devel cmake pkgconf libevdev gtk4 polkit python \
+            qt6-tools; then
+            die "Bağımlılık kurulumu başarısız. Bekleyen sistem güncellemeleri olabilir; 'sudo pacman -Syu' çalıştırıp tekrar deneyin."
+        fi
     elif is_debian_like; then
         ok "Debian/Ubuntu tespit edildi → apt"
         export DEBIAN_FRONTEND=noninteractive
@@ -164,8 +175,14 @@ install_deps() {
         warn "Bilinmeyen dağıtım ($DISTRO_ID); el ile şu paketleri kurun:"
         warn "  g++/clang++, make, cmake, pkg-config, libevdev (devel), gtk4 (devel),"
         warn "  systemd, polkit, python3, qt6-tools (qdbus6; KDE fix için)"
-        warn "Devam etmek için Enter'a basın..."
-        read -r _ || true
+        if [[ -t 0 ]]; then
+            warn "Devam etmek için Enter'a basın..."
+            read -r _ || true
+        else
+            # Non-interactive (CI/pkexec pipe): `read` returns instantly and the
+            # user was never asked.  Say so instead of pretending to prompt.
+            warn "Girdi terminal değil — etkileşimli onay atlandı; devam ediliyor."
+        fi
     fi
 
     # ── Tam doğrulama: herhangi biri eksikse "bağımlılık hatası" görmeden
@@ -298,6 +315,12 @@ build_project() {
     else
         warn "Gerçek kullanıcı olarak derlenemiyor; root olarak derleniyor."
         bash "$ROOT/scripts/build.sh"
+        # Root-owned build-manual makes later user builds/edits fail with EACCES.
+        # Hand the artifacts back to the desktop user when we know one.
+        if [[ -n "$REAL_USER" ]]; then
+            chown -R "$REAL_USER": "$ROOT/build-manual" 2>/dev/null || \
+                warn "build-manual sahipliği $REAL_USER kullanıcısına devredilemedi."
+        fi
     fi
     [[ -x "$ROOT/build-manual/rawaccel-daemon" ]] || die "Build başarısız."
 }
@@ -630,6 +653,25 @@ do_uninstall() {
         # H-3: preserve the session env so kwinrc detection + D-Bus reload work.
         run_as_real_user bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
             || warn "kwinrc iz temizliği hata verdi (önemsiz)."
+    fi
+    # Multi-user boxes: SUDO_USER is only one of the accounts that may carry a
+    # RawAccel per-device kwinrc override.  Clean every real /home user too.
+    if [[ -x "$ROOT/scripts/kde-fix-accel.sh" ]]; then
+        shopt -s nullglob
+        for home in /home/*; do
+            [[ -n "$REAL_HOME" && "$home" == "$REAL_HOME" ]] && continue
+            local u
+            u="$(basename "$home")"
+            id "$u" &>/dev/null || continue
+            if command -v runuser >/dev/null 2>&1; then
+                runuser -m -u "$u" -- bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
+                    >/dev/null 2>&1 || true
+            else
+                sudo -u "$u" bash "$ROOT/scripts/kde-fix-accel.sh" --remove \
+                    >/dev/null 2>&1 || true
+            fi
+        done
+        shopt -u nullglob
     fi
     ok "Kaldırma tamamlandı. Kullanıcı configi (~/.config/rawaccel + /etc/rawaccel) korundu."
     echo "  /etc/rawaccel'i da silmek için: sudo rm -rf /etc/rawaccel"

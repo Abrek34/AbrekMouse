@@ -23,11 +23,16 @@ post_install() {
     # Reload udev rules we installed so /dev/input/event* and /dev/uinput
     # permissions apply now, not only after a reboot (M-4).
     udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger 2>/dev/null || true
+    # Input-only change event: avoids re-triggering every block/net device.
+    udevadm trigger --subsystem-match=input --action=change 2>/dev/null || true
 }
 
 post_upgrade() {
     systemctl daemon-reload
+    # A package upgrade may ship changed udev rules; reload + re-apply them just
+    # like post_install (otherwise the new rule only takes effect on reboot).
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=input --action=change 2>/dev/null || true
     # Restart if the user had it running; never re-enable a service they disabled.
     systemctl try-restart rawaccel.service &>/dev/null || true
 }

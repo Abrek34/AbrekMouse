@@ -437,6 +437,11 @@ static void test_hidpp_onboard_sector_payload_budget() {
     // GERÇEKTEN tele çıkmalı ve parametre vektörü bütçenin tam sınırında
     // (16) olmalı.  Chunk kayarsa (14 → 16) bu test KIRMIZIYA döner.
     auto dev = make_device();
+    // write_onboard_profile_sector() now validates against GetInfo first:
+    // memory=0x01, profile_count=1, sector_count=4, profile_size=2048.
+    dev->canned[{4, 0x00}] = {
+        0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04, 0x08, 0x00, 0x00
+    };
     // Feature 0x8100 OnboardProfiles: fn 0x70 (write_sector) taşımada 4-bit seçiciye
     // normalleşir (0x70 → 0x07) — sahte cihaz da NORMALİZE id ile eşleşir.
     dev->canned[{4, hidpp_normalize_function_id(0x70)}] = {};  // write_sector → başarılı

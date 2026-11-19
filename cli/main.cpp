@@ -1839,6 +1839,71 @@ static int cmd_export(const app_config& cfg, const std::string& name) {
     return 1;
 }
 
+/// Resolve a `diff` file source using the same formats as `import`: a single
+/// profile object, a {"profiles":[...]} wrapper, a JSON array, or the
+/// newline-delimited export stream.  A field-by-field diff only makes sense
+/// for one profile, so multi-profile sources are rejected with an explicit
+/// "extract one" message instead of silently comparing the wrong entry.
+static bool diff_profile_from_file(const std::string& content,
+                                   const std::string& ref,
+                                   device_profile& out) {
+    auto parse_one = [&](const std::string& frag) -> bool {
+        try {
+            out = profile_from_json(frag);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid profile JSON in " << ref << ": "
+                      << e.what() << "\n";
+            return false;
+        }
+    };
+    try {
+        const nlohmann::json raw = nlohmann::json::parse(content);
+        if (raw.is_object() && raw.contains("profiles")) {
+            if (!raw["profiles"].is_array() || raw["profiles"].empty()) {
+                std::cerr << "diff: '" << ref << "' has no profiles array.\n";
+                return false;
+            }
+            if (raw["profiles"].size() != 1) {
+                std::cerr << "diff: '" << ref << "' is a full-config export with "
+                          << raw["profiles"].size() << " profiles; extract one "
+                             "first (rawaccel-cli export <name>).\n";
+                return false;
+            }
+            return parse_one(raw["profiles"][0].dump());
+        }
+        if (raw.is_array()) {
+            if (raw.size() != 1) {
+                std::cerr << "diff: '" << ref << "' contains " << raw.size()
+                          << " profiles; extract one first "
+                             "(rawaccel-cli export <name>).\n";
+                return false;
+            }
+            return parse_one(raw[0].dump());
+        }
+        return parse_one(content); // single profile object
+    } catch (const std::exception&) {
+        // Not one JSON document -> the export line-stream format.
+        std::istringstream is(content);
+        std::string line, only;
+        size_t count = 0;
+        while (std::getline(is, line)) {
+            const size_t a = line.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) continue;
+            const size_t b = line.find_last_not_of(" \t\r\n");
+            only = line.substr(a, b - a + 1);
+            ++count;
+        }
+        if (count != 1) {
+            std::cerr << "diff: '" << ref << "' contains " << count
+                      << " profile lines; extract one first "
+                         "(rawaccel-cli export <name>).\n";
+            return false;
+        }
+        return parse_one(only);
+    }
+}
+
 /// Compare two profiles (either by profile name in the config, or by JSON file
 /// path) and print ONLY the fields that differ, using the same epsilon the
 /// accel_args operator== uses so legitimate round-trip precision differences
@@ -1891,24 +1956,11 @@ static int cmd_diff(const app_config& cfg, const std::string& a, const std::stri
             std::cerr << "Refusing to diff: " << ref << " is larger than 1MB\n";
             return false;
         }
-        try {
-            // L13-05: `export` (no name) emits a {"profiles":[...]} wrapper.
-            // profile_from_json() has no top-level name/profile, so the wrapper
-            // silently degraded to an empty default profile — two completely
-            // different full-config exports diffed as "no differences", rc=0.
-            // Reject the ambiguous source instead of guessing which profile.
-            const nlohmann::json raw = nlohmann::json::parse(content);
-            if (raw.is_object() && raw.contains("profiles")) {
-                std::cerr << "diff: '" << ref << "' is a full-config export "
-                             "(has 'profiles'); extract a single profile first "
-                             "(rawaccel-cli export <name>).\n";
-                return false;
-            }
-            out = profile_from_json(content);
-        } catch (const std::exception& e) {
-            std::cerr << "Invalid profile JSON in " << ref << ": " << e.what() << "\n";
-            return false;
-        }
+        // T36-CLI03: accept the same four formats as `import` (single object,
+        // wrapper, array, line stream), but only when they resolve to exactly
+        // one profile.  The old single-object-only path rejected the very
+        // `export` output the help promised.
+        if (!diff_profile_from_file(content, ref, out)) return false;
         kind = diff_kind::file;
         return true;
     };
@@ -2786,6 +2838,7 @@ static int cmd_status_json(const std::string& config_path) {
             po["name"]      = p.name;
             po["active"]    = (p.name == cfg.active_profile);
             po["device_id"] = p.device_id;
+            po["match_app"] = p.match_app;
             po["dpi"]       = p.dev_cfg.dpi;
             po["polling_rate"] = p.dev_cfg.polling_rate;
             // P115-A5-09: expose the per-profile disable flag so status --json
@@ -2884,6 +2937,10 @@ static int cmd_status(const std::string& config_path) {
             // Show device assignment if set
             if (!p.device_id.empty())
                 std::cout << "  [device: " << p.device_id << "]";
+            // P-APP: app-scoped profiles are first-match-wins on match_app;
+            // surface the gate next to the device binding in text output too.
+            if (!p.match_app.empty())
+                std::cout << "  [app: " << p.match_app << "]";
             // Show mode summary
             const char* mode_s = "noaccel";
             if (p.prof.raw_passthrough) {

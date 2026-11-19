@@ -138,6 +138,10 @@ static std::atomic<bool> g_dump_latency { false };
 //   2. SIGTERM during start() would be overwritten by running_.store(true).
 // Values are only ever written in the handler; main reads them at safe points.
 static std::atomic<bool> g_stop_requested { false };
+// T40-SIG01: a SIGHUP that lands before g_daemon.store() would previously be
+// dropped.  Latch it; main consumes the latch right after the store, and the
+// handler still forwards directly once the pointer is visible.
+static std::atomic<bool> g_reload_requested { false };
 
 static void handle_signal(int sig) {
     // Signal handlers must only call async-signal-safe functions.
@@ -147,6 +151,7 @@ static void handle_signal(int sig) {
     // K2: g_daemon is atomic — load() from signal handler is safe.
     rawaccel::AccelDaemon* d = g_daemon.load();
     if (sig == SIGHUP) {
+        g_reload_requested.store(true);
         if (d) d->reload();
     } else if (sig == SIGUSR1) {
         // K3: set flag; actual dump happens in the main loop (safe to use cout there)
@@ -630,6 +635,11 @@ int main(int argc, char* argv[]) {
         remove_pid();
         return 0;
     }
+
+    // T40-SIG01: consume a SIGHUP that landed before g_daemon.store().
+    // Duplicate requests are harmless: reload() only sets an atomic flag and
+    // the run loop consumes it once.
+    if (g_reload_requested.exchange(false)) daemon.reload();
 
     // Always log to stdout (systemd journal captures it), verbose = also show debug
     bool json_logs = (log_format == "json");

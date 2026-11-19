@@ -112,6 +112,30 @@ run_gate_step() {
     fi
 }
 
+# ── Sürüm senkronu kapısı (P0-1) ──────────────────────────────────────────────
+# RAWACCEL_VERSION tek kaynaktır; CMake/PKGBUILD/.SRCINFO aynı sürümü ilan
+# etmezse paket ile binary farklı sürüm söyler.  Bu kontrol bump prosedürünü
+# testle zorlar; aksi hâlde bir sonraki bump'ta aynı kayma sessizce geri gelir.
+V_HEADER=$(sed -n 's/.*RAWACCEL_VERSION = "\([0-9][0-9.]*\)".*/\1/p' \
+    "$ROOT/include/rawaccel-base.hpp" | head -n1)
+V_CMAKE=$(sed -n 's/^project(rawaccel-linux VERSION \([0-9][0-9.]*\).*/\1/p' \
+    "$ROOT/CMakeLists.txt" | head -n1)
+V_PKG=$(sed -n 's/^pkgver=\([0-9][0-9.]*\).*/\1/p' \
+    "$ROOT/packaging/PKGBUILD" | head -n1)
+V_SRC=$(awk '$1 == "pkgver" { print $3; exit }' \
+    "$ROOT/packaging/.SRCINFO")
+if [ -z "$V_HEADER" ] || [ "$V_HEADER" != "$V_CMAKE" ] || \
+   [ "$V_HEADER" != "$V_PKG" ] || [ "$V_HEADER" != "$V_SRC" ]; then
+    echo "FAIL: sürüm senkronu kırık —" >&2
+    echo "  rawaccel-base.hpp: ${V_HEADER:-<yok>}" >&2
+    echo "  CMakeLists.txt:    ${V_CMAKE:-<yok>}" >&2
+    echo "  PKGBUILD:          ${V_PKG:-<yok>}" >&2
+    echo "  .SRCINFO:          ${V_SRC:-<yok>}" >&2
+    echo "  (dördü birden bump edilmeli; .SRCINFO: makepkg --printsrcinfo)" >&2
+    exit 1
+fi
+echo "Sürüm senkronu: $V_HEADER ✓"
+
 # config.cpp ayrı derleme birimi olarak derlenir (M2: ODR sorununu önler)
 # T53-02: -lpthread NESNElerden SONRAYA — --as-needed sol-sağ okur, öne
 # konursa lib düşürülüp sonraki nesneler çözümsüz kalabilir.
@@ -640,6 +664,47 @@ PY
         echo "FAIL: diff profile vs its own export (rc=$RC): $OUT"
         exit 1
     fi
+    # T36-CLI03: diff, import'un dört biçimini de (tek obje, wrapper, array,
+    # satır akışı) kabul eder — ama yalnızca TEK profil çıkarıyorsa.  Çoklu
+    # kaynak, yanlış girdiyi sessizce karşılaştırmak yerine açıkça reddedilir.
+    TMPDF1=$(mktemp --suffix=.json)
+    TMPDWRAP=$(mktemp --suffix=.json)
+    TMPDARR=$(mktemp --suffix=.json)
+    TMPDMULTI=$(mktemp --suffix=.json)
+    TMPDSTREAM2=$(mktemp --suffix=.json)
+    TMP_FILES+=( "$TMPDF1" "$TMPDWRAP" "$TMPDARR" "$TMPDMULTI" "$TMPDSTREAM2" )
+    run_gate_step "diff export d1" bash -c '"$1" -c "$2" --no-daemon export d1 > "$3"' _ "$CLI" "$TMPD1" "$TMPDF1"
+    printf '{"profiles":[%s]}\n' "$(cat "$TMPDF")" > "$TMPDWRAP"
+    printf '[%s]\n' "$(cat "$TMPDF")" > "$TMPDARR"
+    printf '{"profiles":[%s,%s]}\n' "$(cat "$TMPDF1")" "$(cat "$TMPDF")" > "$TMPDMULTI"
+    printf '%s\n%s\n' "$(cat "$TMPDF1")" "$(cat "$TMPDF")" > "$TMPDSTREAM2"
+    for f in "$TMPDWRAP" "$TMPDARR" "$TMPDF"; do
+        set +e
+        OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d2 "$f" 2>&1)
+        RC=$?
+        set -e
+        if [ $RC -ne 0 ] || ! echo "$OUT" | grep -q "no differences"; then
+            echo "FAIL: diff single-profile format '$f' (rc=$RC): $OUT"
+            exit 1
+        fi
+    done
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d2 "$TMPDMULTI" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "2 profiles"; then
+        echo "FAIL: diff accepted multi-profile wrapper (rc=$RC): $OUT"
+        exit 1
+    fi
+    set +e
+    OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d2 "$TMPDSTREAM2" 2>&1)
+    RC=$?
+    set -e
+    if [ $RC -ne 1 ] || ! echo "$OUT" | grep -q "2 profile lines"; then
+        echo "FAIL: diff accepted multi-profile line stream (rc=$RC): $OUT"
+        exit 1
+    fi
+    echo "CLI diff format kapısı: obje/wrapper/array + çoklu-red ✓"
     # hatalı kaynak: yok + dosya değil → rc 1, config'e dokunulmaz
     set +e
     OUT=$("$CLI" -c "$TMPD1" --no-daemon diff d1 "no-such-name-zzz" 2>&1)
@@ -650,7 +715,8 @@ PY
         exit 1
     fi
     echo "CLI diff kapısı: özdeş/dosya-gidiş-geliş/eksik-kaynak ✓"
-    rm -f "$TMPD1" "$TMPD1.bak" "$TMPDF"
+    rm -f "$TMPD1" "$TMPD1.bak" "$TMPDF" "$TMPDF1" "$TMPDWRAP" \
+          "$TMPDARR" "$TMPDMULTI" "$TMPDSTREAM2"
 
     # ── SEC-2: config yolu politikası ÇÖZÜLMÜŞ yola uygulanmalı (R5-S-9) ─────
     # Yasağın (".json" + /proc/ /sys/ /dev/) "dosya yok" dalında ham dizgeye

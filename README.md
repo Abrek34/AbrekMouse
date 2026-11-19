@@ -2,7 +2,7 @@
 
 A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the same acceleration algorithms.
 
-> **Current state: v1.2.7** — native Logitech HID++ hardware controls for DPI,
+> **Current state: v1.2.10** — native Logitech HID++ hardware controls for DPI,
 > report rate, and sensor lift-off distance. Release notes: see
 > [CHANGELOG.md](CHANGELOG.md).
 >
@@ -17,9 +17,10 @@ A Linux port of [Windows Raw Accel](https://github.com/a1xd/rawaccel), using the
 > not a "verified on an installed system" claim. See the
 > [1.2.7 changelog entry](CHANGELOG.md) before treating this as install-ready.
 
-## Verification status (v1.2.7)
+## Verification status (last fully measured: v1.2.7)
 
-Measured on the v1.2.7 tree (2026-10-07):
+Measured on the v1.2.7 tree (2026-10-07); later commits have not been through
+the full local gate set in this checkout:
 
 - Build: **0 warnings**
 - Unit tests: **34405/34405**
@@ -166,7 +167,7 @@ Kurulumdan önce sihirbaz paket yöneticisi durumunu denetler:
   `bash install-gui.sh --detect`.
 
 > **Arch package coexistence**: on Arch-based distros you can instead install
-> the packaged binary (`packaging/rawaccel-linux-1.2.7-1-x86_64.pkg.tar.zst`,
+> the packaged binary (`packaging/rawaccel-linux-1.2.10-1-x86_64.pkg.tar.zst`,
 > `sudo pacman -U ...`) or publish it via an AUR package. Do **not** mix
 > `setup.sh` and the pacman package: both install the systemd unit to the same
 > path (`/usr/lib/systemd/system/rawaccel.service`) and both install the

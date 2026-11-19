@@ -28,6 +28,25 @@ static void update_raw_sensitivity(AppState* S, bool raw) {
     if (S->output_dpi_spin)    gtk_widget_set_sensitive(S->output_dpi_spin, !raw);
 }
 
+// P1-2: capture the X-only scalar controls exactly as profile_to_widgets()
+// left them.  widgets_to_profile() compares against this before copying X→Y so
+// a value the profile carries only on Y survives an unrelated GUI edit.
+static void capture_unlinked_x_snapshot(AppState* S) {
+    if (!S->gain_check || !S->cap_mode_combo) return;
+    auto& s = S->xy_snapshot;
+    s.gain           = gtk_check_button_get_active(GTK_CHECK_BUTTON(S->gain_check)) != FALSE;
+    s.cap_mode       = (int)gtk_drop_down_get_selected(GTK_DROP_DOWN(S->cap_mode_combo));
+    s.cap_x          = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->cap_x_spin));
+    s.exponent_power = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->power_exp_spin));
+    s.decay_rate     = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->decay_spin));
+    s.scale          = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->scale_spin));
+    s.output_offset  = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->output_offset_spin));
+    s.motivity       = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->motivity_spin));
+    s.gamma          = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->gamma_spin));
+    s.smooth         = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->smooth_spin));
+    s.sync_speed     = gtk_spin_button_get_value(GTK_SPIN_BUTTON(S->sync_speed_spin));
+}
+
 // Which modes consume each curve parameter. Derived from the actual accel_args
 // usage in include/accel-*.hpp (reference-aligned):
 //   classic    → acceleration, exponent_classic, input_offset, cap.x/y, cap_mode
@@ -179,19 +198,34 @@ void widgets_to_profile(AppState* S) {
     if (S->xy_linked) {
         ay = ax;
     } else {
-        // R13: copy fields that have no dedicated Y-axis widget from X,
-        // so they stay in sync rather than going stale when Y is unlinked.
-        ay.gain             = ax.gain;
-        ay.cap_mode_val     = ax.cap_mode_val;
-        ay.cap.x            = ax.cap.x;
-        ay.exponent_power   = ax.exponent_power;
-        ay.decay_rate       = ax.decay_rate;
-        ay.scale            = ax.scale;
-        ay.output_offset    = ax.output_offset;
-        ay.motivity         = ax.motivity;
-        ay.gamma            = ax.gamma;
-        ay.smooth           = ax.smooth;
-        ay.sync_speed       = ax.sync_speed;
+        // R13: fields that have no dedicated Y-axis widget are sourced from X.
+        // P1-2: copy each one ONLY when its X control changed since the profile
+        // was loaded.  The old unconditional copy silently overwrote a distinct
+        // Y value (imported JSON / hand-edited asymmetric profile) on the first
+        // unrelated GUI edit + save.
+        const auto& snap = S->xy_snapshot;
+        if (CHECK(gain_check) != snap.gain)
+            ay.gain             = ax.gain;
+        if (DD(cap_mode_combo) != snap.cap_mode)
+            ay.cap_mode_val     = ax.cap_mode_val;
+        if (SPIN(cap_x_spin) != snap.cap_x)
+            ay.cap.x            = ax.cap.x;
+        if (SPIN(power_exp_spin) != snap.exponent_power)
+            ay.exponent_power   = ax.exponent_power;
+        if (SPIN(decay_spin) != snap.decay_rate)
+            ay.decay_rate       = ax.decay_rate;
+        if (SPIN(scale_spin) != snap.scale)
+            ay.scale            = ax.scale;
+        if (SPIN(output_offset_spin) != snap.output_offset)
+            ay.output_offset    = ax.output_offset;
+        if (SPIN(motivity_spin) != snap.motivity)
+            ay.motivity         = ax.motivity;
+        if (SPIN(gamma_spin) != snap.gamma)
+            ay.gamma            = ax.gamma;
+        if (SPIN(smooth_spin) != snap.smooth)
+            ay.smooth           = ax.smooth;
+        if (SPIN(sync_speed_spin) != snap.sync_speed)
+            ay.sync_speed       = ax.sync_speed;
         // G2-FIX: the LUT editor only targets accel_x, so when Y is unlinked
         // and set to "Lookup" mode its lookup data/length were never populated
         // from the UI (no dedicated Y LUT editor).  Copy ax's raw LUT data
@@ -301,6 +335,10 @@ void widgets_to_profile(AppState* S) {
 #undef CHECK
 #undef DD
 
+    // P1-2: remember what X looks like now, so the next edit only pushes a
+    // genuinely changed X value onto a distinct Y scalar.
+    capture_unlinked_x_snapshot(S);
+
     update_raw_sensitivity(S, dp.prof.raw_passthrough);
 
     gtk_widget_queue_draw(S->graph_area);
@@ -353,6 +391,11 @@ void profile_to_widgets(AppState* S) {
     SET_SPIN(limit_spin_y,    ay.limit);
     SET_SPIN(offset_spin_y,   ay.input_offset);
     SET_SPIN(cap_y_spin_y,    ay.cap.y);
+
+    // P1-2: baseline for "did the user change this X control?" in
+    // widgets_to_profile().  Captured from the widgets themselves so a value
+    // the spin clamps on load cannot read as a user edit.
+    capture_unlinked_x_snapshot(S);
 
     SET_CHK(raw_check,        dp.prof.raw_passthrough);
     SET_SPIN(rotation_spin,   dp.prof.degrees_rotation);
